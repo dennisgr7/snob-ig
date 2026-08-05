@@ -118,8 +118,32 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
 
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    // Not only a speed setting. Without it SQLite may spill a temporary
+    // b-tree into TMPDIR, which is outside every directory `purge` knows
+    // about — so a query's working copy of the follower list would outlive
+    // the command whose whole job is to leave nothing behind.
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "cache_size", -8_000)?; // 8 MiB
+
+    // Deleted rows are overwritten rather than merely unlinked from the page.
+    // This is what `logout` and any future pruning need: they delete content
+    // without deleting the file, and the default leaves it legible in the
+    // freed pages. A database of a few megabytes does not notice the cost.
+    conn.pragma_update(None, "secure_delete", "ON")?;
+
+    // In WAL mode the log is reused rather than truncated, so it keeps the
+    // pre-image of everything `secure_delete` just scrubbed from the database
+    // proper. Bounding it bounds how much of that history survives.
+    conn.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
+
+    // Nothing here uses a virtual table or a function inside the schema, so
+    // this costs nothing — and it is SQLite's own advice for any application
+    // that can manage without them, because the schema of a database file is
+    // executable content and this file sits at a fixed, guessable path.
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+
     Ok(())
 }
 

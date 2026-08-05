@@ -51,19 +51,33 @@ pub fn refuse_incomplete(
     .into()
 }
 
-/// "3 unfollowers", plus what the filters took out when they took anything.
+/// "3 unfollowers", plus what took the others away when anything did.
+///
+/// Three counts, because two things can shorten a list and they are not the
+/// same news. `total` is what the crossing produced, `kept` what survived the
+/// filters, and `shown` what `--limit` left. Measuring only the first and the
+/// last meant `--limit 3` on ten unfollowers with no filters at all reported
+/// "3 unfollowers (of 10, the rest filtered out)" — nothing was filtered, and
+/// `--limit`'s own help calls it a trim.
 ///
 /// Both forms of the noun are handed in rather than an `s` being bolted on:
 /// what gets counted here is a whole phrase — "accounts you follow that do not
 /// follow you back" — whose singular differs by three words rather than by a
 /// final letter. The count of one is not a rare case, either: it is what a
 /// filtered list reaches most often.
-pub fn counted(shown: usize, before_filtering: usize, one: &str, many: &str) -> String {
+pub fn counted(shown: usize, kept: usize, total: usize, one: &str, many: &str) -> String {
     let what = if shown == 1 { one } else { many };
-    if shown == before_filtering {
-        return format!("{shown} {what}");
+    let mut line = format!("{shown} {what}");
+    match (kept < total, shown < kept) {
+        (false, false) => {}
+        (true, false) => line.push_str(&format!(" (of {total}, the rest filtered out)")),
+        (false, true) => line.push_str(&format!(" (of {kept}, trimmed by --limit)")),
+        (true, true) => line.push_str(&format!(
+            " (of {total}: {} filtered out, the rest trimmed by --limit)",
+            total - kept
+        )),
     }
-    format!("{shown} {what} (of {before_filtering}, the rest filtered out)")
+    line
 }
 
 /// "1 request" / "7 requests".
@@ -185,10 +199,28 @@ mod tests {
     /// Filters that took nothing out must not leave a clause saying they did.
     #[test]
     fn the_count_only_mentions_filtering_when_something_was_filtered() {
-        assert_eq!(counted(3, 3, "unfollower", "unfollowers"), "3 unfollowers");
         assert_eq!(
-            counted(3, 10, "unfollower", "unfollowers"),
+            counted(3, 3, 3, "unfollower", "unfollowers"),
+            "3 unfollowers"
+        );
+        assert_eq!(
+            counted(3, 3, 10, "unfollower", "unfollowers"),
             "3 unfollowers (of 10, the rest filtered out)"
+        );
+    }
+
+    /// A cap is not a filter. `--limit 3` on ten unfollowers with no filters
+    /// at all used to report that the other seven were filtered out.
+    #[test]
+    fn a_cap_is_reported_as_a_cap() {
+        assert_eq!(
+            counted(3, 10, 10, "unfollower", "unfollowers"),
+            "3 unfollowers (of 10, trimmed by --limit)"
+        );
+        // And when both happened, both are named.
+        assert_eq!(
+            counted(2, 4, 10, "unfollower", "unfollowers"),
+            "2 unfollowers (of 10: 6 filtered out, the rest trimmed by --limit)"
         );
     }
 
@@ -196,12 +228,18 @@ mod tests {
     /// follow that do not follow you back" was the summary users saw most.
     #[test]
     fn a_count_of_one_reads_as_one() {
-        assert_eq!(counted(1, 1, "unfollower", "unfollowers"), "1 unfollower");
         assert_eq!(
-            counted(1, 9, "unfollower", "unfollowers"),
+            counted(1, 1, 1, "unfollower", "unfollowers"),
+            "1 unfollower"
+        );
+        assert_eq!(
+            counted(1, 1, 9, "unfollower", "unfollowers"),
             "1 unfollower (of 9, the rest filtered out)"
         );
-        assert_eq!(counted(0, 0, "unfollower", "unfollowers"), "0 unfollowers");
+        assert_eq!(
+            counted(0, 0, 0, "unfollower", "unfollowers"),
+            "0 unfollowers"
+        );
     }
 
     #[test]
