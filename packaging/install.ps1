@@ -58,11 +58,37 @@ try {
 
     # The user's PATH, never the machine's: this installs for one account and
     # has no business editing anything the whole system reads.
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($userPath -notlike "*$installDir*") {
-        [Environment]::SetEnvironmentVariable(
-            'Path', ($userPath.TrimEnd(';') + ';' + $installDir), 'User')
-        Write-Host "Added $installDir to your PATH. Open a new terminal for it to take effect."
+    #
+    # Read and written through the registry rather than through
+    # [Environment]::GetEnvironmentVariable, which expands %VAR% references
+    # before handing the value over. Writing that back turns a PATH holding
+    # %USERPROFILE%\.cargo\bin into the literal expanded path, silently and
+    # permanently, which breaks a roaming profile or a relocated home directory
+    # for every tool that was relying on it.
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    try {
+        $userPath = $key.GetValue(
+            'Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        # An account that has never had a user PATH has no value to read, and
+        # calling a method on the $null that comes back is a terminating error
+        # under $ErrorActionPreference = 'Stop' -- after the binary has already
+        # been copied, so the install fails having half worked.
+        if ($null -eq $userPath) { $userPath = '' }
+
+        # Split on the separator and compare whole entries. `-like` treats [ ]
+        # as a character class, so a bracket in the path made the test
+        # meaningless; and a substring match called it present when PATH merely
+        # contained a longer path starting with this one.
+        $entries = $userPath.Split(';') | Where-Object { $_ -ne '' }
+        if ($entries -notcontains $installDir) {
+            $updated = (@($entries) + $installDir) -join ';'
+            # ExpandString, so any %VAR% left in the value keeps expanding.
+            $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            Write-Host "Added $installDir to your PATH. Open a new terminal for it to take effect."
+        }
+    }
+    finally {
+        if ($key) { $key.Dispose() }
     }
 
     Write-Host ""

@@ -211,6 +211,19 @@ fn repo_root() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Directories this never descends into.
+///
+/// `target` and `.git` are the obvious ones. The rest are where a developer's
+/// own files live, and since `json` joined the extension list the walk reaches
+/// things that are nobody's source: an editor's settings, and — the one that
+/// matters — an Instagram data export or a `snob lists -o out.json` written
+/// from the repository root. Those are full of real names with real accents,
+/// so the test would fail on them **and print them into the assertion
+/// message**. That is the "permanent noise and someone switches it off"
+/// outcome the language rule warns about, arriving with someone else's
+/// personal data attached.
+const SKIP_DIRS: [&str; 6] = ["target", ".git", ".claude", ".vscode", ".idea", "exports"];
+
 fn source_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -224,7 +237,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_string_lossy().to_string();
 
             if path.is_dir() {
-                if name != "target" && name != ".git" {
+                if !SKIP_DIRS.contains(&name.as_str()) {
                     pending.push(path);
                 }
             } else if path

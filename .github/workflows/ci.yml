@@ -11,6 +11,12 @@ env:
   # A failed build should not be followed by a slow one.
   CARGO_INCREMENTAL: 0
 
+# Nothing here writes anything back. Said explicitly rather than inherited,
+# because these jobs compile third-party build scripts and a token they never
+# use is one they cannot misuse.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Format and lints
