@@ -1,0 +1,433 @@
+//! Rate control that persists across runs.
+//!
+//! An in-memory limiter is no good here: the budget has to outlive the process,
+//! because running the command twice in a row must not spend twice without
+//! anyone noticing. No Rust crate does this over local storage, so it is
+//! hand-written.
+//!
+//! The algorithm is GCRA, an exact token bucket expressed as a single integer:
+//! instead of storing how many tokens are left and when they were refilled, it
+//! stores the theoretical instant from which the next request is legitimate.
+//! Integer arithmetic, no floating-point drift, and no row to update per tick.
+
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+
+use super::{StoreError, now_ms};
+use crate::paths::AppPaths;
+
+/// Bucket names, as stored in `rate_budget.bucket`.
+///
+/// Constants rather than inline literals: they used to be repeated as loose
+/// strings in five places, and missing one of them silently restarts the budget.
+const PACE_BUCKET: &str = "pace";
+const DAILY_BUCKET: &str = "daily";
+/// The only value of `cooldowns.scope`. A cooldown covers the whole session.
+const SESSION_SCOPE: &str = "session";
+
+/// Sustained pace: one request every 2.4 seconds, the average of the project
+/// ours is modeled on.
+const PACE_EMISSION_MS: i64 = 2_400;
+/// Burst tolerance of the pace bucket: twenty requests.
+const PACE_BURST_MS: i64 = PACE_EMISSION_MS * 20;
+
+/// Daily ceiling of roughly two thousand requests.
+const DAILY_EMISSION_MS: i64 = 43_200;
+const DAILY_BURST_MS: i64 = 86_400_000;
+
+/// Slack before deciding the system clock has gone backwards.
+const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
+
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(2 * 3600);
+const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
+const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
+
+/// Escape hatch environment variable. Deliberately absent from the help: it
+/// exists so a bug of ours cannot lock anyone out, not for skipping the limit
+/// out of convenience.
+const IGNORE_COOLDOWN_ENV: &str = "SNOB_IGNORE_COOLDOWN";
+
+/// How long to wait before firing a request.
+pub trait RateBudget: Send + Sync {
+    /// Reserves a request and returns how long to wait before sending it. Zero
+    /// means go ahead.
+    ///
+    /// The reservation is committed even if the request is never made:
+    /// overcharging is the safe direction to be wrong in.
+    fn reserve(&self) -> Result<Duration, RateBudgetError>;
+
+    /// Until when the account is in cooldown, as an epoch in milliseconds.
+    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError>;
+
+    /// Puts the account in cooldown and returns until when.
+    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct RateBudgetError(pub String);
+
+impl From<StoreError> for RateBudgetError {
+    fn from(e: StoreError) -> Self {
+        Self(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for RateBudgetError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self(e.to_string())
+    }
+}
+
+/// Cooldown length for each cause.
+pub fn rate_limit_cooldown() -> Duration {
+    RATE_LIMIT_COOLDOWN
+}
+
+pub fn action_block_cooldown() -> Duration {
+    ACTION_BLOCK_COOLDOWN
+}
+
+/// The core of the algorithm, isolated so it can be tested without a database.
+///
+/// `emission` is what a request costs in time and `burst` how far ahead one may
+/// run. Returns the new theoretical instant and the wait.
+fn decide(tat: i64, now: i64, emission: i64, burst: i64) -> (i64, i64) {
+    let tat = tat.max(now);
+    let wait = (tat - burst - now).max(0);
+    (tat + emission, wait)
+}
+
+pub struct SqliteRateBudget {
+    /// Behind a `Mutex` because the trait exposes `&self` and opening a
+    /// transaction needs `&mut Connection`. There is never real contention:
+    /// reservations within a process are sequential, and coordination between
+    /// processes is SQLite's job.
+    conn: std::sync::Mutex<Connection>,
+}
+
+impl SqliteRateBudget {
+    /// Opens its **own** connection to the same file.
+    ///
+    /// It deliberately does not share the store's: this way the two-process
+    /// case is the same as the two-connection case, so what runs is what gets
+    /// tested. It also keeps the budget's borrow from clashing with the
+    /// transaction that inserts pages.
+    pub fn open(paths: &AppPaths) -> Result<Self, StoreError> {
+        // The store must have been opened first: it is what creates the schema.
+        let conn = Connection::open(paths.db_file())?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self::over(conn))
+    }
+
+    #[doc(hidden)]
+    pub fn over(conn: Connection) -> Self {
+        Self {
+            conn: std::sync::Mutex::new(conn),
+        }
+    }
+
+    /// Tolerates poisoning: if a thread panicked holding the lock, the worst
+    /// case here is a half-done reservation the transaction already rolled back.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reserve_bucket(
+        tx: &rusqlite::Transaction<'_>,
+        bucket: &str,
+        emission: i64,
+        burst: i64,
+        now: i64,
+    ) -> Result<i64, RateBudgetError> {
+        let row: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT tat_ms, updated_at_ms FROM rate_budget WHERE bucket = ?1",
+                params![bucket],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let stored_tat = match row {
+            // If the clock went backwards the stored instant means nothing any
+            // more: the wait would come out as hours. It is reset. That is not
+            // a free pass, because it still grants no burst beyond tolerance.
+            Some((_, updated)) if now + CLOCK_SKEW_TOLERANCE_MS < updated => {
+                tracing::warn!(bucket, "the system clock went backwards; budget reset");
+                now
+            }
+            Some((tat, _)) => tat,
+            None => now,
+        };
+
+        let (new_tat, wait) = decide(stored_tat, now, emission, burst);
+
+        tx.execute(
+            "INSERT INTO rate_budget (bucket, tat_ms, emission_ms, burst_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(bucket) DO UPDATE SET
+                 tat_ms = excluded.tat_ms,
+                 emission_ms = excluded.emission_ms,
+                 burst_ms = excluded.burst_ms,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![bucket, new_tat, emission, burst, now],
+        )?;
+
+        Ok(wait)
+    }
+}
+
+impl RateBudget for SqliteRateBudget {
+    fn reserve(&self) -> Result<Duration, RateBudgetError> {
+        let now = now_ms();
+
+        // BEGIN IMMEDIATE rather than the default deferred one: with deferred,
+        // two processes read, both try to write, and the second gets
+        // SQLITE_BUSY when upgrading the transaction, at which point
+        // busy_timeout can no longer help and it fails outright. Taking the
+        // write lock up front makes the processes serialize.
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let pace_wait =
+            Self::reserve_bucket(&tx, PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS, now)?;
+        let daily_wait =
+            Self::reserve_bucket(&tx, DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS, now)?;
+
+        tx.commit()?;
+
+        Ok(Duration::from_millis(
+            pace_wait.max(daily_wait).max(0) as u64
+        ))
+    }
+
+    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+        if std::env::var(IGNORE_COOLDOWN_ENV).is_ok() {
+            tracing::warn!("{IGNORE_COOLDOWN_ENV} is set: the cooldown is being ignored");
+            return Ok(None);
+        }
+
+        let row: Option<(i64, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT until_ms, set_at_ms FROM cooldowns WHERE scope = ?1",
+                params![SESSION_SCOPE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let now = now_ms();
+        Ok(match row {
+            // Also checked against `set_at_ms`: if the clock went backwards the
+            // cooldown still stands even though `until_ms` looks past.
+            Some((until, set_at)) if now < until || now < set_at => Some(until),
+            _ => None,
+        })
+    }
+
+    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError> {
+        let now = now_ms();
+        let base = minimum.as_millis() as i64;
+
+        let previous: Option<(i64, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT set_at_ms, strikes FROM cooldowns WHERE scope = ?1",
+                params![SESSION_SCOPE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        // Reoffending within the next day doubles the penalty.
+        let (length, strikes) = match previous {
+            Some((set_at, strikes)) if now - set_at < MAX_COOLDOWN_MS => {
+                let next = strikes + 1;
+                let escalated = base.saturating_mul(1 << (next - 1).min(5));
+                (escalated.min(MAX_COOLDOWN_MS), next)
+            }
+            _ => (base.min(MAX_COOLDOWN_MS), 1),
+        };
+
+        let until = now + length;
+        self.conn().execute(
+            "INSERT INTO cooldowns (scope, until_ms, set_at_ms, reason, strikes)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(scope) DO UPDATE SET
+                 until_ms = excluded.until_ms,
+                 set_at_ms = excluded.set_at_ms,
+                 reason = excluded.reason,
+                 strikes = excluded.strikes",
+            params![SESSION_SCOPE, until, now, reason, strikes],
+        )?;
+
+        tracing::warn!(reason, minutes = length / 60_000, "account in cooldown");
+        Ok(until)
+    }
+}
+
+/// Grants everything and counts nothing. **Tests only**: using it against
+/// Instagram skips rate control entirely.
+#[doc(hidden)]
+pub struct UnlimitedRateBudget;
+
+impl RateBudget for UnlimitedRateBudget {
+    fn reserve(&self) -> Result<Duration, RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+        Ok(None)
+    }
+    fn start_cooldown(&self, _reason: &str, _minimum: Duration) -> Result<i64, RateBudgetError> {
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T: i64 = 2_400;
+    const TAU: i64 = 48_000; // twenty requests
+
+    /// A tolerance of twenty intervals lets twenty-one requests through before
+    /// throttling: the twenty that fit ahead plus the one emitted on pace.
+    const FIT_IN_A_ROW: usize = (TAU / T) as usize + 1;
+
+    #[test]
+    fn the_first_request_from_cold_does_not_wait() {
+        let (tat, wait) = decide(0, 1_000_000, T, TAU);
+        assert_eq!(wait, 0);
+        assert_eq!(tat, 1_000_000 + T);
+    }
+
+    #[test]
+    fn nothing_waits_within_the_burst() {
+        let now = 1_000_000;
+        let mut tat = now;
+        for i in 0..FIT_IN_A_ROW {
+            let (next, wait) = decide(tat, now, T, TAU);
+            assert_eq!(wait, 0, "request {i} should not wait");
+            tat = next;
+        }
+    }
+
+    #[test]
+    fn once_the_burst_is_spent_waiting_begins() {
+        let now = 1_000_000;
+        let mut tat = now;
+        for _ in 0..FIT_IN_A_ROW {
+            tat = decide(tat, now, T, TAU).0;
+        }
+        let (_, wait) = decide(tat, now, T, TAU);
+        assert_eq!(wait, T, "past the burst you pay the full interval");
+    }
+
+    #[test]
+    fn the_budget_refills_over_time() {
+        let now = 1_000_000;
+        let mut tat = now;
+        for _ in 0..25 {
+            tat = decide(tat, now, T, TAU).0;
+        }
+        // An hour later it is fully refilled.
+        let (_, wait) = decide(tat, now + 3_600_000, T, TAU);
+        assert_eq!(wait, 0);
+    }
+
+    #[test]
+    fn an_instant_in_the_past_does_not_grant_unlimited_budget() {
+        // The old tat is clamped to "now": idleness does not accrue credit.
+        let (tat, wait) = decide(1, 1_000_000, T, TAU);
+        assert_eq!(wait, 0);
+        assert_eq!(tat, 1_000_000 + T);
+    }
+
+    fn temp_budget() -> (tempfile::TempDir, SqliteRateBudget) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.db");
+        // The store creates the schema; the budget hooks in afterwards.
+        let _db = super::super::Store::open_at(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        (tmp, SqliteRateBudget::over(conn))
+    }
+
+    #[test]
+    fn the_first_reservations_do_not_throttle() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..10 {
+            assert_eq!(b.reserve().unwrap(), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn the_budget_runs_out_and_starts_throttling() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..21 {
+            b.reserve().unwrap();
+        }
+        assert!(
+            b.reserve().unwrap() > Duration::ZERO,
+            "past the burst it should throttle"
+        );
+    }
+
+    #[test]
+    fn with_no_cooldown_there_is_no_cooldown() {
+        let (_tmp, b) = temp_budget();
+        assert_eq!(b.cooldown().unwrap(), None);
+    }
+
+    #[test]
+    fn a_cooldown_blocks_and_reoffending_lengthens_it() {
+        let (_tmp, b) = temp_budget();
+
+        let first = b.start_cooldown("429", Duration::from_secs(3600)).unwrap();
+        let active = b.cooldown().unwrap().unwrap();
+        assert_eq!(active, first);
+
+        let second = b.start_cooldown("429", Duration::from_secs(3600)).unwrap();
+        assert!(
+            second - now_ms() > first - now_ms(),
+            "reoffending should lengthen the cooldown"
+        );
+    }
+
+    #[test]
+    fn the_cooldown_has_a_ceiling() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..10 {
+            b.start_cooldown("429", Duration::from_secs(12 * 3600))
+                .unwrap();
+        }
+        let until = b.cooldown().unwrap().unwrap();
+        assert!(until - now_ms() <= MAX_COOLDOWN_MS);
+    }
+
+    /// Proves the budget really is shared between connections, which is what
+    /// will keep the CLI and the v2 service from spending at once.
+    #[test]
+    fn two_connections_share_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared.db");
+        let _db = super::super::Store::open_at(&path).unwrap();
+
+        let one = SqliteRateBudget::over(Connection::open(&path).unwrap());
+        let two = SqliteRateBudget::over(Connection::open(&path).unwrap());
+
+        for _ in 0..15 {
+            one.reserve().unwrap();
+        }
+        for _ in 0..15 {
+            two.reserve().unwrap();
+        }
+
+        // Thirty reservations comfortably exceed the burst of twenty, so the
+        // next one has to throttle even on the first connection.
+        assert!(
+            one.reserve().unwrap() > Duration::ZERO,
+            "both connections should share one budget"
+        );
+    }
+}

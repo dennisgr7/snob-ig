@@ -1,0 +1,25 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local data and secrets
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+.env
+session.json
+/exports/
+
+# Scratch notes, if any ever land here. The instruction document is AGENTS.md,
+# which is tracked.
+/docs/
+
+# Agent and editor scratch
+.claude/
+
+# Output the tool itself produces, if it lands in the repo root
+/*.xlsx
+/*.csv
+/*.jpg
+/*.png

@@ -1,0 +1,276 @@
+# AGENTS.md
+
+Context for working on this project. `CLAUDE.md` points here; this is the only
+instruction document.
+
+**Detailed reasoning lives in the doc-comment above the code it governs, not
+here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
+schema in `store/sql/`, the cookie boundary in `cdp.rs`, the headers in
+`fingerprint.rs`. Read those before changing any of them — they explain what a
+number is for, which is what stops it being tuned into something harmful.
+
+## What this is
+
+`snob`, a terminal tool that tells you who does not follow you back on
+Instagram, and tracks changes to your followers and following over time. Single
+binary, no runtime, Windows, Linux and macOS on x86_64 and ARM64.
+
+There is no official API for listing followers — Meta removed it in 2018 — so
+this uses the private web API with the user's own session cookie. That goes
+against Instagram's Terms of Use, and the realistic risk to a user is a
+verification checkpoint on their account. **The whole pacing design exists to
+lower that probability.** It is the reason for most of the rules below.
+
+## Rules
+
+Standing instructions from the repository owner. They are not up for
+re-litigation in a normal change.
+
+- **Branches**: `main` is stable and only good versions land there; `dev` is
+  day-to-day work.
+- **Everything is written in English**: code, identifiers, comments,
+  user-facing strings and documentation. US spelling. A test enforces it —
+  `crates/snob-core/tests/language.rs` fails if Spanish turns up. On a false
+  positive, fix its word list rather than disabling the test; adding a homograph
+  like `red` or `base` turns it into permanent noise and someone switches it off.
+- **`cargo fmt` and `cargo clippy --workspace --all-targets -- -D warnings`
+  before every commit.** Commit messages in English, imperative, no
+  conventional-commit prefixes.
+- Prefer the compiled, dependency-free option. Native binary, instant start,
+  broad platform support — that is the point of the project, not an accident.
+
+And the domain rules, which exist because breaking them puts a real account at
+risk:
+
+- **No write operations against Instagram.** `snob` only reads. No follow,
+  unfollow, block or remove-follower, ever.
+- **Never decrypt the user's browser cookie store.** Chrome and Edge on Windows
+  have used App-Bound Encryption since v127, and the only ways past it are
+  process injection and direct syscalls: infostealer territory. What is allowed,
+  and is the main route, is a browser **we launched with our own profile**
+  handing its cookies over through its debugging protocol. The boundary is whose
+  profile it is and who hands the data over, not whether the cookie is encrypted.
+- **On the first 429, `spam:true`, `feedback_required` or `challenge_required`:
+  hard stop.** No retry within that run, and the account goes into cooldown. A
+  retry loop without backoff is how an account gets flagged.
+- **Request pacing is not changed without a documented reason.** The numbers are
+  copied from `InstagramUnfollowers`, which has years of incident-free real use,
+  and have only ever been changed to make *fewer* requests. They are in
+  `crates/snob-ig/src/pace.rs` with the reasoning attached.
+- **Never walk a real account's lists without the limiter.** Live-API testing is
+  done with single, counted requests.
+- **No test may touch the real keyring.** It belongs to the operating system,
+  not the process: a test deleting the real entry wipes the session of whoever
+  is developing. Tests use their own service name via `SecretStore::with_service`,
+  and a test checks that they do.
+
+## Working on it
+
+```bash
+cargo test --workspace                     # everything
+cargo test -p snob-ig pager                # one module
+cargo test -p snob-cli --test cache        # one integration file
+cargo test the_first_run_walks_the_list    # one test by name
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p snob-cli -- login --paste     # run it; mind the double dash
+```
+
+Without the `--`, cargo keeps the flags instead of passing them through.
+`cargo install --path crates/snob-cli` puts a release `snob` on the PATH, but it
+has to be repeated after every change; for iterating, `cargo run` is the one.
+
+CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds six
+targets. The Linux job installs a keyring daemon on purpose: without one the
+secret store falls back to a file and the backend under test is not the one that
+ships.
+
+## Architecture
+
+Three crates:
+
+| Crate | Responsibility |
+|---|---|
+| `snob-core` | Domain: models, sets, filters, SQLite storage, rate budget, secrets |
+| `snob-ig` | Instagram's private API: endpoints, pagination, pacing, browser headers |
+| `snob-cli` | The `snob` binary, plus a library so commands can be tested |
+
+The tool is a session, a database and a request budget. Everything else is a way
+of asking those three something:
+
+```
+                         app::App
+             the only place they are assembled:
+        client · store · progress · cancellation · viewer
+                            │
+        ┌───────────────────┼────────────────────┐
+        │                   │                    │
+     engine::            engine::            engine::
+   target   freshness   cooldown  walk        people
+   who?     is stored   what can  page by     who you
+            still true? be served page        both know
+        └───────────────────┼────────────────────┘
+                            │
+                       commands::*
+              orchestration and presentation only
+    lists · sets · scan · pfp · login · logout · purge · whoami
+                            │
+              output::* · report::* · exit::*
+```
+
+Two rules keep it that way, and they are what make a change to `scan` or `pfp`
+land in one place:
+
+- **`engine` returns data and where the data came from. It never decides how
+  anything looks.** Wording, formats and exit codes live in `commands`,
+  `report` and `output`.
+- **`commands` never builds a client or opens a database.** It takes an `App`.
+  A command that assembles its own dependencies can be handed a different budget
+  than the rest, which is how rate control gets bypassed by accident.
+
+Every list, crossing and summary the tool prints comes out of `engine::list`.
+
+Storage is SQLite in the platform's **local** data directory — not the roaming
+one, because the database uses WAL and WAL on a synced directory is a documented
+cause of corruption. Every table is `STRICT`. The rule that an incomplete
+snapshot is never a basis for comparison is structural rather than disciplinary:
+comparison code reads the `usable_snapshots` view, which cannot return one.
+
+## Rules the code enforces, and where
+
+Each of these was once something a caller had to remember, and each was
+forgotten at least once. They now live in the one place that cannot be bypassed:
+
+| Rule | Where it lives |
+|---|---|
+| Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get` |
+| A 429 puts the account in cooldown | `IgClient::classify_and_record` |
+| The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
+| Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
+| Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
+| Control characters from a profile never reach a terminal | `User::safe_username` / `safe_full_name` |
+| A panic takes the launched browser with it | `cdp::kill_on_panic` |
+| Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
+| The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
+| Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
+| A directory too near the root is never deleted | `paths::is_safe_to_remove` |
+
+## Running headless
+
+Supported on purpose — a homelab is a first-class place to run this.
+
+`snob login` probes where the session can go **before** asking for anything,
+and on a machine with no keyring it uses the protected file instead of refusing.
+Secret Service needs a desktop session, so a server, a container or WSL has
+none; that is normal rather than an error. The fallback is never silent: the
+command says which backend it landed on, because a session stored somewhere
+less protected than the user expected is its own kind of failure. `--no-keyring`
+still forces the file directly.
+
+Everything else already works without a terminal: `prompt_secret` reads a plain
+line when standard input is not a TTY, the progress bar hides itself, `table`
+becomes one name per line down a pipe, and the output format defaults to JSON.
+The login **method** must be given explicitly there (`--paste`), since there is
+no menu to show.
+
+Two judgement calls worth understanding before touching them:
+
+- **`truncated()` in `pager.rs`** decides whether a short list means the counter
+  lied — it includes deleted accounts — or Instagram stopped serving pages. The
+  threshold is measured against what was **declared**, not against what was
+  walked. A shortfall of more than half is truncation at any size.
+- **`declares_failure()` in `error.rs`** parses the body rather than searching
+  it. Looking for `"status"` and `"fail"` anywhere in the text meant a follower
+  named `fail` stopped the walk.
+
+## Settled, so nobody re-opens them
+
+- **The arithmetic holds**: `unfollowers + friends` is everyone you follow, and
+  `fans + friends` everyone who follows you. A test asserts it.
+- **If the list being crossed against is incomplete, no result is given.** In
+  `unfollowers`, someone who does follow you but was never read would appear as
+  not following you — not a partial result but a wrong one, and the failure
+  tools of this kind carry. The *starting* list being short only warrants a
+  warning: results are missing, but the ones shown are true.
+- **`profile_pic_url_hd` is not the full size.** It hands back a URL telling the
+  CDN to downscale to 320x320, and the signature covers that instruction. The
+  1080x1080 comes from `/api/v1/users/{pk}/info/`.
+- **`count=50` is accepted**, the cursor advances without repeating, and
+  resuming works. Followers are served ~25 per page anyway; budget accordingly.
+- **There is no useful anonymous mode.** Without cookies, `web_profile_info`
+  answers 429 on the very first request from the edge, username-to-id cannot be
+  resolved by any surviving route, and the one endpoint that does answer gives a
+  stub with no counters and a 150x150 picture whose URL is signed for that size.
+  Everything needs a session; that is Instagram, not a gap here.
+- **The TLS stack is not to be touched.** Chrome has randomized its ClientHello
+  extension order since v110, so there is no fixed fingerprint left to match and
+  a stable one is more anomalous than any particular one. Matching it would mean
+  leaving `rustls` and the clean static cross-compilation with it. What actually
+  gets an account throttled, in order: IP reputation, request volume and pace,
+  header coherence.
+- **Header work aims at coherence, not disguise.** Instagram answers
+  `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so those are sent; `Accept` is `*/*`
+  because no browser sends `application/json` here; `sec-ch-ua` is computed from
+  the version rather than hardcoded, including the order of its three entries;
+  no `Origin` on a same-origin GET. The stored User-Agent follows the installed
+  browser's major version, at most daily, never when the user pinned one.
+- **`@someone` never reaches us on PowerShell.** `@` is the splatting operator,
+  so the argument is gone before `main` runs and the tool answers about the
+  user's own account. Nothing can detect it from here — do not write unquoted
+  `@name` in examples aimed at PowerShell users.
+- **Everything is per user, never per directory.** The session, the database and
+  the cache come from `directories`, so running `snob` from two folders is one
+  session and one cache. The only thing the working directory decides is where
+  an export lands without `-o`. The header of `paths.rs` says so; the tests fix
+  it.
+- **No biometric verification, on any platform.** Investigated in August 2026
+  and rejected on the merits, not on difficulty. The principle: any prompt a
+  local process of the same user can trigger, that same process can satisfy by
+  asking the user — and the attacker that matters, a stealer, never runs `snob`
+  at all, it reads the keyring directly with the same permissions. Concretely:
+  Windows `KeyCredentialManager` gives an unpackaged binary **no per-application
+  boundary** (Microsoft's own answer: without an AppContainer it scopes to the
+  user account, and a second executable can open the same credential); the
+  console has no usable window to parent a dialog to under ConPTY; macOS would
+  need an App ID entitlement, a provisioning profile and notarization, which
+  ends the single static binary; and Linux polkit needs a root-installed policy
+  file and falls back to the login password anyway. Two more nails: whoever sits
+  at an unlocked session has the browser logged into Instagram one click away,
+  where they can *write*, and the v2 monitor is a background service that cannot
+  prompt anybody. What is worth doing instead — keep the cookie out of the
+  database and out of logs — is already done.
+- **`snob purge` deletes the stored data and not the binary.** No package
+  manager can do the first half: `winget uninstall`, `brew uninstall` and
+  `apt remove` take away files the package owns, and the session, the database
+  and the browser profile are in the user's own directories, which it never
+  owned. Leaving a live session cookie on a machine whose owner has just
+  uninstalled the tool is the failure the command exists to prevent, so the
+  session is deleted **first**, before any directory that could turn out to be
+  locked. The other half is the binary, and it is left alone deliberately: a
+  process cannot reliably delete its own executable on Windows, and one that
+  managed it would leave `winget` or `apt` reporting a version that is no longer
+  installed. The command prints the path and stops there.
+- **The Windows credential is written as `CRED_PERSIST_ENTERPRISE`**, which
+  Microsoft documents as visible on other computers for accounts with roamable
+  state. `keyring`'s `Entry` does not expose the modifier that would make it
+  local, and reaching it means depending on `keyring-core` directly and keeping
+  its version in lockstep or the shared default store breaks at run time. The
+  reasoning, and what would have to change, is in `secrets.rs::entry_for`.
+
+## State
+
+Every command works and has been exercised against the live API. Two things are
+deliberately unfinished:
+
+- **`commands::import`** reads Instagram's data export correctly and is tested,
+  but is **not registered in `cli.rs`**. What is unsettled is not the parsing but
+  what an import should be allowed to do once it is in — whether it can be
+  crossed against a live list, and whether it belongs in the store at all.
+  Shipping the subcommand would answer those by accident.
+- **The monitor** (`snob watch`, the scheduled service, snapshot diffs and
+  webhooks) is v2. The schema already reserves `events` and `webhook_queue`, and
+  `lost`/`gained` are reserved words for its temporal diff — `unfollowers` is the
+  static set and must never drift to mean `lost`.
+
+Not exercised live, and worth knowing before trusting either: a walk over a list
+of several thousand, and real behavior on a 429, which has never been provoked
+on purpose and is verified against a recorded body instead.

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should not be followed by a slow one.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  lint:
+    name: Format and lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The keyring backend differs on each of these, and so does the path
+        # layout, so the suite has to run on all three rather than on one.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The tests use their own keyring service name and never touch the real
+      # one, but on Linux there is no keyring daemon at all: without this, the
+      # secret store falls back to a file and the backend under test is not the
+      # one that ships.
+      - name: Install a keyring service
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring dbus-x11
+      - name: Test
+        if: runner.os != 'Linux'
+        run: cargo test --workspace
+      - name: Test with a session bus
+        if: runner.os == 'Linux'
+        run: |
+          dbus-run-session -- bash -c '
+            echo "" | gnome-keyring-daemon --unlock --components=secrets
+            cargo test --workspace
+          '
+
+  build:
+    name: Build ${{ matrix.target }}
+    # Only once a change has landed: six native builds on every pull request
+    # buys very little over the three test runs above.
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          # Tier 1, and there are native runners for it, but it is not among
+          # the targets release tooling covers by default.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
+      - name: Check the binary runs
+        run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version

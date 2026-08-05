@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = ["crates/snob-ig", "crates/snob-core", "crates/snob-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/dennisgr7/snob-ig"
+
+[workspace.dependencies]
+snob-core = { path = "crates/snob-core" }
+snob-ig = { path = "crates/snob-ig" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
+# No `webpki-roots`: in reqwest 0.13 the feature only turns on an optional
+# dependency that nothing in reqwest references, so it was a crate compiled for
+# no one. Verification goes through `rustls-platform-verifier`, the operating
+# system's own trust store, which is the right answer on a desktop anyway.
+# No `cookies`: nothing here keeps a cookie jar — the session travels as an
+# explicit header, and the CDN must never receive it. Leaving the feature on
+# meant a later `.cookie_store(true)` would silently start carrying cookies
+# across redirects; without it, that becomes a compile error. It also drops ten
+# crates from the tree.
+# `brotli` and `zstd` alongside `gzip` are not about speed: Chrome advertises
+# `gzip, deflate, br, zstd`, and a client that in 2026 announces gzip alone is
+# an anomaly that costs one line to remove.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip", "brotli", "zstd"] }
+clap = { version = "4", features = ["derive"] }
+# No `fallible_uint` on purpose: without that feature `params![pk]` does not
+# compile for a u64, so the compiler forces everything through pk_to_sql.
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+fastrand = "2.5"
+chrono = "0.4"
+directories = "6"
+# Windows and Linux (zbus) come with the defaults; macOS has to be asked for
+keyring = { version = "4", features = ["apple-native-keyring-store"] }
+comfy-table = "7"
+indicatif = "0.18"
+supports-hyperlinks = "3"
+csv = "1"
+rust_xlsxwriter = "0.97"
+# Only to read Instagram's export. `deflate` is what a zip holding JSON uses;
+# rust_xlsxwriter already pulls this crate in, so the features are kept narrow
+# rather than adding a second copy of the compression code.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dialoguer = { version = "0.12", default-features = false }
+console = "0.16"
+url = "2"
+# Talking to a browser we launched, over the DevTools protocol. Loopback only,
+# so no TLS stack is pulled in: `connect` alone speaks ws:// and nothing more.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+base64 = "0.23"
+# Already in the tree through the Windows keyring backend, so this costs no
+# extra compilation. Used to clear the session cookie out of memory on drop.
+zeroize = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+# Test-only
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,27 @@
+[package]
+name = "snob-core"
+description = "snob-ig domain: models, diffing, storage and notifications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+chrono.workspace = true
+directories.workspace = true
+keyring.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

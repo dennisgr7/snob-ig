@@ -1,0 +1,51 @@
+[package]
+name = "snob-cli"
+description = "snob-ig command line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "snob_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snob"
+path = "src/main.rs"
+
+[dependencies]
+snob-core.workspace = true
+snob-ig.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+dialoguer.workspace = true
+console.workspace = true
+indicatif.workspace = true
+supports-hyperlinks.workspace = true
+# `custom_styling` is what makes the width calculation look past the escape
+# sequences an OSC 8 link puts around a username.
+comfy-table = { workspace = true, features = ["custom_styling"] }
+csv.workspace = true
+rust_xlsxwriter.workspace = true
+zip.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tempfile.workspace = true
+url.workspace = true
+
+[lints.rust]
+# Linking this binary makes MSVC announce that it is creating an import
+# library, because aws-lc -- rustls's crypto provider, four levels down from
+# reqwest -- exports its jitterentropy symbols. There is nothing to act on, and
+# it is the first thing printed on every build.
+linker_messages = "allow"
