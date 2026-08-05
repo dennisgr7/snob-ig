@@ -24,6 +24,22 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The release regenerates the formula and the manifests in its very last
+      # job, which is the most expensive place to learn that the generator is
+      # broken -- it happened once, to a permission bit. Running it here proves
+      # the script still works and that what is committed is what it produces,
+      # so nobody can hand-edit a checksum into one of them either.
+      - name: The packaged manifests are what the generator writes
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if ! curl -fsSL -o /tmp/SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/v$version/SHA256SUMS"; then
+            echo "$version is not released yet, so there is nothing to render against"
+            exit 0
+          fi
+          bash packaging/render.sh "$version" /tmp/SHA256SUMS
+          git diff --exit-code -- Formula bucket packaging/winget
+
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
