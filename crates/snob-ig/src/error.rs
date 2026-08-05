@@ -234,16 +234,18 @@ pub fn classify(status: u16, body: &str) -> IgError {
     }
     if message.contains("checkpoint_required") {
         return IgError::Checkpoint {
-            url: parsed.checkpoint_url.map(absolutize),
+            url: parsed.checkpoint_url.and_then(checked_url),
         };
     }
     if message.contains("challenge_required")
         || parsed.error_type.as_deref() == Some("checkpoint_challenge_required")
     {
-        let url = parsed
-            .challenge
-            .as_ref()
-            .and_then(|c| c.url.clone().or_else(|| c.api_path.clone().map(absolutize)));
+        let url = parsed.challenge.as_ref().and_then(|c| {
+            c.url
+                .clone()
+                .and_then(checked_url)
+                .or_else(|| c.api_path.clone().and_then(checked_url))
+        });
         return IgError::Challenge { url };
     }
     if message.contains("feedback_required") {
@@ -272,19 +274,42 @@ pub fn classify(status: u16, body: &str) -> IgError {
 /// What an unexpected body contributes to the message. An HTML page is a
 /// firewall or an error page: naming it says as much as spilling it over the
 /// terminal would.
+///
+/// What is left goes through the same filter a username does. This excerpt is
+/// printed to a terminal by `main`, and a response body is no more trustworthy
+/// than a profile field — less, when the thing answering is a captive portal
+/// rather than Instagram.
 fn body_excerpt(body: &str) -> String {
     if body.trim_start().starts_with('<') {
         return "(an HTML page, not the API's JSON)".into();
     }
-    body.chars().take(300).collect()
+    snob_core::model::printable(&body.chars().take(300).collect::<String>())
 }
 
-fn absolutize(path: String) -> String {
-    if path.starts_with("http") {
-        path
+/// Hosts a security check can legitimately live on.
+const CHALLENGE_HOSTS: [&str; 3] = ["instagram.com", "www.instagram.com", "i.instagram.com"];
+
+/// The address the user is told to open, if the body named one we would follow
+/// ourselves.
+///
+/// The tool's own words are "Open it in a browser to clear it", so whatever
+/// comes back here carries this program's authority. Instagram naming its own
+/// challenge page is the only case that is worth anything, and it is also the
+/// only case that is safe: a body that names somewhere else gets the generic
+/// wording instead, which loses a convenience rather than sending someone to a
+/// login form that is not Instagram's.
+fn checked_url(value: String) -> Option<String> {
+    let absolute = if value.starts_with("http") {
+        value
+    } else if value.starts_with('/') {
+        format!("https://www.instagram.com{value}")
     } else {
-        format!("https://www.instagram.com{path}")
-    }
+        return None;
+    };
+
+    let parsed = url::Url::parse(&absolute).ok()?;
+    let host = parsed.host_str()?;
+    (parsed.scheme() == "https" && CHALLENGE_HOSTS.contains(&host)).then_some(absolute)
 }
 
 #[cfg(test)]
@@ -480,6 +505,46 @@ mod tests {
                 assert!(!body.contains('<'), "{body}");
                 assert!(body.contains("HTML"), "{body}");
             }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    /// The message says "Open it in a browser to clear it", so the address
+    /// carries this tool's authority. A body that names somewhere else loses
+    /// the convenience rather than sending someone to a login form that is not
+    /// Instagram's.
+    #[test]
+    fn a_challenge_url_that_is_not_instagram_is_not_offered() {
+        for elsewhere in [
+            "https://evil.test/challenge/",
+            "http://www.instagram.com/challenge/",
+            "https://www.instagram.com.evil.test/challenge/",
+            "https://evil.test/#www.instagram.com",
+            "javascript:alert(1)",
+        ] {
+            let body = format!(
+                r#"{{"message":"challenge_required","challenge":{{"url":"{elsewhere}"}},"status":"fail"}}"#
+            );
+            match classify(400, &body) {
+                IgError::Challenge { url } => {
+                    assert_eq!(url, None, "{elsewhere} should not have been offered")
+                }
+                other => panic!("expected a challenge, got {other:?}"),
+            }
+        }
+
+        // The generic wording still tells the user what to do.
+        let message = IgError::Challenge { url: None }.to_string();
+        assert!(message.contains("Open Instagram in a browser"), "{message}");
+    }
+
+    /// A response body is no more trustworthy than a profile field, and this
+    /// excerpt is printed to a terminal.
+    #[test]
+    fn an_unexpected_body_cannot_drive_the_terminal() {
+        let hostile = format!("{esc}[2K{esc}[A gone", esc = '\x1b');
+        match classify(500, &hostile) {
+            IgError::Unexpected { body, .. } => assert!(!body.contains('\x1b'), "{body:?}"),
             other => panic!("expected Unexpected, got {other:?}"),
         }
     }
