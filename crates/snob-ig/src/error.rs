@@ -79,11 +79,24 @@ fn missing_message(what: &Option<String>) -> String {
 /// single-request command reaching it directly. Two copies of this table is one
 /// copy too many — the second would be the one passing a length of zero.
 pub fn cooldown_for(error: &IgError) -> Option<(&'static str, std::time::Duration)> {
-    use snob_core::store::rate_budget::{action_block_cooldown, rate_limit_cooldown};
+    use snob_core::store::rate_budget::{
+        action_block_cooldown, challenge_cooldown, rate_limit_cooldown,
+    };
 
     match error {
         IgError::FeedbackRequired => Some(("feedback_required", action_block_cooldown())),
         IgError::RateLimited => Some(("rate_limit", rate_limit_cooldown())),
+        // The rule says a challenge is a hard stop **and** a cooldown, and only
+        // the first half was implemented: nothing was written down, so the next
+        // run walked straight back into an account Instagram had just flagged.
+        //
+        // Its own length, not the action block's, because it is the one cause
+        // waiting does not fix — the user clears it by opening the link. Long
+        // enough that an unattended rerun cannot knock again, short enough that
+        // someone who dealt with it in a minute is not locked out for the day.
+        IgError::Challenge { .. } | IgError::Checkpoint { .. } => {
+            Some(("challenge", challenge_cooldown()))
+        }
         _ => None,
     }
 }
@@ -479,6 +492,31 @@ mod tests {
         assert!(matches!(e, IgError::RateLimited));
         assert!(e.is_login_tolerable());
         assert!(!e.invalidates_session());
+    }
+
+    /// The three causes that leave a mark, and the shape of each. A challenge
+    /// is the one waiting does not fix, so it gets its own much shorter
+    /// length rather than the action block's.
+    #[test]
+    fn every_pushback_records_a_cooldown_of_its_own_size() {
+        let length = |e: &IgError| cooldown_for(e).map(|(_, d)| d);
+
+        let throttle = length(&IgError::RateLimited).unwrap();
+        let block = length(&IgError::FeedbackRequired).unwrap();
+        let challenge = length(&IgError::Challenge { url: None }).unwrap();
+        let checkpoint = length(&IgError::Checkpoint { url: None }).unwrap();
+
+        assert_eq!(challenge, checkpoint, "both mean the same thing");
+        assert!(
+            challenge < throttle,
+            "waiting is not what clears a challenge"
+        );
+        assert!(throttle < block);
+
+        // A dead session is not push-back and must not put the account in
+        // cooldown: logging in again is what fixes it.
+        assert_eq!(length(&IgError::SessionExpired), None);
+        assert_eq!(length(&IgError::Decode("x".into())), None);
     }
 
     #[test]

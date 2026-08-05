@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 snob-core.workspace = true
-reqwest.workspace = true
 tokio.workspace = true
 fastrand.workspace = true
 serde.workspace = true
@@ -17,6 +16,16 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+# Which TLS stack the client is built on, decided per platform.
+#
+# The two tables are mutually exclusive, so exactly one applies to any target
+# and reqwest never ends up with both backends compiled in.
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

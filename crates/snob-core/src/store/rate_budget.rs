@@ -41,6 +41,18 @@ const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(2 * 3600);
 const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
+
+/// After Instagram asks for the account to be verified.
+///
+/// Deliberately much shorter than the other two, because it is the only one
+/// waiting does not fix: a challenge is cleared by the user opening the link,
+/// and the account is usable again the moment they do. Twelve hours would
+/// punish someone who cleared it in thirty seconds, and nothing would punish
+/// the case this exists for — a scheduled run knocking again on an account
+/// Instagram has just flagged. Half an hour stops the second without
+/// stranding the first, and repeats still escalate.
+const CHALLENGE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 
 /// Escape hatch environment variable. Deliberately absent from the help: it
@@ -108,6 +120,10 @@ pub fn rate_limit_cooldown() -> Duration {
 
 pub fn action_block_cooldown() -> Duration {
     ACTION_BLOCK_COOLDOWN
+}
+
+pub fn challenge_cooldown() -> Duration {
+    CHALLENGE_COOLDOWN
 }
 
 /// The core of the algorithm, isolated so it can be tested without a database.
