@@ -1,0 +1,42 @@
+{
+    "version": "0.1.0",
+    "description": "Instagram from the terminal: who does not follow you back",
+    "homepage": "https://github.com/dennisgr7/snob-ig",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.1.0/snob-v0.1.0-x86_64-pc-windows-msvc.zip",
+            "hash": "abb95b295085ebe5f1d57e0e84e2642c8fadda969b824c511efe6d02af89cd02",
+            "extract_dir": "snob-v0.1.0-x86_64-pc-windows-msvc"
+        },
+        "arm64": {
+            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.1.0/snob-v0.1.0-aarch64-pc-windows-msvc.zip",
+            "hash": "ad48cbf2159a15d3f53b637d454b069a62e0b44d056441ce8753116e3283f8bc",
+            "extract_dir": "snob-v0.1.0-aarch64-pc-windows-msvc"
+        }
+    },
+    "bin": "snob.exe",
+    "notes": [
+        "snob keeps a session, a database and a browser profile outside this",
+        "directory, which uninstalling cannot reach. Run \"snob purge\" before",
+        "removing it to take those off the machine too."
+    ],
+    "checkver": {
+        "github": "https://github.com/dennisgr7/snob-ig"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/dennisgr7/snob-ig/releases/download/v$version/snob-v$version-x86_64-pc-windows-msvc.zip",
+                "extract_dir": "snob-v$version-x86_64-pc-windows-msvc"
+            },
+            "arm64": {
+                "url": "https://github.com/dennisgr7/snob-ig/releases/download/v$version/snob-v$version-aarch64-pc-windows-msvc.zip",
+                "extract_dir": "snob-v$version-aarch64-pc-windows-msvc"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v$version/SHA256SUMS"
+        }
+    }
+}

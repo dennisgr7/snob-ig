@@ -18,16 +18,67 @@ x86_64 and ARM64, macOS on Apple Silicon.
 
 ## Install
 
-Download the binary for your system from the [releases page][releases], put it
-anywhere on your `PATH`, and that is the whole installation.
+**Windows**, with [Scoop][scoop]:
 
-With Rust installed you can also build it from source:
+```bash
+scoop bucket add snob https://github.com/dennisgr7/snob-ig
+scoop install snob
+```
+
+**macOS and Linux**, with [Homebrew][brew]:
+
+```bash
+brew tap dennisgr7/snob https://github.com/dennisgr7/snob-ig
+brew install snob
+```
+
+**Debian and Ubuntu** — download the `.deb` for your architecture from the
+[releases page][releases] and:
+
+```bash
+sudo apt install ./snob-v0.1.0-x86_64-unknown-linux-gnu.deb
+```
+
+**Without a package manager.** These download the release for your platform,
+check it against the published SHA256, and put it on your `PATH`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dennisgr7/snob-ig/main/packaging/install.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/dennisgr7/snob-ig/main/packaging/install.ps1 | iex
+```
+
+Piping a script from the internet into a shell deserves the suspicion it gets:
+both are short, and reading them first is the right instinct.
+
+**From source**, with Rust installed:
 
 ```bash
 cargo install --git https://github.com/dennisgr7/snob-ig snob-cli
 ```
 
+**By hand** — every release has an archive per platform on the [releases
+page][releases]. Unpack it, put `snob` anywhere on your `PATH`, done. There is
+no runtime to install.
+
+### Updating
+
+`scoop update snob`, `brew upgrade snob`, or run the install script again.
+Installed by hand, there is nothing watching for you: check the [releases
+page][releases].
+
+### Uninstalling
+
+Run **`snob purge`** first. The session, the database and the browser profile
+live in your user directories, and no package manager can reach them — removing
+the binary leaves an Instagram session cookie behind. Then `scoop uninstall
+snob`, `brew uninstall snob`, `sudo apt remove snob`, or delete the file.
+
 [releases]: https://github.com/dennisgr7/snob-ig/releases
+[scoop]: https://scoop.sh
+[brew]: https://brew.sh
 
 ## First run
 

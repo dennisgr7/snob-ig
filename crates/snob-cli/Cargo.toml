@@ -43,6 +43,27 @@ wiremock.workspace = true
 tempfile.workspace = true
 url.workspace = true
 
+# Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
+# it. A signed apt repository would be the other half, and it needs a GPG key
+# that only the maintainer can hold, so the loose package is what can be built
+# without one. The maintainer address is the GitHub noreply one on purpose.
+[package.metadata.deb]
+name = "snob"
+maintainer = "dennisgr7 <70021856+dennisgr7@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """
+Walks an Instagram account's followers and following, crosses them, and reports \
+who does not follow you back, who you never followed back, and who you and \
+somebody else both know. Reads only: it never follows, unfollows, blocks or \
+removes anyone."""
+assets = [
+    ["target/release/snob", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/snob/README.md", "644"],
+    ["../../CHANGELOG.md", "usr/share/doc/snob/CHANGELOG.md", "644"],
+]
+
 [lints.rust]
 # Linking this binary makes MSVC announce that it is creating an import
 # library, because aws-lc -- rustls's crypto provider, four levels down from

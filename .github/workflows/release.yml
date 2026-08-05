@@ -105,12 +105,24 @@ jobs:
             tar -C staging -czf "$name.tar.gz" "$name"
           fi
 
+      # A .deb as well on Linux, so Debian and Ubuntu get an install that their
+      # own package manager can undo. --no-build reuses the binary just built
+      # and tested rather than compiling a second, unverified one.
+      - name: Debian package
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build --no-strip -p snob-cli \
+            --target ${{ matrix.target }} \
+            --output "snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}.deb"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
             snob-v*.zip
             snob-v*.tar.gz
+            snob-v*.deb
           if-no-files-found: error
 
   publish:
@@ -163,3 +175,41 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file notes.md \
             artifacts/*
+
+  # Homebrew and Scoop both read a plain repository, so the formula and the
+  # manifest live beside the code and are updated by the release that made them
+  # true. Keeping them in repositories of their own would mean a token with
+  # write access somewhere else, which is a secret to store and rotate for no
+  # benefit anybody can see.
+  packaging:
+    name: Point the packages at the new version
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # main, not the tag: a tag is a detached head and there would be no
+      # branch to push the result to.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Render
+        run: |
+          curl -fsSL -o /tmp/SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
+          packaging/render.sh "${{ needs.check.outputs.version }}" /tmp/SHA256SUMS
+
+      - name: Commit
+        run: |
+          if git diff --quiet -- Formula bucket; then
+            echo "the formula and the manifest already point at this version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula bucket
+          git commit -m "Point the formula and the manifest at $GITHUB_REF_NAME"
+          # Both branches, because they are kept identical at a release and a
+          # commit landing on only one of them is how they stop being so.
+          git push origin HEAD:main HEAD:dev
