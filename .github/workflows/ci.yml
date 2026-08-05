@@ -97,3 +97,14 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
       - name: Check the binary runs
         run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+
+      # The release workflow builds this too, and there `publish` needs `build`:
+      # packaging metadata that no longer works would stop a release rather than
+      # degrade it. One target is enough to catch that, and it costs nothing
+      # here.
+      - name: Check the Debian package builds
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build --no-strip -p snob-cli --target ${{ matrix.target }}
+          ls -la target/${{ matrix.target }}/debian/
