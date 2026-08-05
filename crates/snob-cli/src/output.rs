@@ -226,7 +226,12 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
             locked
                 .write_all(rendered.as_bytes())
                 .context("could not write the result")?;
-            locked.flush().ok();
+            // Not `.ok()`. Standard output is line-buffered, so at this point
+            // the tail of the result is still in the buffer and this is where
+            // a full disk reports itself. Discarded, `snob pfp someone >
+            // face.jpg` on a full filesystem printed nothing, exited 0, and
+            // left a truncated JPEG behind.
+            locked.flush().context("could not write the result")?;
         }
     }
     Ok(())

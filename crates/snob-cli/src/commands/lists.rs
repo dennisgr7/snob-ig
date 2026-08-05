@@ -33,14 +33,15 @@ pub async fn run(
     app.progress().finish();
     let (found, outcome) = result?;
 
-    let before_filtering = found.len();
+    let total = found.len();
     let mut found = filter.apply(found);
+    let kept = found.len();
     if let Some(cap) = args.limit {
         found.truncate(cap);
     }
 
     destination.write(&found)?;
-    print_summary(&found, before_filtering, &outcome, kind);
+    print_summary(&found, kept, total, &outcome, kind);
     Ok(exit_code(&outcome))
 }
 
@@ -68,13 +69,8 @@ fn one_of(kind: ListKind) -> &'static str {
     }
 }
 
-fn print_summary(found: &[User], before_filtering: usize, outcome: &ListOutcome, kind: ListKind) {
-    let mut line = report::counted(
-        found.len(),
-        before_filtering,
-        one_of(kind),
-        &kind.to_string(),
-    );
+fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcome, kind: ListKind) {
+    let mut line = report::counted(found.len(), kept, total, one_of(kind), &kind.to_string());
 
     match outcome.source {
         ResultSource::Cached => {

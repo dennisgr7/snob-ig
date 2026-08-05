@@ -99,11 +99,25 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // Followers first, mirroring the order `unfollowers` consumes the cache
     // in, and so an incomplete list is found out before the second walk is
     // spent.
-    let (followers, followers_outcome) = engine::list(&mut app, &args, ListKind::Followers).await?;
-    check_complete(ListKind::Followers, &followers_outcome)?;
+    // The bar is finished before the `?`, not after it: `indicatif` leaves its
+    // last line on screen when dropped, so an error used to print underneath a
+    // spinner that had stopped spinning.
+    let first = engine::list(&mut app, &args, ListKind::Followers).await;
+    let (followers, followers_outcome) = match first {
+        Ok(pair) => pair,
+        Err(e) => {
+            app.progress().finish();
+            return Err(e);
+        }
+    };
+    if let Err(e) = check_complete(ListKind::Followers, &followers_outcome) {
+        app.progress().finish();
+        return Err(e);
+    }
 
-    let (following, following_outcome) = engine::list(&mut app, &args, ListKind::Following).await?;
+    let second = engine::list(&mut app, &args, ListKind::Following).await;
     app.progress().finish();
+    let (following, following_outcome) = second?;
     check_complete(ListKind::Following, &following_outcome)?;
     engine::cooldown::check_same_moment(&followers_outcome, &following_outcome)?;
 

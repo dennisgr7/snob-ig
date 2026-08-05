@@ -134,8 +134,16 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
 /// folder behind: empty, and named after a tool the user has just finished
 /// removing. `remove_dir` succeeds only on an empty directory, which is what
 /// makes this safe to point at a parent at all.
+///
+/// It has to be **our** folder, though, and that is the part the Windows
+/// reasoning hid. Elsewhere the layout is flat: on Linux the parents are
+/// `~/.local/share` and `~/.config`, on macOS `~/Library/Application Support`.
+/// Those belong to the platform rather than to snob, they are routinely empty
+/// on a minimal container or server image, and removing one is outside what
+/// this command was asked to do.
 fn remove_if_empty(dir: Option<&Path>) {
     if let Some(dir) = dir
+        && dir.file_name().is_some_and(|name| name == "snob-ig")
         && paths::is_safe_to_remove(dir)
     {
         let _ = std::fs::remove_dir(dir);
@@ -151,7 +159,7 @@ pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<
         return Ok(ExitCode::Ok);
     }
 
-    println!("This will permanently delete:");
+    println!("This will delete, from this computer:");
     for line in plan.lines() {
         println!("  {line}");
     }
@@ -173,6 +181,16 @@ pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<
 
     if failures.is_empty() {
         println!("Done.");
+        // Said rather than implied. Removing a file unlinks it; on any modern
+        // filesystem the bytes may survive in a journal, a shadow copy, a
+        // snapshot, or — on flash — in a block the drive has not yet erased.
+        // No program running as an ordinary user can promise otherwise, and a
+        // command called `purge` is exactly where someone would assume it had.
+        ui::info(
+            "snob's files are gone from this computer. Whether the underlying bytes can still\n\
+             be recovered from the disk is not something any program can decide; full-disk\n\
+             encryption is what makes a deletion final.",
+        );
     }
     for failure in &failures {
         ui::warn(&format!(
