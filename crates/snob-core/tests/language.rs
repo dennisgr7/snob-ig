@@ -24,13 +24,17 @@ const SPANISH_SUFFIXES: [&str; 13] = [
 ];
 
 /// English words that end like a Spanish one and would otherwise be flagged.
-const SUFFIX_EXCEPTIONS: [&str; 6] = [
+const SUFFIX_EXCEPTIONS: [&str; 8] = [
     "commando",
     "commands",
     "avocados",
     "tornados",
     "desperados",
     "aficionados",
+    // English almost always spells this ending "-tion" or "-sion". These two
+    // are the ones that do not, and they turn up in ordinary prose.
+    "suspicion",
+    "coercion",
 ];
 
 /// Domain and high-frequency words.
@@ -116,7 +120,13 @@ const ALLOWLIST: [&str; 1] = [
     "crates/snob-core/tests/language.rs",
 ];
 
-const EXTENSIONS: [&str; 5] = ["rs", "sql", "md", "toml", "yml"];
+/// The check is only worth as much as the files it reaches. Packaging brought
+/// in shell, PowerShell, Ruby and JSON, and the manifests are `.yaml` where the
+/// workflows are `.yml`; without these the guard had holes exactly where the
+/// newest text was being written.
+const EXTENSIONS: [&str; 10] = [
+    "rs", "sql", "md", "toml", "yml", "yaml", "sh", "ps1", "rb", "json",
+];
 
 #[test]
 fn no_spanish_is_left_in_the_repository() {
