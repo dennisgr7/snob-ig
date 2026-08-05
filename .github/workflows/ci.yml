@@ -49,12 +49,18 @@ jobs:
       - name: Test
         if: runner.os != 'Linux'
         run: cargo test --workspace
+      # Against musl, which is what Linux users get. The same reasoning as the
+      # keyring daemon above: a suite that passes on a build nobody receives
+      # has not tested the thing that ships. This is where a musl-only problem
+      # in TLS, DNS or SQLite would surface, because the tests drive all three.
       - name: Test with a session bus
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
           dbus-run-session -- bash -c '
             echo "" | gnome-keyring-daemon --unlock --components=secrets
-            cargo test --workspace
+            cargo test --workspace --target x86_64-unknown-linux-musl
           '
 
   build:
@@ -73,9 +79,14 @@ jobs:
           # the targets release tooling covers by default.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
-          - target: x86_64-unknown-linux-gnu
+          # musl, not gnu. A binary linked against the runner's glibc carries
+          # its version as a hard requirement: built on Ubuntu 24.04 it refused
+          # to install on Debian 12 and Ubuntu 22.04, which between them are
+          # most of the Linux machines anyone actually has. musl links
+          # statically and asks the host for nothing.
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -94,16 +105,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      # rusqlite builds SQLite from C, so a musl target needs a musl C
+      # compiler. Without this the failure is a linker error about missing
+      # headers, which reads like a broken machine rather than a missing
+      # package.
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
       - name: Check the binary runs
         run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+
+      # Statically linked is a claim, and it is the whole reason for choosing
+      # musl, so it gets checked rather than assumed: `ldd` on a static binary
+      # reports no dynamic dependencies at all.
+      - name: Check the Linux binary is static
+        if: contains(matrix.target, 'musl')
+        run: |
+          file target/${{ matrix.target }}/release/snob
+          ldd target/${{ matrix.target }}/release/snob 2>&1 | tee /tmp/ldd
+          grep -q "not a dynamic executable\|statically linked" /tmp/ldd
 
       # The release workflow builds this too, and there `publish` needs `build`:
       # packaging metadata that no longer works would stop a release rather than
       # degrade it. One target is enough to catch that, and it costs nothing
       # here.
       - name: Check the Debian package builds
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           cargo install cargo-deb --locked
           # Down to the --output, this is the line the release runs. A check

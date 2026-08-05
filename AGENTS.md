@@ -81,9 +81,13 @@ Without the `--`, cargo keeps the flags instead of passing them through.
 has to be repeated after every change; for iterating, `cargo run` is the one.
 
 CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
-targets. The Linux job installs a keyring daemon on purpose: without one the
-secret store falls back to a file and the backend under test is not the one that
-ships.
+targets. Two things there are deliberate, and both are the same idea: what is
+tested has to be what ships. The Linux job installs a keyring daemon, because
+without one the secret store falls back to a file and the backend under test is
+not the one users get. And the Linux suite runs against **musl**, which is what
+Linux users are given: a glibc build carries the runner's glibc version as a
+hard requirement, and built on Ubuntu 24.04 it will not install on Debian 12 or
+Ubuntu 22.04.
 
 ## Architecture
 

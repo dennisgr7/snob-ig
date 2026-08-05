@@ -36,8 +36,11 @@ brew install snob
 [releases page][releases] and:
 
 ```bash
-sudo apt install ./snob-v0.1.0-x86_64-unknown-linux-gnu.deb
+sudo apt install ./snob-v0.1.1-x86_64-unknown-linux-musl.deb
 ```
+
+The Linux builds are statically linked, so they carry no glibc version
+requirement and run on any distribution.
 
 **Without a package manager.** These download the release for your platform,
 check it against the published SHA256, and put it on your `PATH`:

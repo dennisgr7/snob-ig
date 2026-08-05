@@ -58,9 +58,11 @@ jobs:
             runner: windows-latest
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
-          - target: x86_64-unknown-linux-gnu
+          # musl rather than gnu, so the binary carries no glibc version
+          # requirement and installs on any distribution. See ci.yml.
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -74,6 +76,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+
+      # rusqlite compiles SQLite from C, which a musl target cannot do without
+      # a musl C compiler.
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
 
