@@ -110,10 +110,15 @@ pub(crate) fn attributes(user: &User) -> String {
 /// The contract for pipes and files: a script reading `snob unfollowers` has
 /// always got this, and the real table arriving for terminals does not change
 /// it.
+///
+/// Filtered like the drawn table above. "Not a terminal" is where the output
+/// goes, not where it ends up: `snob followers > people.txt` is followed by
+/// somebody reading `people.txt`, and `| less -r` is a terminal with one step
+/// in between.
 pub(crate) fn plain(users: &[User]) -> String {
     let mut out = String::new();
     for user in users {
-        out.push_str(&user.username);
+        out.push_str(&user.safe_username());
         out.push('\n');
     }
     out
