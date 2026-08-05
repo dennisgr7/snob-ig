@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 — 2026-08-05
+
+- The Linux builds are statically linked against musl. The 0.1.0 ones were
+  linked against the glibc of the machine that built them, which made them
+  refuse to install on Debian 12 and Ubuntu 22.04; the `.deb` said as much with
+  `Depends: libc6 (>= 2.39)`, and the tarballs failed later and less clearly.
+  These carry no such requirement and run on any distribution.
+- Installable with Scoop, with Homebrew, from a `.deb`, or from an install
+  script that verifies the published SHA256 before putting anything on the
+  `PATH`. The README lists all of them.
+
 ## 0.1.0 — 2026-08-05
 
 First release. The essentials, and no more.

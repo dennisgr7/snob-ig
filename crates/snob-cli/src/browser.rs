@@ -445,6 +445,14 @@ mod tests {
 
     /// The check is throttled so that on Linux, where it costs a process
     /// launch, it does not run on every single command.
+    ///
+    /// Nothing here is measured against the wall clock. The timestamp is set
+    /// before `detect` runs, and `detect` launches one process per installed
+    /// browser — on a busy machine with three of them that took longer than
+    /// the few seconds an earlier version of this test allowed, and the test
+    /// failed for being slow rather than for being wrong. What matters is that
+    /// the timestamp moved and that the throttle closed behind it, and both
+    /// can be asserted without asking what time it is.
     #[test]
     fn a_recent_check_is_not_repeated() {
         let mut session = session_with(
@@ -455,9 +463,16 @@ mod tests {
         assert!(!refresh_user_agent(&mut session));
 
         // Past the interval it looks again, whatever it then decides.
-        session.user_agent_checked_at = Some(snob_core::store::now() - RECHECK_AFTER_SECS - 1);
+        let stale = snob_core::store::now() - RECHECK_AFTER_SECS - 1;
+        session.user_agent_checked_at = Some(stale);
         assert!(refresh_user_agent(&mut session));
-        assert!(session.user_agent_checked_at.unwrap() > snob_core::store::now() - 5);
+
+        let moved = session.user_agent_checked_at.unwrap();
+        assert!(moved > stale, "the check ran, so its timestamp must move");
+        assert!(
+            !refresh_user_agent(&mut session),
+            "and having moved, it is inside the throttling window again"
+        );
     }
 
     /// If there is a browser on this machine, the reconstructed User-Agent has
