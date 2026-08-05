@@ -485,6 +485,30 @@ impl WalkState {
         if reason != StopReason::Completed {
             return reason;
         }
+
+        // Nothing walked, and nothing to check that against.
+        //
+        // An account with no followers and an Instagram that served no
+        // followers look identical from here: one page, no users, no cursor,
+        // which `record_page` reads as the list being done. The counter is
+        // what tells them apart, and this is the branch where the counter is
+        // missing — the profile poll failed, which is the same bad afternoon
+        // that produces the empty page.
+        //
+        // Getting it wrong here is not a partial result but a wrong one: an
+        // empty followers list accepted as complete makes every account you
+        // follow an unfollower. A real empty account loses nothing by being
+        // asked again, so this refuses.
+        if request.estimated.is_none() && self.users == 0 {
+            observe(Event::Warning(
+                "the list came back empty and the profile counter could not be read, so there is \
+                 no way to tell an empty list from one Instagram did not serve; treating it as \
+                 incomplete rather than risking the comparison"
+                    .into(),
+            ));
+            return StopReason::Truncated;
+        }
+
         let Some(estimated) = request.estimated else {
             return reason;
         };
@@ -659,6 +683,47 @@ mod tests {
             .unwrap();
 
         (summary, events, seen)
+    }
+
+    /// The one case where a clean ending is not a clean ending.
+    ///
+    /// One page, no users, no cursor: `record_page` reads that as the list
+    /// being done, and it is also what Instagram serving nothing looks like.
+    /// The declared counter is what tells the two apart, and the walk that
+    /// hits this is the one whose profile poll already failed.
+    ///
+    /// Accepted as complete, the empty followers list makes every account you
+    /// follow an unfollower — not a partial answer but a wrong one.
+    #[tokio::test]
+    async fn an_empty_list_with_no_counter_to_check_it_against_is_refused() {
+        let server = server(vec![ok(body(0, 0, None))]).await;
+        let (summary, events, _) = walk(&server, request()).await;
+
+        assert_eq!(summary.users, 0);
+        assert_eq!(summary.reason, StopReason::Truncated);
+        assert!(!summary.is_complete());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Warning(w) if w.contains("came back empty"))),
+            "{events:?}"
+        );
+    }
+
+    /// The same answer, with the counter agreeing that the account really has
+    /// nobody. Nothing to be suspicious of, and refusing it would make an
+    /// empty account permanently unusable.
+    #[tokio::test]
+    async fn an_empty_list_the_counter_confirms_is_complete() {
+        let server = server(vec![ok(body(0, 0, None))]).await;
+        let request = ListRequest {
+            estimated: Some(0),
+            ..request()
+        };
+        let (summary, _, _) = walk(&server, request).await;
+
+        assert_eq!(summary.reason, StopReason::Completed);
+        assert!(summary.is_complete());
     }
 
     #[tokio::test]

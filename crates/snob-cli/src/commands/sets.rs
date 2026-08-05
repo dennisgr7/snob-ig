@@ -143,6 +143,7 @@ fn check_against_list(op: SetOp, outcome: &ListOutcome) -> Result<()> {
     Err(report::refuse_incomplete(
         op.against(),
         outcome.reason,
+        outcome.exit_code(),
         op.misreads_as(),
     ))
 }
@@ -151,7 +152,7 @@ fn exit_code(base: &ListOutcome) -> ExitCode {
     if base.is_complete() {
         ExitCode::Ok
     } else {
-        ExitCode::from_stop_reason(base.reason)
+        base.exit_code()
     }
 }
 
@@ -202,6 +203,7 @@ mod tests {
             taken_at: 0,
             from_cooldown: false,
             account_pk: 1,
+            stopped_by: None,
         }
     }
 

@@ -54,7 +54,7 @@ fn exit_code(outcome: &ListOutcome) -> ExitCode {
     match outcome.reason {
         // A cap was asked for by the user, so it is not a failure.
         StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        other => ExitCode::from_stop_reason(other),
+        _ => outcome.exit_code(),
     }
 }
 
@@ -118,6 +118,7 @@ mod tests {
             taken_at: 0,
             from_cooldown: false,
             account_pk: 1,
+            stopped_by: None,
         }
     }
 

@@ -165,6 +165,7 @@ fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     Err(report::refuse_incomplete(
         kind,
         outcome.reason,
+        outcome.exit_code(),
         "they were not there at all",
     ))
 }
@@ -413,6 +414,7 @@ mod tests {
             taken_at: 1_722_700_000,
             from_cooldown: false,
             account_pk: 1,
+            stopped_by: None,
         }
     }
 
