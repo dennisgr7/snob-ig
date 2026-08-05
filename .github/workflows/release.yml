@@ -206,7 +206,12 @@ jobs:
         run: |
           curl -fsSL -o /tmp/SHA256SUMS \
             "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
-          packaging/render.sh "${{ needs.check.outputs.version }}" /tmp/SHA256SUMS
+          # Invoked through bash rather than run directly. The executable bit
+          # is set in the index, but git on Windows does not track file modes
+          # by default, so an edit from there can quietly drop it again -- and
+          # this job is the last one in a release, where the failure is most
+          # expensive to discover.
+          bash packaging/render.sh "${{ needs.check.outputs.version }}" /tmp/SHA256SUMS
 
       - name: Commit
         run: |
