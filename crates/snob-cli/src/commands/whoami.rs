@@ -8,6 +8,7 @@ use snob_ig::pace::Pacer;
 
 use crate::cli::WhoamiArgs;
 use crate::exit::ExitCode;
+use crate::ui;
 
 pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     let Some(mut session) = store.load()? else {
@@ -45,8 +46,16 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
                         session.username = identity.username;
                     }
                     session.mark_validated();
-                    // Worth persisting so the name is not looked up again.
-                    let _ = store.save(&session);
+                    // Worth persisting so the name is not looked up again —
+                    // and this is the only command that writes it back, so a
+                    // silent failure here means every later run pays for the
+                    // lookup again and nothing ever says why.
+                    if let Err(e) = store.save(&session) {
+                        ui::warn(&format!(
+                            "the session could not be updated, so the account name will be \
+                             looked up again next time: {e}"
+                        ));
+                    }
                 }
                 Err(e) => {
                     alive = Some(false);

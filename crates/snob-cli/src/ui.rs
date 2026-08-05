@@ -161,6 +161,21 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
         .context("could not show the menu")
 }
 
+/// Undoes what a prompt did to the terminal, for an exit that runs no
+/// destructors.
+///
+/// `dialoguer` hides the cursor while a menu is up and shows it again on the
+/// way out. The release profile is `panic = "abort"` and the forced-quit path
+/// calls `exit(130)`, so neither of those runs its way out — and an invisible
+/// cursor is not scoped to this program. It stays that way for the rest of the
+/// shell session, long after the user has forgotten what they pressed.
+///
+/// Idempotent and safe with no terminal: `console` writes the sequence to
+/// stderr and does nothing if that is not a terminal.
+pub fn restore_terminal() {
+    let _ = console::Term::stderr().show_cursor();
+}
+
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }
