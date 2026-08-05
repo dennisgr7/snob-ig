@@ -37,6 +37,10 @@ futures-util.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used so a typed sessionid does not sit in freed memory after the prompt that
+# read it.
+zeroize.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

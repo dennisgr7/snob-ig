@@ -7,6 +7,12 @@
 use std::io::{BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
+use zeroize::Zeroizing;
+
+/// Room reserved for a typed secret, so the buffer never has to grow. A
+/// `sessionid` runs to about seventy characters; this is well past anything
+/// anyone will paste.
+const SECRET_CAPACITY: usize = 256;
 
 pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -26,9 +32,17 @@ const MAX_ASTERISKS: usize = 40;
 /// which is what lets you confirm at a glance that the whole thing went in.
 ///
 /// With no terminal a plain line is read, so scripting keeps working.
-pub fn prompt_secret(prompt: &str) -> Result<String> {
+///
+/// The buffer is reserved up front and wrapped so it clears itself. Both
+/// halves are needed and the first is the one that is easy to miss: a `String`
+/// that grows one keystroke at a time leaves every outgrown buffer behind
+/// untouched, so a seventy-character `sessionid` typed into an empty `String`
+/// scatters half a dozen plaintext prefixes of the cookie through freed memory
+/// that nothing will ever clear. `Zeroizing` can only wipe the buffer it still
+/// owns.
+pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
     if !std::io::stdin().is_terminal() {
-        let mut line = String::new();
+        let mut line = Zeroizing::new(String::with_capacity(SECRET_CAPACITY));
         std::io::stdin()
             .lock()
             .read_line(&mut line)
@@ -37,7 +51,7 @@ pub fn prompt_secret(prompt: &str) -> Result<String> {
     }
 
     let term = console::Term::stderr();
-    let mut buffer = String::new();
+    let mut buffer = Zeroizing::new(String::with_capacity(SECRET_CAPACITY));
 
     term.write_str(prompt)
         .context("could not write to the terminal")?;

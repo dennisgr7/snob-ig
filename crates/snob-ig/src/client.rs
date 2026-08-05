@@ -500,7 +500,7 @@ impl IgClient {
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
             .header("Referer", format!("{BASE_URL}/{referer}"))
-            .header("Cookie", self.session.cookie_header());
+            .header("Cookie", self.session.cookie_header().as_str());
 
         // Deliberately no `Origin`: a browser omits it on same-origin GETs, so
         // sending one alongside `Sec-Fetch-Site: same-origin` is a combination
