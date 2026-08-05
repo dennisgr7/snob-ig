@@ -11,6 +11,7 @@ use snob_core::secrets::SecretStore;
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    restore_terminal_on_panic();
 
     match run(cli).await {
         Ok(code) => code.into(),
@@ -72,6 +73,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Friends(args) => commands::sets::run(args, store, &paths, SetOp::Friends).await,
         Command::Pfp(args) => commands::pfp::run(args, store, &paths).await,
     }
+}
+
+/// Gives the cursor back if the process dies with a menu on screen.
+///
+/// The release profile is `panic = "abort"`, so nothing runs on the way out —
+/// and `dialoguer` hides the cursor while a prompt is up. A panic during the
+/// login menu therefore left the user with an invisible cursor for the rest of
+/// their shell session, which reads as the terminal being broken rather than
+/// as this program having failed.
+///
+/// The hook still runs under an aborting runtime: `set_hook` is documented to
+/// run with both runtimes, which is the same property `cdp::kill_on_panic`
+/// depends on.
+fn restore_terminal_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        snob_cli::ui::restore_terminal();
+        previous(info);
+    }));
 }
 
 fn init_tracing(verbose: bool) {

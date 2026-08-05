@@ -82,7 +82,13 @@ impl std::fmt::Display for SessionOrigin {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// `Debug` is derived, and safe to derive: both credential fields are
+/// [`Secret`], which prints `<hidden>`. It used to be written out by hand to
+/// get that, and by the time three fields had been added without being added
+/// there too, the hand-written version was hiding less than the derive would
+/// — it silently omitted `user_agent_pinned`, `user_agent_checked_at` and
+/// `browser` from every dump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub schema_version: u32,
     pub ds_user_id: Pk,
@@ -225,35 +231,26 @@ impl Session {
     }
 }
 
-/// Still hand-written, but only to keep the field list explicit. The two
-/// credentials hide themselves: see [`Secret`].
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("schema_version", &self.schema_version)
-            .field("ds_user_id", &self.ds_user_id)
-            .field("username", &self.username)
-            .field("sessionid", &self.sessionid)
-            .field("csrftoken", &self.csrftoken)
-            .field("mid", &self.mid)
-            .field("ig_did", &self.ig_did)
-            .field("user_agent", &self.user_agent)
-            .field("origin", &self.origin)
-            .field("created_at", &self.created_at)
-            .field("validated_at", &self.validated_at)
-            .finish()
-    }
-}
-
 /// Tolerates what people actually paste: whitespace, the whole `sessionid=…`
-/// pair, and surrounding quotes.
+/// pair, surrounding quotes, and the entire cookie string.
+///
+/// That last one used to half-work, which is worse than failing. Copying the
+/// whole `Cookie` row out of the developer tools gives
+/// `sessionid=…; csrftoken=…; mid=…`, and the prefix was stripped while
+/// everything after the first `;` was kept — so the stored credential was the
+/// sessionid *plus three other cookies*, the request happened to work because
+/// that is still a valid cookie string, and `csrftoken` stayed `None`, so the
+/// `X-CSRFToken` header was never sent. Nothing visibly failed. The value now
+/// ends where the cookie does.
 fn clean_sessionid(raw: &str) -> Result<String, SessionError> {
     let mut s = raw.trim();
     if let Some(rest) = s.strip_prefix("sessionid=") {
         s = rest.trim();
     }
     s = s.trim_matches(['"', '\'']).trim();
-    s = s.trim_end_matches(';').trim();
+    // A cookie value ends at the separator, whether or not anything follows it.
+    s = s.split(';').next().unwrap_or(s).trim();
+    s = s.trim_matches(['"', '\'']).trim();
 
     if s.is_empty() {
         return Err(SessionError::EmptySessionId);
@@ -391,12 +388,33 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_the_credential() {
-        let dump = format!("{:?}", session());
+        let mut s = session();
+        s.csrftoken = Some(Secret::new("SeCrEtToKeN"));
+        let dump = format!("{s:?}");
         assert!(
-            !dump.contains("AbCdEfGhIjKl"),
-            "Debug leaked the sessionid: {dump}"
+            !dump.contains("AbCdEfGhIjKl") && !dump.contains("SeCrEtToKeN"),
+            "Debug leaked a credential: {dump}"
         );
         assert!(dump.contains("<hidden>"));
+        // Derived rather than written out, so a field added later cannot go
+        // missing from the dump the way three of them already had.
+        assert!(dump.contains("browser"), "{dump}");
+        assert!(dump.contains("user_agent_pinned"), "{dump}");
+    }
+
+    /// Copying the whole `Cookie` row out of the developer tools is the
+    /// commonest way to get this wrong, and it used to half-work: the extra
+    /// cookies were stored inside the credential, the request still went out
+    /// because that is a valid cookie string, and `csrftoken` stayed unset so
+    /// its header was silently never sent.
+    #[test]
+    fn pasting_the_whole_cookie_string_keeps_only_the_sessionid() {
+        let whole_row = "sessionid=71234567890%3AAbCd%3A20; csrftoken=abc123; mid=ZZZ; ig_did=Q";
+        let s = Session::from_sessionid(whole_row, UA, SessionOrigin::Paste).unwrap();
+
+        assert_eq!(s.sessionid.expose(), "71234567890%3AAbCd%3A20");
+        assert_eq!(s.ds_user_id, 71234567890);
+        assert!(!s.cookie_header().contains("csrftoken=abc123"));
     }
 
     #[test]
