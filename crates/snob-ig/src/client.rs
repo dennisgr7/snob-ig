@@ -39,24 +39,79 @@ const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Redirects are followed, but never off HTTPS and never far.
+/// How far a redirect chain may go before it is a loop by another name.
+const MAX_HOPS: usize = 3;
+
+/// Same scheme, same host, same port. Not "the same host", which is what this
+/// used to be in one place and is the reason the rest of this section exists.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Whether a URL is somewhere a profile picture actually comes from.
+///
+/// HTTPS, and one of the two hosts Instagram serves media from. The leading
+/// dot the suffix is built with is what stops `evilcdninstagram.com` matching.
+///
+/// The one exception is the server this client was pointed at, which is how a
+/// test serves an asset over plain HTTP from localhost. It is matched on
+/// scheme, host **and** port together, and that matters in production rather
+/// than in tests: on host alone the exception is live against the real base
+/// URL, so a `profile_pic_url` of `http://www.instagram.com:8080/x` was
+/// accepted and fetched in the clear.
+fn serves_pictures(base: &Url, url: &Url) -> bool {
+    const CDN_HOSTS: [&str; 2] = ["cdninstagram.com", "fbcdn.net"];
+
+    if same_origin(base, url) {
+        return true;
+    }
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    CDN_HOSTS
+        .iter()
+        .any(|cdn| host == *cdn || host.ends_with(&format!(".{cdn}")))
+}
+
+/// Redirects for the API: the same origin, or nowhere.
+///
+/// Instagram's JSON endpoints do not redirect off their own host, so refusing
+/// costs nothing — and two of the headers on those requests are credentials.
+/// reqwest drops `Cookie` when a redirect crosses hosts, but `X-CSRFToken` is
+/// not on the list it knows about and would travel to wherever the response
+/// pointed. A boundary that depends on somebody else's list of header names is
+/// not one, so this one is drawn here.
+fn api_policy(base: Url) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_HOPS {
+            attempt.error("too many redirects")
+        } else if same_origin(&base, attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("a redirect tried to take an API call off instagram.com")
+        }
+    })
+}
+
+/// Redirects for an asset: every hop held to the same rule as the first.
 ///
 /// The picture URL comes out of Instagram's own answer, so a redirect chain is
 /// the one place where a response gets to choose where the next request goes.
-/// Refusing to step down to plain HTTP is what keeps that from reaching a
-/// loopback port or a cloud metadata endpoint, neither of which speaks TLS.
-/// Test servers run on HTTP, so the first hop is judged by where it started.
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let downgraded = attempt.url().scheme() != "https"
-            && attempt.previous().first().map(|u| u.scheme()) != Some(attempt.url().scheme());
-
-        if attempt.previous().len() >= 3 {
+/// Checking only the address as written left hops two and three judged by
+/// scheme alone, which is a weaker rule than the one the module documents.
+fn cdn_policy(base: Url) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_HOPS {
             attempt.error("too many redirects")
-        } else if downgraded {
-            attempt.error("a redirect tried to leave https")
-        } else {
+        } else if serves_pictures(&base, attempt.url()) {
             attempt.follow()
+        } else {
+            attempt.error("a redirect tried to leave the CDN")
         }
     })
 }
@@ -107,7 +162,18 @@ impl Direction {
 }
 
 pub struct IgClient {
-    http: reqwest::Client,
+    /// Talks to Instagram. Carries the session, and follows a redirect only
+    /// while it stays on the origin it started from.
+    api: reqwest::Client,
+    /// Talks to the CDN. Carries nothing that identifies the account, and
+    /// every hop has to be somewhere pictures come from.
+    ///
+    /// Two clients rather than one because the two have opposite rules: the
+    /// API request must not leave instagram.com, and the asset request has to
+    /// be allowed to move between CDN hosts. One client can only have one
+    /// redirect policy, so sharing it meant the looser of the two governed the
+    /// requests carrying the credentials.
+    cdn: reqwest::Client,
     base: Url,
     session: Session,
     /// Reserving budget lives here rather than in each caller, so a request
@@ -123,19 +189,30 @@ const INITIAL_CLAIM: &str = "0";
 
 impl IgClient {
     pub fn new(session: Session, pacer: Pacer) -> Result<Self, IgError> {
-        let http = reqwest::Client::builder()
-            .user_agent(session.user_agent.clone())
-            .redirect(redirect_policy())
-            // Without these, a server that accepts the connection and then says
-            // nothing hangs the process for good: neither the cancel token nor
-            // any deadline above reaches a socket that is simply waiting.
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
+        Self::pointed_at(session, pacer, Url::parse(BASE_URL)?)
+    }
+
+    fn pointed_at(session: Session, pacer: Pacer, base: Url) -> Result<Self, IgError> {
+        // Both policies close over the base URL, so which server this client
+        // talks to has to be settled before either client is built.
+        let build = |redirect| {
+            reqwest::Client::builder()
+                .user_agent(session.user_agent.clone())
+                .redirect(redirect)
+                // Without these, a server that accepts the connection and then
+                // says nothing hangs the process for good: neither the cancel
+                // token nor any deadline above reaches a socket that is simply
+                // waiting.
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+        };
+
         Ok(Self {
             fingerprint: Fingerprint::from_user_agent(&session.user_agent),
-            http,
-            base: Url::parse(BASE_URL)?,
+            api: build(api_policy(base.clone()))?,
+            cdn: build(cdn_policy(base.clone()))?,
+            base,
             session,
             pacer,
             claim: Mutex::new(INITIAL_CLAIM.to_string()),
@@ -186,9 +263,13 @@ impl IgClient {
     }
 
     /// Points the client at a different server. Tests only.
-    pub fn with_base_url(mut self, base: Url) -> Self {
-        self.base = base;
-        self
+    ///
+    /// Rebuilds rather than assigns: both redirect policies are decided from
+    /// the base URL when the client is made, so moving the field alone would
+    /// leave them judging every hop against the wrong server.
+    pub fn with_base_url(self, base: Url) -> Self {
+        Self::pointed_at(self.session, self.pacer, base)
+            .expect("rebuilding a client that already exists cannot fail")
     }
 
     pub fn session(&self) -> &Session {
@@ -320,46 +401,23 @@ impl IgClient {
 
     /// Refuses a picture URL that does not go where a picture goes.
     ///
-    /// The redirect policy covers every hop **after** the first one, which left
-    /// the one hop whose address comes straight out of Instagram's answer as
-    /// the only unchecked one — and that is the one an attacker gets to choose.
-    /// A `profile_pic_url` of `http://127.0.0.1:9222/json` or of a cloud
-    /// metadata address would have been fetched as written.
-    ///
-    /// So the first hop is held to what the CDN actually is: HTTPS, and one of
-    /// the two hosts Instagram serves media from. Tests point the client at a
-    /// local server, and its base URL is what says so.
+    /// The address of the first hop comes straight out of Instagram's answer,
+    /// so it is the one an attacker gets to choose: a `profile_pic_url` of
+    /// `http://127.0.0.1:9222/json` or of a cloud metadata address would be
+    /// fetched as written. It is held to the same rule [`cdn_policy`] holds
+    /// every hop after it to, which is the point of the rule being one
+    /// function.
     fn check_downloadable(&self, url: &Url) -> Result<(), IgError> {
-        const CDN_HOSTS: [&str; 2] = ["cdninstagram.com", "fbcdn.net"];
-
-        let refuse = || IgError::Unexpected {
+        if serves_pictures(&self.base, url) {
+            return Ok(());
+        }
+        Err(IgError::Unexpected {
             status: 0,
             body: format!(
                 "the picture URL points somewhere pictures do not come from: {}",
                 url.host_str().unwrap_or("nowhere")
             ),
-        };
-
-        // A test server is the deliberate exception, and it is recognized by
-        // being the very host this client was pointed at rather than by a
-        // scheme or an address range.
-        if self.base.host_str().is_some() && url.host_str() == self.base.host_str() {
-            return Ok(());
-        }
-
-        if url.scheme() != "https" {
-            return Err(refuse());
-        }
-        let host = url.host_str().ok_or_else(refuse)?;
-        let served_by_the_cdn = CDN_HOSTS
-            .iter()
-            .any(|cdn| host == *cdn || host.ends_with(&format!(".{cdn}")));
-
-        if served_by_the_cdn {
-            Ok(())
-        } else {
-            Err(refuse())
-        }
+        })
     }
 
     /// The body of [`IgClient::download`], with the ceiling as an argument so a
@@ -372,7 +430,7 @@ impl IgClient {
         // Deliberately not paced: the CDN is a different host with its own
         // limits, and charging a picture against Instagram's budget would make
         // the number mean two things at once.
-        let mut response = self.http.get(url).send().await?;
+        let mut response = self.cdn.get(url).send().await?;
         let status = response.status();
 
         // Deliberately not `classify`: that reads Instagram's API vocabulary,
@@ -425,7 +483,7 @@ impl IgClient {
         self.pacer.clear_to_send().await?;
 
         let mut request = self
-            .http
+            .api
             .get(url)
             .query(query)
             // Without this header Instagram answers 403 even with a good session.
@@ -814,6 +872,87 @@ mod tests {
 
         // The same body under a ceiling that fits arrives whole.
         assert_eq!(client.download_capped(&url, 64).await.unwrap().len(), 64);
+    }
+
+    /// The exception that lets a test serve a picture over plain HTTP used to
+    /// match on host alone. Against the real base URL that is
+    /// `www.instagram.com`, so it was live in production, and it ran *before*
+    /// the https check.
+    #[test]
+    fn the_test_server_exception_does_not_open_a_hole_in_production() {
+        let production = Url::parse(BASE_URL).unwrap();
+        for refused in [
+            "http://www.instagram.com/pic.jpg",
+            "http://www.instagram.com:8080/pic.jpg",
+            "https://www.instagram.com:8443/pic.jpg",
+        ] {
+            assert!(
+                !serves_pictures(&production, &Url::parse(refused).unwrap()),
+                "{refused} should not be downloadable"
+            );
+        }
+        assert!(serves_pictures(
+            &production,
+            &Url::parse("https://scontent-mad1-1.cdninstagram.com/v/pic.jpg").unwrap()
+        ));
+    }
+
+    /// The leading dot is what makes this a suffix rather than a substring.
+    #[test]
+    fn a_host_that_merely_ends_in_the_cdns_name_is_refused() {
+        let production = Url::parse(BASE_URL).unwrap();
+        for impostor in [
+            "https://evilcdninstagram.com/pic.jpg",
+            "https://fbcdn.net.evil.test/pic.jpg",
+            "https://cdninstagram.com.evil.test/pic.jpg",
+        ] {
+            assert!(
+                !serves_pictures(&production, &Url::parse(impostor).unwrap()),
+                "{impostor} should not be downloadable"
+            );
+        }
+    }
+
+    /// Checking only the address as written left hops two and three judged by
+    /// scheme alone, which is a weaker rule than the first hop gets.
+    #[tokio::test]
+    async fn a_redirect_off_the_cdn_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pic.jpg"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.test/pic.jpg"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = client(&server)
+            .await
+            .download(&format!("{}/pic.jpg", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IgError::Network(_)), "{error:?}");
+    }
+
+    /// `Cookie` is dropped by the HTTP client on a cross-host redirect, but
+    /// `X-CSRFToken` is not on its list and would have travelled. Instagram's
+    /// API does not redirect off its own host, so refusing costs nothing.
+    #[tokio::test]
+    async fn an_api_redirect_off_the_origin_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.test/collected"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = client(&server).await.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::Network(_)), "{error:?}");
+
+        // The one request that was made is the one we made on purpose.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
