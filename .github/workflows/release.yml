@@ -1,0 +1,165 @@
+name: Release
+
+# A tag is the only trigger. Everything a release consists of is derived from
+# it, so publishing one is `git tag v0.2.0 && git push origin v0.2.0` and
+# nothing else.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Runs before anything is built. A tag that disagrees with the manifest, or a
+  # version with no changelog entry, is a release nobody can interpret later --
+  # and once a tag is pushed, correcting it means deleting a public ref.
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag and the manifest must agree
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The first `version` in the root manifest is the workspace one, which
+          # all three crates inherit.
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $version, Cargo.toml says $manifest"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: The changelog must describe it
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## ${version} " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for ${version}"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # No fail-fast: one target failing should not hide whether the others
+      # would have worked.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # The same five as CI, and no x86_64-apple-darwin, for the reason
+          # documented in ci.yml.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
+
+      # Every runner here is native, so this really runs the binary being
+      # shipped rather than checking that a file exists.
+      - name: Check the binary runs
+        run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+
+      # Two archive formats because the platforms disagree about what is
+      # ordinary: a .tar.gz keeps the executable bit that a .zip would lose on
+      # Unix, and Windows opens a .zip with nothing installed.
+      #
+      # Both hold a directory rather than loose files, so unpacking in the
+      # wrong place leaves one folder to delete instead of four files to find.
+      - name: Package
+        shell: bash
+        run: |
+          name="snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "staging/$name"
+          cp README.md LICENSE CHANGELOG.md "staging/$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/snob.exe" "staging/$name/"
+            # Compress-Archive rather than 7z: it ships with PowerShell, and
+            # the Windows on ARM image cannot be assumed to carry 7-Zip.
+            (cd staging && powershell -NoProfile -Command \
+              "Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
+          else
+            cp "target/${{ matrix.target }}/release/snob" "staging/$name/"
+            tar -C staging -czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            snob-v*.zip
+            snob-v*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # The only write this workflow needs anywhere.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One file rather than one per archive: `sha256sum -c SHA256SUMS` then
+      # verifies whatever the user downloaded without them having to know which
+      # line belongs to it.
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum snob-v* | tee SHA256SUMS
+
+      - name: Release notes
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          # The changelog entry for this version, up to the next heading.
+          awk -v h="## ${version} " '
+            index($0, h) == 1 { flag = 1; next }
+            /^## / { flag = 0 }
+            flag
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<'EOF'
+
+          ---
+
+          Download the archive for your system, unpack it, and put `snob`
+          anywhere on your `PATH`. There is no runtime to install.
+
+          Verify a download with `sha256sum -c SHA256SUMS` on Linux or macOS, or
+          `Get-FileHash` on Windows.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            artifacts/*
