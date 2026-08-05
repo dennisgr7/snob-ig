@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::Pk;
 use crate::secret::Secret;
@@ -153,20 +154,48 @@ impl Session {
 
     /// Value of the `Cookie` header. The `sessionid` goes exactly as the
     /// browser handed it over, undecoded: the `%3A` travels literally.
-    pub fn cookie_header(&self) -> String {
-        let mut pairs = vec![
-            format!("sessionid={}", self.sessionid.expose()),
-            format!("ds_user_id={}", self.ds_user_id),
+    ///
+    /// Built into one buffer reserved up front, and handed back in a
+    /// [`Zeroizing`] wrapper. This is called on **every** request, so the
+    /// obvious spelling — a `Vec` of `format!`s joined at the end — left three
+    /// plaintext copies of the live cookie in freed memory per request, which
+    /// over a walk of a few thousand accounts is a few hundred of them. That is
+    /// exactly the core-dump, swap and hibernation exposure [`Secret`] exists
+    /// to prevent; its module doc waives only the copy inside the HTTP client,
+    /// not the ones this function makes itself.
+    ///
+    /// Reserving the capacity is the half that matters. A `String` that grows
+    /// leaves each outgrown buffer behind untouched, and `Zeroizing` can only
+    /// clear the one it still owns.
+    pub fn cookie_header(&self) -> Zeroizing<String> {
+        let mut out = String::with_capacity(512);
+
+        out.push_str("sessionid=");
+        out.push_str(self.sessionid.expose());
+        // The account id is not a credential — it is the first field of the
+        // sessionid in plain sight — so a small allocation for it costs
+        // nothing worth avoiding.
+        out.push_str("; ds_user_id=");
+        out.push_str(&self.ds_user_id.to_string());
+
+        // Empty values are left out rather than sent blank. A cookie that is
+        // present with no value is not the same as an absent one to Instagram's
+        // session and CSRF checks, and it is a shape no browser produces.
+        let optional = [
+            ("csrftoken", self.csrftoken.as_ref().map(Secret::expose)),
+            ("mid", self.mid.as_deref()),
+            ("ig_did", self.ig_did.as_deref()),
         ];
-        if let Some(csrf) = &self.csrftoken {
-            pairs.push(format!("csrftoken={}", csrf.expose()));
-        }
-        for (name, value) in [("mid", &self.mid), ("ig_did", &self.ig_did)] {
-            if let Some(v) = value {
-                pairs.push(format!("{name}={v}"));
+        for (name, value) in optional {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                out.push_str("; ");
+                out.push_str(name);
+                out.push('=');
+                out.push_str(value);
             }
         }
-        pairs.join("; ")
+
+        Zeroizing::new(out)
     }
 
     pub fn check_schema(&self) -> Result<(), SessionError> {
@@ -339,6 +368,25 @@ mod tests {
         let header = session().cookie_header();
         assert!(!header.contains("csrftoken"));
         assert!(!header.contains("mid="));
+    }
+
+    /// A cookie sent with an empty value is worse than one not sent at all:
+    /// Instagram's session and CSRF checks read it as present-but-blank, which
+    /// is a shape no browser produces. Absent fields are already left out
+    /// above; this pins that a field that exists but is empty is too, so a
+    /// later `unwrap_or_default` cannot quietly start emitting `mid=`.
+    #[test]
+    fn no_cookie_is_ever_sent_with_an_empty_value() {
+        let mut s = session();
+        s.csrftoken = Some(Secret::new(""));
+        s.mid = Some(String::new());
+        s.ig_did = Some(String::new());
+
+        let header = s.cookie_header();
+        for pair in header.split("; ") {
+            let (name, value) = pair.split_once('=').expect("every cookie is a pair");
+            assert!(!value.is_empty(), "{name} went out empty: {}", &*header);
+        }
     }
 
     #[test]

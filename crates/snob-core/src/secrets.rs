@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::paths::{AppPaths, PathError};
 use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
@@ -236,8 +236,22 @@ impl SecretStore {
                 self.entry()?
                     .set_password(&json)
                     .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))?;
-                // Do not leave two different sessions lying around.
-                let _ = std::fs::remove_file(self.paths.session_file());
+                // Do not leave two different sessions lying around. Both
+                // locations, not just the current one: `load` checks the
+                // keyring first, so once an entry exists the rescue path that
+                // would have found and removed the legacy file is never
+                // reached again, and an older account's live cookie stays in
+                // the roaming profile — where it roams — until someone happens
+                // to run `logout` or `purge`.
+                for stale in [
+                    Some(self.paths.session_file()),
+                    self.paths.legacy_session_file(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let _ = std::fs::remove_file(stale);
+                }
             }
             Backend::File => {
                 self.write_file(&json)?;
@@ -365,14 +379,23 @@ impl SecretStore {
         Ok(Some(json))
     }
 
+    /// Reads a stored session, clearing what it read on the way out.
+    ///
+    /// On Unix the payload **is** the session in the clear — the protection
+    /// there is the file's 0600 permissions, not encryption — so the bytes read
+    /// off the disk and the payload parsed out of them are both the cookie.
+    /// This runs on every command, so an unzeroized copy of each is left in
+    /// freed memory every time the tool starts.
     fn read_file(&self, path: &std::path::Path) -> Result<Zeroizing<String>, SecretsError> {
-        let raw = std::fs::read(path).map_err(|source| SecretsError::Read {
+        let raw = Zeroizing::new(std::fs::read(path).map_err(|source| SecretsError::Read {
             path: path.display().to_string(),
             source,
-        })?;
-        let stored: StoredSession = serde_json::from_slice(&raw)
+        })?);
+        let mut stored: StoredSession = serde_json::from_slice(&raw)
             .map_err(|e| SecretsError::Corrupt(format!("the session file is not valid: {e}")))?;
-        unprotect(&stored)
+        let session = unprotect(&stored);
+        stored.payload.zeroize();
+        session
     }
 
     fn write_file(&self, json: &str) -> Result<(), SecretsError> {
@@ -561,7 +584,18 @@ mod dpapi {
         let output = unsafe {
             std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
         };
-        unsafe { LocalFree(out_blob.pbData as *mut core::ffi::c_void) };
+        // On the decrypt path this buffer is the session in the clear, and it
+        // is Windows's memory rather than ours: nothing else will wipe it, and
+        // `LocalFree` only returns it to the heap with the cookie still in it.
+        // The copy above is what the caller wraps in `Zeroizing`; this is the
+        // original.
+        //
+        // SAFETY: same pointer and length the read above used, still owned by
+        // this function and not yet freed.
+        unsafe {
+            std::ptr::write_bytes(out_blob.pbData, 0, out_blob.cbData as usize);
+            LocalFree(out_blob.pbData as *mut core::ffi::c_void)
+        };
 
         Ok(output)
     }
