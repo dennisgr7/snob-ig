@@ -334,14 +334,35 @@ impl SecretStore {
     fn load_from_keyring(&self) -> Result<Option<Zeroizing<String>>, SecretsError> {
         let entry = match self.entry() {
             Ok(e) => e,
-            Err(_) => return Ok(None),
+            // No keyring backend at all. Ordinary on a server, a container or
+            // WSL, and the session may still be in the fallback file.
+            Err(e) => {
+                tracing::debug!(error = %e, "there is no keyring to read from");
+                return Ok(None);
+            }
         };
         match entry.get_password() {
             Ok(json) => Ok(Some(Zeroizing::new(json))),
+            // The entry is simply not there.
             Err(keyring::Error::NoEntry) => Ok(None),
-            // A missing keyring is not a read error: the session may be in the
-            // fallback file.
-            Err(_) => Ok(None),
+            // The keyring is there and refused. Every error used to land here
+            // silently alongside `NoEntry`, and the two are not the same
+            // claim: a credential that cannot be read this once became "no
+            // session stored", which sends the user to log in again over a
+            // session that is still there — and `save` removes the file
+            // fallback once a keyring entry exists, so there is nothing behind
+            // it to catch them.
+            //
+            // It still falls through to the file, because that is the right
+            // thing to try next. What it no longer does is fall through in
+            // silence.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "the keyring refused to hand the session over; trying the file instead"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -677,12 +698,38 @@ mod tests {
             landed == Backend::File,
             "the file should exist exactly when the probe named the file"
         );
+        let read_back = load_settled(&store);
         assert_eq!(
-            store.load().unwrap().unwrap().sessionid.expose(),
+            read_back
+                .expect("the session was just written and has to read back")
+                .sessionid
+                .expose(),
             session.sessionid.expose()
         );
 
         store.delete().unwrap();
+    }
+
+    /// Reads the session back, giving the platform's credential store one
+    /// second chance to answer.
+    ///
+    /// Not a retry for its own sake. This suite creates and deletes dozens of
+    /// credentials in parallel under a different service name each, and the
+    /// Windows Credential Manager occasionally refuses a read that lands right
+    /// behind a write — which `load` correctly reports as "nothing found",
+    /// because a keyring that will not answer is not the same as one that has
+    /// nothing, and the fallback file is the right next place to look.
+    ///
+    /// That distinction is the point. Until recently every keyring error was
+    /// swallowed into `Ok(None)` in silence, so this read coming back empty was
+    /// indistinguishable from the credential never having been written, and the
+    /// test failed as a bare `unwrap` on `None` with nothing to go on. The
+    /// production path now says so out loud; this says so here.
+    fn load_settled(store: &SecretStore) -> Option<Session> {
+        match store.load().unwrap() {
+            Some(session) => Some(session),
+            None => store.load().unwrap(),
+        }
     }
 
     #[test]
