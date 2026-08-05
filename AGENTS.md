@@ -206,12 +206,20 @@ Two judgement calls worth understanding before touching them:
   resolved by any surviving route, and the one endpoint that does answer gives a
   stub with no counters and a 150x150 picture whose URL is signed for that size.
   Everything needs a session; that is Instagram, not a gap here.
-- **The TLS stack is not to be touched.** Chrome has randomized its ClientHello
-  extension order since v110, so there is no fixed fingerprint left to match and
-  a stable one is more anomalous than any particular one. Matching it would mean
-  leaving `rustls` and the clean static cross-compilation with it. What actually
-  gets an account throttled, in order: IP reputation, request volume and pace,
-  header coherence.
+- **The TLS stack is not to be tuned for fingerprinting.** Chrome has randomized
+  its ClientHello extension order since v110, so there is no fixed fingerprint
+  left to match and a stable one is more anomalous than any particular one.
+  Matching it would mean leaving `rustls` and the clean static
+  cross-compilation with it. What actually gets an account throttled, in order:
+  IP reputation, request volume and pace, header coherence.
+  **One target is the exception, and it is a build concern rather than a
+  fingerprinting one**: Windows on ARM64 uses schannel, because neither of
+  rustls's crypto providers builds there without LLVM — the pre-generated
+  assembly is GNU syntax and both shell out to clang. Everything else, x86_64
+  Windows included, stays on `rustls`. The reasoning, why it is deliberately
+  not widened to all of Windows, and what it costs is in
+  `crates/snob-ig/Cargo.toml` next to the two dependency tables. Nothing about
+  it is an attempt to look like a browser, and `http2` stays mandatory on both.
 - **Header work aims at coherence, not disguise.** Instagram answers
   `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so those are sent; `Accept` is `*/*`
   because no browser sends `application/json` here; `sec-ch-ua` is computed from

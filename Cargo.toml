@@ -18,19 +18,21 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
-# No `webpki-roots`: in reqwest 0.13 the feature only turns on an optional
-# dependency that nothing in reqwest references, so it was a crate compiled for
-# no one. Verification goes through `rustls-platform-verifier`, the operating
-# system's own trust store, which is the right answer on a desktop anyway.
+# The TLS backend is **not** listed here. It is chosen per platform, in
+# crates/snob-ig/Cargo.toml, and the reason is written out there.
 # No `cookies`: nothing here keeps a cookie jar — the session travels as an
 # explicit header, and the CDN must never receive it. Leaving the feature on
 # meant a later `.cookie_store(true)` would silently start carrying cookies
 # across redirects; without it, that becomes a compile error. It also drops ten
 # crates from the tree.
+# `http2` is not optional and not a performance choice: Instagram answers 429 to
+# HTTP/1.1 on these endpoints from some hosts and networks where the same
+# request over h2 succeeds, and a browser always negotiates h2 against
+# instagram.com. Both TLS backends below advertise `h2` through ALPN.
 # `brotli` and `zstd` alongside `gzip` are not about speed: Chrome advertises
 # `gzip, deflate, br, zstd`, and a client that in 2026 announces gzip alone is
 # an anomaly that costs one line to remove.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip", "brotli", "zstd"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "charset", "query", "gzip", "brotli", "zstd"] }
 clap = { version = "4", features = ["derive"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.
