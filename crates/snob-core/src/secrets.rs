@@ -710,26 +710,32 @@ mod tests {
         store.delete().unwrap();
     }
 
-    /// Reads the session back, giving the platform's credential store one
-    /// second chance to answer.
+    /// Reads the session back, waiting out the credential store if it needs it.
     ///
-    /// Not a retry for its own sake. This suite creates and deletes dozens of
-    /// credentials in parallel under a different service name each, and the
-    /// Windows Credential Manager occasionally refuses a read that lands right
-    /// behind a write — which `load` correctly reports as "nothing found",
-    /// because a keyring that will not answer is not the same as one that has
-    /// nothing, and the fallback file is the right next place to look.
+    /// Not a retry bolted on to make a red test green. What it waits for was
+    /// measured: this suite creates and deletes dozens of credentials in
+    /// parallel, and two or three runs in fifty ended with `save` reporting the
+    /// write to the Windows Credential Manager as successful and the read
+    /// immediately after it answering `NoEntry` — the credential is not
+    /// missing, it is not visible yet.
     ///
-    /// That distinction is the point. Until recently every keyring error was
-    /// swallowed into `Ok(None)` in silence, so this read coming back empty was
-    /// indistinguishable from the credential never having been written, and the
-    /// test failed as a bare `unwrap` on `None` with nothing to go on. The
-    /// production path now says so out loud; this says so here.
+    /// The delay is the whole mechanism, which is why an immediate second
+    /// attempt did not help: both landed inside the same window, microseconds
+    /// apart. Adding any tracing to the path made it stop reproducing, which is
+    /// the other reason to believe it is a timing window rather than logic.
+    ///
+    /// The real store is deliberately kept rather than faked. What this test is
+    /// for is that the answer `probe_writable` gave and the place `save` put it
+    /// cannot disagree, and against an in-memory double that proves nothing
+    /// about the platform it is asserting.
     fn load_settled(store: &SecretStore) -> Option<Session> {
-        match store.load().unwrap() {
-            Some(session) => Some(session),
-            None => store.load().unwrap(),
+        for attempt in 0..5 {
+            if let Some(session) = store.load().unwrap() {
+                return Some(session);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
         }
+        store.load().unwrap()
     }
 
     #[test]
