@@ -106,5 +106,11 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           cargo install cargo-deb --locked
-          cargo deb --no-build --no-strip -p snob-cli --target ${{ matrix.target }}
-          ls -la target/${{ matrix.target }}/debian/
+          # Down to the --output, this is the line the release runs. A check
+          # that invokes something other than what it is guarding is not
+          # guarding it, and the difference would only show during a release.
+          cargo deb --no-build --no-strip -p snob-cli \
+            --target ${{ matrix.target }} \
+            --output "snob-v0.0.0-check.deb"
+          dpkg-deb --info snob-v0.0.0-check.deb | head -12
+          dpkg-deb --contents snob-v0.0.0-check.deb
