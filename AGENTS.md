@@ -13,7 +13,8 @@ number is for, which is what stops it being tuned into something harmful.
 
 `snob`, a terminal tool that tells you who does not follow you back on
 Instagram, and tracks changes to your followers and following over time. Single
-binary, no runtime, Windows, Linux and macOS on x86_64 and ARM64.
+binary, no runtime. Windows and Linux on x86_64 and ARM64, macOS on Apple
+Silicon.
 
 There is no official API for listing followers — Meta removed it in 2018 — so
 this uses the private web API with the user's own session cookie. That goes
@@ -79,7 +80,7 @@ Without the `--`, cargo keeps the flags instead of passing them through.
 `cargo install --path crates/snob-cli` puts a release `snob` on the PATH, but it
 has to be repeated after every change; for iterating, `cargo run` is the one.
 
-CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds six
+CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
 targets. The Linux job installs a keyring daemon on purpose: without one the
 secret store falls back to a file and the backend under test is not the one that
 ships.

@@ -7,8 +7,8 @@ questions the app will not: who does not follow you back, who you never followed
 back, and who you and somebody else both know. It can also pull a profile
 picture at full size.
 
-One binary, no runtime, nothing to install alongside it. Windows, Linux and
-macOS, on x86_64 and ARM64.
+One binary, no runtime, nothing to install alongside it. Windows and Linux on
+x86_64 and ARM64, macOS on Apple Silicon.
 
 **snob only ever reads.** It never follows, unfollows, blocks or removes anyone.
 

@@ -77,10 +77,15 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            runner: macos-13
           - target: aarch64-apple-darwin
             runner: macos-latest
+          # No x86_64-apple-darwin. The only runner that built it, macos-13,
+          # was retired in December 2025, and a job asking for it does not
+          # fail: it sits queued with no runner until the run is cancelled.
+          # `macos-15-intel` would still work, but it is the last Intel image
+          # Actions will offer and it goes away in August 2027, so adding it
+          # buys a target with a known expiry date. Apple stopped selling
+          # Intel Macs in 2023. Anyone still on one can build from source.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
