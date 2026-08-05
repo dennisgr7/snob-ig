@@ -81,6 +81,16 @@ pub async fn fetch(
 
     snapshots::close(app.db().conn(), id, summary.reason)?;
 
+    // What Instagram said, said out loud. The walker keeps the error next to
+    // the stop reason and nothing used to read it, so a checkpoint arrived as
+    // "the session stopped working" — with the address that would have cleared
+    // it, which `IgError::Checkpoint` carries precisely so it can be shown,
+    // dropped on the way.
+    let stopped_by = summary.error.map(|error| {
+        app.warn(&error.to_string());
+        ExitCode::from_ig_error(&error)
+    });
+
     Ok((
         snapshots::members(app.db().conn(), id)?,
         ListOutcome {
@@ -91,6 +101,7 @@ pub async fn fetch(
             taken_at: now(),
             from_cooldown: false,
             account_pk: target.pk,
+            stopped_by,
         },
     ))
 }

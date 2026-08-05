@@ -190,6 +190,13 @@ struct ChallengeBody {
 /// and every good answer already carries `"status":"ok"` so the first half of
 /// that test was always true.
 ///
+/// Three fields rather than one, because this is the gate in front of
+/// [`classify`] and therefore in front of the cooldown. `status` alone meant a
+/// 200 carrying `spam: true` without it went to the deserializer instead: the
+/// run stopped, which is safe, but nothing was written down, so the next run
+/// walked straight back into the same wall. All three are typed fields, so the
+/// follower named `fail` stays fixed.
+///
 /// A body that is not JSON is not a declared failure. Deciding what it is
 /// instead is the deserializer's job, and it says so more precisely.
 pub fn declares_failure(body: &str) -> bool {
@@ -197,12 +204,18 @@ pub fn declares_failure(body: &str) -> bool {
     struct Envelope {
         #[serde(default)]
         status: Option<String>,
+        #[serde(default)]
+        spam: Option<bool>,
+        #[serde(default)]
+        require_login: Option<bool>,
     }
 
-    serde_json::from_str::<Envelope>(body)
-        .ok()
-        .and_then(|e| e.status)
-        .is_some_and(|status| status == "fail")
+    let Ok(envelope) = serde_json::from_str::<Envelope>(body) else {
+        return false;
+    };
+    envelope.status.as_deref() == Some("fail")
+        || envelope.spam == Some(true)
+        || envelope.require_login == Some(true)
 }
 
 /// Translates an Instagram error response into the matching error.
@@ -429,6 +442,18 @@ mod tests {
         ));
         // Order does not matter: it is a field, not a position.
         assert!(declares_failure(r#"{"status":"fail","message":"x"}"#));
+    }
+
+    /// This gate is what stands in front of the cooldown. A throttling answer
+    /// that skips it stops the run — which is safe — without writing anything
+    /// down, so the next run walks straight back into the same wall.
+    #[test]
+    fn throttling_without_the_status_field_is_still_a_failure() {
+        assert!(declares_failure(r#"{"spam":true}"#));
+        assert!(declares_failure(r#"{"require_login":true,"message":"x"}"#));
+
+        // And the flags being false is not a failure.
+        assert!(!declares_failure(r#"{"spam":false,"status":"ok"}"#));
     }
 
     /// A body with no status, or one that is not JSON at all, is not a

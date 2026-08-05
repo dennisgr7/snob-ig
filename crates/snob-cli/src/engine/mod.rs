@@ -21,6 +21,7 @@ use snob_core::store::{accounts, users};
 
 use crate::app::App;
 use crate::cli::ListArgs;
+use crate::exit::ExitCode;
 use crate::ui;
 
 /// Where a returned list came from.
@@ -48,6 +49,15 @@ pub struct ListOutcome {
     /// spelling Instagram uses, and — for your own account — may not be known
     /// at all until something goes and looks it up.
     pub account_pk: Pk,
+    /// What Instagram actually said, when a walk stopped because it said
+    /// something.
+    ///
+    /// [`StopReason`] is coarser than the error behind it on purpose — the
+    /// store only needs to know whether the list is usable. But
+    /// `SessionInvalid` covers both "log in again" and "Instagram wants the
+    /// account verified", and those are exit code 3 and exit code 4, which the
+    /// v2 service is meant to be able to tell apart without reading English.
+    pub stopped_by: Option<ExitCode>,
 }
 
 impl ListOutcome {
@@ -63,11 +73,22 @@ impl ListOutcome {
             taken_at,
             from_cooldown,
             account_pk,
+            stopped_by: None,
         }
     }
 
     pub fn is_complete(&self) -> bool {
         self.reason.yields_complete_list()
+    }
+
+    /// The code a command should exit with when it has to refuse this result.
+    ///
+    /// What Instagram said beats what the store had to record, because the
+    /// store's vocabulary is about whether the list is usable and the exit
+    /// code is about what the caller should do next.
+    pub fn exit_code(&self) -> ExitCode {
+        self.stopped_by
+            .unwrap_or_else(|| ExitCode::from_stop_reason(self.reason))
     }
 
     /// Whether this is the list of the account the run acts as.

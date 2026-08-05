@@ -34,9 +34,14 @@ fn format_epoch(seconds: i64, unknown: &str) -> String {
 ///
 /// `misreading` completes "the accounts missing from it would appear as if …",
 /// which is the only part that differs between them.
-pub fn refuse_incomplete(list: ListKind, reason: StopReason, misreading: &str) -> anyhow::Error {
+pub fn refuse_incomplete(
+    list: ListKind,
+    reason: StopReason,
+    code: ExitCode,
+    misreading: &str,
+) -> anyhow::Error {
     ExitError::new(
-        ExitCode::from_stop_reason(reason),
+        code,
         format!(
             "the {list} list could not be read in full, so the answer would be wrong: \
              the accounts missing from it would appear as if {misreading}.\n{}",
@@ -76,11 +81,20 @@ pub fn requests(n: u32) -> String {
 /// fifteen minutes from `started_at` and the shortest cooldown is two hours, so
 /// by the time walking is allowed again the partial has expired. Promising a
 /// continuation there would be a lie.
+///
+/// A dead session and a checkpoint are worse than a lie: running it again is
+/// the one thing that cannot help, and against an account Instagram has just
+/// flagged it is what turns a checkpoint into something longer.
 pub fn try_again_advice(reason: StopReason) -> &'static str {
-    if reason == StopReason::RateLimit {
-        "Run it again once the cooldown lifts; a walk stopped by throttling starts over."
-    } else {
-        "Run it again to continue where it left off."
+    match reason {
+        StopReason::RateLimit => {
+            "Run it again once the cooldown lifts; a walk stopped by throttling starts over."
+        }
+        StopReason::SessionInvalid => {
+            "Deal with what Instagram asked for first. Running it again before that cannot get \
+             any further."
+        }
+        _ => "Run it again to continue where it left off.",
     }
 }
 
@@ -120,6 +134,7 @@ mod tests {
         let error = refuse_incomplete(
             ListKind::Followers,
             StopReason::RateLimit,
+            ExitCode::RateLimited,
             "they did not follow you",
         );
         let text = error.to_string();
@@ -138,9 +153,33 @@ mod tests {
             (StopReason::SessionInvalid, ExitCode::NoSession),
             (StopReason::Truncated, ExitCode::Error),
         ] {
-            let error = refuse_incomplete(ListKind::Following, reason, "whatever");
+            let code = ExitCode::from_stop_reason(reason);
+            let error = refuse_incomplete(ListKind::Following, reason, code, "whatever");
             assert_eq!(ExitCode::from_chain(&error), Some(expected), "{reason:?}");
         }
+    }
+
+    /// `SessionInvalid` is what the store records for both "log in again" and
+    /// "Instagram wants the account verified", and those are different codes.
+    /// The caller is allowed to know better than the stop reason does.
+    #[test]
+    fn a_challenge_keeps_its_own_code_under_a_session_invalid_stop() {
+        let error = refuse_incomplete(
+            ListKind::Followers,
+            StopReason::SessionInvalid,
+            ExitCode::Challenge,
+            "whatever",
+        );
+        assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Challenge));
+    }
+
+    /// Against an account Instagram has just flagged, "run it again" is the
+    /// one piece of advice that cannot help and can make it worse.
+    #[test]
+    fn a_dead_session_is_not_told_to_try_again() {
+        let advice = try_again_advice(StopReason::SessionInvalid);
+        assert!(!advice.contains("continue where it left off"), "{advice}");
+        assert!(advice.contains("Instagram asked for"), "{advice}");
     }
 
     /// Filters that took nothing out must not leave a clause saying they did.
