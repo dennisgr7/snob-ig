@@ -48,6 +48,27 @@ const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 /// out of convenience.
 const IGNORE_COOLDOWN_ENV: &str = "SNOB_IGNORE_COOLDOWN";
 
+/// Whether the escape hatch is open.
+fn ignoring_cooldowns() -> bool {
+    std::env::var(IGNORE_COOLDOWN_ENV).is_ok_and(|value| is_affirmative(&value))
+}
+
+/// Whether a variable's value means yes.
+///
+/// The switch takes an answer rather than merely existing. This is the one
+/// thing that turns off the protection the whole project is built around, and
+/// `SNOB_IGNORE_COOLDOWN=0` meaning "yes, ignore it" is the kind of surprise
+/// that only shows up later as an account in trouble.
+///
+/// Split from the read above so a test can drive it without setting a variable
+/// the rest of the suite is reading at the same time.
+fn is_affirmative(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// How long to wait before firing a request.
 pub trait RateBudget: Send + Sync {
     /// Reserves a request and returns how long to wait before sending it. Zero
@@ -204,7 +225,7 @@ impl RateBudget for SqliteRateBudget {
     }
 
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-        if std::env::var(IGNORE_COOLDOWN_ENV).is_ok() {
+        if ignoring_cooldowns() {
             tracing::warn!("{IGNORE_COOLDOWN_ENV} is set: the cooldown is being ignored");
             return Ok(None);
         }
@@ -227,22 +248,35 @@ impl RateBudget for SqliteRateBudget {
         })
     }
 
+    /// Reads the previous cooldown and writes the next one in **one**
+    /// transaction, and never lets the result end sooner than what was already
+    /// there.
+    ///
+    /// Both halves matter for the same reason `reserve` takes the write lock up
+    /// front: the CLI and the v2 service share this file. Two processes reading
+    /// `strikes = 1` at the same instant both wrote `strikes = 2`, so one
+    /// escalation was lost. And the write was unconditional, so a two-hour
+    /// throttle recorded ten minutes into a twelve-hour action block replaced
+    /// it — the account came out of the more serious block early, which is the
+    /// one direction this table must never be wrong in.
     fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError> {
         let now = now_ms();
         let base = minimum.as_millis() as i64;
 
-        let previous: Option<(i64, i64)> = self
-            .conn()
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let previous: Option<(i64, i64, i64)> = tx
             .query_row(
-                "SELECT set_at_ms, strikes FROM cooldowns WHERE scope = ?1",
+                "SELECT set_at_ms, strikes, until_ms FROM cooldowns WHERE scope = ?1",
                 params![SESSION_SCOPE],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
 
         // Reoffending within the next day doubles the penalty.
         let (length, strikes) = match previous {
-            Some((set_at, strikes)) if now - set_at < MAX_COOLDOWN_MS => {
+            Some((set_at, strikes, _)) if now - set_at < MAX_COOLDOWN_MS => {
                 let next = strikes + 1;
                 let escalated = base.saturating_mul(1 << (next - 1).min(5));
                 (escalated.min(MAX_COOLDOWN_MS), next)
@@ -250,8 +284,10 @@ impl RateBudget for SqliteRateBudget {
             _ => (base.min(MAX_COOLDOWN_MS), 1),
         };
 
-        let until = now + length;
-        self.conn().execute(
+        let standing = previous.map_or(0, |(_, _, until)| until);
+        let until = (now + length).max(standing);
+
+        tx.execute(
             "INSERT INTO cooldowns (scope, until_ms, set_at_ms, reason, strikes)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(scope) DO UPDATE SET
@@ -261,6 +297,7 @@ impl RateBudget for SqliteRateBudget {
                  strikes = excluded.strikes",
             params![SESSION_SCOPE, until, now, reason, strikes],
         )?;
+        tx.commit()?;
 
         tracing::warn!(reason, minutes = length / 60_000, "account in cooldown");
         Ok(until)
@@ -392,6 +429,42 @@ mod tests {
             second - now_ms() > first - now_ms(),
             "reoffending should lengthen the cooldown"
         );
+    }
+
+    /// The one direction this table must never be wrong in. A twelve-hour
+    /// action block, followed ten minutes later by a two-hour throttle, used to
+    /// end at the two-hour mark: the account came out of the more serious block
+    /// early.
+    #[test]
+    fn a_shorter_cause_never_cuts_a_standing_cooldown_short() {
+        let (_tmp, b) = temp_budget();
+
+        let long = b
+            .start_cooldown("feedback_required", Duration::from_secs(12 * 3600))
+            .unwrap();
+        let after_short = b
+            .start_cooldown("rate_limit", Duration::from_secs(2 * 3600))
+            .unwrap();
+
+        assert!(
+            after_short >= long,
+            "the cooldown was cut from {long} to {after_short}"
+        );
+        assert_eq!(b.cooldown().unwrap().unwrap(), after_short);
+    }
+
+    /// The switch that turns off the protection the whole project is built
+    /// around takes a yes, not merely a value. Setting it to `0` and getting
+    /// "cooldowns ignored" is a surprise that only surfaces later, as an
+    /// account in trouble.
+    #[test]
+    fn the_escape_hatch_needs_an_affirmative_value() {
+        for yes in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_affirmative(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "off", "", "  ", "maybe"] {
+            assert!(!is_affirmative(no), "{no:?}");
+        }
     }
 
     #[test]

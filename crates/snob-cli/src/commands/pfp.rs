@@ -11,7 +11,6 @@ use anyhow::{Result, anyhow};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
-use snob_ig::error::{IgError, cooldown_for};
 
 use crate::app::App;
 use crate::cli::PfpArgs;
@@ -41,18 +40,13 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
         .into());
     }
 
-    let picture = match fetch(app.client(), &args.target).await {
-        Ok(picture) => picture,
-        Err(e) => {
-            // Throttling has to leave a mark, or the next run walks straight
-            // into it again. Same table the walker uses, so a picture and a
-            // list earn the same wait.
-            if let Some((reason, minimum)) = e.downcast_ref::<IgError>().and_then(cooldown_for) {
-                let _ = app.client().pacer().start_cooldown(reason, minimum);
-            }
-            return Err(e);
-        }
-    };
+    // Nothing here records a cooldown. `IgClient::classify_and_record` already
+    // did, on the request that earned it, which is the one place that sees
+    // every request. Doing it again here wrote a second row within
+    // milliseconds, and `start_cooldown` reads a row it finds inside the last
+    // day as a repeat offense: one 429 during `snob pfp` became two strikes
+    // and four hours instead of one strike and two.
+    let picture = fetch(app.client(), &args.target).await?;
 
     if app.cancel().is_canceled() {
         return Ok(ExitCode::Interrupted);
