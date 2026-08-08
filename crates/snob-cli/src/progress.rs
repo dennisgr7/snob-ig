@@ -5,6 +5,7 @@
 //! results would make them vanish when redirecting to a file. Data goes to
 //! standard output and this bar to standard error, so the two never collide.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,25 +29,47 @@ pub struct Progress {
     bar: ProgressBar,
     quiet: bool,
     waiting_until: Deadline,
+    /// Whether the steady tick is currently armed. Shared, like the bar.
+    ticking: Arc<AtomicBool>,
 }
+
+/// How often the bar redraws itself. It is also how often the countdown moves.
+const TICK: Duration = Duration::from_millis(120);
 
 impl Progress {
     pub fn new(enabled: bool) -> Self {
         let bar = if enabled {
-            // `indicatif` already hides itself when standard error is not a
-            // terminal, so this only covers being asked to hide it explicitly.
             ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr())
         } else {
             ProgressBar::hidden()
         };
         let waiting_until: Deadline = Arc::new(Mutex::new(None));
         bar.set_style(style_without_total(&waiting_until));
-        bar.enable_steady_tick(Duration::from_millis(120));
 
-        Self {
+        let progress = Self {
+            // Asked from the bar, not taken from the flag. `indicatif` hides
+            // itself when standard error is not a terminal, and a message set
+            // on a bar that never draws is a message nobody reads — so
+            // `snob unfollowers 2>log` used to swallow every wait
+            // announcement, which is the one thing that explains a run
+            // standing still.
+            quiet: !enabled || bar.is_hidden(),
             bar,
-            quiet: !enabled,
             waiting_until,
+            ticking: Arc::new(AtomicBool::new(false)),
+        };
+        progress.animate();
+        progress
+    }
+
+    /// Arms the steady tick, if it is not already armed.
+    ///
+    /// It has to be re-armed rather than set once. `indicatif` ends the ticker
+    /// thread when the bar is finished and `reset` does not bring it back, and
+    /// a crossing finishes one walk before starting the next.
+    fn animate(&self) {
+        if !self.quiet && !self.ticking.swap(true, Ordering::Relaxed) {
+            self.bar.enable_steady_tick(TICK);
         }
     }
 
@@ -63,6 +86,7 @@ impl Progress {
     /// there is nothing to animate and a line per second down a pipe would be
     /// noise.
     pub fn waiting(&self, reason: &str, duration: Duration) {
+        self.animate();
         self.set_deadline(Some(Instant::now() + duration));
         if self.quiet {
             eprintln!("{reason} ({} s)", seconds_left(duration));
@@ -79,10 +103,35 @@ impl Progress {
     pub fn event(&self, e: &Event) {
         match e {
             Event::Started { estimated, resumed } => {
-                if let Some(total) = estimated {
-                    self.bar.set_length(*total);
-                    self.bar.set_style(style_with_total(&self.waiting_until));
+                // A crossing walks two lists through one shared bar, and the
+                // walker emits `Finished` at the end of each. Clearing the bar
+                // there left indicatif in `DoneHidden`, where it never draws
+                // again and its ticker thread has already exited — so the
+                // second and usually slower half of every `unfollowers`,
+                // `fans`, `friends` and `scan` ran against a blank terminal.
+                // `reset` is the way back, and it also zeroes a position left
+                // sitting at the previous list's total.
+                self.bar.reset();
+                self.animate();
+                // The style's tracker has no reset of its own, so a pause left
+                // over from the previous list would keep counting down beside
+                // the new one.
+                self.set_deadline(None);
+
+                match estimated {
+                    Some(total) => {
+                        self.bar.set_length(*total);
+                        self.bar.set_style(style_with_total(&self.waiting_until));
+                    }
+                    // Not "leave it as it was": after a list that had a total,
+                    // that would keep drawing `{pos}/{len}` against the
+                    // previous list's length.
+                    None => {
+                        self.bar.unset_length();
+                        self.bar.set_style(style_without_total(&self.waiting_until));
+                    }
                 }
+
                 if *resumed {
                     self.warn("continuing an interrupted walk");
                 }
@@ -127,7 +176,13 @@ impl Progress {
                 self.waiting(&format!("waiting before retry {attempt}"), *after);
             }
             Event::Warning(text) => self.warn(text),
-            Event::Finished { .. } => self.bar.finish_and_clear(),
+            // Deliberately not `finish_and_clear`. One walk ending is not the
+            // run ending, and the commands already clear the bar themselves
+            // when it is — see `Started` for what finishing here cost.
+            Event::Finished { .. } => {
+                self.set_deadline(None);
+                self.ticking.store(false, Ordering::Relaxed);
+            }
         }
     }
 
@@ -138,6 +193,7 @@ impl Progress {
     /// With no bar it goes to standard error, where every other message the
     /// user reads already goes.
     pub fn note(&self, text: &str) {
+        self.animate();
         // Whatever this is about, it is not the wait that was being counted
         // down, and leaving the old deadline would keep a number ticking next
         // to a message it has nothing to do with.
@@ -158,7 +214,10 @@ impl Progress {
         }
     }
 
+    /// Ends the bar for good. Called by the commands, which are the only ones
+    /// that know the run is over.
     pub fn finish(&self) {
+        self.ticking.store(false, Ordering::Relaxed);
         self.bar.finish_and_clear();
     }
 }
@@ -241,6 +300,14 @@ mod tests {
         assert_eq!(seconds_left(Duration::ZERO), 0);
     }
 
+    fn finished() -> Event {
+        Event::Finished {
+            pages: 1,
+            users: 50,
+            reason: snob_core::model::StopReason::Completed,
+        }
+    }
+
     fn deadline_of(p: &Progress) -> Option<Instant> {
         *p.waiting_until.lock().unwrap()
     }
@@ -271,6 +338,38 @@ mod tests {
             received: 50,
         });
         assert_eq!(deadline_of(&p), None);
+    }
+
+    /// A crossing walks two lists through one shared bar. The first walk's
+    /// `Finished` used to clear it, which left indicatif in `DoneHidden` —
+    /// where it never draws again and its ticker has already exited — so the
+    /// second and usually slower half of `unfollowers`, `fans`, `friends` and
+    /// `scan` ran against a blank terminal.
+    #[test]
+    fn a_second_walk_gets_the_bar_back() {
+        let p = Progress::new(false);
+        p.event(&Event::Started {
+            estimated: Some(300),
+            resumed: false,
+        });
+        p.event(&Event::Page {
+            number: 1,
+            running_total: 50,
+            added: 50,
+            received: 50,
+        });
+        p.event(&finished());
+
+        p.event(&Event::Started {
+            estimated: None,
+            resumed: false,
+        });
+        assert!(!p.bar.is_finished(), "the second list would draw nothing");
+        assert_eq!(p.bar.position(), 0, "the first list's position leaked");
+        assert!(
+            p.bar.length().is_none(),
+            "the first list's total leaked into a list that has none"
+        );
     }
 
     /// Only the long pause is announced. The micro pause and the cycle wait
