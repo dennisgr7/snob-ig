@@ -29,13 +29,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 # HTTP/1.1 on these endpoints from some hosts and networks where the same
 # request over h2 succeeds, and a browser always negotiates h2 against
 # instagram.com. Both TLS backends below advertise `h2` through ALPN.
+# No `charset`: it exists to serve `Response::text()` and `text_with_charset`,
+# and nothing here calls either — the two read paths go through `chunk()` and
+# `from_utf8_lossy` on purpose, so that a body's size is bounded before it is
+# decoded. It was compiling `encoding_rs`, most of which is character tables,
+# for no one.
 # The four decoders are not about speed. Chrome advertises
 # `gzip, deflate, br, zstd`, the client sends exactly that string, and a codec
 # may only be advertised if it can be decoded — announcing one and then failing
 # to read the answer is worse than not announcing it. `deflate` was the one
 # missing, so the header did not match the comment that asked for it.
 
-reqwest = { version = "0.13", default-features = false, features = ["http2", "charset", "query", "gzip", "deflate", "brotli", "zstd"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "gzip", "deflate", "brotli", "zstd"] }
 # Depended on only to turn one feature back on. reqwest declares rustls with
 # `default-features = false`, which drops `prefer-post-quantum` — and without it
 # the client advertises the hybrid group X25519MLKEM768 in `supported_groups`

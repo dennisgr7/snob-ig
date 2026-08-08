@@ -128,7 +128,11 @@ jobs:
       - name: Debian package
         if: runner.os == 'Linux'
         run: |
-          cargo install cargo-deb --locked
+          # Pinned. The comment below says this is the line the release runs,
+          # and that is only true if both resolve the same tool: unpinned, CI
+          # could pass on one version on Monday and the release build a .deb
+          # with a different one on Wednesday.
+          cargo install cargo-deb@3.7.0 --locked
           cargo deb --no-build --no-strip -p snob-cli \
             --target ${{ matrix.target }} \
             --output "snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}.deb"

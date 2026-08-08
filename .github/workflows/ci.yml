@@ -177,7 +177,11 @@ jobs:
       - name: Check the Debian package builds
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          cargo install cargo-deb --locked
+          # Pinned. The comment below says this is the line the release runs,
+          # and that is only true if both resolve the same tool: unpinned, CI
+          # could pass on one version on Monday and the release build a .deb
+          # with a different one on Wednesday.
+          cargo install cargo-deb@3.7.0 --locked
           # Down to the --output, this is the line the release runs. A check
           # that invokes something other than what it is guarding is not
           # guarding it, and the difference would only show during a release.
