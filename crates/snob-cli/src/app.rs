@@ -91,11 +91,11 @@ impl App {
 
         let announce = {
             let progress = progress.clone();
+            // `waiting` rather than `note`: the number counts down on the bar
+            // instead of being frozen into the message at the moment the wait
+            // began.
             Arc::new(move |waited: std::time::Duration| {
-                progress.note(&format!(
-                    "waiting {}s to keep the pace down",
-                    waited.as_secs().max(1)
-                ));
+                progress.waiting("the request budget is rationing", waited);
             })
         };
 
