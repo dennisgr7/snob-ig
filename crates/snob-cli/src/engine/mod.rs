@@ -21,7 +21,7 @@ use snob_core::store::{accounts, users};
 
 use crate::app::App;
 use crate::cli::ListArgs;
-use crate::exit::ExitCode;
+use crate::exit::{ExitCode, ExitError};
 use crate::ui;
 
 /// Where a returned list came from.
@@ -243,9 +243,8 @@ async fn decide(
 /// Asks before enumerating somebody else's account, at most once per run.
 ///
 /// It happens **before** the account is resolved, because resolving is already
-/// a request: asking afterwards meant that answering "no" — or running down a
-/// pipe, where the answer defaults to no — had still spent one on a run the
-/// user never authorized.
+/// a request: asking afterwards meant that answering "no" had still spent one
+/// on a run the user never authorized.
 ///
 /// The price of asking first is that the name shown is the one typed rather
 /// than the one Instagram spells. That costs nothing when it is wrong, and the
@@ -269,12 +268,36 @@ async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Being unable to ask and being told no are two different events, and they
+    // were reported as one. `confirm` answers with its default the moment
+    // there is no terminal, so `snob unfollowers someone > out.json` — a way
+    // of running this the README advertises — failed with "canceled", blaming
+    // the user for something nobody did. The question goes to standard output,
+    // which is the very stream being captured.
+    if !ui::is_interactive() {
+        return Err(ExitError::new(
+            ExitCode::Interrupted,
+            format!(
+                "reading @{name}'s lists needs confirmation, and there is no terminal to \
+                 ask at. Pass -y to confirm in advance."
+            ),
+        )
+        .into());
+    }
+
     app.warn(
         "enumerating someone else's followers is the pattern Instagram's detection \
          systems watch most closely",
     );
     if !ui::confirm_off_thread(format!("Continue with @{name}?"), false).await? {
-        bail!("canceled; use -y to skip the confirmation");
+        // No mention of -y here. They have just said no, and answering that
+        // with "pass the flag that skips the question" is telling them to do
+        // it anyway.
+        return Err(ExitError::new(
+            ExitCode::Interrupted,
+            format!("nothing was done: @{name} was not confirmed"),
+        )
+        .into());
     }
     // Asked and answered. A crossing wants two lists and a summary four, and
     // asking again about the same account reads as not having listened.
