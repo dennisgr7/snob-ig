@@ -5,6 +5,21 @@
 //! *fewer* requests. **They are not changed without a documented reason** —
 //! each one carries below what it is for, and that is what stops a number
 //! being tuned into something that gets an account flagged.
+//!
+//! Two limits on what that provenance covers, both worth knowing before
+//! leaning on it:
+//!
+//! - **It covers the cadence, not the error handling.** The reference project
+//!   has none: its whole failure path is `catch { continue; }`, which re-enters
+//!   the loop without advancing the cursor and without sleeping — an unbounded
+//!   retry against Instagram on any failure, and precisely the pattern this
+//!   project forbids. The hard stop here is a deliberate improvement on it, not
+//!   a copy of it, and nobody should "restore fidelity" by removing it.
+//! - **It covers the cadence, not the total volume.** The reference walks one
+//!   list: it reads who you follow and derives the rest from a per-account flag
+//!   in the same response. This walks both lists, so for a symmetric account it
+//!   spends roughly twice the requests for the same answer. What offsets that is
+//!   a budget that persists across runs, which the reference also does not have.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,9 +30,16 @@ use snob_core::store::rate_budget::RateBudget;
 /// Request cadence during a walk.
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
-    /// Users per page. The reference project asks for 24 over GraphQL; we ask
-    /// for 50 over REST, which is the same users in half the requests, and
-    /// requests are what gets measured.
+    /// Users per page. The reference project asks for 24 over GraphQL; this
+    /// asks for 50 over REST.
+    ///
+    /// **It does not halve the requests.** Independent measurement in 2026 puts
+    /// the followers endpoint at about 25 accounts per response whatever is
+    /// asked for — a thousand followers costs around forty requests either way
+    /// — which is what the settled note in AGENTS.md already says and what this
+    /// comment used to contradict. It is kept at 50 because it costs nothing,
+    /// it is honoured on the following list, and asking for less would only
+    /// ever mean more requests.
     pub per_page: u32,
     /// Short pause before each request.
     pub micro_pause_ms: (u64, u64),
@@ -58,8 +80,8 @@ impl Pace {
     /// is roughly two to three times the default and the long pause comes round
     /// almost twice as often.
     ///
-    /// `per_page` deliberately stays at 50. Asking for smaller pages would mean
-    /// more requests for the same users, and requests are the thing being
+    /// `per_page` deliberately stays at 50. Asking for smaller pages could only
+    /// mean more requests for the same users, and requests are the thing being
     /// counted — slowing down must not turn into knocking more often.
     ///
     /// The cost is that a walk takes about three times as long, and the resume
