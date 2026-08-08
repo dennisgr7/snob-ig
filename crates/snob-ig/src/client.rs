@@ -494,6 +494,15 @@ impl IgClient {
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
             .header("Accept", "*/*")
+            // Set here rather than left to the HTTP client, which builds its
+            // own from whichever decoders were compiled in and produces
+            // `zstd,gzip,deflate,br` — a fixed string, on every request, that
+            // no browser has ever sent. This is Chrome's, and every codec in
+            // it is one the client can actually decode.
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            // The one header here that comes from the person rather than from
+            // the User-Agent. Every browser sends it on every request.
+            .header("Accept-Language", fingerprint::accept_language())
             // Instagram answers `Vary` on the first two, which is it saying
             // its reply depends on them.
             .header("Sec-Fetch-Site", "same-origin")
@@ -517,6 +526,11 @@ impl IgClient {
                 .header("Sec-CH-UA", brands)
                 .header("Sec-CH-UA-Mobile", self.fingerprint.mobile)
                 .header("Sec-CH-UA-Platform", self.fingerprint.platform);
+        }
+
+        // Likewise: only the versions that send one.
+        if let Some(priority) = self.fingerprint.priority {
+            request = request.header("Priority", priority);
         }
 
         let response = request.send().await?;
@@ -597,6 +611,20 @@ mod tests {
         // What `fetch()` sends when the page sets nothing. `application/json`
         // is a value no browser produces here.
         assert_eq!(read("accept"), "*/*");
+
+        // Chrome's own string, not the one the HTTP client assembles from
+        // whichever decoders happen to be compiled in.
+        assert_eq!(read("accept-encoding"), "gzip, deflate, br, zstd");
+
+        // Present, and shaped like a language preference rather than like a
+        // locale. What it says depends on the machine, so that is all this can
+        // assert.
+        let language = read("accept-language");
+        assert!(!language.is_empty());
+        assert!(!language.contains('_'), "{language}");
+
+        // Chrome 138 is past the version that started sending this.
+        assert_eq!(read("priority"), fingerprint::FETCH_PRIORITY);
 
         // The client hints have to agree with the User-Agent above, which says
         // Chrome 138 on Windows.

@@ -56,9 +56,18 @@ url.workspace = true
 # it will show both.
 [target.'cfg(not(all(windows, target_arch = "aarch64")))'.dependencies]
 reqwest = { workspace = true, features = ["rustls"] }
+# Never named in the code: it is here to turn `prefer-post-quantum` on, and it
+# is under this cfg rather than in `[dependencies]` so that the target which
+# does not use rustls does not pull it in.
+rustls.workspace = true
 
 [target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
 reqwest = { workspace = true, features = ["native-tls"] }
+
+# Only for the user's language preference, which Windows keeps in an API
+# rather than in the environment. Already in the tree through snob-core.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
