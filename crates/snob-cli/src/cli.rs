@@ -51,7 +51,15 @@ Examples:
   snob unfollowers --format csv -o unfollowers.csv
 
 A username may be written with or without a leading @. If you write the @, quote
-it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.";
+it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.
+
+Exit codes:
+  0   it worked
+  1   it failed, or a result was refused because a list came back incomplete
+  3   no session, or the stored one no longer works -- run \"snob login\"
+  4   Instagram wants the account verified -- open the address it prints
+  5   Instagram is throttling, or the account is in cooldown -- wait
+  130 interrupted";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
