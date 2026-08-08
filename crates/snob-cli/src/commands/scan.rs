@@ -383,7 +383,7 @@ fn labeled(summary: &Summary<'_>) -> Vec<(&'static str, usize)> {
 
 fn list_object(outcome: &ListOutcome) -> serde_json::Value {
     serde_json::json!({
-        "source": source_token(outcome.source),
+        "source": source_token(outcome.source()),
         "taken_at": outcome.taken_at,
         "requests": outcome.requests,
     })
@@ -422,11 +422,10 @@ mod tests {
 
     fn outcome() -> ListOutcome {
         ListOutcome {
-            source: ResultSource::Fetched,
+            provenance: engine::Provenance::Walked,
             reason: StopReason::Completed,
             requests: 3,
             taken_at: 1_722_700_000,
-            from_cooldown: false,
             account_pk: 1,
             stopped_by: None,
         }

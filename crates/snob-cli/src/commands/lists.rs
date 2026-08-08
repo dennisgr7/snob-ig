@@ -49,7 +49,7 @@ pub async fn run(
 /// account in it really is in the list, only some are missing. So it prints,
 /// says so, and reports what stopped it.
 fn exit_code(outcome: &ListOutcome) -> ExitCode {
-    if outcome.source == ResultSource::Cached {
+    if outcome.source() == ResultSource::Cached {
         return ExitCode::Ok;
     }
     match outcome.reason {
@@ -72,7 +72,7 @@ fn one_of(kind: ListKind) -> &'static str {
 fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcome, kind: ListKind) {
     let mut line = report::counted(found.len(), kept, total, one_of(kind), &kind.to_string());
 
-    match outcome.source {
+    match outcome.source() {
         ResultSource::Cached => {
             line.push_str(&format!(
                 " - list stored on {}",
@@ -94,7 +94,7 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
 
     ui::info(&line);
 
-    if !outcome.is_complete() && outcome.source == ResultSource::Fetched {
+    if !outcome.is_complete() && outcome.source() == ResultSource::Fetched {
         ui::warn(&format!(
             "the list is incomplete, so it cannot be compared against another one. {}",
             report::try_again_advice(outcome.reason)
@@ -108,11 +108,13 @@ mod tests {
 
     fn outcome(source: ResultSource, reason: StopReason) -> ListOutcome {
         ListOutcome {
-            source,
+            provenance: match source {
+                ResultSource::Fetched => engine::Provenance::Walked,
+                ResultSource::Cached => engine::Provenance::CounterVerified,
+            },
             reason,
             requests: 1,
             taken_at: 0,
-            from_cooldown: false,
             account_pk: 1,
             stopped_by: None,
         }

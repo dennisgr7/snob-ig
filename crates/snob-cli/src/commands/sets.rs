@@ -217,11 +217,10 @@ mod tests {
 
     fn outcome(reason: StopReason) -> ListOutcome {
         ListOutcome {
-            source: engine::ResultSource::Fetched,
+            provenance: engine::Provenance::Walked,
             reason,
             requests: 1,
             taken_at: 0,
-            from_cooldown: false,
             account_pk: 1,
             stopped_by: None,
         }
