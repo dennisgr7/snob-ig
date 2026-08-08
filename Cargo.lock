@@ -2644,6 +2644,7 @@ version = "0.1.1"
 dependencies = [
  "fastrand",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "snob-core",
@@ -2651,6 +2652,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 

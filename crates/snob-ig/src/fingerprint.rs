@@ -5,8 +5,16 @@
 //! those headers change its reply; and a request claiming to be Chrome 151
 //! while sending no client hints at all is a combination Chrome cannot produce.
 //! Being inconsistent is worse than being plain, so everything here is computed
-//! from one source — the User-Agent the session was created with — and anything
-//! that cannot be computed from it is left out rather than guessed.
+//! rather than chosen, and anything that cannot be computed is left out rather
+//! than guessed.
+//!
+//! Almost all of it comes from one source, the User-Agent the session was
+//! created with. `Accept-Language` is the exception and has to be: it describes
+//! the person rather than the program, so it is read from the operating system.
+//! That is still computing it from something true rather than picking a value —
+//! and picking one would mean announcing `en-US` from an address in Spain,
+//! which is the same kind of mismatch as a Windows User-Agent with a macOS
+//! platform hint.
 //!
 //! Nothing here touches the TLS stack. Chrome has randomized its ClientHello
 //! extension order since version 110, so there is no fixed TLS fingerprint left
@@ -14,6 +22,108 @@
 //! than any particular one. What actually gets an account throttled, in order,
 //! is IP reputation, request volume and pace, and header coherence — and only
 //! the last of those is ours to fix here.
+
+/// From which Chromium sends `Priority` on a fetch or XHR.
+///
+/// Below this it does not send the header at all, so a request claiming to be
+/// an older Chrome and carrying one would be the same kind of mismatch as
+/// inventing client hints for Firefox.
+const PRIORITY_SINCE_CHROMIUM: u32 = 123;
+
+/// What Chromium sends on a fetch it did not prioritize itself: the default
+/// urgency, and incremental delivery.
+pub const FETCH_PRIORITY: &str = "u=1, i";
+
+/// Language preference, as a browser would state it.
+///
+/// Every browser sends `Accept-Language` on every request without exception,
+/// so having none at all was the most conspicuous thing missing from the set.
+/// It is also the one header here that cannot be derived from the User-Agent:
+/// it comes from the person, not the program.
+///
+/// So it is read from the system, and the fallback is the last resort rather
+/// than the plan. A Spanish user on a Spanish address announcing `en-US` is
+/// the same class of incoherence as a Windows User-Agent with a macOS platform
+/// hint — Instagram can see the address the request came from, and it knows
+/// which language the account reads in.
+///
+/// Worked out once: the answer cannot change while the process runs, and this
+/// is on the path of every request.
+pub fn accept_language() -> &'static str {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| language_header(system_locale().as_deref()))
+}
+
+/// Builds the header value from a locale tag such as `es-ES`.
+///
+/// `es-ES,es;q=0.9` is the shape Chrome produces for a browser configured with
+/// one language, and one language is what a system locale describes. English
+/// is deliberately **not** appended as a second preference: Chrome only lists
+/// what the user actually configured, and inventing an extra entry would be
+/// guessing at the person rather than reading them.
+fn language_header(locale: Option<&str>) -> String {
+    const FALLBACK: &str = "en-US,en;q=0.9";
+
+    let Some(tag) = locale.map(normalize_tag).filter(|t| !t.is_empty()) else {
+        return FALLBACK.to_string();
+    };
+    match tag.split_once('-') {
+        Some((language, _)) => format!("{tag},{language};q=0.9"),
+        // A bare language with no region is already its own primary
+        // preference, and repeating it at a lower weight is not something a
+        // browser does.
+        None => tag,
+    }
+}
+
+/// Turns what a platform hands back into a language tag.
+///
+/// Unix locales arrive as `es_ES.UTF-8` and may be the C locale, which
+/// describes no language at all and must not become one.
+fn normalize_tag(raw: &str) -> String {
+    let tag = raw
+        .split(['.', '@'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .replace('_', "-");
+
+    if matches!(tag.as_str(), "C" | "POSIX") || !tag.starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        return String::new();
+    }
+    tag
+}
+
+/// The user's configured language, as the operating system states it.
+#[cfg(windows)]
+fn system_locale() -> Option<String> {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+
+    /// `LOCALE_NAME_MAX_LENGTH`, which the binding does not export. Windows
+    /// documents it as the ceiling for every locale name it will produce.
+    const MAX_LOCALE_UNITS: usize = 85;
+
+    let mut buffer = [0u16; MAX_LOCALE_UNITS];
+    // SAFETY: the buffer and the length handed over describe the same array,
+    // and Windows writes at most that many units into it.
+    let written = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) };
+    if written <= 1 {
+        return None;
+    }
+    // The count includes the terminating null.
+    String::from_utf16(&buffer[..written as usize - 1]).ok()
+}
+
+/// Elsewhere the environment is where this lives. `LC_ALL` overrides `LANG`,
+/// which is the order the C library itself resolves them in.
+#[cfg(not(windows))]
+fn system_locale() -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.is_empty())
+}
 
 /// Build counter of Instagram's own web bundle.
 ///
@@ -33,15 +143,22 @@ pub struct Fingerprint {
     pub platform: &'static str,
     /// `sec-ch-ua-mobile`, an sf-boolean.
     pub mobile: &'static str,
+    /// `priority`, for the browsers that send one on a fetch. `None` for the
+    /// rest, and for Chromium old enough to predate it.
+    pub priority: Option<&'static str>,
 }
 
 impl Fingerprint {
     /// Reads a User-Agent and works out what else the browser would send.
     pub fn from_user_agent(user_agent: &str) -> Self {
+        let major = chromium_major(user_agent);
         Self {
-            ua_brands: chromium_major(user_agent).map(|major| brands(brand_of(user_agent), major)),
+            ua_brands: major.map(|major| brands(brand_of(user_agent), major)),
             platform: platform_of(user_agent),
             mobile: if is_mobile(user_agent) { "?1" } else { "?0" },
+            priority: major
+                .filter(|major| *major >= PRIORITY_SINCE_CHROMIUM)
+                .map(|_| FETCH_PRIORITY),
         }
     }
 }
@@ -237,6 +354,62 @@ mod tests {
         let f = Fingerprint::from_user_agent(android);
         assert_eq!(f.mobile, "?1");
         assert_eq!(f.platform, "\"Android\"");
+    }
+
+    /// The shape Chrome produces for a browser configured with one language,
+    /// which is what a system locale describes.
+    #[test]
+    fn the_language_header_follows_the_locale() {
+        assert_eq!(language_header(Some("es-ES")), "es-ES,es;q=0.9");
+        assert_eq!(language_header(Some("en-US")), "en-US,en;q=0.9");
+        // Unix hands it over with an encoding and an underscore attached.
+        assert_eq!(language_header(Some("pt_BR.UTF-8")), "pt-BR,pt;q=0.9");
+        // A language with no region is already its own preference; a browser
+        // does not repeat it at a lower weight.
+        assert_eq!(language_header(Some("eu")), "eu");
+    }
+
+    /// The C locale describes no language at all, and must not become one.
+    /// Neither must an empty or nonsense value.
+    #[test]
+    fn a_locale_that_names_no_language_falls_back() {
+        for nothing in [None, Some(""), Some("C"), Some("POSIX"), Some("C.UTF-8")] {
+            assert_eq!(language_header(nothing), "en-US,en;q=0.9", "{nothing:?}");
+        }
+    }
+
+    /// Whatever the machine says, the header has to be one a browser could
+    /// have sent.
+    #[test]
+    fn the_real_system_language_is_well_formed() {
+        let value = accept_language();
+        assert!(!value.is_empty());
+        assert!(
+            value.starts_with(|c: char| c.is_ascii_alphabetic()),
+            "{value}"
+        );
+        assert!(!value.contains('_'), "{value}");
+        assert!(!value.contains(' ') || value.contains(";q="), "{value}");
+    }
+
+    /// Chromium started sending `Priority` on fetch at 123. Claiming to be an
+    /// older one and sending it anyway is the same mismatch as inventing
+    /// client hints for Firefox.
+    #[test]
+    fn priority_is_only_sent_by_the_versions_that_send_it() {
+        assert_eq!(
+            Fingerprint::from_user_agent(&desktop(151)).priority,
+            Some(FETCH_PRIORITY)
+        );
+        assert_eq!(
+            Fingerprint::from_user_agent(&desktop(123)).priority,
+            Some(FETCH_PRIORITY)
+        );
+        assert_eq!(Fingerprint::from_user_agent(&desktop(122)).priority, None);
+
+        let firefox =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
+        assert_eq!(Fingerprint::from_user_agent(firefox).priority, None);
     }
 
     #[test]
