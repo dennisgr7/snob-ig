@@ -101,9 +101,14 @@ main() {
 
   echo "Installed $("$INSTALL_DIR/snob" --version) to $INSTALL_DIR"
 
+  # Which profile file to write is a question only the user's shell can
+  # answer, so this prints the line rather than guessing at one. What it must
+  # not do is then tell them to run a command that will not resolve.
+  on_path=yes
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)
+      on_path=no
       echo
       echo "$INSTALL_DIR is not on your PATH. Add this to your shell profile:"
       echo "    export PATH=\"\$PATH:$INSTALL_DIR\""
@@ -111,7 +116,11 @@ main() {
   esac
 
   echo
-  echo "Start with: snob login"
+  if [ "$on_path" = yes ]; then
+    echo "Start with: snob login"
+  else
+    echo "Start with: $INSTALL_DIR/snob login"
+  fi
   echo "Before uninstalling, run \"snob purge\": the session and the database"
   echo "live outside this directory and deleting the binary will not reach them."
 }

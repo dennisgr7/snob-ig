@@ -107,7 +107,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    # Only once a change has landed: six native builds on every pull request
+    # Only once a change has landed: five native builds on every pull request
     # buys very little over the three test runs above.
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
