@@ -169,9 +169,29 @@ pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<
         return Ok(ExitCode::Ok);
     }
 
-    // The default is no, and with no terminal `confirm` keeps its default, so
-    // an unattended purge takes `--yes` typed on purpose. That is the right way
-    // round for the only command here that destroys data.
+    // With no terminal, `confirm` keeps its default without asking anything —
+    // and the default here is no. So an uninstall script used to be shown the
+    // whole deletion plan, told "Nothing was deleted.", and given exit 0, then
+    // carry on to `apt remove` with the session cookie still in the keyring.
+    // Success is the one thing that must not be reported there: this is the
+    // command whose entire purpose is that a live credential does not outlive
+    // the tool.
+    //
+    // `--yes` remains the way to do it unattended, and it has to be typed on
+    // purpose, which is the right way round for the only command here that
+    // destroys anything.
+    if !args.yes && !ui::is_interactive() {
+        ui::info(
+            "There is no terminal to confirm at, so nothing was deleted.\n\
+             To delete it unattended, run \"snob purge --yes\".",
+        );
+        return Err(ExitError::new(
+            ExitCode::Error,
+            "nothing was deleted: there was no terminal to confirm at",
+        )
+        .into());
+    }
+
     if !args.yes && !ui::confirm("\nDelete all of it?", false)? {
         println!("Nothing was deleted.");
         return Ok(ExitCode::Ok);

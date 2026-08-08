@@ -59,7 +59,7 @@ Exit codes:
   3   no session, or the stored one no longer works -- run \"snob login\"
   4   Instagram wants the account verified -- open the address it prints
   5   Instagram is throttling, or the account is in cooldown -- wait
-  130 interrupted";
+  130 stopped by you: Ctrl+C, or a confirmation not given";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {

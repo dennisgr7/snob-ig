@@ -36,11 +36,19 @@ async fn main() -> std::process::ExitCode {
     match run(cli).await {
         Ok(code) => code.into(),
         Err(e) => {
-            eprintln!("error: {e}");
-            for cause in e.chain().skip(1) {
-                eprintln!("  caused by: {cause}");
+            let code = exit_code_for(&e);
+            // A run the user stopped is not a failure to report. The "error:"
+            // prefix, and a chain of causes under it, is what made declining a
+            // confirmation read as a reprimand for something that went wrong.
+            if code == ExitCode::Interrupted {
+                eprintln!("{e}");
+            } else {
+                eprintln!("error: {e}");
+                for cause in e.chain().skip(1) {
+                    eprintln!("  caused by: {cause}");
+                }
             }
-            exit_code_for(&e).into()
+            code.into()
         }
     }
 }

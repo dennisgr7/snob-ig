@@ -242,7 +242,7 @@ apart from "wait a while" without reading the message text.
 | 3 | No session stored, or the one there no longer works. Run `snob login`. |
 | 4 | Instagram wants the account verified. Open the address it prints. |
 | 5 | Instagram is throttling, or the account is in cooldown. Wait. |
-| 130 | Interrupted with Ctrl+C. |
+| 130 | Stopped by you: Ctrl+C, or a confirmation that was not given — including with no terminal to ask at, where `-y` confirms in advance. |
 
 `followers` and `following` print what they got and exit 0 even when the walk
 was cut short, because a partial list is still true as far as it goes.
