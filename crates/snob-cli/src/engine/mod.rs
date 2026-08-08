@@ -133,7 +133,7 @@ async fn decide(
         return cooldown::serve(app, args, kind, until_ms);
     }
 
-    ask_consent(app, args)?;
+    ask_consent(app, args).await?;
 
     let target = if args.cache {
         target::from_store(app, args.target.as_deref(), kind)?
@@ -180,7 +180,7 @@ async fn decide(
 /// than the one Instagram spells. That costs nothing when it is wrong, and the
 /// only account it can wrongly ask about is your own, which needs you to have
 /// typed your own name.
-fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
+async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
@@ -202,7 +202,7 @@ fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
         "enumerating someone else's followers is the pattern Instagram's detection \
          systems watch most closely",
     );
-    if !ui::confirm(&format!("Continue with @{name}?"), false)? {
+    if !ui::confirm_off_thread(format!("Continue with @{name}?"), false).await? {
         bail!("canceled; use -y to skip the confirmation");
     }
     // Asked and answered. A crossing wants two lists and a summary four, and

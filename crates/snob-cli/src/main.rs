@@ -7,7 +7,27 @@ use snob_core::model::ListKind;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 
-#[tokio::main]
+/// Two workers, always two, whatever the machine has.
+///
+/// The default is one per core, which is both too many and — on the machines
+/// this project explicitly supports — too few. Too many because the program
+/// makes one request at a time and spends most of its life asleep between them,
+/// so thirty-two worker threads on a thirty-two core desktop are thirty-one
+/// doing nothing. Too few because on a one-vCPU server or container the default
+/// is **one**, and that is the case that breaks something.
+///
+/// It breaks Ctrl+C. `tokio::signal::ctrl_c()` permanently disables the process
+/// default handler from the first call onwards, so the only thing that can stop
+/// a run is the task waiting on that signal. Give it a single worker and let
+/// anything block that worker — the consent prompt waiting on a human, a
+/// request budget waiting out the busy timeout — and the signal task cannot be
+/// scheduled at all. Ctrl+C then does nothing, twice, and the run cannot be
+/// stopped. A homelab is a first-class place to run this, and a one-vCPU box is
+/// what a homelab is.
+///
+/// The second worker is what guarantees there is always somewhere for that task
+/// to go.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
