@@ -110,6 +110,23 @@ pub fn prompt_line(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// A yes or no question, asked without holding an async worker while the
+/// person thinks about it.
+///
+/// Waiting on a human is the longest block in the program — unbounded, by
+/// definition — and the runtime has exactly two workers. Doing it on one of
+/// them leaves one for everything else, including the task that owns Ctrl+C
+/// now that `tokio::signal` has taken it away from the operating system.
+///
+/// Only for the prompts that are asked while a run is under way. `purge` and
+/// `logout` ask before there is anything else to schedule, so they call
+/// [`confirm`] directly and this indirection would buy them nothing.
+pub async fn confirm_off_thread(question: String, default: bool) -> Result<bool> {
+    tokio::task::spawn_blocking(move || confirm(&question, default))
+        .await
+        .context("the question could not be asked")?
+}
+
 /// A yes or no question. With no terminal it keeps the default.
 pub fn confirm(question: &str, default: bool) -> Result<bool> {
     if !is_interactive() {
