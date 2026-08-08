@@ -14,7 +14,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
-use snob_cli::engine::{self, ListOutcome, ResultSource};
+use snob_cli::engine::cooldown::check_same_moment;
+use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 const SID: &str = "42%3AAbCdEfGh%3A20";
@@ -117,14 +118,14 @@ async fn the_first_run_walks_the_list_and_later_ones_reuse() {
     // First: nothing stored, so it walks.
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Fetched);
+    assert_eq!(outcome.source(), ResultSource::Fetched);
     let after_first = requests(&server).await;
     assert!(after_first >= 1);
 
     // Second, with the counter unchanged: a single request, the poll.
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(
         requests(&server).await - after_first,
         1,
@@ -148,12 +149,52 @@ async fn with_cache_the_network_is_not_touched() {
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(outcome.requests, 0);
     assert_eq!(
         requests(&server).await,
         before,
         "--cache must not ask for anything"
+    );
+}
+
+/// `--cache` promises not to spend a request, so nothing in the run checked
+/// whether the stored list is still true — and a list nobody checked must not
+/// be crossed against another one.
+///
+/// This is the wiring behind the bug: two lists three months apart were crossed
+/// with no date comparison at all, because the outcome said only "not a
+/// cooldown" and `--cache` is not a cooldown. `snob unfollowers --cache` then
+/// reported everyone who had followed the account since as an unfollower.
+#[tokio::test]
+async fn a_cached_pair_carries_no_evidence_and_cannot_be_crossed() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 30).await;
+    mount_list(&server, 30).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    execute(&server, tmp.path(), &args()).await.unwrap();
+
+    let mut args = args();
+    args.cache = true;
+    let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
+
+    assert_eq!(
+        outcome.provenance,
+        Provenance::CacheFlag,
+        "nothing was spent finding out whether this is still true"
+    );
+    assert!(
+        !outcome.provenance.describes_now(),
+        "a list nobody checked cannot be crossed"
+    );
+
+    // What the rule then does with that is `check_same_moment`'s own tests;
+    // what this one is for is the wiring, because the wiring is where the bug
+    // was — the rule was right and never got told.
+    assert!(
+        check_same_moment(&outcome, &outcome).is_ok(),
+        "one list is one moment"
     );
 }
 
@@ -170,7 +211,7 @@ async fn refresh_walks_again_even_with_no_changes() {
     args.refresh = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
-    assert_eq!(outcome.source, ResultSource::Fetched);
+    assert_eq!(outcome.source(), ResultSource::Fetched);
 }
 
 #[tokio::test]
@@ -190,7 +231,7 @@ async fn an_old_snapshot_is_walked_again() {
 
     let (_, outcome) = execute(&server, tmp.path(), &args()).await.unwrap();
     assert_eq!(
-        outcome.source,
+        outcome.source(),
         ResultSource::Fetched,
         "past the maximum age it has to walk again even if the counter has not moved"
     );
@@ -248,7 +289,7 @@ async fn cache_with_a_named_target_stays_off_the_network() {
     let (found, outcome) = execute(&empty, tmp.path(), &cached).await.unwrap();
 
     assert_eq!(found.len(), 2);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(requests(&empty).await, 0);
 }
 

@@ -33,15 +33,68 @@ pub enum ResultSource {
     Cached,
 }
 
+/// Where a returned list came from, in the sense that decides whether two of
+/// them may be crossed against each other.
+///
+/// This used to be a `bool` called `from_cooldown`, and two of the three paths
+/// that serve from storage set it to `false` — so `snob unfollowers --cache`
+/// crossed a followers list stored in June against a following list stored in
+/// August and reported the difference as unfollowers, with nothing on screen
+/// saying either list came out of storage.
+///
+/// The distinction that matters is not how old a stored list is. It is whether
+/// anything in **this run** established that it still describes the account:
+/// two lists a month apart are fine to cross if both counters were checked just
+/// now and neither had moved, and two lists an hour apart are not fine if
+/// nobody looked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Walked in this run. It is the account as it is.
+    Walked,
+    /// Stored, and a counter poll in this run said it had not moved.
+    CounterVerified,
+    /// Stored, served during a cooldown. Nothing may be spent to check.
+    Cooldown,
+    /// Stored, served because the counter poll failed. No evidence either way.
+    PollFailed,
+    /// Stored, served because `--cache` said not to look.
+    CacheFlag,
+}
+
+impl Provenance {
+    /// Whether this list is known to describe the account as it is now.
+    ///
+    /// The three that answer `false` are the three where no request was spent
+    /// finding out — deliberately, in every case. That is what makes them safe
+    /// to *serve* and unsafe to *cross*.
+    pub fn describes_now(self) -> bool {
+        matches!(self, Self::Walked | Self::CounterVerified)
+    }
+
+    /// Whether the cause was Instagram pushing back rather than the user
+    /// asking for storage. It decides which of two pieces of advice to give
+    /// and which exit code goes with it.
+    pub fn is_cooldown(self) -> bool {
+        self == Self::Cooldown
+    }
+
+    fn source(self) -> ResultSource {
+        match self {
+            Self::Walked => ResultSource::Fetched,
+            _ => ResultSource::Cached,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ListOutcome {
-    pub source: ResultSource,
+    /// How this list was obtained, and therefore what is known about whether
+    /// it is still true. [`ResultSource`] falls out of it, which is why there
+    /// is no second field that could disagree with this one.
+    pub provenance: Provenance,
     pub reason: StopReason,
     pub requests: u32,
     pub taken_at: i64,
-    /// Whether the list was served by the cooldown path, which asks no
-    /// confirmation and carries no freshness evidence.
-    pub from_cooldown: bool,
     /// Whose list this is.
     ///
     /// The caller asked with a name and gets back an id, which is the only
@@ -63,18 +116,29 @@ pub struct ListOutcome {
 impl ListOutcome {
     /// What a stored snapshot answers with. Complete by construction: the
     /// store only ever hands back snapshots that are.
-    pub(crate) fn cached(account_pk: Pk, taken_at: i64, from_cooldown: bool) -> Self {
+    ///
+    /// The provenance is not defaulted here. Every caller has to say which of
+    /// the three storage paths it is, because getting that wrong is the whole
+    /// of the bug this argument exists to prevent.
+    pub(crate) fn cached(account_pk: Pk, taken_at: i64, provenance: Provenance) -> Self {
+        debug_assert!(
+            !matches!(provenance, Provenance::Walked),
+            "a stored list was not walked"
+        );
         Self {
-            source: ResultSource::Cached,
+            provenance,
             reason: StopReason::Completed,
             // Filled in by `list`, which is the only place that sees the whole
             // run and can ask the pacer what it really charged.
             requests: 0,
             taken_at,
-            from_cooldown,
             account_pk,
             stopped_by: None,
         }
+    }
+
+    pub fn source(&self) -> ResultSource {
+        self.provenance.source()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -154,7 +218,14 @@ async fn decide(
         };
         return Ok((
             snob_core::store::snapshots::members(app.db().conn(), snapshot.id)?,
-            ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), false),
+            // `--cache` is a promise not to spend a request, so nothing here
+            // checked whether the stored list is still true. That is exactly
+            // what makes it unsafe to cross against another one.
+            ListOutcome::cached(
+                target.pk,
+                snapshot.taken_at.unwrap_or_default(),
+                Provenance::CacheFlag,
+            ),
         ));
     }
 
@@ -217,8 +288,8 @@ mod tests {
 
     #[test]
     fn a_cached_outcome_is_complete_by_construction() {
-        let outcome = ListOutcome::cached(7, 0, false);
+        let outcome = ListOutcome::cached(7, 0, Provenance::CounterVerified);
         assert!(outcome.is_complete());
-        assert_eq!(outcome.source, ResultSource::Cached);
+        assert_eq!(outcome.source(), ResultSource::Cached);
     }
 }

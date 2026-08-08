@@ -14,7 +14,7 @@ use snob_ig::pager::{ListRequest, ListWalker, WalkError};
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::target::Target;
-use crate::engine::{ListOutcome, ResultSource};
+use crate::engine::{ListOutcome, Provenance};
 use crate::exit::{ExitCode, ExitError};
 
 /// Walks the list, resuming an interrupted one when there is a usable one.
@@ -94,12 +94,11 @@ pub async fn fetch(
     Ok((
         snapshots::members(app.db().conn(), id)?,
         ListOutcome {
-            source: ResultSource::Fetched,
+            provenance: Provenance::Walked,
             reason: summary.reason,
             // Filled in by `engine::list` from the pacer.
             requests: 0,
             taken_at: now(),
-            from_cooldown: false,
             account_pk: target.pk,
             stopped_by,
         },

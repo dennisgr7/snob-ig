@@ -14,7 +14,7 @@ use snob_core::store::{accounts, now, snapshots};
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::target::{Counters, Target};
-use crate::engine::{ListOutcome, walk};
+use crate::engine::{ListOutcome, Provenance, walk};
 
 /// Polls, compares, and either serves what is stored or walks.
 pub async fn decide_and_fetch(
@@ -33,7 +33,10 @@ pub async fn decide_and_fetch(
                 app.warn(&format!(
                     "could not check for changes ({e}); using the stored list"
                 ));
-                return serve(app, target, snapshot);
+                // Served, but with nothing said about whether it is still
+                // true. It is fine to print; it is not fine to cross against
+                // another list, and only the provenance can carry that.
+                return serve(app, target, snapshot, Provenance::PollFailed);
             }
             app.warn(&format!("could not read the profile ({e})"));
             None
@@ -44,7 +47,10 @@ pub async fn decide_and_fetch(
         && let Some(snapshot) = &stored
         && is_still_good(snapshot, declared, args.max_age.as_secs() as i64)
     {
-        return serve(app, target, snapshot);
+        // The counter was polled just now and had not moved, so this describes
+        // the account as it is however old the snapshot is. That is what makes
+        // it safe to cross.
+        return serve(app, target, snapshot, Provenance::CounterVerified);
     }
 
     walk::fetch(app, args, kind, target, declared).await
@@ -68,10 +74,11 @@ fn serve(
     app: &App,
     target: &Target,
     snapshot: &snapshots::Snapshot,
+    provenance: Provenance,
 ) -> Result<(Vec<User>, ListOutcome)> {
     Ok((
         snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), false),
+        ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), provenance),
     ))
 }
 
