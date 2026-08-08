@@ -5,6 +5,9 @@ on:
     branches: [main, dev]
   pull_request:
   workflow_dispatch:
+  # For the advisory check only. See the note on that job.
+  schedule:
+    - cron: "17 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +21,23 @@ permissions:
   contents: read
 
 jobs:
+  # Reads Cargo.lock against the advisory database. It compiles nothing and
+  # runs in well under a minute, so it sits beside `lint` rather than in front
+  # of the build.
+  #
+  # Also on a schedule, and that is the point of the schedule: an advisory
+  # published on a Tuesday would otherwise turn somebody's unrelated Wednesday
+  # pull request red for the first time. Finding it on a timer means it is
+  # already known about by then.
+  supply-chain:
+    name: Advisories and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories sources
+
   lint:
     name: Format and lints
     runs-on: ubuntu-latest
