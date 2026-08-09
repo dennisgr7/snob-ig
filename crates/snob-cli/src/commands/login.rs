@@ -6,6 +6,8 @@
 //! anything, so nobody completes a two-factor login only to be told afterwards
 //! that there was nowhere to put the result.
 
+use std::io::IsTerminal;
+
 use anyhow::{Result, bail};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::{Backend, SecretStore};
@@ -16,6 +18,7 @@ use snob_ig::pace::{CancelToken, Pacer};
 
 use crate::cli::LoginArgs;
 use crate::exit::ExitCode;
+use crate::progress::Progress;
 use crate::report;
 use crate::ui::{self, LoginMethod};
 use crate::{browser, cdp, interrupt};
@@ -45,6 +48,15 @@ pub async fn run(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Resul
     }
     let store = store.using(usable);
 
+    // Before anything is asked for, and this is the half the probe above does
+    // not cover: `probe_writable` returns as soon as the keyring answers, so it
+    // never touches the data directory at all on a machine that has one. The
+    // database was then opened for the first time inside `finish`, *after* the
+    // browser login or the paste — so a full or read-only data directory threw
+    // away a login the user had already completed. With `--paste` that means
+    // fetching and pasting the sessionid again; with `--browser`, relaunching.
+    let pacer = pacer(paths)?;
+
     announce_replacement(&store);
 
     let Some(method) = choose_method(&args)? else {
@@ -53,8 +65,8 @@ pub async fn run(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Resul
     };
 
     match method {
-        LoginMethod::Paste => by_paste(args, store, paths).await,
-        LoginMethod::Browser => by_browser(args, store, paths).await,
+        LoginMethod::Paste => by_paste(args, store, pacer).await,
+        LoginMethod::Browser => by_browser(args, store, paths, pacer).await,
     }
 }
 
@@ -121,12 +133,18 @@ fn choose_method(args: &LoginArgs) -> Result<Option<LoginMethod>> {
 /// matters both ways: for `--browser` it decides which one opens, and for
 /// `--paste` it decides the User-Agent the session will be tied to. Guessing
 /// gets it wrong about half the time on a machine with Chrome and Edge.
-fn choose_browser(purpose: &str) -> Option<browser::Browser> {
-    let installed = browser::detect_all();
-    match installed.len() {
-        0 => None,
-        1 => installed.into_iter().next(),
-        _ if !ui::is_interactive() => installed.into_iter().next(),
+///
+/// The list is passed in rather than detected here. Off Windows, detecting
+/// means launching every installed browser to ask its version, so
+/// `resolve_user_agent` calling this after its own `detect_all` spawned six
+/// processes to answer a question worth three. Detecting twice also meant the
+/// count that decides whether to ask "is that the right browser?" came from a
+/// different snapshot than the browser actually chosen.
+fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<browser::Browser> {
+    match installed {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ if !ui::is_interactive() => installed.first().cloned(),
         _ => {
             let labels: Vec<String> = installed
                 .iter()
@@ -134,10 +152,12 @@ fn choose_browser(purpose: &str) -> Option<browser::Browser> {
                 .collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             match ui::choose(purpose, &refs) {
-                Ok(Some(i)) => installed.into_iter().nth(i),
+                // `get` rather than `nth`: total where the old one relied on the
+                // index being in range.
+                Ok(Some(i)) => installed.get(i).cloned(),
                 // Esc, or no menu to show: the preferred one still beats
                 // refusing to continue.
-                _ => installed.into_iter().next(),
+                _ => installed.first().cloned(),
             }
         }
     }
@@ -148,8 +168,14 @@ fn choose_browser(purpose: &str) -> Option<browser::Browser> {
 /// Nothing is read out of the user's own browser profile. This one is ours,
 /// under our data directory, and the browser hands the cookies over itself
 /// through its debugging protocol. `snob logout --purge-profile` deletes it.
-async fn by_browser(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    let Some(found) = choose_browser("Which browser should snob open?") else {
+async fn by_browser(
+    args: LoginArgs,
+    store: SecretStore,
+    paths: &AppPaths,
+    pacer: Pacer,
+) -> Result<ExitCode> {
+    let installed = browser::detect_all();
+    let Some(found) = choose_browser("Which browser should snob open?", &installed) else {
         bail!(
             "no Chromium-based browser was found installed, and this needs one to \
              open.\n\
@@ -164,9 +190,11 @@ async fn by_browser(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Re
         "Opening {} on Instagram's login page.\n\
          It uses a profile of its own, at {}, so it is not your everyday browser \
          and logging in there changes nothing about it.\n\
-         Log in as usual; snob will notice when you are done. Ctrl+C to cancel.",
+         Log in as usual; snob will notice when you are done, and gives up after \
+         {} minutes. Ctrl+C to cancel.",
         found.name,
-        profile.display()
+        profile.display(),
+        cdp::LOGIN_TIMEOUT.as_secs() / 60
     ));
 
     // Anything from here on can be interrupted, and a Ctrl+C has to read as
@@ -182,7 +210,7 @@ async fn by_browser(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Re
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
     session.browser = Some(found.name.to_string());
-    finish(session, store, paths, LoginMethod::Browser).await
+    finish(session, store, pacer, LoginMethod::Browser).await
 }
 
 /// Drives the browser from launch to captured session, and always closes it.
@@ -231,13 +259,33 @@ async fn collect(
             );
             existing
         }
-        None => cdp::wait_for_login(cdp, cancel).await?,
+        None => {
+            // Ten minutes with nothing on screen reads as a hang, and this is
+            // the one stretch where the user is in another window typing a
+            // password and a code and comes back to check.
+            //
+            // Started inside this branch rather than before `capture()`: the
+            // sibling branch above prints with a plain `eprintln!`, which would
+            // be overdrawn by a bar already running. The countdown is
+            // deadline-driven, so one call covers the whole wait.
+            //
+            // `stderr().is_terminal()` rather than `true`, because that is
+            // where the bar draws — and rather than `ui::is_interactive()`,
+            // which asks about stdin and stdout.
+            let progress = Progress::new(std::io::stderr().is_terminal());
+            progress.waiting("waiting for you to log in", cdp::LOGIN_TIMEOUT);
+            let captured = cdp::wait_for_login(cdp, cancel).await;
+            // Before the `?`, so both the Ctrl+C bail and a broken socket leave
+            // a clean terminal behind.
+            progress.finish();
+            captured?
+        }
     };
 
     Ok((cookies, user_agent))
 }
 
-async fn by_paste(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+async fn by_paste(args: LoginArgs, store: SecretStore, pacer: Pacer) -> Result<ExitCode> {
     // The User-Agent is settled first because it is the half that can still ask
     // questions. Sorting it out after a seventy-character paste means answering
     // a menu with the credential already sitting on screen.
@@ -257,7 +305,7 @@ async fn by_paste(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Resu
     let mut session = login::session_from_paste(&sessionid, &chosen.user_agent)?;
     session.user_agent_pinned = chosen.pinned;
     session.browser = chosen.browser;
-    finish(session, store, paths, LoginMethod::Paste).await
+    finish(session, store, pacer, LoginMethod::Paste).await
 }
 
 /// Validates, stores and reports. Shared by both methods so a session obtained
@@ -265,31 +313,29 @@ async fn by_paste(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Resu
 async fn finish(
     mut session: Session,
     store: SecretStore,
-    paths: &AppPaths,
+    pacer: Pacer,
     method: LoginMethod,
 ) -> Result<ExitCode> {
     ui::info("Checking the session against Instagram...");
-    let outcome = login::validate(&mut session, pacer(paths)?)
-        .await
-        .map_err(|e| {
-            // A rejection during login means different things depending on where
-            // the session came from. Telling someone to check what they pasted is
-            // useless advice when the browser handed it over itself.
-            match &e {
-                login::LoginError::Instagram(ig) if ig.invalidates_session() => anyhow::anyhow!(e)
-                    .context(match method {
-                        LoginMethod::Paste => {
-                            "Instagram rejected the session. Check that the sessionid was \
+    let outcome = login::validate(&mut session, pacer).await.map_err(|e| {
+        // A rejection during login means different things depending on where
+        // the session came from. Telling someone to check what they pasted is
+        // useless advice when the browser handed it over itself.
+        match &e {
+            login::LoginError::Instagram(ig) if ig.invalidates_session() => anyhow::anyhow!(e)
+                .context(match method {
+                    LoginMethod::Paste => {
+                        "Instagram rejected the session. Check that the sessionid was \
                              copied whole and that the User-Agent belongs to the same browser"
-                        }
-                        LoginMethod::Browser => {
-                            "Instagram rejected the session the browser handed over. It may \
+                    }
+                    LoginMethod::Browser => {
+                        "Instagram rejected the session the browser handed over. It may \
                              have been signed out in the meantime; try again"
-                        }
-                    }),
-                _ => anyhow::anyhow!(e),
-            }
-        })?;
+                    }
+                }),
+            _ => anyhow::anyhow!(e),
+        }
+    })?;
 
     store.save(&session)?;
 
@@ -357,7 +403,7 @@ impl ChosenAgent {
 fn resolve_user_agent() -> Result<ChosenAgent> {
     let installed = browser::detect_all();
 
-    if let Some(b) = choose_browser("Which browser is your Instagram session in?") {
+    if let Some(b) = choose_browser("Which browser is your Instagram session in?", &installed) {
         let user_agent = b.user_agent();
         ui::info(&format!(
             "Using the User-Agent of {} {}.",

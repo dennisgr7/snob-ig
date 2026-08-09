@@ -39,7 +39,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for someone to finish logging in. Generous on purpose:
 /// two-factor codes arrive by SMS and people go looking for their phone.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Gap between cookie checks.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -144,7 +144,7 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     let active_port = profile.join("DevToolsActivePort");
     let _ = std::fs::remove_file(&active_port);
 
-    let child = tokio::process::Command::new(&browser.path)
+    let mut child = tokio::process::Command::new(&browser.path)
         .arg(format!("--user-data-dir={}", profile.display()))
         // Port 0 means "pick a free one and write it down", which avoids both
         // colliding with something already on 9222 and handing a fixed port to
@@ -173,7 +173,7 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     // would make a later `kill_launched` shoot at whatever has since been given
     // that number. Every way out of this function clears it except the one that
     // hands the browser over to `Launched`.
-    let endpoint = match wait_for_endpoint(&active_port, cancel).await {
+    let endpoint = match wait_for_endpoint(&active_port, &mut child, profile, cancel).await {
         Ok(endpoint) => endpoint,
         Err(e) => {
             kill_launched();
@@ -183,25 +183,47 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     Ok(Launched { child, endpoint })
 }
 
-/// Both waits below are the same shape, and all three of their endings matter:
-/// found, gave up, ran out of time. They are written out rather than shared
-/// because an async closure holding the connection across the await does not
-/// survive the borrow checker, and eight duplicated lines are a better price
-/// than the contortion that would.
+/// Both waits below are the same shape, and every one of their endings matters:
+/// found, the browser exited, gave up, ran out of time. They are written out
+/// rather than shared because an async closure holding the connection across
+/// the await does not survive the borrow checker, and eight duplicated lines
+/// are a better price than the contortion that would.
 ///
 /// Reads the endpoint the browser wrote: the port on the first line and the
 /// path to the browser-level target on the second.
-async fn wait_for_endpoint(active_port: &Path, cancel: &CancelToken) -> Result<String> {
+async fn wait_for_endpoint(
+    active_port: &Path,
+    child: &mut tokio::process::Child,
+    profile: &Path,
+    cancel: &CancelToken,
+) -> Result<String> {
     let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
 
     loop {
         if cancel.is_canceled() {
             bail!("canceled");
         }
+        // The file first, then the child: a browser that wrote its endpoint and
+        // then exited still handed us a usable one.
         if let Ok(text) = std::fs::read_to_string(active_port)
             && let Some((port, path)) = parse_endpoint(&text)
         {
             return Ok(format!("ws://127.0.0.1:{port}{path}"));
+        }
+        // Chrome's profile singleton makes this ordinary rather than exotic: a
+        // second `snob login --browser` hands its command line to the instance
+        // already holding the profile and exits within a second. Watching only
+        // the port file meant waiting the full thirty seconds and then blaming
+        // the debugging port, which is the wrong problem — and holding a dead
+        // pid the whole time, which is what the comment above `LAUNCHED_PID`
+        // warns about.
+        if let Ok(Some(status)) = child.try_wait() {
+            // `try_wait` is what reaps the child, so this is the moment the
+            // number becomes reusable. Clearing it here also makes the
+            // `kill_launched()` in the caller's error arm a deliberate no-op
+            // rather than a shot at a stranger.
+            LAUNCHED_PID.store(0, std::sync::atomic::Ordering::Relaxed);
+            bail!("{}", died_early(status.code(), profile));
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
@@ -212,6 +234,27 @@ async fn wait_for_endpoint(active_port: &Path, cancel: &CancelToken) -> Result<S
         if cancel.sleep_or_cancel(Duration::from_millis(100)).await {
             bail!("canceled");
         }
+    }
+}
+
+/// What to say when the browser started and stopped again.
+///
+/// Split out so the wording can be read and changed without a browser: nothing
+/// about the branch above is testable without launching one, and `ExitStatus`
+/// cannot be constructed portably in a test anyway, so this takes the code.
+fn died_early(code: Option<i32>, profile: &Path) -> String {
+    match code {
+        // Exiting cleanly and immediately is the singleton: the browser handed
+        // its command line to the instance that already has this profile open.
+        Some(0) | None => format!(
+            "the browser closed straight away, which means one is already open on              snob's profile at {}.
+             Close that window and try again, or use \"snob login --paste\".",
+            profile.display()
+        ),
+        Some(code) => format!(
+            "the browser exited with code {code} instead of starting.
+             Try \"snob login --paste\" instead."
+        ),
     }
 }
 
@@ -394,6 +437,33 @@ pub async fn wait_for_login(cdp: &mut Cdp, cancel: &CancelToken) -> Result<Brows
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second `snob login --browser` hands its command line to the instance
+    /// already holding the profile and exits within a second. Waiting the full
+    /// thirty seconds and then talking about the debugging port described the
+    /// wrong problem entirely.
+    #[test]
+    fn a_browser_that_exited_cleanly_names_the_profile() {
+        let profile = Path::new("C:/somewhere/browser-profile");
+        for code in [Some(0), None] {
+            let said = died_early(code, profile);
+            assert!(said.contains("already open"), "{said}");
+            assert!(said.contains("browser-profile"), "{said}");
+            assert!(said.contains("--paste"), "{said}");
+            assert!(
+                !said.contains("debugging port"),
+                "that is the other failure: {said}"
+            );
+        }
+    }
+
+    /// A browser that failed to start is a different thing, and says so.
+    #[test]
+    fn a_browser_that_failed_reports_its_code() {
+        let said = died_early(Some(127), Path::new("/tmp/p"));
+        assert!(said.contains("127"), "{said}");
+        assert!(!said.contains("already open"), "{said}");
+    }
 
     #[test]
     fn it_reads_the_two_line_endpoint() {
