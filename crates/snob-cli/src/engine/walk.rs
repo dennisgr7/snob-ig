@@ -6,7 +6,7 @@
 //! run destructors.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, User};
+use snob_core::model::{ListKind, User, printable};
 use snob_core::store::{now, snapshots};
 use snob_ig::pace::Pace;
 use snob_ig::pager::{ListRequest, ListWalker, WalkError};
@@ -15,7 +15,7 @@ use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::target::Target;
 use crate::engine::{ListOutcome, Provenance};
-use crate::exit::{ExitCode, ExitError};
+use crate::exit::ExitCode;
 
 /// Walks the list, resuming an interrupted one when there is a usable one.
 pub async fn fetch(
@@ -72,16 +72,21 @@ pub async fn fetch(
         // Reachable only when the cooldown lands between the check in
         // `engine::list` and the walk, e.g. set by another process.
         Err(WalkError::Cooldown { until_ms, .. }) => {
-            return Err(ExitError::new(
-                ExitCode::RateLimited,
-                format!(
-                    "the account is in cooldown until {}; nothing can be walked until it lifts",
-                    crate::report::cooldown_ends_at(until_ms)
-                ),
-            )
-            .into());
+            return Err(crate::report::refuse_cooldown_mid_walk(until_ms));
         }
-        Err(error) => return Err(anyhow::Error::new(error).context("the walk failed")),
+        // A crossing walks two lists in the same run, so "the walk failed" did
+        // not say which one stopped. The name goes through `printable` for the
+        // same reason every other account name this tool prints does: it came
+        // off Instagram, not out of anybody's keyboard.
+        Err(error) => {
+            let who = match target.username.as_deref() {
+                Some(name) => format!("@{}", printable(name)),
+                None => "your account".to_string(),
+            };
+            return Err(
+                anyhow::Error::new(error).context(format!("could not read {who}'s {kind} list"))
+            );
+        }
     };
 
     snapshots::close(app.db().conn(), id, summary.reason)?;

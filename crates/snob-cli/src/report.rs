@@ -6,7 +6,61 @@
 
 use snob_core::model::{ListKind, StopReason};
 
+use crate::engine::Provenance;
+
 use crate::exit::{ExitCode, ExitError};
+
+/// Prints a failed run's error, as one message rather than as several.
+///
+/// The refusals this tool produces are paragraphs — two or three sentences with
+/// deliberate newlines between them. Printed with a bare `error: {e}`, only the
+/// first line carried the label and every one after it started at column zero,
+/// so a single refusal read as one error followed by some unattributed text.
+/// The continuations are indented under the label now, and the advice comes
+/// back on its own as a `hint:` rather than as more of the complaint.
+///
+/// A run the user stopped is not a failure to report: it gets no label and no
+/// cause chain, because "error:" over "@someone was not confirmed" reads as a
+/// reprimand for doing something wrong.
+///
+/// `.for_stderr()` on every styled label is not optional. Without it `console`
+/// decides on stdout's colour state, so the labels lose their colour when only
+/// stdout is redirected, and write escape codes into the file when only stderr
+/// is.
+pub fn print_error(error: &anyhow::Error) {
+    let code = ExitCode::from_chain(error);
+    if code == Some(ExitCode::Interrupted) {
+        eprintln!("{error}");
+        return;
+    }
+
+    let label = console::style("error:").red().bold().for_stderr();
+    eprintln!("{label} {}", indented(&error.to_string()));
+
+    for cause in error.chain().skip(1) {
+        let caused = console::style("caused by:").dim().for_stderr();
+        eprintln!("  {caused} {}", indented(&cause.to_string()));
+    }
+
+    if let Some(hint) = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<ExitError>())
+        .and_then(ExitError::hint)
+    {
+        let label = console::style("hint:").cyan().bold().for_stderr();
+        eprintln!("{label}  {}", indented(hint));
+    }
+}
+
+/// Lines after the first start under the label rather than at column zero.
+///
+/// Deliberately not re-wrapped to the terminal width: the only hard breaks in
+/// these strings are the ones somebody put between sentences, and re-wrapping
+/// would eventually split a URL or `snob login --paste` across a line. The
+/// terminal already soft-wraps at the width it really has.
+fn indented(text: &str) -> String {
+    text.replace('\n', "\n       ")
+}
 
 /// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
 /// timestamp the tool prints.
@@ -44,8 +98,97 @@ pub fn refuse_incomplete(
         code,
         format!(
             "the {list} list could not be read in full, so the answer would be wrong: \
-             the accounts missing from it would appear as if {misreading}.\n{}",
-            try_again_advice(reason)
+             the accounts missing from it would appear as if {misreading}."
+        ),
+    )
+    .with_hint(try_again_advice(reason))
+    .into()
+}
+
+/// Two stored lists too far apart to be crossed.
+///
+/// The wording and the code live here rather than in `engine` because that is
+/// what AGENTS.md says: engine returns data and where the data came from, and
+/// never decides how anything looks. It hands over the two provenances and the
+/// two dates; which sentence and which code those deserve is this module's
+/// question.
+///
+/// And they really do differ. A cooldown is waited out, so "run it again later"
+/// is true and the throttling code is right. `--cache` and a failed poll are
+/// not waited out, and telling somebody to sit out a cooldown they are not in
+/// is worse than saying nothing.
+pub fn refuse_different_moments(
+    a: Provenance,
+    b: Provenance,
+    a_at: i64,
+    b_at: i64,
+) -> anyhow::Error {
+    let throttled = a.is_cooldown() || b.is_cooldown();
+    let (code, hint) = if throttled {
+        (
+            ExitCode::RateLimited,
+            "Run it again once the cooldown lifts.",
+        )
+    } else {
+        (
+            ExitCode::Error,
+            "Run it again without --cache, so both lists are checked against the account.",
+        )
+    };
+
+    ExitError::new(
+        code,
+        format!(
+            "the two stored lists are from different moments ({} and {}), so crossing \
+             them would invent results.",
+            stored_on(a_at),
+            stored_on(b_at)
+        ),
+    )
+    .with_hint(hint)
+    .into()
+}
+
+/// Why a cooldown could not be served around.
+///
+/// A plain description of the situation, handed over by `engine` so that this
+/// module can choose the words.
+#[derive(Debug, Clone, Copy)]
+pub enum Blocked<'a> {
+    /// `--refresh` was asked for, and walking is exactly what cannot happen.
+    RefreshWanted,
+    /// The named account has never been tracked, so there is nothing stored.
+    AccountUnknown(&'a str),
+    /// The account is known but this list has never been walked to the end.
+    NothingStored(ListKind),
+}
+
+/// The account is in cooldown and storage cannot answer either.
+pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error {
+    let when = cooldown_ends_at(until_ms);
+    let detail = match blocked {
+        Blocked::RefreshWanted => {
+            format!("the account is in cooldown until {when}; --refresh cannot walk until it lifts")
+        }
+        Blocked::AccountUnknown(name) => format!(
+            "the account is in cooldown until {when}, and no list of @{name} is stored \
+             to serve in the meantime"
+        ),
+        Blocked::NothingStored(kind) => format!(
+            "the account is in cooldown until {when}, and no complete snapshot of the \
+             {kind} list is stored, so there is nothing to serve"
+        ),
+    };
+    ExitError::new(ExitCode::RateLimited, detail).into()
+}
+
+/// A cooldown that landed between the check and the walk.
+pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::RateLimited,
+        format!(
+            "the account is in cooldown until {}; nothing can be walked until it lifts",
+            cooldown_ends_at(until_ms)
         ),
     )
     .into()
@@ -154,7 +297,9 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("followers list"), "{text}");
         assert!(text.contains("they did not follow you"), "{text}");
-        assert!(text.contains("starts over"), "{text}");
+        // The advice lives on the hint now, not in the sentence: see
+        // `a_refusal_keeps_its_advice_apart_from_what_happened`.
+        assert!(hint_of(&error).unwrap().contains("starts over"));
 
         assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::RateLimited));
     }
@@ -194,6 +339,96 @@ mod tests {
         let advice = try_again_advice(StopReason::SessionInvalid);
         assert!(!advice.contains("continue where it left off"), "{advice}");
         assert!(advice.contains("Instagram asked for"), "{advice}");
+    }
+
+    fn hint_of(error: &anyhow::Error) -> Option<String> {
+        error
+            .chain()
+            .find_map(|c| c.downcast_ref::<ExitError>())
+            .and_then(ExitError::hint)
+            .map(str::to_string)
+    }
+
+    /// The advice is separate from the failure, so the printer can label them
+    /// differently. Glued together with a newline, both came out under
+    /// `error:` and the advice read as more of the complaint.
+    #[test]
+    fn a_refusal_keeps_its_advice_apart_from_what_happened() {
+        let error = refuse_incomplete(
+            ListKind::Followers,
+            StopReason::RateLimit,
+            ExitCode::RateLimited,
+            "they did not follow you",
+        );
+        assert!(error.to_string().contains("would be wrong"), "{error}");
+        assert!(
+            !error.to_string().contains("Run it again"),
+            "the advice is not part of what happened: {error}"
+        );
+        assert!(hint_of(&error).unwrap().contains("starts over"));
+    }
+
+    /// A cooldown is waited out and the other two causes are not, so the same
+    /// refusal owes them different advice. Telling somebody to sit out a
+    /// cooldown they are not in is worse than saying nothing.
+    #[test]
+    fn different_moments_are_explained_by_why_nobody_checked() {
+        let throttled = refuse_different_moments(Provenance::Cooldown, Provenance::Cooldown, 0, 1);
+        assert!(hint_of(&throttled).unwrap().contains("cooldown lifts"));
+        assert_eq!(
+            ExitCode::from_chain(&throttled),
+            Some(ExitCode::RateLimited)
+        );
+
+        let asked_for =
+            refuse_different_moments(Provenance::CacheFlag, Provenance::PollFailed, 0, 1);
+        let hint = hint_of(&asked_for).unwrap();
+        assert!(hint.contains("--cache"), "{hint}");
+        assert!(!hint.contains("cooldown"), "{hint}");
+        assert_eq!(ExitCode::from_chain(&asked_for), Some(ExitCode::Error));
+
+        // Both say the same thing about what happened.
+        for error in [&throttled, &asked_for] {
+            assert!(error.to_string().contains("different moments"), "{error}");
+        }
+    }
+
+    /// Every way a cooldown can leave the user with nothing says which one it
+    /// was, and all of them carry the throttling code.
+    #[test]
+    fn a_cooldown_refusal_names_what_is_missing() {
+        let cases = [
+            (Blocked::RefreshWanted, "--refresh"),
+            (Blocked::AccountUnknown("someone"), "@someone"),
+            (Blocked::NothingStored(ListKind::Followers), "followers"),
+        ];
+        for (blocked, expected) in cases {
+            let error = refuse_in_cooldown(1_722_700_000_000, blocked);
+            let text = error.to_string();
+            assert!(text.contains(expected), "{text}");
+            assert!(text.contains("in cooldown until"), "{text}");
+            assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::RateLimited));
+        }
+    }
+
+    /// A refusal is several sentences. Under a bare `error:` only the first one
+    /// carried the label and the rest started at column zero, reading as
+    /// separate unattributed text.
+    #[test]
+    fn continuation_lines_sit_under_the_label() {
+        let indented = indented(
+            "first
+second
+third",
+        );
+        assert_eq!(
+            indented,
+            "first
+       second
+       third"
+        );
+        // A single line is left exactly as it was.
+        assert_eq!(super::indented("only one"), "only one");
     }
 
     /// Filters that took nothing out must not leave a clause saying they did.
