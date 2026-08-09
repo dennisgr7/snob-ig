@@ -90,10 +90,14 @@ fn serve(
 /// hand and asking twice would only spend the request that the whole cache
 /// policy exists to save.
 async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u64>> {
-    let counters = match target.counters {
-        Some(counters) => counters,
-        None => {
-            let profile = app.client().web_profile_info(&target.username).await?;
+    let counters = match (target.counters, target.username.as_deref()) {
+        (Some(counters), _) => counters,
+        // The profile endpoint takes a name, so without one there is nothing to
+        // ask with. Saying the counter is unknown costs nothing; asking about a
+        // numeric id would spend a request on a guaranteed 404 every run.
+        (None, None) => return Ok(None),
+        (None, Some(username)) => {
+            let profile = app.client().web_profile_info(username).await?;
             Counters {
                 followers: profile.follower_count(),
                 following: profile.following_count(),
