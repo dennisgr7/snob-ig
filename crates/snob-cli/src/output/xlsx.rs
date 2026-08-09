@@ -9,7 +9,7 @@
 //! makes the interesting half testable without unpacking anything.
 
 use anyhow::{Context, Result};
-use rust_xlsxwriter::{Format, FormatAlign, Workbook, Worksheet};
+use rust_xlsxwriter::{ExcelDateTime, Format, FormatAlign, Workbook, Worksheet};
 use snob_core::model::User;
 
 /// The column names. The same six frozen keys the csv uses.
@@ -39,7 +39,15 @@ pub(crate) enum Cell {
     Number(f64),
     Text(String),
     Bool(bool),
-    Link { url: String, text: String },
+    Link {
+        url: String,
+        text: String,
+    },
+    /// A moment, as epoch seconds, written as a date the spreadsheet
+    /// understands. Only `scan` uses it, and only because a column of epoch
+    /// integers in a spreadsheet is unreadable where the same number in csv is
+    /// exactly what a script wants.
+    DateTime(i64),
     Empty,
 }
 
@@ -155,6 +163,18 @@ fn write_header(sheet: &mut Worksheet, header: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Turns epoch seconds into what the spreadsheet writer takes, in UTC like
+/// every other timestamp this tool prints.
+fn datetime(epoch: i64) -> Option<ExcelDateTime> {
+    use chrono::{Datelike, Timelike};
+
+    let t = chrono::DateTime::from_timestamp(epoch, 0)?;
+    ExcelDateTime::from_ymd(t.year().try_into().ok()?, t.month() as u8, t.day() as u8)
+        .ok()?
+        .and_hms(t.hour() as u16, t.minute() as u8, t.second() as u16)
+        .ok()
+}
+
 fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Result<()> {
     match cell {
         Cell::Number(value) => sheet.write_number(row, column, *value).map(|_| ()),
@@ -163,6 +183,18 @@ fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Resu
         Cell::Link { url, text } => sheet
             .write_url_with_text(row, column, url.as_str(), text.as_str())
             .map(|_| ()),
+        // A timestamp outside what a spreadsheet can hold is written as the
+        // number it is rather than dropped: wrong-looking beats absent, and
+        // nothing else in this file invents a value.
+        Cell::DateTime(epoch) => match datetime(*epoch) {
+            Some(value) => {
+                let format = Format::new().set_num_format("yyyy-mm-dd hh:mm");
+                sheet
+                    .write_datetime_with_format(row, column, &value, &format)
+                    .map(|_| ())
+            }
+            None => sheet.write_number(row, column, *epoch as f64).map(|_| ()),
+        },
         Cell::Empty => Ok(()),
     }
     .with_context(|| format!("could not write row {row}"))
