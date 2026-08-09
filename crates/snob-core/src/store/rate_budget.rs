@@ -145,17 +145,32 @@ pub struct SqliteRateBudget {
 }
 
 impl SqliteRateBudget {
-    /// Opens its **own** connection to the same file.
+    /// Opens its **own** connection to the same file, with the store's settings.
     ///
-    /// It deliberately does not share the store's: this way the two-process
-    /// case is the same as the two-connection case, so what runs is what gets
-    /// tested. It also keeps the budget's borrow from clashing with the
+    /// Not sharing the store's connection is deliberate: this way the
+    /// two-process case is the same as the two-connection case, so what runs is
+    /// what gets tested, and the budget's borrow cannot clash with the
     /// transaction that inserts pages.
+    ///
+    /// But separate must not mean differently configured. `trusted_schema` and
+    /// the defensive flag are about the file rather than about a handle, so one
+    /// undefended connection leaves the file undefended and cancels what the
+    /// store set. The same goes for `secure_delete` and the WAL size bound —
+    /// and this is the connection that enforces the bound, because it commits
+    /// an `IMMEDIATE` transaction before every single request and is therefore
+    /// the one that checkpoints.
     pub fn open(paths: &AppPaths) -> Result<Self, StoreError> {
         // The store must have been opened first: it is what creates the schema.
         let conn = Connection::open(paths.db_file())?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        super::configure(&conn)?;
+
+        // The one setting this connection does not want from `configure`.
+        // Under WAL, `synchronous = NORMAL` skips the fsync at commit, so a
+        // power cut can lose the last transactions. Here those are the cooldown
+        // writes, and losing one brings the account out of a block early — the
+        // single direction `start_cooldown` must never be wrong in. One fsync
+        // against a pace of one request every 2.4 seconds costs nothing.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self::over(conn))
     }
 
@@ -397,13 +412,15 @@ mod tests {
         assert_eq!(tat, 1_000_000 + T);
     }
 
+    /// Built through the real constructor, not through `over`. The claim above
+    /// `open` is that what runs is what gets tested, and a helper that skipped
+    /// the configuration would have made that false for every test in here.
     fn temp_budget() -> (tempfile::TempDir, SqliteRateBudget) {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.db");
+        let paths = crate::paths::AppPaths::rooted_at(tmp.path());
         // The store creates the schema; the budget hooks in afterwards.
-        let _db = super::super::Store::open_at(&path).unwrap();
-        let conn = Connection::open(&path).unwrap();
-        (tmp, SqliteRateBudget::over(conn))
+        let _db = super::super::Store::open(&paths).unwrap();
+        (tmp, SqliteRateBudget::open(&paths).unwrap())
     }
 
     #[test]
@@ -424,6 +441,31 @@ mod tests {
             b.reserve().unwrap() > Duration::ZERO,
             "past the burst it should throttle"
         );
+    }
+
+    /// The connection that writes most often gets everything the store sets on
+    /// itself. A second connection to one file, configured differently, is the
+    /// same as not configuring the file.
+    #[test]
+    fn the_budget_connection_is_protected_like_the_store() {
+        let (_tmp, budget) = temp_budget();
+        let conn = budget.conn();
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+                .unwrap()
+        };
+
+        assert_eq!(
+            pragma("trusted_schema"),
+            0,
+            "the schema is executable content"
+        );
+        assert_eq!(pragma("secure_delete"), 1);
+        assert_eq!(pragma("journal_size_limit"), 4 * 1024 * 1024);
+
+        // FULL, not the store's NORMAL: losing the last commit here would bring
+        // an account out of a cooldown early.
+        assert_eq!(pragma("synchronous"), 2, "cooldown writes must be fsynced");
     }
 
     #[test]
