@@ -92,6 +92,21 @@ async fn mount_list(server: &MockServer, how_many: u64) {
         .await;
 }
 
+/// The other side of a crossing. Only the tests that walk both lists need it.
+async fn mount_following(server: &MockServer, how_many: u64) {
+    let users: Vec<String> = (0..how_many)
+        .map(|i| format!(r#"{{"pk":{i},"username":"u{i}"}}"#))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/following/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"users":[{}]}}"#, users.join(","))),
+        )
+        .mount(server)
+        .await;
+}
+
 async fn execute(
     server: &MockServer,
     root: &std::path::Path,
@@ -156,6 +171,95 @@ async fn with_cache_the_network_is_not_touched() {
         before,
         "--cache must not ask for anything"
     );
+}
+
+/// A crossing asks for two lists through one `App`, which is what `sets` and
+/// `scan` really do — unlike `execute` above, which builds a fresh one per call
+/// to imitate a second run of the command.
+///
+/// When both lists come out of storage, that is the whole cost of the run: one
+/// answer names the account and carries both of its counters, so asking a second
+/// time was asking Instagram the identical question about the identical account
+/// seconds apart.
+#[tokio::test]
+async fn a_cached_crossing_asks_about_the_account_once() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 30).await;
+    mount_list(&server, 30).await;
+    mount_following(&server, 30).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = args();
+    args.target = Some("someone".into());
+    args.yes = true;
+
+    // Populate both lists, in runs of their own.
+    execute(&server, tmp.path(), &args).await.unwrap();
+    {
+        let mut app = app(&server, open_db(tmp.path()));
+        engine::list(&mut app, &args, ListKind::Following)
+            .await
+            .unwrap();
+    }
+    let before = requests(&server).await;
+
+    // Now the crossing, in one run, with both lists already stored.
+    let mut app = app(&server, open_db(tmp.path()));
+    let (_, followers) = engine::list(&mut app, &args, ListKind::Followers)
+        .await
+        .unwrap();
+    let (_, following) = engine::list(&mut app, &args, ListKind::Following)
+        .await
+        .unwrap();
+
+    assert_eq!(followers.source(), ResultSource::Cached);
+    assert_eq!(following.source(), ResultSource::Cached);
+    assert_eq!(
+        requests(&server).await - before,
+        1,
+        "one answer names the account and counts it; the second list needs neither again"
+    );
+}
+
+/// The counters are reused only while nothing has been spent. A walk takes
+/// minutes, and a number read before it no longer says whether a stored list is
+/// current — serving one on that evidence and calling it counter-verified is
+/// the failure `Provenance` exists to stop.
+#[tokio::test]
+async fn a_walk_invalidates_the_counters_it_was_started_with() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 30).await;
+    mount_list(&server, 30).await;
+    mount_following(&server, 30).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = args();
+    args.target = Some("someone".into());
+    args.yes = true;
+
+    let mut app = app(&server, open_db(tmp.path()));
+    // Nothing stored, so this one walks.
+    engine::list(&mut app, &args, ListKind::Followers)
+        .await
+        .unwrap();
+
+    let before = requests(&server).await;
+    engine::list(&mut app, &args, ListKind::Following)
+        .await
+        .unwrap();
+
+    let profiles = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("web_profile_info"))
+        .count();
+    assert_eq!(
+        profiles, 2,
+        "after a walk the counters have to be read again"
+    );
+    assert!(requests(&server).await > before);
 }
 
 /// `--cache` promises not to spend a request, so nothing in the run checked

@@ -21,6 +21,7 @@ use snob_core::store::rate_budget::SqliteRateBudget;
 use snob_ig::client::IgClient;
 use snob_ig::pace::{CancelToken, Pacer};
 
+use crate::engine::target;
 use crate::interrupt;
 use crate::progress::Progress;
 
@@ -50,6 +51,21 @@ pub struct App {
     cancel: CancelToken,
     viewer: Viewer,
     consented: bool,
+    /// The account this run is about, once something has worked it out, and the
+    /// request count at the moment it did.
+    ///
+    /// A crossing calls `engine::list` twice, and each call used to resolve from
+    /// scratch: two identical `web_profile_info` requests about the same account
+    /// seconds apart. On a session whose username has never been resolved it was
+    /// four, because resolving the name and polling the counters are separate
+    /// requests there.
+    ///
+    /// The count is what makes reuse safe. Anything that spends a request may
+    /// have changed the account — a walk, a retry, a `--refresh` — so the memo
+    /// is only good while `Pacer::spent()` has not moved. That is strictly
+    /// stronger than asking whether the previous list came from cache, and it
+    /// reuses the number AGENTS.md already names as the truth about requests.
+    resolved: Option<(target::Target, u32)>,
 }
 
 impl App {
@@ -110,6 +126,7 @@ impl App {
             cancel,
             viewer,
             consented: false,
+            resolved: None,
         }))
     }
 
@@ -127,6 +144,7 @@ impl App {
             cancel: CancelToken::default(),
             viewer,
             consented: false,
+            resolved: None,
         }
     }
 
@@ -176,6 +194,56 @@ impl App {
 
     pub fn record_consent(&mut self) {
         self.consented = true;
+    }
+
+    /// The target this run already worked out, if anything did.
+    ///
+    /// Who the account is does not go stale inside one run: the id is stable,
+    /// and a rename mid-run would not change which account was meant. So the
+    /// identity comes back whatever has happened since.
+    ///
+    /// **The counters do go stale**, and they are handed back only while
+    /// nothing has been spent — which is to say, only while no time has passed
+    /// that the account could have moved in. A walk takes minutes. Reusing a
+    /// number read before it, to decide a stored list is still current, would
+    /// serve a snapshot that missed everything those minutes contained and call
+    /// it counter-verified: the exact shape of failure `Provenance` exists to
+    /// stop. Cheaper is not worth wrong.
+    ///
+    /// One consequence worth naming: the private-account refusal in
+    /// `target::resolve` runs once per run rather than once per list. That is
+    /// fine — the first list already passed it, and the account cannot have
+    /// become private in between in a way that matters — but it is a skip, not
+    /// an oversight.
+    pub fn resolved_target(&self) -> Option<target::Target> {
+        let (target, at) = self.resolved.as_ref()?;
+        let mut target = target.clone();
+        if *at != self.client.pacer().spent() {
+            target.counters = None;
+        }
+        Some(target)
+    }
+
+    /// Remembers what the run is about, stamped with what had been spent.
+    pub fn remember_target(&mut self, target: target::Target) {
+        let spent = self.client.pacer().spent();
+        self.resolved = Some((target, spent));
+    }
+
+    /// Adds the counters a poll just obtained, and re-stamps.
+    ///
+    /// Re-stamping is the point. The poll is itself a request, so without this
+    /// the memo would be invalidated by the very call that completed it, and
+    /// the second list of a crossing would resolve and poll all over again.
+    /// What must invalidate it is a request spent **after** the counters were
+    /// read — a walk, a retry — because that is time in which the account can
+    /// have moved.
+    pub fn remember_counters(&mut self, counters: target::Counters) {
+        let spent = self.client.pacer().spent();
+        if let Some((target, at)) = &mut self.resolved {
+            target.counters = Some(counters);
+            *at = spent;
+        }
     }
 
     /// A warning, through the progress bar when there is one so it does not

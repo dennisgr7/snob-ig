@@ -199,10 +199,20 @@ async fn decide(
 
     ask_consent(app, args).await?;
 
-    let target = if args.cache {
-        target::from_store(app, args.target.as_deref(), kind)?
-    } else {
-        target::resolve(app, args).await?
+    // A crossing asks for two lists, and resolving is a request. Reusing what
+    // the first call worked out is what stops the second asking Instagram the
+    // identical question about the identical account seconds later.
+    let target = match app.resolved_target() {
+        Some(target) => target,
+        None => {
+            let target = if args.cache {
+                target::from_store(app, args.target.as_deref(), kind)?
+            } else {
+                target::resolve(app, args).await?
+            };
+            app.remember_target(target.clone());
+            target
+        }
     };
 
     // The user row has to exist before the account row: `accounts.pk`

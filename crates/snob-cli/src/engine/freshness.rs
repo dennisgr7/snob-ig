@@ -98,10 +98,16 @@ async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u
         (None, None) => return Ok(None),
         (None, Some(username)) => {
             let profile = app.client().web_profile_info(username).await?;
-            Counters {
+            let counters = Counters {
                 followers: profile.follower_count(),
                 following: profile.following_count(),
-            }
+            };
+            // One answer carries both counters, so the other list of a crossing
+            // does not have to ask again. Without this the memo held the
+            // identity and the second list still spent a request on the numbers
+            // it already had in hand.
+            app.remember_counters(counters);
+            counters
         }
     };
 
