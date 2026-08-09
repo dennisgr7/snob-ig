@@ -78,6 +78,13 @@ impl From<ExitCode> for std::process::ExitCode {
 pub struct ExitError {
     pub code: ExitCode,
     message: String,
+    /// What to do about it, kept apart from what happened.
+    ///
+    /// They used to be one string with a newline between them, which left the
+    /// printer no way to tell the sentence describing the failure from the one
+    /// telling the user what to try — so both came out under `error:` and the
+    /// advice read as more of the complaint.
+    hint: Option<String>,
 }
 
 impl ExitError {
@@ -85,11 +92,27 @@ impl ExitError {
         Self {
             code,
             message: message.into(),
+            hint: None,
         }
+    }
+
+    /// Adds the advice. A builder rather than a third argument to `new`,
+    /// because most of the places that construct one of these have no advice
+    /// to give and should not have to say so.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
     }
 }
 
 impl std::fmt::Display for ExitError {
+    /// The failure alone. The advice is [`ExitError::hint`], and the printer
+    /// puts it back — but anything that only has a `Display`, like an `anyhow`
+    /// chain being formatted somewhere else, still reads a complete sentence.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }

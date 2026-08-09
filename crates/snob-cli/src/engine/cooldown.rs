@@ -12,8 +12,7 @@ use snob_core::store::snapshots;
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::{ListOutcome, Provenance, target};
-use crate::exit::{ExitCode, ExitError};
-use crate::report::{cooldown_ends_at, stored_on};
+use crate::report::{self, Blocked, cooldown_ends_at, stored_on};
 
 /// Serves what is stored, or explains why nothing can be.
 ///
@@ -25,14 +24,8 @@ pub fn serve(
     kind: ListKind,
     until_ms: i64,
 ) -> Result<(Vec<User>, ListOutcome)> {
-    let when = cooldown_ends_at(until_ms);
-    let refuse =
-        |detail: String| -> anyhow::Error { ExitError::new(ExitCode::RateLimited, detail).into() };
-
     if args.refresh {
-        return Err(refuse(format!(
-            "the account is in cooldown until {when}; --refresh cannot walk until it lifts"
-        )));
+        return Err(report::refuse_in_cooldown(until_ms, Blocked::RefreshWanted));
     }
 
     let pk = match args.target.as_deref() {
@@ -42,22 +35,23 @@ pub fn serve(
             match snob_core::store::accounts::find_pk_by_username(app.db().conn(), username)? {
                 Some(pk) => pk,
                 None => {
-                    return Err(refuse(format!(
-                        "the account is in cooldown until {when}, and no list of \
-                         @{username} is stored to serve in the meantime"
-                    )));
+                    return Err(report::refuse_in_cooldown(
+                        until_ms,
+                        Blocked::AccountUnknown(username),
+                    ));
                 }
             }
         }
     };
 
     let Some(snapshot) = snapshots::latest_complete(app.db().conn(), pk, kind)? else {
-        return Err(refuse(format!(
-            "the account is in cooldown until {when}, and no complete snapshot of \
-             the {kind} list is stored, so there is nothing to serve"
-        )));
+        return Err(report::refuse_in_cooldown(
+            until_ms,
+            Blocked::NothingStored(kind),
+        ));
     };
 
+    let when = cooldown_ends_at(until_ms);
     let taken_at = snapshot.taken_at.unwrap_or_default();
     // The list is named because a crossing serves two of them, and two
     // identical warnings in a row read like the same one printed twice.
@@ -96,39 +90,21 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
         return Ok(());
     }
 
-    // A cooldown is waited out; `--cache` and a failed poll are not, and
-    // telling someone to wait for a cooldown they are not in is worse than
-    // saying nothing. The code follows the same split, because `exit.rs` says
-    // these exist so a service can tell "wait a while" from everything else
-    // without reading English.
-    let throttled = a.provenance.is_cooldown() || b.provenance.is_cooldown();
-    let (code, advice) = if throttled {
-        (
-            ExitCode::RateLimited,
-            "Run it again once the cooldown lifts.",
-        )
-    } else {
-        (
-            ExitCode::Error,
-            "Run it again without --cache, so both lists are checked against the account.",
-        )
-    };
-
-    Err(ExitError::new(
-        code,
-        format!(
-            "the two stored lists are from different moments ({} and {}), so crossing \
-             them would invent results.\n{advice}",
-            stored_on(a.taken_at),
-            stored_on(b.taken_at)
-        ),
-    )
-    .into())
+    // What happened, handed over as it is. Which sentence and which exit code
+    // that deserves is `report`'s question, not this module's: AGENTS.md is
+    // explicit that engine never decides how anything looks.
+    Err(report::refuse_different_moments(
+        a.provenance,
+        b.provenance,
+        a.taken_at,
+        b.taken_at,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit::ExitCode;
 
     fn outcome(provenance: Provenance, taken_at: i64) -> ListOutcome {
         ListOutcome::cached(1, taken_at, provenance)
@@ -182,21 +158,17 @@ mod tests {
         assert!(check_same_moment(&walked, &stale).is_err());
     }
 
-    /// The advice and the code have to match the cause. Telling somebody to
-    /// wait out a cooldown they are not in is worse than saying nothing, and
-    /// `exit.rs` says these codes exist so a service can tell "wait a while"
-    /// from everything else without reading the sentence.
+    /// The code has to match the cause, because `exit.rs` says these exist so a
+    /// service can tell "wait a while" from everything else without reading the
+    /// sentence. What the sentence says is `report`'s test: this module hands
+    /// over the provenances and stops there.
     #[test]
-    fn the_advice_matches_why_nobody_checked() {
+    fn the_code_matches_why_nobody_checked() {
         let throttled = check_same_moment(
             &outcome(Provenance::Cooldown, 0),
             &outcome(Provenance::Cooldown, 5_000_000),
         )
         .unwrap_err();
-        assert!(
-            throttled.to_string().contains("cooldown lifts"),
-            "{throttled}"
-        );
         assert_eq!(
             ExitCode::from_chain(&throttled),
             Some(ExitCode::RateLimited)
@@ -207,8 +179,6 @@ mod tests {
             &outcome(Provenance::CacheFlag, 5_000_000),
         )
         .unwrap_err();
-        assert!(asked_for.to_string().contains("--cache"), "{asked_for}");
-        assert!(!asked_for.to_string().contains("cooldown"), "{asked_for}");
         assert_eq!(ExitCode::from_chain(&asked_for), Some(ExitCode::Error));
     }
 }
