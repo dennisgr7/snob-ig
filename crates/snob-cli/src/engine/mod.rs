@@ -207,7 +207,28 @@ async fn decide(
 
     // The user row has to exist before the account row: `accounts.pk`
     // references `users.pk`.
-    users::upsert(app.db().conn(), &User::from(&target))?;
+    //
+    // Two calls rather than one, because "we know this account exists" and "we
+    // know what it is called" are different claims. Writing a name we never
+    // learned is how the numeric id ended up in `users.username`, clobbering a
+    // correct stored one and filing a rename that never happened.
+    match target.username.as_deref() {
+        Some(username) => users::upsert(
+            app.db().conn(),
+            &User {
+                pk: target.pk,
+                username: username.to_string(),
+                // Nothing is invented: the metadata arrives with the walk, and
+                // the upsert leaves whatever it already had alone.
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            },
+        )
+        .map(|_| ())?,
+        None => users::ensure(app.db().conn(), target.pk)?,
+    }
     accounts::upsert(app.db().conn(), target.pk, target.is_self)?;
 
     let stored = snob_core::store::snapshots::latest_complete(app.db().conn(), target.pk, kind)?;

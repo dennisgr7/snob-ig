@@ -10,10 +10,40 @@ use super::{StoreError, now, pk_from_sql, pk_to_sql};
 use crate::Pk;
 use crate::model::User;
 
+/// Records that an account exists, without claiming to know its name.
+///
+/// `users.username` is `TEXT NOT NULL` in a `STRICT` table and
+/// `accounts.pk REFERENCES users(pk)`, so a row has to exist before anything
+/// else about the account can be stored — even on the paths where the name has
+/// never been learned. Those paths used to write the numeric id into the name
+/// column, which is a different and worse thing than admitting ignorance.
+///
+/// The empty string is what "not known" looks like here. No Instagram account
+/// has one, so it cannot collide with a real name — but it is not
+/// self-defending: `find_pk_by_username` refuses it explicitly, because a
+/// lookup for `""` would otherwise match whichever unnamed account was polled
+/// last. [`upsert`] reads it as never having known rather than as a name that
+/// changed.
+pub fn ensure(conn: &Connection, pk: Pk) -> Result<(), StoreError> {
+    let now = now();
+    conn.execute(
+        "INSERT INTO users (pk, username, first_seen, last_seen)
+         VALUES (?1, '', ?2, ?2)
+         ON CONFLICT(pk) DO UPDATE SET last_seen = excluded.last_seen",
+        params![pk_to_sql(pk), now],
+    )?;
+    Ok(())
+}
+
 /// Inserts or updates a user and records the rename if there was one.
 ///
 /// Returns the previous username when it changed, which is an event worth
 /// reporting in its own right.
+///
+/// An empty stored name is not a rename. It is what [`ensure`] writes when the
+/// account was seen but never named, and filing `"" -> realname` in
+/// `username_history` would put a change that never happened into the table the
+/// monitor is meant to read.
 pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError> {
     let pk = pk_to_sql(u.pk);
     let now = now();
@@ -51,7 +81,7 @@ pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError>
     )?;
 
     match previous {
-        Some(old) if old != u.username => {
+        Some(old) if !old.is_empty() && old != u.username => {
             conn.execute(
                 "INSERT INTO username_history (pk, username, changed_at) VALUES (?1, ?2, ?3)",
                 params![pk, old, now],
@@ -106,6 +136,56 @@ mod tests {
             is_verified: Some(false),
             pfp_url: None,
         }
+    }
+
+    /// The sequence that used to corrupt a real name.
+    ///
+    /// A session stored without a username reaches `ensure`; a later run online
+    /// learns the name; a run with `--cache` reaches `ensure` again. The last
+    /// step used to write the numeric id over the name, so the account could no
+    /// longer be found by it and a rename that never happened was filed.
+    #[test]
+    fn a_run_that_does_not_know_the_name_never_overwrites_one() {
+        let db = Store::in_memory().unwrap();
+
+        ensure(db.conn(), 7).unwrap();
+        upsert(db.conn(), &user(7, "realname")).unwrap();
+        ensure(db.conn(), 7).unwrap();
+
+        assert_eq!(find(db.conn(), 7).unwrap().unwrap().username, "realname");
+        assert!(
+            previous_usernames(db.conn(), 7).unwrap().is_empty(),
+            "nothing was renamed, so nothing may be filed as a rename"
+        );
+    }
+
+    /// Learning the name for the first time is not a rename either: the empty
+    /// string is what `ensure` writes for "never knew it".
+    #[test]
+    fn learning_a_name_for_the_first_time_is_not_a_rename() {
+        let db = Store::in_memory().unwrap();
+        ensure(db.conn(), 7).unwrap();
+
+        assert_eq!(upsert(db.conn(), &user(7, "realname")).unwrap(), None);
+        assert!(previous_usernames(db.conn(), 7).unwrap().is_empty());
+
+        // A genuine rename still is one.
+        assert_eq!(
+            upsert(db.conn(), &user(7, "newname")).unwrap().as_deref(),
+            Some("realname")
+        );
+    }
+
+    /// The empty name must never be findable: it is a placeholder, not a
+    /// username, and matching it would hand back the wrong account.
+    #[test]
+    fn an_unnamed_account_cannot_be_looked_up_by_name() {
+        let db = Store::in_memory().unwrap();
+        ensure(db.conn(), 7).unwrap();
+        crate::store::accounts::upsert(db.conn(), 7, true).unwrap();
+
+        let found = crate::store::accounts::find_pk_by_username(db.conn(), "").unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]
