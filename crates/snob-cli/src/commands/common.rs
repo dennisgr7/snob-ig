@@ -16,6 +16,7 @@ use snob_core::secrets::SecretStore;
 use crate::app::App;
 use crate::cli::{Attr, Format, ListArgs};
 use crate::output::{self, Presentation, Rendered};
+use crate::ui;
 
 /// What opening a session produced.
 ///
@@ -38,7 +39,7 @@ pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<
     match App::open(secrets, paths, with_progress)? {
         Some(app) => Ok(Session::Open(Box::new(app))),
         None => {
-            eprintln!("No session stored. Run \"snob login\".");
+            ui::no_session();
             Ok(Session::Missing)
         }
     }

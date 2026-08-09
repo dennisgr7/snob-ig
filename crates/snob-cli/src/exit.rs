@@ -21,6 +21,23 @@ pub enum ExitCode {
 }
 
 impl ExitCode {
+    /// The stable token for this code, for machine-readable output.
+    ///
+    /// The same vocabulary as the table in the README, so a caller reading the
+    /// JSON and a caller reading `$?` are told the same thing by the same name.
+    /// It exists so nothing has to invent tokens inline, which is how two
+    /// spellings of one condition get shipped.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::NoSession => "no_session",
+            Self::Challenge => "challenge",
+            Self::RateLimited => "rate_limited",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
     pub fn from_ig_error(e: &IgError) -> Self {
         match e {
             IgError::SessionExpired | IgError::UserAgentMismatch => Self::NoSession,
