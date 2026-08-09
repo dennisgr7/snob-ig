@@ -96,9 +96,26 @@ fn mask(value: &str) -> String {
     format!("{}{tail} ({total})", "*".repeat(hidden))
 }
 
+/// Whether there is somebody at the keyboard to answer a question.
+///
+/// Deliberately weaker than [`is_interactive`]: it asks only about standard
+/// input, because a prompt whose *output* is redirected is still answerable.
+/// [`prompt_secret`] draws the line the same way, and the two questions
+/// `login --paste` asks must not disagree about whether anyone is there.
+pub fn can_be_asked() -> bool {
+    std::io::stdin().is_terminal()
+}
+
+/// Asks a question and reads one line back.
+///
+/// The prompt goes to standard error because it is not the result. On stdout it
+/// was swallowed by a redirect: `snob login --paste > out.txt` on a machine with
+/// no Chromium browser installed reaches `prompt_user_agent`, which wrote
+/// "User-Agent: " into the file and then blocked on stdin with nothing on
+/// screen. That reads as a hang.
 pub fn prompt_line(prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    std::io::stdout().flush().ok();
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin()
         .lock()

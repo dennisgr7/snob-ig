@@ -102,6 +102,9 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // The bar is finished before the `?`, not after it: `indicatif` leaves its
     // last line on screen when dropped, so an error used to print underneath a
     // spinner that had stopped spinning.
+    let subject = engine::target::label(&app, &args);
+    app.progress()
+        .begin(&report::walking(ListKind::Followers, &subject));
     let first = engine::list(&mut app, &args, ListKind::Followers).await;
     let (followers, followers_outcome) = match first {
         Ok(pair) => pair,
@@ -115,6 +118,8 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         return Err(e);
     }
 
+    app.progress()
+        .begin(&report::walking(ListKind::Following, &subject));
     let second = engine::list(&mut app, &args, ListKind::Following).await;
     app.progress().finish();
     let (following, following_outcome) = second?;

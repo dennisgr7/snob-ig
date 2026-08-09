@@ -194,6 +194,12 @@ pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
     .into()
 }
 
+/// "@someone followers" — what a run is walking, said the same way by every
+/// command that walks something.
+pub fn walking(kind: ListKind, subject: &str) -> String {
+    format!("{subject} {kind}")
+}
+
 /// "3 unfollowers", plus what took the others away when anything did.
 ///
 /// Three counts, because two things can shorten a list and they are not the
