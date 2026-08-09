@@ -326,7 +326,18 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
 ///
 /// `followed_by` is the count alone: a cell holding a list of names is a cell
 /// the next tool has to parse, and the JSON output is where the names live.
-const ROW_HEADER: [&str; 8] = [
+///
+/// The last four are `scan` earning an exception rather than csv being fixed.
+/// This is the one command whose entire output is derived numbers with no
+/// account list to sanity-check them against, and its rows get appended to a
+/// tracking spreadsheet over time — where two rows taken from one snapshot are
+/// indistinguishable from two taken a month apart without a date beside them.
+/// `--format json` has carried this since it existed; the row formats did not.
+///
+/// `requests` is deliberately not among them, for the same reason `followed_by`
+/// is only a count: it is a cost of the run rather than a fact about the data,
+/// and it is already on standard error.
+const ROW_HEADER: [&str; 12] = [
     "target",
     "filtered",
     "followers",
@@ -335,6 +346,10 @@ const ROW_HEADER: [&str; 8] = [
     "fans",
     "unfollowers",
     "followed_by",
+    "followers_source",
+    "followers_taken_at",
+    "following_source",
+    "following_taken_at",
 ];
 
 /// The count of people in common, or an empty cell when the question could not
@@ -352,6 +367,12 @@ fn row_fields(summary: &Summary<'_>) -> Vec<String> {
             .map(|n| n.to_string())
             .unwrap_or_default(),
     );
+    for outcome in [summary.followers, summary.following] {
+        fields.push(source_token(outcome.source()).to_string());
+        // Epoch seconds, matching the JSON — not `report::stored_on`, which is
+        // "03/08 at 14:12": a human string, and one with no year in it.
+        fields.push(outcome.taken_at.to_string());
+    }
     fields
 }
 
@@ -370,6 +391,13 @@ fn row_cells(summary: &Summary<'_>) -> Vec<Cell> {
         Some(n) => Cell::Number(n as f64),
         None => Cell::Empty,
     });
+    for outcome in [summary.followers, summary.following] {
+        cells.push(Cell::Text(source_token(outcome.source()).to_string()));
+        // A spreadsheet can hold a real date, and a column of epoch integers in
+        // one is unreadable. This is the one place the row formats diverge, and
+        // `xlsx.rs`'s claim that the two answer alike says so.
+        cells.push(Cell::DateTime(outcome.taken_at));
+    }
     cells
 }
 
@@ -423,6 +451,24 @@ mod tests {
             is_verified: Some(true),
             ..user(pk, name)
         }
+    }
+
+    /// The one data row of a single-row csv, parsed into fields.
+    ///
+    /// Parsed rather than matched against a literal: the row gains columns, and
+    /// a test that pins the whole line has to be rewritten every time it does —
+    /// which is how it stops testing anything and starts being edited to pass.
+    fn csv_field_at(csv: &str) -> Vec<String> {
+        csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes())
+            .records()
+            .next()
+            .expect("a data row")
+            .expect("a readable row")
+            .iter()
+            .map(str::to_string)
+            .collect()
     }
 
     fn outcome() -> ListOutcome {
@@ -603,11 +649,21 @@ mod tests {
         let csv = rendered_text(&summary(counts(), false, &outcomes), Format::Csv, false);
         let lines: Vec<_> = csv.lines().collect();
         assert_eq!(lines.len(), 2, "{csv}");
+        // The header is the contract, so it is checked whole — and the first
+        // eight columns keep their positions, which is what stops the four new
+        // ones from being a break for anything already reading this.
+        assert_eq!(lines[0], ROW_HEADER.join(","));
         assert_eq!(
-            lines[0],
+            ROW_HEADER[..8].join(","),
             "target,filtered,followers,following,friends,fans,unfollowers,followed_by"
         );
-        assert_eq!(lines[1], "someone,false,301,136,104,197,32,");
+        // Indexed rather than compared whole: the row grew four columns and a
+        // literal would have to be rewritten every time it grows again.
+        let row = csv_field_at(&csv);
+        assert_eq!(row[0], "someone");
+        assert_eq!(row[1], "false");
+        assert_eq!(&row[2..7], ["301", "136", "104", "197", "32"]);
+        assert_eq!(row[7], "", "nobody looked, so the cell is empty");
 
         let md = rendered_text(&summary(counts(), false, &outcomes), Format::Md, false);
         assert!(md.contains("@someone"), "{md}");
@@ -660,6 +716,29 @@ mod tests {
         assert!(text.contains("Account:      @someone"), "{text}");
     }
 
+    /// The row formats say the same thing about provenance that the JSON does.
+    /// `scan` is the one command whose whole output is derived numbers, so a
+    /// row appended to a tracking spreadsheet with no date beside it cannot be
+    /// told from one taken a month earlier.
+    #[test]
+    fn the_row_formats_carry_the_same_provenance_as_the_json() {
+        let outcomes = (outcome(), outcome());
+        let summary = summary(counts(), false, &outcomes);
+
+        let row = csv_field_at(&rendered_text(&summary, Format::Csv, false));
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered_text(&summary, Format::Json, false)).unwrap();
+
+        for (i, side) in [(8, "followers"), (10, "following")] {
+            assert_eq!(row[i], json["lists"][side]["source"].as_str().unwrap());
+            // Epoch seconds in both, so the two answer in one unit.
+            assert_eq!(
+                row[i + 1].parse::<i64>().unwrap(),
+                json["lists"][side]["taken_at"].as_i64().unwrap()
+            );
+        }
+    }
+
     /// Nobody in common is an answer, and it is not the same answer as having
     /// nothing to check against. The count says so; the line says nothing.
     #[test]
@@ -673,7 +752,11 @@ mod tests {
         assert!(text.starts_with("Account:"), "{text}");
 
         let csv = rendered_text(&summary, Format::Csv, false);
-        assert!(csv.lines().nth(1).unwrap().ends_with(",0"), "{csv}");
+        assert_eq!(
+            csv_field_at(&csv)[7],
+            "0",
+            "looked and found nobody, which is not the same as not having looked"
+        );
     }
 
     /// Not having looked is an empty cell, never a zero: a script must be able
@@ -684,7 +767,11 @@ mod tests {
         let unknown = summary(counts(), true, &outcomes);
 
         let csv = rendered_text(&unknown, Format::Csv, false);
-        assert!(csv.lines().nth(1).unwrap().ends_with(",32,"), "{csv}");
+        assert_eq!(
+            csv_field_at(&csv)[7],
+            "",
+            "not having looked is an empty cell, never a zero"
+        );
 
         let json = rendered_text(&unknown, Format::Json, false);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
