@@ -25,7 +25,7 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
     // No bar: three requests do not need one, and the picture goes to standard
     // output when there is no `-o`.
     let Some(app) = App::open(&secrets, paths, false)? else {
-        eprintln!("No session stored. Run \"snob login\".");
+        ui::no_session();
         return Ok(ExitCode::NoSession);
     };
 

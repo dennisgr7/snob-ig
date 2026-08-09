@@ -280,9 +280,12 @@ deliberately unfinished:
   crossed against a live list, and whether it belongs in the store at all.
   Shipping the subcommand would answer those by accident.
 - **The monitor** (`snob watch`, the scheduled service, snapshot diffs and
-  webhooks) is v2. The schema already reserves `events` and `webhook_queue`, and
-  `lost`/`gained` are reserved words for its temporal diff — `unfollowers` is the
-  static set and must never drift to mean `lost`.
+  webhooks) is v2. `lost`/`gained` are reserved words for its temporal diff —
+  `unfollowers` is the static set and must never drift to mean `lost`. The
+  table it will read is **`username_history`**, which exists and is written on
+  every walk; nothing consumes it yet, so it looks orphaned and is not. (This
+  used to claim the schema reserved `events` and `webhook_queue`. It does not:
+  neither table has ever been in `001_initial.sql`.)
 
 Not exercised live, and worth knowing before trusting either: a walk over a list
 of several thousand, and real behavior on a 429, which has never been provoked

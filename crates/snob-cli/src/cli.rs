@@ -163,11 +163,16 @@ pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
     pub target: Option<String>,
 
-    /// Hide accounts with these attributes
+    /// Hide accounts with any of these attributes
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub hide: Vec<Attr>,
 
-    /// Show only accounts with these attributes
+    /// Show only accounts with all of these attributes
+    // Written out because the two combine in opposite ways and used to be
+    // described as a symmetric pair: `--only verified,private` reads as "the
+    // verified ones and the private ones" and returns neither — it means
+    // verified AND private. See `Filter::allows` for why that is the useful
+    // reading of `only`.
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub only: Vec<Attr>,
 

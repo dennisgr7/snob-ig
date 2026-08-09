@@ -210,6 +210,16 @@ pub fn restore_terminal() {
     let _ = console::Term::stderr().show_cursor();
 }
 
+/// What every command says when there is no session, said once.
+///
+/// Three commands printed this line, byte for byte, hand-written, with a
+/// doc-comment in one of them claiming the copy was shared. It was not, and
+/// nothing pinned any of the three, so they could have drifted into three ways
+/// of describing one situation without a test noticing.
+pub fn no_session() {
+    eprintln!("No session stored. Run \"snob login\".");
+}
+
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }
