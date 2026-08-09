@@ -31,6 +31,10 @@ pub struct Progress {
     waiting_until: Deadline,
     /// Whether the steady tick is currently armed. Shared, like the bar.
     ticking: Arc<AtomicBool>,
+    /// Whether this terminal can draw block and braille characters. Worked out
+    /// once: it cannot change while the process runs, and it is read on every
+    /// style rebuild.
+    rich: bool,
 }
 
 /// How often the bar redraws itself. It is also how often the countdown moves.
@@ -44,7 +48,8 @@ impl Progress {
             ProgressBar::hidden()
         };
         let waiting_until: Deadline = Arc::new(Mutex::new(None));
-        bar.set_style(style_without_total(&waiting_until));
+        let rich = rich_glyphs();
+        bar.set_style(style_without_total(&waiting_until, rich));
 
         let progress = Self {
             // Asked from the bar, not taken from the flag. `indicatif` hides
@@ -57,8 +62,24 @@ impl Progress {
             bar,
             waiting_until,
             ticking: Arc::new(AtomicBool::new(false)),
+            rich,
         };
         progress.animate();
+        progress
+    }
+
+    /// A bar that draws nowhere but still behaves as though it draws.
+    ///
+    /// **Tests only.** `Progress::new(true)` would decide `quiet` from whatever
+    /// stderr the harness happens to have — hidden on CI, a real terminal when
+    /// somebody runs `cargo test` in one — so a test built on it asserts a
+    /// different thing depending on where it runs. This fixes the drawing path
+    /// without a terminal: `indicatif` tracks prefix, message and position on a
+    /// hidden bar just the same.
+    #[cfg(test)]
+    fn drawing() -> Self {
+        let mut progress = Self::new(false);
+        progress.quiet = false;
         progress
     }
 
@@ -121,14 +142,16 @@ impl Progress {
                 match estimated {
                     Some(total) => {
                         self.bar.set_length(*total);
-                        self.bar.set_style(style_with_total(&self.waiting_until));
+                        self.bar
+                            .set_style(style_with_total(&self.waiting_until, self.rich));
                     }
                     // Not "leave it as it was": after a list that had a total,
                     // that would keep drawing `{pos}/{len}` against the
                     // previous list's length.
                     None => {
                         self.bar.unset_length();
-                        self.bar.set_style(style_without_total(&self.waiting_until));
+                        self.bar
+                            .set_style(style_without_total(&self.waiting_until, self.rich));
                     }
                 }
 
@@ -149,8 +172,14 @@ impl Progress {
                     self.bar.set_length(running_total);
                 }
                 self.bar.set_position(running_total);
-                self.bar
-                    .set_message(format!("page {number}, {running_total} accounts"));
+                // With a total on screen the running count is already the left
+                // half of the fraction, and saying it again put the same number
+                // twice on one line.
+                self.bar.set_message(if self.bar.length().is_some() {
+                    format!("page {number}")
+                } else {
+                    format!("page {number}, {running_total} accounts")
+                });
                 // A page arriving is the wait being over.
                 self.set_deadline(None);
             }
@@ -183,6 +212,26 @@ impl Progress {
                 self.set_deadline(None);
                 self.ticking.store(false, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Names what is being walked, for as long as it is being walked.
+    ///
+    /// The prefix rather than the message, because the message is transient: it
+    /// is overwritten by the next page and by every pause. Set before
+    /// `engine::list`, so it is up during consent, resolution and the counter
+    /// poll — the seconds where the bar otherwise says nothing at all.
+    ///
+    /// It is a label, not a claim: `engine::list` can answer out of storage
+    /// without walking anything, in which case the name flashes and `finish`
+    /// clears it. `snob scan someone` walks four lists in a row, and without
+    /// this every one of them looked identical.
+    pub fn begin(&self, subject: &str) {
+        self.animate();
+        if self.quiet {
+            eprintln!("walking {subject}");
+        } else {
+            self.bar.set_prefix(subject.to_string());
         }
     }
 
@@ -225,23 +274,71 @@ impl Progress {
 /// Named rather than written inline, because the fallback below swallows a
 /// broken one: a typo here would not fail, it would quietly draw indicatif's
 /// default bar with no countdown in it and nobody would know why. A test
-/// checks that both of these parse.
-const TEMPLATE_WITHOUT_TOTAL: &str = "{spinner} {msg}{countdown}";
+/// checks that both of these parse and that neither has lost a key.
+///
+/// `{prefix}` is what the run is walking and stays put; `{msg}` is what is
+/// happening right now and is overwritten by every page and every pause. Both
+/// templates carry both, because a pause has to be sayable whichever one is up
+/// — and the one with a total is the common case, since the counter poll
+/// usually supplies a length.
+const TEMPLATE_WITHOUT_TOTAL: &str = "{spinner:.cyan} {prefix} {msg}{countdown}";
 /// No percentage and no ETA: the total comes from a counter that can lie, and a
 /// bar going past one hundred percent looks worse than no bar at all.
-const TEMPLATE_WITH_TOTAL: &str = "{bar:30} {pos}/{len} {msg}{countdown}";
+///
+/// `{bar:30}` rather than `{wide_bar}`: the prefix is a username, so it changes
+/// width between the two lists of a crossing, and a bar measured against the
+/// remaining space would change width with it.
+const TEMPLATE_WITH_TOTAL: &str =
+    "{prefix} {bar:30.cyan/blue} {human_pos}/{human_len} {msg}{countdown}";
 
-fn style_without_total(deadline: &Deadline) -> ProgressStyle {
-    ProgressStyle::with_template(TEMPLATE_WITHOUT_TOTAL)
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .with_key("countdown", countdown(deadline))
+/// Whether stderr can be trusted with block and braille characters.
+///
+/// A deny-list, not an allow-list, and that is the whole design. `console`'s
+/// own `wants_emoji` answers this on Windows with `WT_SESSION.is_ok()`, which
+/// is false in VS Code's terminal, in Git Bash and in WezTerm — all three of
+/// which draw braille perfectly well. The terminals that genuinely cannot are
+/// countable: the Linux kernel console, which sets a UTF-8 locale and then
+/// draws from a 512-glyph font, `dumb`, and anything that is not a terminal.
+fn rich_glyphs() -> bool {
+    if !console::Term::stderr().features().is_attended() {
+        return false;
+    }
+    !matches!(std::env::var("TERM").as_deref(), Ok("linux" | "dumb"))
 }
 
-fn style_with_total(deadline: &Deadline) -> ProgressStyle {
+/// The spinner frames. The last one is the "finished" frame and is not part of
+/// the cycle, which is why both lists end in a space.
+fn tick_chars(rich: bool) -> &'static str {
+    if rich {
+        "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "
+    } else {
+        r"|/-\ "
+    }
+}
+
+/// Filled, partial, empty. Every entry has to be one column wide or indicatif
+/// panics mid-walk, which is why the test builds both styles both ways.
+fn progress_chars(rich: bool) -> &'static str {
+    if rich {
+        "█▉▊▋▌▍▎▏ "
+    } else {
+        "=> "
+    }
+}
+
+fn style_without_total(deadline: &Deadline, rich: bool) -> ProgressStyle {
+    ProgressStyle::with_template(TEMPLATE_WITHOUT_TOTAL)
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .tick_chars(tick_chars(rich))
+        .with_key("countdown", countdown(deadline, rich))
+}
+
+fn style_with_total(deadline: &Deadline, rich: bool) -> ProgressStyle {
     ProgressStyle::with_template(TEMPLATE_WITH_TOTAL)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("=> ")
-        .with_key("countdown", countdown(deadline))
+        .tick_chars(tick_chars(rich))
+        .progress_chars(progress_chars(rich))
+        .with_key("countdown", countdown(deadline, rich))
 }
 
 /// Renders the time left in the current wait, or nothing at all.
@@ -249,8 +346,9 @@ fn style_with_total(deadline: &Deadline) -> ProgressStyle {
 /// Called by the bar on every redraw, which is what makes the number move. It
 /// holds the lock for the length of a subtraction, several times a second, and
 /// nothing else contends for it.
-fn countdown(deadline: &Deadline) -> impl ProgressTracker + 'static {
+fn countdown(deadline: &Deadline, rich: bool) -> impl ProgressTracker + 'static {
     let deadline = Arc::clone(deadline);
+    let dash = if rich { " — " } else { " - " };
     move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
         let Some(end) = *deadline.lock().unwrap_or_else(|e| e.into_inner()) else {
             return;
@@ -259,7 +357,7 @@ fn countdown(deadline: &Deadline) -> impl ProgressTracker + 'static {
         if left.is_zero() {
             return;
         }
-        let _ = write!(w, " — {} s", seconds_left(left));
+        let _ = write!(w, "{dash}{} s", seconds_left(left));
     }
 }
 
@@ -286,6 +384,90 @@ mod tests {
                 "{template} does not parse, so the bar would silently lose it"
             );
         }
+    }
+
+    /// Parsing is not enough: a template that lost a key still parses, and the
+    /// thing it lost would simply stop appearing with no test noticing.
+    #[test]
+    fn both_templates_keep_every_key_they_need() {
+        for template in [TEMPLATE_WITHOUT_TOTAL, TEMPLATE_WITH_TOTAL] {
+            assert!(
+                template.contains("{countdown}"),
+                "{template} lost the countdown"
+            );
+            assert!(
+                template.contains("{msg}"),
+                "{template} lost the pause announcement"
+            );
+            assert!(
+                template.contains("{prefix}"),
+                "{template} lost the name of what is being walked"
+            );
+        }
+    }
+
+    /// `progress_chars` panics at run time on entries of unequal width, and it
+    /// would do it mid-walk. Both sets get built both ways here instead.
+    #[test]
+    fn every_glyph_set_builds() {
+        let deadline: Deadline = Arc::new(Mutex::new(None));
+        for rich in [true, false] {
+            let _ = style_without_total(&deadline, rich);
+            let _ = style_with_total(&deadline, rich);
+        }
+    }
+
+    /// `snob scan someone` walks four lists in a row and every bar looked the
+    /// same. The name goes in the prefix rather than the message because the
+    /// message is overwritten by the next page and by every pause.
+    #[test]
+    fn the_bar_says_what_it_is_walking_and_keeps_saying_it() {
+        let p = Progress::drawing();
+        p.begin("@someone followers");
+        assert_eq!(p.bar.prefix(), "@someone followers");
+
+        // A page and a pause both replace the message, and neither touches it.
+        p.event(&Event::Page {
+            number: 1,
+            running_total: 50,
+            added: 50,
+            received: 50,
+        });
+        p.waiting("pausing", Duration::from_secs(5));
+        assert_eq!(p.bar.prefix(), "@someone followers");
+
+        // The second list of a crossing renames it.
+        p.begin("@someone following");
+        assert_eq!(p.bar.prefix(), "@someone following");
+    }
+
+    /// With a total on screen the fraction already says the running count, so
+    /// saying it again put the same number twice on one line.
+    #[test]
+    fn the_running_count_is_not_printed_beside_the_fraction() {
+        let p = Progress::new(false);
+        let page = Event::Page {
+            number: 7,
+            running_total: 350,
+            added: 50,
+            received: 50,
+        };
+
+        p.event(&Event::Started {
+            estimated: Some(400),
+            resumed: false,
+        });
+        p.event(&page);
+        assert_eq!(p.bar.message(), "page 7");
+
+        // With no total there is no fraction, so the count is the only place
+        // the number appears.
+        p.event(&Event::Started {
+            estimated: None,
+            resumed: false,
+        });
+        p.event(&page);
+        assert_eq!(p.bar.message(), "page 7, 350 accounts");
     }
 
     /// Rounded up, so the last fraction of a wait reads as `1 s` and then goes

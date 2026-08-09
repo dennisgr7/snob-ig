@@ -64,6 +64,18 @@ pub fn clean(typed: &str) -> &str {
     typed.trim_start_matches('@')
 }
 
+/// How to name the account a run is about, before anything has resolved it.
+///
+/// The typed name when there is one, the viewer's own label otherwise. It goes
+/// through `printable` because it is drawn on a terminal and `clean` only
+/// strips the at sign.
+pub fn label(app: &App, args: &ListArgs) -> String {
+    match args.target.as_deref() {
+        Some(raw) => format!("@{}", snob_core::model::printable(clean(raw))),
+        None => app.viewer().label(),
+    }
+}
+
 /// Resolves against Instagram, spending one request when a name was given.
 ///
 /// A private account the viewer does not follow is refused **here**, before a

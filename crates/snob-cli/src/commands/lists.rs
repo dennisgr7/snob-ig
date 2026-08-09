@@ -29,6 +29,12 @@ pub async fn run(
         return Ok(ExitCode::NoSession);
     };
 
+    // Named before the engine runs, so the bar says what it is about during
+    // consent, resolution and the counter poll rather than only once pages
+    // start arriving.
+    let subject = engine::target::label(&app, &args);
+    app.progress().begin(&report::walking(kind, &subject));
+
     let result = engine::list(&mut app, &args, kind).await;
     app.progress().finish();
     let (found, outcome) = result?;

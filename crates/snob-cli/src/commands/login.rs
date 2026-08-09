@@ -433,6 +433,24 @@ fn resolve_user_agent() -> Result<ChosenAgent> {
 /// thing the user can do — so what comes back is pinned. Following a browser's
 /// updates makes no sense for a string we could not have produced ourselves.
 fn prompt_user_agent() -> Result<ChosenAgent> {
+    // The one prompt in the command with no guard on it. `echo "$SESSIONID" |
+    // snob login --paste` on a server with no browser installed reached here,
+    // fed the piped sessionid in as the User-Agent, and then failed with a
+    // message about the User-Agent — never mentioning that the thing it had
+    // eaten was the credential.
+    if !ui::can_be_asked() {
+        bail!(
+            "there is no browser installed to take a User-Agent from, and no terminal \
+             to ask for one at.\n\
+             Give it explicitly, for example:\n\
+            \x20   snob login --paste --user-agent \"Mozilla/5.0 (X11; Linux x86_64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36\"\n\
+             Copy the whole \"User Agent\" line from about:version in the browser your \
+             Instagram session is in. The sessionid can still be piped in on standard \
+             input."
+        );
+    }
+
     eprintln!(
         "\n\
          In the address bar of the browser your session is in, go to:\n\

@@ -96,6 +96,9 @@ pub async fn run(
     // last line on screen when it is dropped, so a run that ends in a cooldown
     // refusal or a private account used to print the error underneath a
     // spinner that had stopped spinning. `lists` already does it this way.
+    let subject = engine::target::label(&app, &args);
+    app.progress()
+        .begin(&report::walking(op.against(), &subject));
     let first = engine::list(&mut app, &args, op.against()).await;
     let (against, against_outcome) = match first {
         Ok(pair) => pair,
@@ -109,6 +112,9 @@ pub async fn run(
         return Err(e);
     }
 
+    // The second walk renames the bar: a crossing is two lists, and without
+    // this the slower half looked exactly like the first.
+    app.progress().begin(&report::walking(op.base(), &subject));
     let second = engine::list(&mut app, &args, op.base()).await;
     app.progress().finish();
     let (base, base_outcome) = second?;
