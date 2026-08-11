@@ -25,7 +25,8 @@ pub async fn fetch(
     target: &Target,
     declared: Option<u64>,
 ) -> Result<(Vec<User>, ListOutcome)> {
-    let (id, cursor, already_stored) = open_snapshot(app, args, kind, target, declared)?;
+    let opened = open_snapshot(app, args, kind, target, declared)?;
+    let id = opened.id;
 
     let request = ListRequest {
         pk: target.pk,
@@ -36,10 +37,10 @@ pub async fn fetch(
         // no browser would ever have been on.
         username: target.username.as_deref().unwrap_or_default(),
         direction: kind.into(),
-        from: cursor.as_deref(),
+        from: opened.cursor.as_deref(),
         estimated: declared,
         max_pages: args.max_pages,
-        already_stored,
+        already_stored: opened.already_stored,
     };
 
     let cancel = app.cancel().clone();
@@ -108,11 +109,29 @@ pub async fn fetch(
             reason: summary.reason,
             // Filled in by `engine::list` from the pacer.
             requests: 0,
+            started_at: opened.started_at,
             taken_at: now(),
             account_pk: target.pk,
             stopped_by,
         },
     ))
+}
+
+/// The snapshot this walk will fill, and what is already known about it.
+///
+/// A struct rather than a tuple because the fourth field is what tipped it: two
+/// of them are now numbers, and `(i64, i64, Option<String>, usize)` at a call
+/// site says nothing about which is which.
+struct Opened {
+    id: i64,
+    /// Read from the row rather than taken now, so a resumed walk keeps the
+    /// moment its **first** page was asked for. That is the honest start of the
+    /// interval this list covers: it does reflect everything from that page
+    /// onward, and `snapshots::RESUME_WINDOW_SECS` has already decided a pause
+    /// of that length is one capture.
+    started_at: i64,
+    cursor: Option<String>,
+    already_stored: usize,
 }
 
 /// Continues an interrupted walk when one is still usable, and starts a fresh
@@ -124,7 +143,7 @@ fn open_snapshot(
     kind: ListKind,
     target: &Target,
     declared: Option<u64>,
-) -> Result<(i64, Option<String>, usize)> {
+) -> Result<Opened> {
     let conn = app.db().conn();
 
     let pending = if args.no_resume {
@@ -135,13 +154,20 @@ fn open_snapshot(
 
     if let Some(snapshot) = pending {
         snapshots::mark_resumed(conn, snapshot.id)?;
-        return Ok((
-            snapshot.id,
-            snapshot.next_cursor,
-            snapshot.member_count as usize,
-        ));
+        return Ok(Opened {
+            id: snapshot.id,
+            started_at: snapshot.started_at,
+            cursor: snapshot.next_cursor,
+            already_stored: snapshot.member_count as usize,
+        });
     }
 
     snapshots::delete_partials(conn, target.pk, kind)?;
-    Ok((snapshots::begin(conn, target.pk, kind, declared)?, None, 0))
+    let fresh = snapshots::begin(conn, target.pk, kind, declared)?;
+    Ok(Opened {
+        id: fresh.id,
+        started_at: fresh.started_at,
+        cursor: None,
+        already_stored: 0,
+    })
 }

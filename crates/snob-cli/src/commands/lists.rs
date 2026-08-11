@@ -120,6 +120,7 @@ mod tests {
             },
             reason,
             requests: 1,
+            started_at: 0,
             taken_at: 0,
             account_pk: 1,
             stopped_by: None,

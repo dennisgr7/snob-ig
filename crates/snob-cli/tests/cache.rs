@@ -490,3 +490,73 @@ async fn a_named_target_is_asked_about_once() {
     // single page.
     assert_eq!(outcome.requests, 2);
 }
+
+/// A crossing walked in one run has to still be crossable when it is read back.
+///
+/// This is the user-visible half of the same-moment rule, and the wiring is
+/// what it checks: the two `started_at` values have to travel from the stored
+/// rows into the outcomes, or the rule is right and never gets told.
+///
+/// The dates are back-dated to what a real account produces. `taken_at` is when
+/// a walk **finished**, and walking six thousand accounts takes about twenty
+/// minutes at the documented pace — so the two lists of one perfectly good
+/// `snob unfollowers` run finish far more than fifteen minutes apart. Comparing
+/// finishing times refused exactly that pair, every time it was read back with
+/// `--cache`, with an answer that was correct sitting in the database.
+#[tokio::test]
+async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 30).await;
+    mount_list(&server, 30).await;
+    mount_following(&server, 30).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    execute(&server, tmp.path(), &args()).await.unwrap();
+    let mut following_args = args();
+    following_args.cache = false;
+    {
+        let mut app = app(&server, open_db(tmp.path()));
+        engine::list(&mut app, &following_args, ListKind::Following)
+            .await
+            .unwrap();
+    }
+
+    // One run of a real size: followers from 0 to +400, following from +400 to
+    // +1600. Nothing happened in between, and the finishing times are 1200
+    // seconds apart.
+    {
+        let db = open_db(tmp.path());
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET started_at = 1000, taken_at = 1400 WHERE kind = 'followers'",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET started_at = 1400, taken_at = 2600 WHERE kind = 'following'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let mut cached = args();
+    cached.cache = true;
+    let (_, followers) = execute(&server, tmp.path(), &cached).await.unwrap();
+    let following = {
+        let mut app = app(&server, open_db(tmp.path()));
+        engine::list(&mut app, &cached, ListKind::Following)
+            .await
+            .unwrap()
+            .1
+    };
+
+    assert_eq!(followers.provenance, Provenance::CacheFlag);
+    assert_eq!(following.provenance, Provenance::CacheFlag);
+    assert!(
+        (following.taken_at - followers.taken_at).abs() > 900,
+        "the finishing times are far apart; that is the shape being tested"
+    );
+    check_same_moment(&followers, &following)
+        .expect("the two walks touched, so nothing happened that only one of them saw");
+}

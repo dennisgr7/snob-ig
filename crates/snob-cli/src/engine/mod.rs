@@ -17,7 +17,7 @@ pub mod walk;
 use anyhow::{Result, bail};
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::store::{accounts, users};
+use snob_core::store::{accounts, snapshots, users};
 
 use crate::app::App;
 use crate::cli::ListArgs;
@@ -94,6 +94,16 @@ pub struct ListOutcome {
     pub provenance: Provenance,
     pub reason: StopReason,
     pub requests: u32,
+    /// When the walk that produced this list **began**.
+    ///
+    /// Half of an interval, and the half that used to be missing. A list is not
+    /// an instant: walking six thousand accounts at the documented pace takes
+    /// twenty minutes, and every question about whether two lists describe one
+    /// moment is really about the time between the two walks rather than
+    /// between the two moments they happened to finish at.
+    pub started_at: i64,
+    /// When it finished. The date shown to a person, and the one the store
+    /// orders by.
     pub taken_at: i64,
     /// Whose list this is.
     ///
@@ -120,7 +130,14 @@ impl ListOutcome {
     /// The provenance is not defaulted here. Every caller has to say which of
     /// the three storage paths it is, because getting that wrong is the whole
     /// of the bug this argument exists to prevent.
-    pub(crate) fn cached(account_pk: Pk, taken_at: i64, provenance: Provenance) -> Self {
+    ///
+    /// The row itself rather than three fields picked out of it. Two of them
+    /// are epoch seconds in the same unit and would sit next to each other in
+    /// every call, which is one transposition away from a list claiming to have
+    /// finished before it started; and the account id used to come from the
+    /// caller while the members came from the row, which is a second pair that
+    /// could disagree.
+    pub(crate) fn cached(snapshot: &snapshots::Snapshot, provenance: Provenance) -> Self {
         debug_assert!(
             !matches!(provenance, Provenance::Walked),
             "a stored list was not walked"
@@ -131,8 +148,12 @@ impl ListOutcome {
             // Filled in by `list`, which is the only place that sees the whole
             // run and can ask the pacer what it really charged.
             requests: 0,
-            taken_at,
-            account_pk,
+            started_at: snapshot.started_at,
+            // The view this comes from cannot return an open snapshot, so the
+            // fallback is unreachable. It used to be written out at all three
+            // call sites.
+            taken_at: snapshot.taken_at.unwrap_or_default(),
+            account_pk: snapshot.account_pk,
             stopped_by: None,
         }
     }
@@ -252,11 +273,7 @@ async fn decide(
             // `--cache` is a promise not to spend a request, so nothing here
             // checked whether the stored list is still true. That is exactly
             // what makes it unsafe to cross against another one.
-            ListOutcome::cached(
-                target.pk,
-                snapshot.taken_at.unwrap_or_default(),
-                Provenance::CacheFlag,
-            ),
+            ListOutcome::cached(&snapshot, Provenance::CacheFlag),
         ));
     }
 
@@ -372,8 +389,25 @@ mod tests {
 
     #[test]
     fn a_cached_outcome_is_complete_by_construction() {
-        let outcome = ListOutcome::cached(7, 0, Provenance::CounterVerified);
+        let snapshot = snapshots::Snapshot {
+            id: 1,
+            account_pk: 7,
+            kind: ListKind::Followers,
+            started_at: 0,
+            taken_at: Some(0),
+            complete: true,
+            member_count: 0,
+            declared_count: None,
+            pages: 0,
+            requests: 0,
+            next_cursor: None,
+            resumes: 0,
+        };
+        let outcome = ListOutcome::cached(&snapshot, Provenance::CounterVerified);
         assert!(outcome.is_complete());
         assert_eq!(outcome.source(), ResultSource::Cached);
+        // Both ends of the interval come off the row, so they cannot disagree
+        // with the members read from the same one.
+        assert_eq!(outcome.account_pk, 7);
     }
 }

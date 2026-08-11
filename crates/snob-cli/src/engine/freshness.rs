@@ -36,7 +36,7 @@ pub async fn decide_and_fetch(
                 // Served, but with nothing said about whether it is still
                 // true. It is fine to print; it is not fine to cross against
                 // another list, and only the provenance can carry that.
-                return serve(app, target, snapshot, Provenance::PollFailed);
+                return serve(app, snapshot, Provenance::PollFailed);
             }
             app.warn(&format!("could not read the profile ({e})"));
             None
@@ -50,7 +50,7 @@ pub async fn decide_and_fetch(
         // The counter was polled just now and had not moved, so this describes
         // the account as it is however old the snapshot is. That is what makes
         // it safe to cross.
-        return serve(app, target, snapshot, Provenance::CounterVerified);
+        return serve(app, snapshot, Provenance::CounterVerified);
     }
 
     walk::fetch(app, args, kind, target, declared).await
@@ -72,13 +72,12 @@ fn is_still_good(snapshot: &snapshots::Snapshot, declared: Option<u64>, max_age_
 
 fn serve(
     app: &App,
-    target: &Target,
     snapshot: &snapshots::Snapshot,
     provenance: Provenance,
 ) -> Result<(Vec<User>, ListOutcome)> {
     Ok((
         snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), provenance),
+        ListOutcome::cached(snapshot, provenance),
     ))
 }
 
