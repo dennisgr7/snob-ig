@@ -160,6 +160,22 @@ fn remove_if_empty(dir: Option<&Path>) {
 }
 
 pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<ExitCode> {
+    run_with(args, store, app_paths, ui::can_be_asked())
+}
+
+/// Split from [`run`] so a test can say whether anybody is there.
+///
+/// **The fourth argument is for tests only.** Being a terminal is a property of
+/// the process's streams, and a test binary inherits whatever the suite was
+/// started from — so the one refusal here that depends on it would otherwise be
+/// pinned by a test that passes or fails according to who ran it.
+#[doc(hidden)]
+pub fn run_with(
+    args: PurgeArgs,
+    store: SecretStore,
+    app_paths: &AppPaths,
+    someone_is_there: bool,
+) -> Result<ExitCode> {
     let plan = survey(&store, app_paths);
 
     if plan.is_empty() {
@@ -189,7 +205,10 @@ pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<
     // `--yes` remains the way to do it unattended, and it has to be typed on
     // purpose, which is the right way round for the only command here that
     // destroys anything.
-    if !args.yes && !ui::is_interactive() {
+    // The same predicate `confirm` gates on, deliberately: two questions about
+    // whether anybody is there, asked differently, is how one of them starts
+    // answering for a person who is sitting right in front of it.
+    if !args.yes && !someone_is_there {
         ui::info(
             "There is no terminal to confirm at, so nothing was deleted.\n\
              To delete it unattended, run \"snob purge --yes\".",

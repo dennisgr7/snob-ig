@@ -181,6 +181,14 @@ becomes one name per line down a pipe, and the output format defaults to JSON.
 The login **method** must be given explicitly there (`--paste`), since there is
 no menu to show.
 
+**Redirecting the results does not turn a question into a refusal.** Every
+prompt is written to standard error and answered on standard input, so
+`ui::can_be_asked` asks about standard input alone and nothing gates on standard
+output. `snob scan someone | jq` is a supported shape and used to stop at the
+consent question with exit 130. The one exception is `ui::can_show_a_menu`,
+which also needs standard **error** to be a terminal, because that is where
+`dialoguer` draws — not standard output, which no prompt here touches.
+
 Two judgement calls worth understanding before touching them:
 
 - **`truncated()` in `pager.rs`** decides whether a short list means the counter
