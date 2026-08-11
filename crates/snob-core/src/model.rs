@@ -25,9 +25,36 @@ pub struct User {
     pub pfp_url: Option<String>,
 }
 
+/// What may sit in a path segment unescaped: RFC 3986's unreserved set, which
+/// contains every character Instagram lets a username be made of.
+const IN_A_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
 impl User {
+    /// The address of this account, with the name encoded into it.
+    ///
+    /// **Encoded rather than filtered, and the reason is not the terminal.**
+    /// This string lands in the URL slot of an OSC 8 sequence, in a markdown
+    /// link destination and in a spreadsheet hyperlink, and [`printable`] would
+    /// keep all three safe — but it *removes* characters, and a name with one
+    /// removed is the address of a **different account**, which may well exist.
+    /// A link that quietly points at somebody else is worse than one that does
+    /// not work, because nothing on screen says anything happened.
+    ///
+    /// Percent-encoding cannot do that. It is the identity on the alphabet
+    /// Instagram allows, so ordinary names come out byte for byte as they did
+    /// before, and anything else round-trips instead of resolving elsewhere.
+    /// It also closes the hole this had: an `ESC` in a username ended the OSC 8
+    /// sequence early and let the rest of the name open one of its own, so the
+    /// cell showed a filtered name and pointed wherever the name said.
     pub fn profile_url(&self) -> String {
-        format!("https://www.instagram.com/{}/", self.username)
+        format!(
+            "https://www.instagram.com/{}/",
+            percent_encoding::utf8_percent_encode(&self.username, IN_A_PATH)
+        )
     }
 
     /// The full name with control characters taken out, for anything a
@@ -189,6 +216,59 @@ impl StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(username: &str) -> User {
+        User {
+            pk: 1,
+            username: username.to_string(),
+            full_name: None,
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        }
+    }
+
+    /// Encoding has to be the identity on the alphabet Instagram allows, or
+    /// every link in every export changes for no reason.
+    #[test]
+    fn an_ordinary_name_comes_out_of_the_link_unchanged() {
+        assert_eq!(
+            named("some.user_1-x").profile_url(),
+            "https://www.instagram.com/some.user_1-x/"
+        );
+    }
+
+    /// The hole this closes. The address goes into the URL slot of an OSC 8
+    /// sequence and into a markdown link destination, and an `ESC` there ended
+    /// the sequence early: the cell showed a filtered name and pointed wherever
+    /// the unfiltered one said.
+    #[test]
+    fn a_name_cannot_break_out_of_the_link_it_is_put_in() {
+        let url = named("a\x1b\\\x1b]8;;http://evil.test\x1b\\Official").profile_url();
+
+        assert!(!url.contains('\x1b'), "an escape survived: {url}");
+        assert!(!url.contains(']'), "a sequence introducer survived: {url}");
+        assert!(
+            !url.contains("evil.test/"),
+            "the second address is still a path of its own: {url}"
+        );
+    }
+
+    /// Why this encodes instead of filtering. `printable` would remove the
+    /// slashed o, and `/sren/` is somebody else's account — one that may well
+    /// exist. A link quietly pointing at the wrong person is worse than a
+    /// broken one, because nothing says it happened.
+    ///
+    /// The letter is Danish rather than Spanish so that the language guard has
+    /// nothing to say about it. Which letter it is does not matter here; that
+    /// it is not ASCII does.
+    #[test]
+    fn an_accent_still_points_at_the_same_account() {
+        assert_eq!(
+            named("søren").profile_url(),
+            "https://www.instagram.com/s%C3%B8ren/"
+        );
+    }
 
     #[test]
     fn only_a_full_walk_yields_a_complete_list() {
