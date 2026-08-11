@@ -92,12 +92,12 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p snob-cli
 
       # Every runner here is native, so this really runs the binary being
       # shipped rather than checking that a file exists.
       - name: Check the binary runs
-        run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+        run: cargo run --release --locked --target ${{ matrix.target }} -p snob-cli -- --version
 
       # Two archive formats because the platforms disagree about what is
       # ordinary: a .tar.gz keeps the executable bit that a .zip would lose on
