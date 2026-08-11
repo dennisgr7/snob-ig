@@ -92,6 +92,13 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
 pub struct Failure {
     pub what: String,
     pub why: String,
+    /// Whether this is the credential rather than a directory of stored data.
+    ///
+    /// A purge that leaves a browser profile behind has failed at housekeeping;
+    /// one that leaves the session behind has failed at the only thing it
+    /// exists for. The two do not deserve the same closing sentence, and a
+    /// field says which is which without anyone matching on [`Failure::what`].
+    pub credential: bool,
 }
 
 /// Deletes what the plan describes and returns whatever refused to go.
@@ -108,6 +115,7 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
         failures.push(Failure {
             what: "the stored session".to_string(),
             why: e.to_string(),
+            credential: true,
         });
     }
 
@@ -116,6 +124,7 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
             failures.push(Failure {
                 what: dir.display().to_string(),
                 why: e.to_string(),
+                credential: false,
             });
         }
     }
@@ -219,7 +228,18 @@ pub fn run(args: PurgeArgs, store: SecretStore, app_paths: &AppPaths) -> Result<
         ));
     }
 
-    if plan.session {
+    // The credential is the point of this command, so a refusal there is not
+    // one more line in the warning list. It also decides which closing sentence
+    // is true: "the session is still active on Instagram" says the only thing
+    // left is Instagram's side, which is the false half of the message when the
+    // copy on this computer is what would not go.
+    let session_survived = failures.iter().any(|f| f.credential);
+    if session_survived {
+        ui::warn(
+            "the stored session is still on this computer. Removing it is what this command \
+             exists for, so treat the rest of this run as not done.",
+        );
+    } else if plan.session {
         // What logout says, for the same reason: nothing was closed on
         // Instagram's side, because closing it would be a write.
         ui::info(

@@ -11,6 +11,7 @@
 
 use snob_cli::cli::PurgeArgs;
 use snob_cli::commands::purge;
+use snob_cli::exit::ExitCode;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_core::session::{Session, SessionOrigin};
@@ -143,4 +144,41 @@ fn a_corrupt_session_is_still_something_to_remove() {
 
     purge::run(purge_now(), store, &paths).unwrap();
     assert!(!paths.session_file().exists());
+}
+
+/// A session that would not go is the one failure this command cannot report as
+/// success.
+///
+/// `SecretStore::delete` used to discard the keyring's answer, so a refusal
+/// there reached `execute` as `Ok` and `run` printed "snob's files are gone from
+/// this computer" and exited 0 over a live cookie. An uninstall script keyed on
+/// that code then carried on to remove the binary. The keyring branch cannot be
+/// driven from a test, but it and the file branch return through the same place,
+/// which is what this pins — along with the other half: the database goes even
+/// though the credential refused.
+/// A directory standing where the session file goes is how the refusal is
+/// arranged: `remove_file` fails on one everywhere, unlike a permission bit.
+#[test]
+fn a_session_that_will_not_go_is_reported_and_the_exit_is_not_zero() {
+    let (_tmp, paths, store) = setup("refused");
+    populate(&paths, &store);
+
+    let holding = paths.session_file();
+    std::fs::remove_file(&holding).unwrap();
+    std::fs::create_dir(&holding).unwrap();
+
+    assert!(
+        purge::survey(&store, &paths).session,
+        "a session that cannot be read is still one to remove"
+    );
+
+    let error = purge::run(purge_now(), store, &paths)
+        .expect_err("a credential that survived is not a success");
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Error));
+
+    // And the other half: one item refusing does not spare the rest. The
+    // browser profile holds a logged-in session of its own, so leaving it
+    // because the keyring said no would be a second credential kept alive by
+    // the first one's failure.
+    assert!(!paths.browser_profile().exists());
 }
