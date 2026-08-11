@@ -62,7 +62,7 @@ pub fn serve(
 
     Ok((
         snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(pk, taken_at, Provenance::Cooldown),
+        ListOutcome::cached(&snapshot, Provenance::Cooldown),
     ))
 }
 
@@ -76,7 +76,9 @@ pub fn serve(
 ///
 /// Stitching two distant moments together invents arrivals and departures that
 /// never happened, which is the failure this whole tool is built not to have.
-/// The bound is the resume window, for the same reason it bounds that.
+///
+/// What is measured is the time **between** the two walks, not between the two
+/// moments they finished at. See [`gap_between`].
 pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
     // Both sides have to carry evidence, not just neither side being a
     // cooldown. This used to ask the second question, and two of the three
@@ -86,7 +88,7 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
     if a.provenance.describes_now() && b.provenance.describes_now() {
         return Ok(());
     }
-    if (a.taken_at - b.taken_at).abs() <= snapshots::RESUME_WINDOW_SECS {
+    if gap_between(a, b) <= SAME_MOMENT_GAP_SECS {
         return Ok(());
     }
 
@@ -101,13 +103,75 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
     ))
 }
 
+/// How much dead time there may be between two walks and still be one moment.
+///
+/// Deliberately the same size as [`snapshots::RESUME_WINDOW_SECS`] and
+/// deliberately not that constant. Fifteen minutes of an account's life is the
+/// drift this tool already treats as a single instant — that is what the resume
+/// window decides for one interrupted walk, and this decides the same thing for
+/// two finished ones. Two questions, so two numbers: changing how long a walk
+/// may be paused must not quietly change what may be crossed.
+const SAME_MOMENT_GAP_SECS: i64 = 15 * 60;
+
+/// The seconds during which neither walk was looking.
+///
+/// Each list covers an interval — first page to last — rather than an instant,
+/// and what can invent an arrival is a stretch of time one list saw and the
+/// other did not. So this is the distance **between** the intervals: zero when
+/// they overlap or touch, however long either of them took.
+///
+/// That difference is the whole point. Two lists walked back to back in one
+/// correct run *finish* far apart by definition — on an account following six
+/// thousand people the second walk alone is about twenty minutes at the
+/// documented pace — so comparing finishing times against a fifteen-minute
+/// bound refused precisely the pair that was most obviously one moment, and
+/// went on refusing it every time that pair was read back with `--cache`.
+///
+/// It is not a licence, either. A walk that genuinely took an hour, crossed
+/// against a snapshot from two hours later, still has an hour of gap and is
+/// still refused.
+///
+/// A resumed walk widens its own interval by up to the resume window, and that
+/// is not an extra concession: [`snapshots::RESUME_WINDOW_SECS`] has already
+/// decided a walk paused that long is one capture. The span treated as one
+/// moment here is exactly the span the store was already willing to call one.
+fn gap_between(a: &ListOutcome, b: &ListOutcome) -> i64 {
+    (b.started_at - a.taken_at)
+        .max(a.started_at - b.taken_at)
+        .max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::exit::ExitCode;
 
+    /// A stored row, which is what the outcomes under test are built from.
+    fn stored(started_at: i64, taken_at: i64) -> snapshots::Snapshot {
+        snapshots::Snapshot {
+            id: 1,
+            account_pk: 1,
+            kind: ListKind::Followers,
+            started_at,
+            taken_at: Some(taken_at),
+            complete: true,
+            member_count: 0,
+            declared_count: None,
+            pages: 0,
+            requests: 0,
+            next_cursor: None,
+            resumes: 0,
+        }
+    }
+
+    /// A capture with no duration, which is what these tests used to be able to
+    /// assume and real ones never are.
     fn outcome(provenance: Provenance, taken_at: i64) -> ListOutcome {
-        ListOutcome::cached(1, taken_at, provenance)
+        walked(provenance, taken_at, taken_at)
+    }
+
+    fn walked(provenance: Provenance, started_at: i64, taken_at: i64) -> ListOutcome {
+        ListOutcome::cached(&stored(started_at, taken_at), provenance)
     }
 
     /// A counter checked in this run is what makes age harmless, so any skew
@@ -145,6 +209,63 @@ mod tests {
         let a = outcome(Provenance::CacheFlag, 1_000);
         let b = outcome(Provenance::CacheFlag, 1_800);
         assert!(check_same_moment(&a, &b).is_ok());
+    }
+
+    /// The defect this predicate was rewritten for, and the shape of every
+    /// correct crossing on an account of any size.
+    ///
+    /// `taken_at` is when a walk **finished**. Walking six thousand accounts
+    /// takes about twenty minutes at the documented pace, so the two lists of
+    /// one perfectly good `snob unfollowers` run finish far more than fifteen
+    /// minutes apart — and reading that same pair back with `--cache`, where
+    /// neither side carries evidence, was refused as "different moments". The
+    /// answer was correct and the tool would not show it, ever again.
+    #[test]
+    fn two_walks_run_back_to_back_are_one_moment_however_long_they_took() {
+        let followers = walked(Provenance::CacheFlag, 0, 1_200);
+        let following = walked(Provenance::CacheFlag, 1_260, 3_600);
+
+        assert!(
+            (following.taken_at - followers.taken_at).abs() > SAME_MOMENT_GAP_SECS,
+            "the finishing times are far apart; that is the point"
+        );
+        assert!(check_same_moment(&followers, &following).is_ok());
+    }
+
+    /// Two walks that were running at the same time left no unobserved stretch
+    /// at all.
+    #[test]
+    fn overlapping_walks_have_no_gap_at_all() {
+        let a = walked(Provenance::CacheFlag, 0, 2_000);
+        let b = walked(Provenance::CacheFlag, 1_000, 3_000);
+        assert_eq!(gap_between(&a, &b), 0);
+        assert!(check_same_moment(&a, &b).is_ok());
+    }
+
+    /// Measuring the gap rather than the distance must not become permission.
+    /// A long walk widens its own interval; it does not excuse a partner from
+    /// hours later.
+    #[test]
+    fn a_long_walk_is_not_a_licence_for_a_stale_partner() {
+        let hour_long = walked(Provenance::CacheFlag, 0, 3_600);
+        let much_later = outcome(Provenance::CacheFlag, 10_000);
+        assert!(check_same_moment(&hour_long, &much_later).is_err());
+    }
+
+    /// A resumed walk keeps the moment its first page was asked for, so its
+    /// interval is wider by however long it was paused. That is not a second
+    /// concession: `RESUME_WINDOW_SECS` has already decided a pause of that
+    /// length leaves one capture, and this treats exactly that span as one
+    /// moment. It still expires.
+    #[test]
+    fn a_resumed_walk_is_one_interval_from_its_first_page() {
+        let resumed = walked(Provenance::CacheFlag, 0, 2_000);
+
+        let just_after = walked(Provenance::CacheFlag, 2_010, 2_100);
+        assert!(check_same_moment(&resumed, &just_after).is_ok());
+
+        let much_later = outcome(Provenance::CacheFlag, 20_000);
+        assert!(check_same_moment(&resumed, &much_later).is_err());
     }
 
     /// One side without evidence is enough to lose it, even against a walk.

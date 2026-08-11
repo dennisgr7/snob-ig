@@ -37,7 +37,9 @@ fn store_list(db: &mut Store, account: u64, kind: ListKind, members: &[User]) {
     users::upsert(db.conn(), &user(account, &format!("account{account}"))).unwrap();
     accounts::upsert(db.conn(), account, account == ME).unwrap();
 
-    let id = snapshots::begin(db.conn(), account, kind, Some(members.len() as u64)).unwrap();
+    let id = snapshots::begin(db.conn(), account, kind, Some(members.len() as u64))
+        .unwrap()
+        .id;
     snapshots::save_page(db, id, members, None).unwrap();
     snapshots::close(db.conn(), id, StopReason::Completed).unwrap();
 }
@@ -48,7 +50,9 @@ fn store_partial(db: &mut Store, account: u64, kind: ListKind, members: &[User])
     users::upsert(db.conn(), &user(account, &format!("account{account}"))).unwrap();
     accounts::upsert(db.conn(), account, account == ME).unwrap();
 
-    let id = snapshots::begin(db.conn(), account, kind, Some(999)).unwrap();
+    let id = snapshots::begin(db.conn(), account, kind, Some(999))
+        .unwrap()
+        .id;
     snapshots::save_page(db, id, members, Some("more")).unwrap();
     snapshots::close(db.conn(), id, StopReason::Canceled).unwrap();
 }

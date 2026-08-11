@@ -478,6 +478,7 @@ mod tests {
             provenance: engine::Provenance::Walked,
             reason: StopReason::Completed,
             requests: 3,
+            started_at: 1_722_699_000,
             taken_at: 1_722_700_000,
             account_pk: 1,
             stopped_by: None,
