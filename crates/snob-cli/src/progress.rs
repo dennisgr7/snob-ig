@@ -226,31 +226,18 @@ impl Progress {
     /// without walking anything, in which case the name flashes and `finish`
     /// clears it. `snob scan someone` walks four lists in a row, and without
     /// this every one of them looked identical.
+    ///
+    /// A label that flashes costs nothing. A **line** that says it does is
+    /// different: with no bar to draw on this printed `walking @someone
+    /// followers` to standard error, and the two runs that have no bar are
+    /// `--no-progress`, where the user asked for silence, and `--cache`, which
+    /// walks nothing at all and answers from the database. Both were told about
+    /// a walk that never happened, and `snob scan --cache` said it four times.
+    /// So without a bar there is nothing to name.
     pub fn begin(&self, subject: &str) {
         self.animate();
-        if self.quiet {
-            eprintln!("walking {subject}");
-        } else {
+        if !self.quiet {
             self.bar.set_prefix(subject.to_string());
-        }
-    }
-
-    /// Says what the run is doing right now. It replaces the bar's own message
-    /// rather than scrolling, because this is transient: it stops being true as
-    /// soon as the next page arrives.
-    ///
-    /// With no bar it goes to standard error, where every other message the
-    /// user reads already goes.
-    pub fn note(&self, text: &str) {
-        self.animate();
-        // Whatever this is about, it is not the wait that was being counted
-        // down, and leaving the old deadline would keep a number ticking next
-        // to a message it has nothing to do with.
-        self.set_deadline(None);
-        if self.quiet {
-            eprintln!("{text}");
-        } else {
-            self.bar.set_message(text.to_string());
         }
     }
 
@@ -260,6 +247,23 @@ impl Progress {
             eprintln!("warning: {text}");
         } else {
             self.bar.suspend(|| eprintln!("warning: {text}"));
+        }
+    }
+
+    /// Runs something that writes to the terminal itself, with the bar out of
+    /// the way and put back afterwards.
+    ///
+    /// For a prompt. `ui::prompt_line` writes to standard error and so does the
+    /// bar, so the consent question landed on the line the animation owns and
+    /// was erased by the next tick — leaving somebody staring at a spinner,
+    /// waiting for input they had not been asked for. `warn` has always gone
+    /// through `suspend` for the same reason; the question needs it more,
+    /// because it is what the run is waiting on.
+    pub fn while_paused<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.quiet {
+            f()
+        } else {
+            self.bar.suspend(f)
         }
     }
 
@@ -508,11 +512,7 @@ mod tests {
         let set = deadline_of(&p).expect("a wait has to leave a deadline");
         assert!(set > Instant::now(), "the deadline is in the future");
 
-        p.note("page 7, 350 accounts");
-        assert_eq!(deadline_of(&p), None, "the note ended the wait");
-
-        // And the event that really ends a pause: the next page arriving.
-        p.waiting("pausing", Duration::from_secs(10));
+        // The event that ends a pause: the next page arriving.
         p.event(&Event::Page {
             number: 7,
             running_total: 350,
