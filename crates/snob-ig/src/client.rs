@@ -550,9 +550,14 @@ impl IgClient {
         }
 
         serde_json::from_str(&body).map_err(|e| {
+            // The same excerpt every other error gets. This one had a copy of
+            // its own that took 200 raw characters: unfiltered, though it is
+            // printed to a terminal, and with no idea that a body starting with
+            // `<` is a captive portal rather than the API — which is exactly
+            // what a body that will not parse usually is.
             IgError::Decode(format!(
                 "{e} - response: {}",
-                body.chars().take(200).collect::<String>()
+                crate::error::body_excerpt(&body)
             ))
         })
     }
@@ -574,6 +579,38 @@ mod tests {
         IgClient::new(session, crate::pace::Pacer::unlimited())
             .unwrap()
             .with_base_url(Url::parse(&server.uri()).unwrap())
+    }
+
+    /// A 200 whose body will not parse gets the same excerpt as every other
+    /// error.
+    ///
+    /// It had a copy of its own that took 200 raw characters. The filtering and
+    /// the "this is an HTML page" recognition both lived in `body_excerpt`,
+    /// which only the non-success path called — so an escape sequence arriving
+    /// with a 500 was filtered and the identical body arriving with a 200 was
+    /// printed to the terminal verbatim. A captive portal answering 200 with a
+    /// login page is the ordinary way to reach this.
+    #[tokio::test]
+    async fn a_body_that_will_not_parse_is_excerpted_like_every_other_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/42/following/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<html><body>{esc}[2K{esc}[A Sign in to the network</body></html>",
+                esc = '\x1b'
+            )))
+            .mount(&server)
+            .await;
+
+        let error = client(&server)
+            .await
+            .validate()
+            .await
+            .expect_err("that is not the API's JSON");
+        let message = error.to_string();
+
+        assert!(!message.contains('\x1b'), "{message:?}");
+        assert!(message.contains("an HTML page"), "{message}");
     }
 
     #[tokio::test]

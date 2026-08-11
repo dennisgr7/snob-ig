@@ -34,10 +34,21 @@ pub struct Viewer {
 }
 
 impl Viewer {
+    /// The name, filtered for anything that is going to draw it.
+    ///
+    /// It came from Instagram — `resolve_username`, or the browser handing the
+    /// session over — not from the person running the tool, so it is treated
+    /// like any other name off the wire. `engine::target::label` filters the
+    /// name that was **typed** and used to hand this one straight through,
+    /// which had the filtering on the safe half and not on the other one.
+    pub fn safe_username(&self) -> Option<String> {
+        self.username.as_deref().map(snob_core::model::printable)
+    }
+
     /// How to name this account to a person: `@someone`, or the id when the
     /// name has not been learned yet.
     pub fn label(&self) -> String {
-        match &self.username {
+        match self.safe_username() {
             Some(name) => format!("@{name}"),
             None => format!("account {}", self.pk),
         }
@@ -250,5 +261,42 @@ impl App {
     /// land in the middle of a drawn line.
     pub fn warn(&self, text: &str) {
         self.progress.warn(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Viewer;
+
+    /// The name here came from Instagram — `whoami` writes it out of
+    /// `resolve_username` — not from the command line, and it ends up as the
+    /// progress bar's prefix, redrawn several times a second. `target::label`
+    /// filtered the name the user **typed** and handed this one straight
+    /// through, which put the filtering on the safe half and not the other one.
+    ///
+    /// What is left is the brackets as text, which is `printable`'s contract:
+    /// it removes what a terminal obeys, not what it prints. Without the escape
+    /// in front of them they are three characters in a name.
+    #[test]
+    fn a_viewer_label_does_not_carry_what_a_terminal_would_obey() {
+        let viewer = Viewer {
+            pk: 42,
+            username: Some(format!("me{esc}[2K{esc}[A", esc = '\x1b')),
+        };
+
+        let label = viewer.label();
+        assert!(!label.contains('\x1b'), "{label:?}");
+        assert_eq!(label, "@me[2K[A");
+    }
+
+    /// Without a name there is nothing to filter and the id stands in.
+    #[test]
+    fn an_unnamed_viewer_is_still_nameable() {
+        let viewer = Viewer {
+            pk: 42,
+            username: None,
+        };
+
+        assert_eq!(viewer.label(), "account 42");
     }
 }

@@ -305,7 +305,7 @@ pub fn classify(status: u16, body: &str) -> IgError {
 /// printed to a terminal by `main`, and a response body is no more trustworthy
 /// than a profile field — less, when the thing answering is a captive portal
 /// rather than Instagram.
-fn body_excerpt(body: &str) -> String {
+pub(crate) fn body_excerpt(body: &str) -> String {
     if body.trim_start().starts_with('<') {
         return "(an HTML page, not the API's JSON)".into();
     }

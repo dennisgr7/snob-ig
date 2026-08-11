@@ -8,7 +8,7 @@
 
 use anyhow::{Result, bail};
 use snob_core::Pk;
-use snob_core::model::ListKind;
+use snob_core::model::{ListKind, printable};
 use snob_core::store::{accounts, users};
 
 use crate::app::App;
@@ -118,16 +118,19 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
     // never turn into a refusal: with `None` the walk runs and fails, or does
     // not, on its own terms.
     if !is_self && profile.is_private == Some(true) && profile.followed_by_viewer == Some(false) {
+        // Filtered: it came off Instagram, not out of anybody's keyboard, and
+        // this sentence is written to a terminal. `pfp.rs` does the same with
+        // the same field in the same shape of refusal.
         if profile.requested_by_viewer == Some(true) {
             bail!(
                 "@{} is private and your follow request has not been accepted yet, \
                  so its lists cannot be read",
-                profile.username
+                printable(&profile.username)
             );
         }
         bail!(
             "@{} is a private account you do not follow, so its lists cannot be read",
-            profile.username
+            printable(&profile.username)
         );
     }
 

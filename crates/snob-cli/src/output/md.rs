@@ -57,14 +57,22 @@ fn link(user: &User) -> String {
     )
 }
 
-/// Escapes what would otherwise break the table.
+/// Escapes what would otherwise break the table or the link around it.
 ///
 /// The backslash goes first: doing it after the pipe would escape the escape
 /// and leave the pipe bare. A newline cannot live in a cell at all, so it
 /// becomes a space.
+///
+/// The brackets are here because every string this escapes is then wrapped in
+/// `[…]` by [`link`], and a `]` in a name ends that label early — so a username
+/// of `x](http://evil.test)` produced a second, working link to somewhere else,
+/// sitting in the row as though this file had put it there. The destination is
+/// a separate problem with a separate answer: `User::profile_url` encodes.
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
         .replace("\r\n", " ")
         .replace(['\n', '\r'], " ")
 }
@@ -91,6 +99,33 @@ mod tests {
             out.contains("| [one](https://www.instagram.com/one/) | One Person | verified |"),
             "{out}"
         );
+    }
+
+    /// A row is a link, and both halves of one were open.
+    ///
+    /// The destination took the raw name, so a `)` in it ended the address
+    /// early; and the label is wrapped in `[…]`, so a `]` ended *that* early and
+    /// what followed became a second, working link to wherever the name said.
+    /// Two holes, two answers: the destination is percent-encoded and the label
+    /// is escaped.
+    #[test]
+    fn a_bracket_in_a_name_cannot_end_the_link_early() {
+        let out = table(&[User {
+            username: "one](http://evil.test)".into(),
+            ..user()
+        }]);
+
+        // The only place a label ends is the one this file wrote.
+        assert_eq!(
+            out.matches("](https://www.instagram.com/").count(),
+            1,
+            "{out}"
+        );
+        assert!(
+            out.contains("\\](http://evil.test)"),
+            "the name's own bracket has to be escaped, not left to close the label: {out}"
+        );
+        assert!(out.contains("%5D"), "and encoded in the destination: {out}");
     }
 
     #[test]

@@ -90,9 +90,11 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     let viewer = app.viewer().clone();
     let target = match &args.target {
         Some(raw) => engine::target::clean(raw).to_string(),
+        // Filtered, because this one came from Instagram rather than from the
+        // command line. It becomes the `@{target}` heading in the markdown and
+        // the closing line on the terminal.
         None => viewer
-            .username
-            .clone()
+            .safe_username()
             .unwrap_or_else(|| viewer.pk.to_string()),
     };
 

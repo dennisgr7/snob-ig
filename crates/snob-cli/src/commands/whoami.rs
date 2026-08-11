@@ -135,7 +135,15 @@ fn describe(session: &snob_core::session::Session, alive: Option<bool>) -> Strin
     let mut lines = Vec::new();
 
     match &session.username {
-        Some(u) => lines.push(format!("Account:  @{u} ({})", session.ds_user_id)),
+        // Filtered here and not in the JSON above: this line is drawn on a
+        // terminal, and the name was written by `whoami` out of Instagram's
+        // answer. `serde_json` escapes what it emits, and a machine format has
+        // to carry the true value.
+        Some(u) => lines.push(format!(
+            "Account:  @{} ({})",
+            snob_core::model::printable(u),
+            session.ds_user_id
+        )),
         None => lines.push(format!("Account:  {}", session.ds_user_id)),
     }
     lines.push(format!("Origin:   {}", session.origin));

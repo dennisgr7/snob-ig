@@ -323,6 +323,33 @@ mod tests {
         assert!(out.contains("clean"), "{out}");
     }
 
+    /// The same attack through the field next door, which was open.
+    ///
+    /// The visible text went through `safe_username`, but the address beside it
+    /// came from `profile_url`, which pasted the name in raw. An `ESC` there
+    /// closed the sequence early and the rest of the name opened one of its
+    /// own, so the cell read as a filtered name and pointed somewhere else —
+    /// the split between what is shown and where it goes that the test above
+    /// exists to prevent.
+    #[test]
+    fn a_hostile_username_cannot_drive_the_terminal_through_its_link() {
+        let link_in_a_username = User {
+            username: format!(
+                "a{esc}\\{esc}]8;;http://evil.test{esc}\\Official",
+                esc = '\x1b'
+            ),
+            ..user()
+        };
+        let out = table(&[link_in_a_username], looking_at_a_terminal());
+
+        assert!(!out.contains("\x1b]8;;http://evil.test"), "{out:?}");
+        assert_eq!(
+            out.matches("\x1b]8").count(),
+            2,
+            "the only link in the row is the one this table put there: {out:?}"
+        );
+    }
+
     /// Taking control characters out must not take the language with them.
     #[test]
     fn ordinary_names_survive_untouched() {

@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use rust_xlsxwriter::{ExcelDateTime, Format, FormatAlign, Workbook, Worksheet};
-use snob_core::model::User;
+use snob_core::model::{User, printable};
 
 /// The column names. The same six frozen keys the csv uses.
 const HEADER: [&str; 6] = [
@@ -63,13 +63,18 @@ fn rows_with_url_cap(users: &[User], cap: usize) -> Vec<[Cell; 6]> {
         .iter()
         .enumerate()
         .map(|(index, user)| {
+            // Filtered like every other name that gets drawn. Not only because
+            // a workbook is opened and read: characters below 0x20 other than
+            // tab, newline and carriage return are **illegal in XML 1.0**, so a
+            // hostile name here produced a file that would not open at all.
+            // The address is `profile_url`'s problem, and it encodes.
             let username = if index < cap {
                 Cell::Link {
                     url: user.profile_url(),
-                    text: user.username.clone(),
+                    text: user.safe_username(),
                 }
             } else {
-                Cell::Text(user.username.clone())
+                Cell::Text(user.safe_username())
             };
             [
                 number(user.pk),
@@ -94,9 +99,16 @@ fn number(pk: u64) -> Cell {
     }
 }
 
+/// Filtered before it is measured, for the reason `csv::clean` gives: a full
+/// name is whatever its owner typed, and half of the control characters cannot
+/// legally appear in the XML a workbook is made of.
+///
+/// No leading apostrophe, unlike the csv. That defuses a *formula*, and a
+/// formula is a hazard the csv has because a spreadsheet re-parses the text it
+/// imports. `write_string` writes a string cell, which Excel never evaluates.
 fn text(value: Option<&str>) -> Cell {
     match value {
-        Some(value) => Cell::Text(truncate(value)),
+        Some(value) => Cell::Text(truncate(&printable(value))),
         None => Cell::Empty,
     }
 }
@@ -235,6 +247,30 @@ mod tests {
                 text: "one".into(),
             }
         );
+    }
+
+    /// Not only about what a reader sees. Characters below 0x20 other than tab,
+    /// newline and carriage return are illegal in XML 1.0, and a workbook is
+    /// XML — so a name carrying one produced a file that would not open.
+    #[test]
+    fn a_name_that_would_break_the_file_is_filtered_before_it_is_written() {
+        let rows = rows(&[User {
+            pk: 1,
+            username: format!("one{esc}[2K", esc = '\x1b'),
+            full_name: Some(format!("A{esc}[A Person", esc = '\x1b')),
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        }]);
+
+        let Cell::Link { url, text } = &rows[0][1] else {
+            panic!("the username cell is a link: {:?}", rows[0][1]);
+        };
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(!url.contains('\x1b'), "{url:?}");
+        // The brackets stay, as text. `printable` removes what a terminal obeys
+        // and what XML forbids, not what either of them would happily print.
+        assert_eq!(rows[0][2], Cell::Text("A[A Person".into()));
     }
 
     #[test]
