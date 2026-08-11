@@ -14,10 +14,6 @@ use zeroize::Zeroizing;
 /// anyone will paste.
 const SECRET_CAPACITY: usize = 256;
 
-pub fn is_interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-}
-
 /// How many characters at the end are left visible.
 const VISIBLE_TAIL_CHARS: usize = 4;
 /// Cap on the asterisks drawn, so the line never wraps and leaves behind
@@ -98,12 +94,42 @@ fn mask(value: &str) -> String {
 
 /// Whether there is somebody at the keyboard to answer a question.
 ///
-/// Deliberately weaker than [`is_interactive`]: it asks only about standard
-/// input, because a prompt whose *output* is redirected is still answerable.
+/// Standard input alone, because that is the only stream a question needs: it
+/// is asked on standard error by [`prompt_line`] and answered on standard
+/// input, so redirecting the *results* has nothing to do with it.
 /// [`prompt_secret`] draws the line the same way, and the two questions
 /// `login --paste` asks must not disagree about whether anyone is there.
+///
+/// This used to sit beside a predicate that asked about standard input **and**
+/// standard output, and that one governed every prompt in the program. It is
+/// gone: no question here is asked on standard output, so there was no correct
+/// use of it left.
 pub fn can_be_asked() -> bool {
     std::io::stdin().is_terminal()
+}
+
+/// Whether an arrow-key menu can be shown.
+///
+/// Stricter than [`can_be_asked`], and about a different pair of streams than
+/// the stdin-and-stdout one this replaced. A menu is not a line of text: it
+/// needs keys, which arrive on standard input, and it redraws itself with
+/// cursor movement on **standard error**, which is where `dialoguer` puts every
+/// prompt — `Select::interact_opt` builds a `Term::stderr()`. Standard output
+/// is the one stream a menu never touches.
+///
+/// Asking about the wrong two got it wrong in both directions: `snob login |
+/// tee log` refused to show a menu it could have drawn perfectly well, and
+/// `snob login 2>log` drew one into the file and then waited for arrow keys
+/// with nothing on screen — the same failure [`prompt_line`] documents, from
+/// the other side.
+///
+/// Standard input is required even though `console` would fall back to the
+/// controlling terminal when it is redirected. Whether somebody is there is one
+/// question with one answer: [`prompt_secret`] reads piped bytes when standard
+/// input is not a terminal, and a menu that still worked in the same run would
+/// be asking a person something while the credential arrived from a file.
+pub fn can_show_a_menu() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Asks a question and reads one line back.
@@ -135,18 +161,25 @@ pub fn prompt_line(prompt: &str) -> Result<String> {
 /// them leaves one for everything else, including the task that owns Ctrl+C
 /// now that `tokio::signal` has taken it away from the operating system.
 ///
-/// Only for the prompts that are asked while a run is under way. `purge` and
-/// `logout` ask before there is anything else to schedule, so they call
-/// [`confirm`] directly and this indirection would buy them nothing.
+/// Only for the prompts that are asked while a run is under way. `purge` asks
+/// before there is anything else to schedule, so it calls [`confirm`] directly
+/// and this indirection would buy it nothing.
 pub async fn confirm_off_thread(question: String, default: bool) -> Result<bool> {
     tokio::task::spawn_blocking(move || confirm(&question, default))
         .await
         .context("the question could not be asked")?
 }
 
-/// A yes or no question. With no terminal it keeps the default.
+/// A yes or no question. With nobody at the keyboard it keeps the default.
+///
+/// The gate is [`can_be_asked`], not both standard streams. The question goes
+/// to standard error through [`prompt_line`] and the answer comes off standard
+/// input, so `snob unfollowers someone | jq` can be asked and answered like any
+/// other run. It used to ask about standard output as well — the one stream
+/// with nothing to do with it — which turned every redirect and every pipe into
+/// a machine with nobody at it.
 pub fn confirm(question: &str, default: bool) -> Result<bool> {
-    if !is_interactive() {
+    if !can_be_asked() {
         return Ok(default);
     }
     let suffix = if default { "[Y/n]" } else { "[y/N]" };
@@ -276,7 +309,23 @@ pub fn looks_like_console_dump(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_console_dump, mask};
+    use super::{can_be_asked, can_show_a_menu, looks_like_console_dump, mask};
+
+    /// A menu is strictly more demanding than a line, and this must never
+    /// invert.
+    ///
+    /// Both need somebody at the keyboard; only the menu also needs a terminal
+    /// to draw its cursor movement on. If a run could ever show a menu it could
+    /// not ask a plain question, `login` would put arrow keys in front of
+    /// somebody it had already decided was not there.
+    ///
+    /// Deliberately a relation rather than a value: what either answers depends
+    /// on where the suite was started from, and a test that asserted `true`
+    /// would pass under `cargo test` and fail in a pipeline, or the reverse.
+    #[test]
+    fn a_menu_asks_about_the_stream_it_draws_on() {
+        assert!(!can_show_a_menu() || can_be_asked());
+    }
 
     #[test]
     fn nothing_is_drawn_when_nothing_is_typed() {

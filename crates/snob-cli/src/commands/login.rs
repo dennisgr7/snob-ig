@@ -118,7 +118,7 @@ fn choose_method(args: &LoginArgs) -> Result<Option<LoginMethod>> {
     if args.browser {
         return Ok(Some(LoginMethod::Browser));
     }
-    if !ui::is_interactive() {
+    if !ui::can_show_a_menu() {
         bail!(
             "there is no interactive terminal to show the menu in.\n\
              Give the method explicitly, for example \"snob login --paste\"."
@@ -144,7 +144,7 @@ fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<brows
     match installed {
         [] => None,
         [only] => Some(only.clone()),
-        _ if !ui::is_interactive() => installed.first().cloned(),
+        _ if !ui::can_show_a_menu() => installed.first().cloned(),
         _ => {
             let labels: Vec<String> = installed
                 .iter()
@@ -411,11 +411,14 @@ fn resolve_user_agent() -> Result<ChosenAgent> {
         ));
 
         // With one browser installed nothing was asked, so the confirmation is
-        // the only chance to say it guessed wrong.
-        if installed.len() == 1
-            && ui::is_interactive()
-            && !ui::confirm("Is that the browser your session is in?", true)?
-        {
+        // the only chance to say it guessed wrong. No second gate on there
+        // being somebody to ask: `confirm` decides that itself, and asking the
+        // same question twice with two different predicates is how the answers
+        // came to disagree — this one was the stricter of the two, so a run
+        // with its output redirected accepted the guess in silence. That guess
+        // becomes the stored User-Agent, and a wrong one is an
+        // `IgError::UserAgentMismatch` several commands later.
+        if installed.len() == 1 && !ui::confirm("Is that the browser your session is in?", true)? {
             return prompt_user_agent();
         }
         return Ok(ChosenAgent {

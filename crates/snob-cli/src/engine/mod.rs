@@ -282,6 +282,21 @@ async fn decide(
 /// only account it can wrongly ask about is your own, which needs you to have
 /// typed your own name.
 async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
+    ask_consent_with(app, args, ui::can_be_asked()).await
+}
+
+/// Split from [`ask_consent`] so a test can say whether anybody is there.
+///
+/// **The third argument is for tests only.** Being a terminal is a property of
+/// the process's streams, which `cargo test` answers differently depending on
+/// where the suite was started from — the same reason `Presentation` carries
+/// `interactive` as data rather than asking at the point of use.
+#[doc(hidden)]
+pub async fn ask_consent_with(
+    app: &mut App,
+    args: &ListArgs,
+    someone_is_there: bool,
+) -> Result<()> {
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
@@ -301,11 +316,18 @@ async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
 
     // Being unable to ask and being told no are two different events, and they
     // were reported as one. `confirm` answers with its default the moment
-    // there is no terminal, so `snob unfollowers someone > out.json` — a way
-    // of running this the README advertises — failed with "canceled", blaming
-    // the user for something nobody did. The question goes to standard output,
-    // which is the very stream being captured.
-    if !ui::is_interactive() {
+    // nobody can answer, so `snob unfollowers someone > out.json` failed with
+    // "canceled", blaming the user for something nobody did.
+    //
+    // What is asked here is whether somebody is at the keyboard, and nothing
+    // else. The question is written to standard error and the answer read from
+    // standard input, so a pipe or a redirect on standard output does not touch
+    // it — and `snob scan someone | jq` is a shape the README promises, which
+    // this used to refuse with exit 130 before spending a single request. The
+    // comment here used to justify the wider gate by saying the question went
+    // to standard output. That stopped being true when the prompt moved to
+    // standard error, and the gate did not follow it.
+    if !someone_is_there {
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
