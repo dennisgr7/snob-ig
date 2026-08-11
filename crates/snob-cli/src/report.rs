@@ -113,26 +113,36 @@ pub fn refuse_incomplete(
 /// two dates; which sentence and which code those deserve is this module's
 /// question.
 ///
-/// And they really do differ. A cooldown is waited out, so "run it again later"
-/// is true and the throttling code is right. `--cache` and a failed poll are
-/// not waited out, and telling somebody to sit out a cooldown they are not in
-/// is worse than saying nothing.
+/// And they really do differ, in three ways rather than two:
+///
+/// - A **cooldown** is waited out, so "run it again later" is true and the
+///   throttling code is right.
+/// - **`--cache`** is the user's own doing, and dropping it is the fix.
+/// - A **failed poll** is neither. Nobody asked for storage — the request to
+///   check went out and did not come back — so advising them to drop a flag
+///   they never typed sends them looking for something that is not there. This
+///   arm used to fall in with `--cache` because the only question asked was
+///   whether either side was a cooldown.
 pub fn refuse_different_moments(
     a: Provenance,
     b: Provenance,
     a_at: i64,
     b_at: i64,
 ) -> anyhow::Error {
-    let throttled = a.is_cooldown() || b.is_cooldown();
-    let (code, hint) = if throttled {
+    let (code, hint) = if a.is_cooldown() || b.is_cooldown() {
         (
             ExitCode::RateLimited,
             "Run it again once the cooldown lifts.",
         )
-    } else {
+    } else if a == Provenance::CacheFlag || b == Provenance::CacheFlag {
         (
             ExitCode::Error,
             "Run it again without --cache, so both lists are checked against the account.",
+        )
+    } else {
+        (
+            ExitCode::Error,
+            "Instagram could not be reached to check either list. Run it again in a while.",
         )
     };
 
@@ -387,14 +397,29 @@ mod tests {
         );
 
         let asked_for =
-            refuse_different_moments(Provenance::CacheFlag, Provenance::PollFailed, 0, 1);
+            refuse_different_moments(Provenance::CacheFlag, Provenance::CacheFlag, 0, 1);
         let hint = hint_of(&asked_for).unwrap();
         assert!(hint.contains("--cache"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(ExitCode::from_chain(&asked_for), Some(ExitCode::Error));
 
-        // Both say the same thing about what happened.
-        for error in [&throttled, &asked_for] {
+        // A failed poll is neither of the two. Nobody asked for storage — the
+        // request to check went out and did not come back — so it used to be
+        // told to drop a flag it never passed, which sends somebody looking for
+        // something that is not in their command line.
+        let nobody_could_check =
+            refuse_different_moments(Provenance::PollFailed, Provenance::PollFailed, 0, 1);
+        let hint = hint_of(&nobody_could_check).unwrap();
+        assert!(!hint.contains("--cache"), "{hint}");
+        assert!(!hint.contains("cooldown"), "{hint}");
+        assert_eq!(
+            ExitCode::from_chain(&nobody_could_check),
+            Some(ExitCode::Error)
+        );
+
+        // All three say the same thing about what happened; only the advice
+        // differs.
+        for error in [&throttled, &asked_for, &nobody_could_check] {
             assert!(error.to_string().contains("different moments"), "{error}");
         }
     }
