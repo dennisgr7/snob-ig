@@ -317,8 +317,8 @@ async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
     }
 
     app.warn(
-        "enumerating someone else's followers is the pattern Instagram's detection \
-         systems watch most closely",
+        "reading somebody else's lists is a heavier request than reading your own, \
+         and Instagram is readier to refuse it",
     );
     if !ui::confirm_off_thread(format!("Continue with @{name}?"), false).await? {
         // No mention of -y here. They have just said no, and answering that

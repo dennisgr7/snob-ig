@@ -1,27 +1,35 @@
-//! The headers a browser sends alongside its User-Agent, derived from it.
+//! The User-Agent Client Hints that go with a request, derived from the
+//! User-Agent itself.
 //!
-//! The goal is **coherence, not disguise**. Instagram's own edge answers
-//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, which is it saying out loud that
-//! those headers change its reply; and a request claiming to be Chrome 151
-//! while sending no client hints at all is a combination Chrome cannot produce.
-//! Being inconsistent is worse than being plain, so everything here is computed
-//! rather than chosen, and anything that cannot be computed is left out rather
-//! than guessed.
+//! These are ordinary HTTP request headers with a written specification:
+//! `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, `Priority` and
+//! `Accept-Language`. Instagram's own edge answers
+//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, which is the server saying out loud
+//! that headers of this kind change its reply — so getting them right is a
+//! correctness requirement, not a nicety.
 //!
-//! Almost all of it comes from one source, the User-Agent the session was
-//! created with. `Accept-Language` is the exception and has to be: it describes
-//! the person rather than the program, so it is read from the operating system.
-//! That is still computing it from something true rather than picking a value —
-//! and picking one would mean announcing `en-US` from an address in Spain,
-//! which is the same kind of mismatch as a Windows User-Agent with a macOS
-//! platform hint.
+//! **The rule is that the set has to agree with itself.** A request that
+//! declares Chrome 151 in its User-Agent and then sends no client hints at all
+//! describes a browser that does not exist, and a server is entitled to answer
+//! nonsense however it likes. So every value here is *computed* from the
+//! User-Agent the session was actually created with, and anything that cannot
+//! be computed is left out rather than guessed: an absent header is honest, an
+//! invented one is not.
 //!
-//! Nothing here touches the TLS stack. Chrome has randomized its ClientHello
-//! extension order since version 110, so there is no fixed TLS fingerprint left
-//! to match, and a stable one across hundreds of connections is more anomalous
-//! than any particular one. What actually gets an account throttled, in order,
-//! is IP reputation, request volume and pace, and header coherence — and only
-//! the last of those is ours to fix here.
+//! `Accept-Language` is the one exception, and has to be — it describes the
+//! person rather than the program, so it is read from the operating system.
+//! That is still deriving it from something true rather than picking a value.
+//!
+//! Two things this module deliberately does not do. It does not touch the TLS
+//! stack: Chrome has randomized its ClientHello extension order since version
+//! 110, so there is nothing stable there to copy even in principle. And it does
+//! not invent a browser — the User-Agent comes from one actually installed on
+//! the machine (see `browser.rs`), and everything here follows from that.
+//!
+//! Headers are also not the lever that matters. What determines whether
+//! Instagram throttles an account is, in order, the address the requests come
+//! from, how many there are, and how fast. Only the last two are the project's
+//! to control, and they live in `pace.rs`.
 
 /// From which Chromium sends `Priority` on a fetch or XHR.
 ///
@@ -135,7 +143,7 @@ pub const ASBD_ID: &str = "198387";
 
 /// What the browser behind a User-Agent would say about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint {
+pub struct ClientHints {
     /// `sec-ch-ua`, already formatted. `None` for browsers that do not send
     /// client hints at all, which is every non-Chromium one.
     pub ua_brands: Option<String>,
@@ -148,7 +156,7 @@ pub struct Fingerprint {
     pub priority: Option<&'static str>,
 }
 
-impl Fingerprint {
+impl ClientHints {
     /// Reads a User-Agent and works out what else the browser would send.
     pub fn from_user_agent(user_agent: &str) -> Self {
         let major = chromium_major(user_agent);
@@ -187,11 +195,14 @@ fn brand_of(user_agent: &str) -> &'static str {
 
 /// Builds `sec-ch-ua` exactly as Chromium does.
 ///
-/// Three entries — a deliberately meaningless one, Chromium, and the brand —
-/// where **both the fake brand's spelling and the order of the three are
-/// derived from the major version**. Hardcoding "the fake one goes first" is
-/// wrong for two versions out of every three, and since the whole thing is a
-/// pure function of the major, the other end can check it for free.
+/// Three entries — the GREASE entry, Chromium, and the brand — where **both the
+/// GREASE entry's spelling and the order of the three are derived from the
+/// major version**. GREASE is the standard trick of including a deliberately
+/// meaningless value so that parsers cannot come to depend on the list being
+/// fixed; it is part of the header, not an embellishment on it. Hardcoding "the
+/// GREASE entry goes first" is wrong for two versions out of every three, and
+/// since the whole thing is a pure function of the major version, the other end
+/// can check it for free.
 ///
 /// The algorithm is Chromium's `GetGreasedUserAgentBrandVersion`, kept here
 /// because there is nowhere to read it from at runtime.
@@ -320,14 +331,14 @@ mod tests {
     fn a_browser_that_sends_no_hints_gets_none() {
         let firefox =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
-        let f = Fingerprint::from_user_agent(firefox);
+        let f = ClientHints::from_user_agent(firefox);
         assert_eq!(f.ua_brands, None);
         // The platform is still known, and it still has to agree with the UA.
         assert_eq!(f.platform, "\"Windows\"");
     }
 
-    /// The pairing that gives a client away fastest: a User-Agent naming one
-    /// system and a platform hint naming another.
+    /// The contradiction this module exists to prevent: a User-Agent naming one
+    /// operating system and a platform hint naming another.
     #[test]
     fn the_platform_agrees_with_the_user_agent() {
         let cases = [
@@ -341,7 +352,7 @@ mod tests {
                 "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) \
                  Chrome/151.0.0.0 Safari/537.36"
             );
-            let f = Fingerprint::from_user_agent(&ua);
+            let f = ClientHints::from_user_agent(&ua);
             assert_eq!(f.platform, expected, "{ua}");
             assert_eq!(f.mobile, "?0");
         }
@@ -351,7 +362,7 @@ mod tests {
     fn a_phone_says_so() {
         let android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 \
                        (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36";
-        let f = Fingerprint::from_user_agent(android);
+        let f = ClientHints::from_user_agent(android);
         assert_eq!(f.mobile, "?1");
         assert_eq!(f.platform, "\"Android\"");
     }
@@ -398,23 +409,23 @@ mod tests {
     #[test]
     fn priority_is_only_sent_by_the_versions_that_send_it() {
         assert_eq!(
-            Fingerprint::from_user_agent(&desktop(151)).priority,
+            ClientHints::from_user_agent(&desktop(151)).priority,
             Some(FETCH_PRIORITY)
         );
         assert_eq!(
-            Fingerprint::from_user_agent(&desktop(123)).priority,
+            ClientHints::from_user_agent(&desktop(123)).priority,
             Some(FETCH_PRIORITY)
         );
-        assert_eq!(Fingerprint::from_user_agent(&desktop(122)).priority, None);
+        assert_eq!(ClientHints::from_user_agent(&desktop(122)).priority, None);
 
         let firefox =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
-        assert_eq!(Fingerprint::from_user_agent(firefox).priority, None);
+        assert_eq!(ClientHints::from_user_agent(firefox).priority, None);
     }
 
     #[test]
-    fn a_full_desktop_fingerprint_is_coherent() {
-        let f = Fingerprint::from_user_agent(&desktop(141));
+    fn a_full_desktop_hint_set_is_coherent() {
+        let f = ClientHints::from_user_agent(&desktop(141));
         assert_eq!(
             f.ua_brands.as_deref(),
             Some(r#""Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141""#)

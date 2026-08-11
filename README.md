@@ -190,7 +190,7 @@ snob purge
 It shows you the list and asks before deleting anything. Then remove the binary
 however you installed it.
 
-## Staying out of trouble
+## The risk, and what the design does about it
 
 There is no official API for any of this — Meta removed the followers endpoint
 in 2018 — so snob uses the private web API with your own session. That goes
@@ -205,13 +205,15 @@ Most of the design exists to make that unlikely:
   [InstagramUnfollowers][iu], which has years of real use behind it, and only
   ever adjusted downwards. Nothing in snob can send a request without paying for
   it first.
-- **The first sign of trouble stops the run.** A 429, a `feedback_required` or a
-  challenge ends it immediately and puts the account in cooldown; there is no
-  retry loop, because a retry loop is how an account gets flagged.
+- **The first refusal stops the run.** A 429, a `feedback_required` or a
+  challenge ends it immediately and puts the account in cooldown. There is no
+  retry loop: when a service says no, the answer is to stop asking, and pushing
+  on is also how a momentary limit becomes a lasting one.
 - **Nothing is asked twice.** A recent list is reused from storage instead of
   walked again, and an interrupted walk resumes rather than starting over.
-- **The headers match a browser** that is actually installed on the machine,
-  rather than announcing something no browser sends.
+- **The requests are well-formed.** The headers are derived from a browser
+  actually installed on the machine, so they agree with each other instead of
+  describing something contradictory.
 
 One part of this is not snob's to control, and it is the part that matters
 most. The single strongest signal Instagram has is **where the requests come

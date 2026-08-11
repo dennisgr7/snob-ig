@@ -12,8 +12,8 @@ use snob_core::Pk;
 use snob_core::session::Session;
 use url::Url;
 
+use crate::client_hints::{self, ClientHints};
 use crate::error::{IgError, classify, declares_failure};
-use crate::fingerprint::{self, Fingerprint};
 use crate::model::{
     FriendshipsPage, Identity, UserInfo, UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
 };
@@ -179,7 +179,7 @@ pub struct IgClient {
     /// Reserving budget lives here rather than in each caller, so a request
     /// that is never paid for cannot be written.
     pacer: Pacer,
-    fingerprint: Fingerprint,
+    hints: ClientHints,
     /// Instagram's session-continuity token. See [`IgClient::claim`].
     claim: Mutex<String>,
 }
@@ -209,7 +209,7 @@ impl IgClient {
         };
 
         Ok(Self {
-            fingerprint: Fingerprint::from_user_agent(&session.user_agent),
+            hints: ClientHints::from_user_agent(&session.user_agent),
             api: build(api_policy(base.clone()))?,
             cdn: build(cdn_policy(base.clone()))?,
             base,
@@ -221,12 +221,15 @@ impl IgClient {
 
     /// The current `X-IG-WWW-Claim`.
     ///
-    /// Instagram hands one back in `x-ig-set-www-claim` and expects it echoed
-    /// on every request after that. A browser sends the literal `0` **once**,
-    /// on its first request of the session, and never again — so a client that
-    /// ignores the response header keeps announcing `0` forever, which is to
-    /// say "I have just been born", four hundred times in a row. Following the
-    /// cycle costs a header and removes a free tell.
+    /// Instagram's session-continuity token. The server hands one back in
+    /// `x-ig-set-www-claim` and expects it echoed on every request after that;
+    /// the literal `0` is what a client sends **once**, on its first request of
+    /// the session, to say it has not been given one yet.
+    ///
+    /// Following that cycle is just implementing the protocol as specified.
+    /// Ignoring the response header would leave the client sending `0` forever
+    /// — announcing on every request that it is making its first — which is a
+    /// false statement about our own session and costs one line to avoid.
     fn claim(&self) -> String {
         self.claim.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -488,7 +491,7 @@ impl IgClient {
             .query(query)
             // Without this header Instagram answers 403 even with a good session.
             .header("X-IG-App-ID", IG_APP_ID)
-            .header("X-ASBD-ID", fingerprint::ASBD_ID)
+            .header("X-ASBD-ID", client_hints::ASBD_ID)
             .header("X-IG-WWW-Claim", self.claim())
             .header("X-Requested-With", "XMLHttpRequest")
             // `*/*`, not `application/json`: that is what `fetch()` sends when
@@ -502,7 +505,7 @@ impl IgClient {
             .header("Accept-Encoding", "gzip, deflate, br, zstd")
             // The one header here that comes from the person rather than from
             // the User-Agent. Every browser sends it on every request.
-            .header("Accept-Language", fingerprint::accept_language())
+            .header("Accept-Language", client_hints::accept_language())
             // Instagram answers `Vary` on the first two, which is it saying
             // its reply depends on them.
             .header("Sec-Fetch-Site", "same-origin")
@@ -511,9 +514,10 @@ impl IgClient {
             .header("Referer", format!("{BASE_URL}/{referer}"))
             .header("Cookie", self.session.cookie_header().as_str());
 
-        // Deliberately no `Origin`: a browser omits it on same-origin GETs, so
-        // sending one alongside `Sec-Fetch-Site: same-origin` is a combination
-        // Chrome cannot produce. Several tools like this one send it anyway.
+        // Deliberately no `Origin`: the Fetch standard omits it on same-origin
+        // GETs, so sending one next to `Sec-Fetch-Site: same-origin` would be
+        // two headers contradicting each other. Easy to add by reflex, which is
+        // why it is called out here rather than left to be noticed.
 
         if let Some(csrf) = &self.session.csrftoken {
             request = request.header("X-CSRFToken", csrf.expose());
@@ -521,15 +525,15 @@ impl IgClient {
 
         // Only for browsers that send client hints at all. Inventing them for
         // Firefox would be a mismatch rather than an improvement.
-        if let Some(brands) = &self.fingerprint.ua_brands {
+        if let Some(brands) = &self.hints.ua_brands {
             request = request
                 .header("Sec-CH-UA", brands)
-                .header("Sec-CH-UA-Mobile", self.fingerprint.mobile)
-                .header("Sec-CH-UA-Platform", self.fingerprint.platform);
+                .header("Sec-CH-UA-Mobile", self.hints.mobile)
+                .header("Sec-CH-UA-Platform", self.hints.platform);
         }
 
         // Likewise: only the versions that send one.
-        if let Some(priority) = self.fingerprint.priority {
+        if let Some(priority) = self.hints.priority {
             request = request.header("Priority", priority);
         }
 
@@ -624,7 +628,7 @@ mod tests {
         assert!(!language.contains('_'), "{language}");
 
         // Chrome 138 is past the version that started sending this.
-        assert_eq!(read("priority"), fingerprint::FETCH_PRIORITY);
+        assert_eq!(read("priority"), client_hints::FETCH_PRIORITY);
 
         // The client hints have to agree with the User-Agent above, which says
         // Chrome 138 on Windows.
@@ -640,9 +644,9 @@ mod tests {
         );
     }
 
-    /// A browser announces the literal `0` once and then echoes whatever the
-    /// server hands back. Staying on `0` forever says "I have just been born"
-    /// on every request, which is a free tell.
+    /// The token is announced as `0` once and is the server's answer after
+    /// that. Staying on `0` forever would claim, on every request, to be
+    /// making the first request of the session.
     #[tokio::test]
     async fn the_www_claim_is_echoed_back_after_the_first_answer() {
         let server = MockServer::start().await;
