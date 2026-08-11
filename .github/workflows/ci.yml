@@ -47,8 +47,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # `--locked` on everything that resolves dependencies, here and in the
+      # release. Without it a manifest change with no matching lockfile change
+      # is silently re-resolved and passes, `cargo deny` audits that fresh graph
+      # instead of the committed one, and the tag that follows ships versions
+      # nobody reviewed. `cargo fmt` takes no such flag and resolves nothing.
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The release regenerates the formula and the manifests in its very last
       # job, which is the most expensive place to learn that the generator is
@@ -90,7 +95,7 @@ jobs:
           sudo apt-get install -y gnome-keyring dbus-x11
       - name: Test
         if: runner.os != 'Linux'
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       # Against musl, which is what Linux users get. The same reasoning as the
       # keyring daemon above: a suite that passes on a build nobody receives
       # has not tested the thing that ships. This is where a musl-only problem
@@ -102,7 +107,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           dbus-run-session -- bash -c '
             echo "" | gnome-keyring-daemon --unlock --components=secrets
-            cargo test --workspace --target x86_64-unknown-linux-musl
+            cargo test --workspace --locked --target x86_64-unknown-linux-musl
           '
 
   build:
@@ -156,9 +161,9 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p snob-cli
       - name: Check the binary runs
-        run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+        run: cargo run --release --locked --target ${{ matrix.target }} -p snob-cli -- --version
 
       # Statically linked is a claim, and it is the whole reason for choosing
       # musl, so it gets checked rather than assumed: `ldd` on a static binary
