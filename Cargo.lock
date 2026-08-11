@@ -2610,6 +2610,7 @@ dependencies = [
  "chrono",
  "directories",
  "keyring",
+ "percent-encoding",
  "rusqlite",
  "rusqlite_migration",
  "serde",

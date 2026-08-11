@@ -78,6 +78,11 @@ url = "2"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 base64 = "0.23"
+# Already in the tree under `url`, so this costs no extra compilation. Used to
+# put a username into the profile address. Encoding rather than filtering,
+# because filtering removes characters and a name with one removed is the
+# address of a different account; the reasoning is on `User::profile_url`.
+percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
