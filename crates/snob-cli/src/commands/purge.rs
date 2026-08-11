@@ -209,13 +209,20 @@ pub fn run_with(
     // whether anybody is there, asked differently, is how one of them starts
     // answering for a person who is sitting right in front of it.
     if !args.yes && !someone_is_there {
-        ui::info(
-            "There is no terminal to confirm at, so nothing was deleted.\n\
-             To delete it unattended, run \"snob purge --yes\".",
-        );
+        // `Interrupted`, which is what the README's table and `--help` both
+        // promise for "a confirmation that was not given — including with no
+        // terminal to ask at". This returned the generic failure, so a script
+        // branching on 130 to re-run with `--yes` never fired and one branching
+        // on 1 warned about a half-finished delete that had not started.
+        //
+        // The advice goes in the message rather than the hint: `print_error`
+        // returns early for this code, so a hint would be dropped. That early
+        // return is also why the duplicate `ui::info` is gone — the sentence is
+        // printed once, by the printer.
         return Err(ExitError::new(
-            ExitCode::Error,
-            "nothing was deleted: there was no terminal to confirm at",
+            ExitCode::Interrupted,
+            "nothing was deleted: there is no terminal to confirm at.\n\
+             To delete it unattended, run \"snob purge --yes\".",
         )
         .into());
     }

@@ -204,9 +204,17 @@ fn an_unattended_run_without_yes_is_refused_rather_than_assumed_no() {
     let error = purge::run_with(args, store, &paths, false)
         .expect_err("silence is not consent, and it is not success either");
 
+    // The code the README's table and `--help` both promise for a confirmation
+    // that was not given. It used to be the generic failure, so a script
+    // branching on 130 to re-run with `--yes` never fired.
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Interrupted));
     assert!(
         error.to_string().contains("terminal"),
         "it has to say why it could not ask: {error}"
+    );
+    assert!(
+        error.to_string().contains("--yes"),
+        "and how to do it unattended: {error}"
     );
     assert!(
         paths.session_file().exists(),
