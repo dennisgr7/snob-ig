@@ -115,13 +115,20 @@ main() {
       ;;
   esac
 
-  echo
+  # Both lines, not just the first. The flag was added so this script would not
+  # "tell them to run a command that will not resolve", and the purge reminder
+  # was left saying a bare `snob` — the one command here it matters most that
+  # somebody can actually type, because skipping it leaves a live session cookie
+  # on a machine whose owner has just uninstalled the tool.
   if [ "$on_path" = yes ]; then
-    echo "Start with: snob login"
+    snob=snob
   else
-    echo "Start with: $INSTALL_DIR/snob login"
+    snob="$INSTALL_DIR/snob"
   fi
-  echo "Before uninstalling, run \"snob purge\": the session and the database"
+
+  echo
+  echo "Start with: $snob login"
+  echo "Before uninstalling, run \"$snob purge\": the session and the database"
   echo "live outside this directory and deleting the binary will not reach them."
 }
 
