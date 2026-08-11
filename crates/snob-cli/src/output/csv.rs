@@ -96,9 +96,18 @@ fn optional(value: Option<&str>) -> String {
 /// Order matters, and this way round. Defusing first would look at the control
 /// character, decide the field is not a formula, and only then take that
 /// character out — handing the spreadsheet a bare `=1+1` that nothing marked.
+///
+/// The **first non-blank** character, not the first, and that is the other half
+/// of the same trap. `printable` turns whitespace into a space rather than
+/// removing it, deliberately, so that deleting a newline does not join two
+/// words — which means `"\t=1+1"` survives as `" =1+1"`, whose first character
+/// is a space. Excel and LibreOffice both trim leading whitespace when they
+/// import, so what they then evaluate is the formula that nothing marked. The
+/// existing test used an escape, which `printable` does remove, so it never saw
+/// this.
 fn clean(field: &str) -> String {
     let field = printable(field);
-    match field.chars().next() {
+    match field.chars().find(|c| !c.is_whitespace()) {
         Some('=' | '+' | '-' | '@') => format!("'{field}"),
         _ => field,
     }
@@ -233,6 +242,26 @@ mod tests {
         };
         let records = parse(&rows(&[user]).unwrap());
         assert_eq!(records[1][2], "'=1+1");
+    }
+
+    /// The half the test above could not see. An escape is *removed* by
+    /// `printable`, so the `=` ends up first and the old check caught it; a tab
+    /// or a carriage return is turned into a **space**, on purpose, and left the
+    /// `=` in second place where nothing looked. Both spreadsheets trim leading
+    /// whitespace on import, so what they evaluated was a formula nobody marked.
+    #[test]
+    fn a_formula_behind_whitespace_is_defused_too() {
+        for hidden in ['\t', '\r', '\n', ' '] {
+            let user = User {
+                full_name: Some(format!("{hidden}=1+1")),
+                ..users()[0].clone()
+            };
+            let records = parse(&rows(&[user]).unwrap());
+            assert_eq!(
+                records[1][2], "' =1+1",
+                "a formula behind {hidden:?} reached the spreadsheet"
+            );
+        }
     }
 
     #[test]

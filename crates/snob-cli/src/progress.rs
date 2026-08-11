@@ -260,11 +260,7 @@ impl Progress {
     /// through `suspend` for the same reason; the question needs it more,
     /// because it is what the run is waiting on.
     pub fn while_paused<T>(&self, f: impl FnOnce() -> T) -> T {
-        if self.quiet {
-            f()
-        } else {
-            self.bar.suspend(f)
-        }
+        if self.quiet { f() } else { self.bar.suspend(f) }
     }
 
     /// Ends the bar for good. Called by the commands, which are the only ones
