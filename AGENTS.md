@@ -161,6 +161,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
+| A session is never reported gone unless it went | `SecretStore::delete`, which keeps the keyring's answer instead of discarding it |
+| Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers rather than the moment it ended |
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
 

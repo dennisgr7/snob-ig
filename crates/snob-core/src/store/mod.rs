@@ -164,9 +164,12 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "cache_size", -8_000)?; // 8 MiB
 
     // Deleted rows are overwritten rather than merely unlinked from the page.
-    // This is what `logout` and any future pruning need: they delete content
-    // without deleting the file, and the default leaves it legible in the
-    // freed pages. A database of a few megabytes does not notice the cost.
+    // This is what any pruning inside the file needs — `delete_partials` on
+    // every walk today, and whatever the monitor ends up expiring: they remove
+    // content without removing the file, and the default leaves it legible in
+    // the freed pages. A database of a few megabytes does not notice the cost.
+    // (`logout` used to be named here. It never opens the database: it takes
+    // the session and the browser profile, and `purge` deletes the file whole.)
     conn.pragma_update(None, "secure_delete", "ON")?;
 
     // In WAL mode the log is reused rather than truncated, so it keeps the
