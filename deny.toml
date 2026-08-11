@@ -1,4 +1,6 @@
-# What CI checks Cargo.lock for. Run it locally with `cargo deny check`.
+# What CI checks Cargo.lock for. Run the same thing locally with
+# `cargo deny check advisories sources` — not a bare `cargo deny check`, which
+# runs all four and fails on the two the note below says are off on purpose.
 #
 # Two checks are on, and the two that are not are left off on purpose:
 #
