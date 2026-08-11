@@ -92,30 +92,16 @@ pub async fn run(
     // The list being crossed against comes first. If it turns out incomplete
     // there is no result to give, so it is worth finding out before spending
     // the second walk.
-    // The bar is finished before the `?`, not after it. `indicatif` leaves its
-    // last line on screen when it is dropped, so a run that ends in a cooldown
-    // refusal or a private account used to print the error underneath a
-    // spinner that had stopped spinning. `lists` already does it this way.
     let subject = engine::target::label(&app, &args);
-    app.progress()
-        .begin(&report::walking(op.against(), &subject));
-    let first = engine::list(&mut app, &args, op.against()).await;
-    let (against, against_outcome) = match first {
-        Ok(pair) => pair,
-        Err(e) => {
-            app.progress().finish();
-            return Err(e);
-        }
-    };
-    if let Err(e) = check_against_list(op, &against_outcome) {
-        app.progress().finish();
-        return Err(e);
-    }
+    let (against, against_outcome) =
+        common::walk_named(&mut app, &args, op.against(), &subject, |outcome| {
+            check_against_list(op, outcome)
+        })
+        .await?;
 
     // The second walk renames the bar: a crossing is two lists, and without
     // this the slower half looked exactly like the first.
-    app.progress().begin(&report::walking(op.base(), &subject));
-    let second = engine::list(&mut app, &args, op.base()).await;
+    let second = common::walk_named(&mut app, &args, op.base(), &subject, |_| Ok(())).await;
     app.progress().finish();
     let (base, base_outcome) = second?;
 

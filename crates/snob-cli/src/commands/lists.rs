@@ -33,9 +33,7 @@ pub async fn run(
     // consent, resolution and the counter poll rather than only once pages
     // start arriving.
     let subject = engine::target::label(&app, &args);
-    app.progress().begin(&report::walking(kind, &subject));
-
-    let result = engine::list(&mut app, &args, kind).await;
+    let result = common::walk_named(&mut app, &args, kind, &subject, |_| Ok(())).await;
     app.progress().finish();
     let (found, outcome) = result?;
 
