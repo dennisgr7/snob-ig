@@ -1,0 +1,36 @@
+name: Supply chain
+
+# Its own file because of the schedule. `on:` is a property of the workflow, not
+# of a job, so a weekly cron living in ci.yml started every job in ci.yml — the
+# three-OS test matrix and the full five-target release build, every Monday,
+# for a check that compiles nothing. Three `if: github.event_name != 'schedule'`
+# guards would have worked and would have to be remembered by whoever adds the
+# fourth job. A file whose only triggers are the ones this check needs cannot
+# drift that way.
+#
+# The schedule is the point rather than a convenience: an advisory published on
+# a Tuesday would otherwise turn somebody's unrelated Wednesday pull request red
+# for the first time. Finding it on a timer means it is already known about by
+# then.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # Reads Cargo.lock against the advisory database. It compiles nothing and runs
+  # in well under a minute.
+  supply-chain:
+    name: Advisories and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories sources
