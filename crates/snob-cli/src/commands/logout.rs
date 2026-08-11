@@ -14,18 +14,27 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     // needs it. `purge::survey` already reads it this way and has a test
     // forbidding the other.
     let had_session = !matches!(store.load(), Ok(None));
-    store.delete()?;
+    // Not `?`. A keyring that refuses must not take the browser profile with
+    // it: that profile holds a logged-in session too, and `purge` already
+    // refuses to let one locked item hold the rest back for exactly this
+    // reason. The refusal is carried to the end and returned there.
+    let removal = store.delete();
 
-    if had_session {
-        println!("Session deleted.");
-        // Worth saying: nothing was closed on Instagram's side, because that
-        // would be a write and snob does not write.
-        ui::info(
-            "The session is still active on Instagram. To really close it, use\n\
-             \"Active sessions\" in the app's settings.",
-        );
-    } else {
-        println!("There was no session stored.");
+    match (&removal, had_session) {
+        (Ok(()), true) => {
+            println!("Session deleted.");
+            // Worth saying: nothing was closed on Instagram's side, because
+            // that would be a write and snob does not write.
+            ui::info(
+                "The session is still active on Instagram. To really close it, use\n\
+                 \"Active sessions\" in the app's settings.",
+            );
+        }
+        (Ok(()), false) => println!("There was no session stored."),
+        // Nothing is claimed here. What refused says so itself, printed by
+        // `main`, and "the session is still active on Instagram" would read as
+        // though the local copy were the part that had gone.
+        (Err(_), _) => {}
     }
 
     let profile = paths.browser_profile();
@@ -60,5 +69,9 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
         (false, false) => {}
     }
 
+    // After the profile, so that one refusal does not decide the other. There
+    // is no documented exit code for "a local delete was refused", and neither
+    // 3 nor 5 would be true, so this becomes the generic failure.
+    removal?;
     Ok(ExitCode::Ok)
 }
