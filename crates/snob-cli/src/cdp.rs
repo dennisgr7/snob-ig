@@ -254,13 +254,21 @@ fn died_early(code: Option<i32>, profile: &Path) -> String {
     match code {
         // Exiting cleanly and immediately is the singleton: the browser handed
         // its command line to the instance that already has this profile open.
-        Some(0) | None => format!(
-            "the browser closed straight away, which means one is already open on              snob's profile at {}.
+        Some(0) => format!(
+            "the browser closed straight away, which means one is already open on snob's \
+             profile at {}.\n\
              Close that window and try again, or use \"snob login --paste\".",
             profile.display()
         ),
+        // No code at all means something killed it — a signal on Unix, an
+        // external terminate on Windows. Reporting that as the singleton sent
+        // people hunting for a window that was never open, and the profile path
+        // in the message made the wrong story convincing.
+        None => "the browser was killed before it opened its debugging port.\n\
+                 Try again, or use \"snob login --paste\"."
+            .to_string(),
         Some(code) => format!(
-            "the browser exited with code {code} instead of starting.
+            "the browser exited with code {code} instead of starting.\n\
              Try \"snob login --paste\" instead."
         ),
     }
@@ -453,16 +461,14 @@ mod tests {
     #[test]
     fn a_browser_that_exited_cleanly_names_the_profile() {
         let profile = Path::new("C:/somewhere/browser-profile");
-        for code in [Some(0), None] {
-            let said = died_early(code, profile);
-            assert!(said.contains("already open"), "{said}");
-            assert!(said.contains("browser-profile"), "{said}");
-            assert!(said.contains("--paste"), "{said}");
-            assert!(
-                !said.contains("debugging port"),
-                "that is the other failure: {said}"
-            );
-        }
+        let said = died_early(Some(0), profile);
+        assert!(said.contains("already open"), "{said}");
+        assert!(said.contains("browser-profile"), "{said}");
+        assert!(said.contains("--paste"), "{said}");
+        assert!(
+            !said.contains("did not open"),
+            "that is the startup timeout, a different failure: {said}"
+        );
     }
 
     /// A browser that failed to start is a different thing, and says so.
@@ -548,5 +554,55 @@ mod tests {
 
         let real = vec![cookie("sessionid", "mine", "www.instagram.com")];
         assert_eq!(collect(&real).unwrap().sessionid.expose(), "mine");
+    }
+
+    /// Three different things happen when a launched browser is not there any
+    /// more, and they were reported as two.
+    ///
+    /// A clean immediate exit is Chrome's profile singleton: the second launch
+    /// handed its command line to the instance already holding the profile.
+    /// **No code at all is not that** — it means something killed the process —
+    /// and it used to share the singleton's sentence, so the message named a
+    /// profile and a window to close that had never been open.
+    ///
+    /// The wording is split out precisely so it can be read without launching a
+    /// browser: `ExitStatus` cannot be built portably in a test, so this takes
+    /// the code instead.
+    #[test]
+    fn what_killed_the_browser_decides_what_is_said() {
+        let profile = std::path::Path::new("/tmp/snob-profile");
+
+        let killed = died_early(None, profile);
+        assert!(killed.contains("killed"), "{killed}");
+        assert!(
+            !killed.contains("already open"),
+            "there is no window to close: {killed}"
+        );
+
+        let failed = died_early(Some(3), profile);
+        assert!(failed.contains("code 3"), "{failed}");
+    }
+
+    /// Every line of these has to start where the terminal puts it. The two
+    /// literals carried the source's own newline and indentation inside the
+    /// string, so the message came out with a fourteen-space gap in the middle
+    /// of a sentence and a thirteen-space hanging indent -- which
+    /// `report::indented` then widened by seven more.
+    #[test]
+    fn the_browser_messages_have_no_source_indentation_in_them() {
+        let profile = std::path::Path::new("/tmp/snob-profile");
+        for message in [
+            died_early(Some(0), profile),
+            died_early(None, profile),
+            died_early(Some(3), profile),
+        ] {
+            assert!(
+                !message.contains("  "),
+                "a run of spaces survived: {message:?}"
+            );
+            for line in message.lines() {
+                assert!(!line.starts_with(' '), "a line is indented: {line:?}");
+            }
+        }
     }
 }
