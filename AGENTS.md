@@ -161,8 +161,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
-| A session is never reported gone unless it went | `SecretStore::delete`, which keeps the keyring's answer instead of discarding it |
-| Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers rather than the moment it ended |
+| A session is never reported gone unless it went | `SecretStore::delete`, which carries the keyring's own answer back |
+| Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers |
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
 
@@ -187,10 +187,10 @@ no menu to show.
 **Redirecting the results does not turn a question into a refusal.** Every
 prompt is written to standard error and answered on standard input, so
 `ui::can_be_asked` asks about standard input alone and nothing gates on standard
-output. `snob scan someone | jq` is a supported shape and used to stop at the
-consent question with exit 130. The one exception is `ui::can_show_a_menu`,
-which also needs standard **error** to be a terminal, because that is where
-`dialoguer` draws — not standard output, which no prompt here touches.
+output: `snob scan someone | jq` reaches the consent question and can answer it.
+The one exception is `ui::can_show_a_menu`, which also needs standard **error**
+to be a terminal, because that is where `dialoguer` draws — not standard output,
+which no prompt here touches.
 
 Two judgement calls worth understanding before touching them:
 
@@ -302,10 +302,21 @@ deliberately unfinished:
   webhooks) is v2. `lost`/`gained` are reserved words for its temporal diff —
   `unfollowers` is the static set and must never drift to mean `lost`. The
   table it will read is **`username_history`**, which exists and is written on
-  every walk; nothing consumes it yet, so it looks orphaned and is not. (This
-  used to claim the schema reserved `events` and `webhook_queue`. It does not:
-  neither table has ever been in `001_initial.sql`.)
+  every walk; nothing consumes it yet, so it looks orphaned and is not. No other
+  table is reserved for it — `001_initial.sql` is the whole schema.
 
-Not exercised live, and worth knowing before trusting either: a walk over a list
-of several thousand, and real behavior on a 429, which has never been provoked
-on purpose and is verified against a recorded body instead.
+## Known walls
+
+- **A list of tens of thousands does not come back.** On an account declaring
+  21631 followers, Instagram served 39 on the first page and offered no cursor.
+  `pager::verdict` catches that — the shortfall is far past what deleted
+  accounts explain — and `scan` and the set commands refuse rather than cross a
+  list that is 0.2% of the account. The walk cannot be resumed either: the
+  pagination ended, so there is no cursor to store, which is why
+  `try_again_advice` tells the user it starts over rather than continues.
+  Whether the limit is the account, the session or the endpoint is not known;
+  what is known is that the tool reports it instead of answering wrongly.
+- **Real behavior on a 429 has never been provoked on purpose.** The handling is
+  verified against a recorded body. Everything downstream of it — the cooldown,
+  the hard stop, the exit code — is tested; the classification of a live one is
+  not.

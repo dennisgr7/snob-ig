@@ -267,6 +267,16 @@ pub fn try_again_advice(reason: StopReason) -> &'static str {
             "Deal with what Instagram asked for first. Running it again before that cannot get \
              any further."
         }
+        // Nothing was left off. This reason is reached after the pagination has
+        // already ended — `pager::verdict` reclassifies a walk that finished
+        // far short of the declared count — so the snapshot closes with no
+        // cursor, and `snapshots::resumable` requires one. There is nothing for
+        // a second run to continue from, and it will usually be served the same
+        // short list again.
+        StopReason::Truncated => {
+            "Instagram stopped serving this account's list; there is nothing to continue from, \
+             so running it again starts over. Try later."
+        }
         _ => "Run it again to continue where it left off.",
     }
 }
@@ -518,6 +528,7 @@ third",
     #[test]
     fn the_advice_depends_on_the_stop_reason() {
         assert!(try_again_advice(StopReason::RateLimit).contains("starts over"));
+        // These three leave a cursor behind, so there is something to continue.
         for reason in [
             StopReason::Canceled,
             StopReason::PageLimit,
@@ -525,6 +536,21 @@ third",
         ] {
             assert!(try_again_advice(reason).contains("continue where it left off"));
         }
+    }
+
+    /// A truncated walk has nothing to continue from, so it must not say it
+    /// has.
+    ///
+    /// `pager::verdict` reaches this reason **after** the pagination has ended,
+    /// by reclassifying a walk that finished far short of the declared count.
+    /// The snapshot therefore closes with no cursor, and
+    /// `snapshots::resumable` will not return a row without one — so the offer
+    /// to continue was for a walk that could never be found again.
+    #[test]
+    fn a_truncated_walk_does_not_promise_to_continue() {
+        let advice = try_again_advice(StopReason::Truncated);
+        assert!(!advice.contains("continue where it left off"), "{advice}");
+        assert!(advice.contains("starts over"), "{advice}");
     }
 
     /// Only a full walk has nothing to explain. Every other ending owes the
