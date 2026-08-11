@@ -210,3 +210,29 @@ async fn your_own_account_is_never_blocked() {
     let (found, _) = execute(&server).await.unwrap();
     assert_eq!(found.len(), 1);
 }
+
+/// The refusal names the account, and that name came off Instagram.
+///
+/// Every sibling that prints this field filters it — `walk.rs`, `pfp.rs`,
+/// `people::name_a_few` — and this one did not, so a private account whose
+/// username carried `\x1b[2K\x1b[A` erased the line the tool had just printed.
+/// It reaches the terminal through `report::print_error`, which is where the
+/// whole chain is written out.
+#[tokio::test]
+async fn the_refusal_names_a_hostile_account_without_obeying_it() {
+    let server = MockServer::start().await;
+    mount_profile(
+        &server,
+        r#"{"id":99,"username":"gh\u001b[2K\u001b[Aost","is_private":true,
+            "followed_by_viewer":false}"#,
+    )
+    .await;
+
+    let error = execute(&server)
+        .await
+        .expect_err("a private account you do not follow is refused");
+    let printed = format!("{error:#}");
+
+    assert!(!printed.contains('\x1b'), "{printed:?}");
+    assert!(printed.contains("private"), "{printed}");
+}

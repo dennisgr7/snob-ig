@@ -305,6 +305,9 @@ pub async fn ask_consent_with(
     }
 
     let name = target::clean(typed);
+    // Compared raw, deliberately. A typed name with a zero-width character in
+    // it is not your own account, and filtering before this comparison would
+    // make it match — which skips the question for somebody else's lists.
     let is_own_name = app
         .viewer()
         .username
@@ -313,6 +316,11 @@ pub async fn ask_consent_with(
     if is_own_name {
         return Ok(());
     }
+
+    // Drawn, so filtered. `target::label` already runs this very value through
+    // `printable` — with a doc-comment saying it does so because it is drawn on
+    // a terminal — and the three sentences below did not.
+    let shown = snob_core::model::printable(name);
 
     // Being unable to ask and being told no are two different events, and they
     // were reported as one. `confirm` answers with its default the moment
@@ -331,7 +339,7 @@ pub async fn ask_consent_with(
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
-                "reading @{name}'s lists needs confirmation, and there is no terminal to \
+                "reading @{shown}'s lists needs confirmation, and there is no terminal to \
                  ask at. Pass -y to confirm in advance."
             ),
         )
@@ -342,13 +350,13 @@ pub async fn ask_consent_with(
         "reading somebody else's lists is a heavier request than reading your own, \
          and Instagram is readier to refuse it",
     );
-    if !ui::confirm_off_thread(format!("Continue with @{name}?"), false).await? {
+    if !ui::confirm_off_thread(format!("Continue with @{shown}?"), false).await? {
         // No mention of -y here. They have just said no, and answering that
         // with "pass the flag that skips the question" is telling them to do
         // it anyway.
         return Err(ExitError::new(
             ExitCode::Interrupted,
-            format!("nothing was done: @{name} was not confirmed"),
+            format!("nothing was done: @{shown} was not confirmed"),
         )
         .into());
     }
