@@ -6,8 +6,9 @@ instruction document.
 **Detailed reasoning lives in the doc-comment above the code it governs, not
 here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
 schema in `store/sql/`, the cookie boundary in `cdp.rs`, the headers in
-`fingerprint.rs`. Read those before changing any of them — they explain what a
-number is for, which is what stops it being tuned into something harmful.
+`client_hints.rs`. Read those before changing any of them — they explain what a
+number is for, which is what stops it being changed into something that no
+longer does the job it was there to do.
 
 ## What this is
 
@@ -45,15 +46,18 @@ risk:
 
 - **No write operations against Instagram.** `snob` only reads. No follow,
   unfollow, block or remove-follower, ever.
-- **Never decrypt the user's browser cookie store.** Chrome and Edge on Windows
-  have used App-Bound Encryption since v127, and the only ways past it are
-  process injection and direct syscalls: infostealer territory. What is allowed,
-  and is the main route, is a browser **we launched with our own profile**
-  handing its cookies over through its debugging protocol. The boundary is whose
-  profile it is and who hands the data over, not whether the cookie is encrypted.
+- **Never read or decrypt the user's browser cookie store.** Chrome and Edge on
+  Windows have protected it with App-Bound Encryption since v127, and getting
+  past that protection is what credential-stealing malware is built to do. This
+  project does not go there, and has no reason to. What is allowed, and is the
+  main route, is a browser **we launched against our own profile**, which the
+  user logs into themselves and which then hands the cookies over through its
+  debugging protocol. The boundary is whose profile it is and who hands the data
+  over, not whether the cookie happens to be encrypted.
 - **On the first 429, `spam:true`, `feedback_required` or `challenge_required`:
-  hard stop.** No retry within that run, and the account goes into cooldown. A
-  retry loop without backoff is how an account gets flagged.
+  hard stop.** No retry within that run, and the account goes into cooldown.
+  When a service says no, the answer is to stop asking — and a retry loop is
+  also how a momentary limit becomes a lasting restriction.
 - **Request pacing is not changed without a documented reason.** The numbers are
   copied from `InstagramUnfollowers`, which has years of incident-free real use,
   and have only ever been changed to make *fewer* requests. They are in
@@ -201,31 +205,35 @@ Two judgement calls worth understanding before touching them:
   1080x1080 comes from `/api/v1/users/{pk}/info/`.
 - **`count=50` is accepted**, the cursor advances without repeating, and
   resuming works. Followers are served ~25 per page anyway; budget accordingly.
-- **There is no useful anonymous mode.** Without cookies, `web_profile_info`
-  answers 429 on the very first request from the edge, username-to-id cannot be
-  resolved by any surviving route, and the one endpoint that does answer gives a
-  stub with no counters and a 150x150 picture whose URL is signed for that size.
-  Everything needs a session; that is Instagram, not a gap here.
-- **The TLS stack is not to be tuned for fingerprinting.** Chrome has randomized
-  its ClientHello extension order since v110, so there is no fixed fingerprint
-  left to match and a stable one is more anomalous than any particular one.
-  Matching it would mean leaving `rustls` and the clean static
-  cross-compilation with it. What actually gets an account throttled, in order:
-  IP reputation, request volume and pace, header coherence.
-  **One target is the exception, and it is a build concern rather than a
-  fingerprinting one**: Windows on ARM64 uses schannel, because neither of
+- **There is no useful logged-out mode.** Signed out, `web_profile_info` answers
+  429 on the very first request from the edge, username-to-id cannot be resolved
+  by any surviving route, and the one endpoint that does answer gives a stub
+  with no counters and a 150x150 picture whose URL is signed for that size.
+  Everything needs a session; that is how Instagram has built it, not a gap
+  here.
+- **The TLS stack is chosen for portability, and is not to be tuned to imitate
+  anything.** There would be nothing to imitate in any case: Chrome has
+  randomized its ClientHello extension order since v110. Trying would mean
+  leaving `rustls`, and the clean static cross-compilation with it, and would
+  buy nothing — what determines whether Instagram throttles an account is, in
+  order, the address the requests come from, how many there are, and how fast.
+  **One target picks a different backend, and that is purely a build concern**:
+  Windows on ARM64 uses schannel, because neither of
   rustls's crypto providers builds there without LLVM — the pre-generated
   assembly is GNU syntax and both shell out to clang. Everything else, x86_64
   Windows included, stays on `rustls`. The reasoning, why it is deliberately
   not widened to all of Windows, and what it costs is in
-  `crates/snob-ig/Cargo.toml` next to the two dependency tables. Nothing about
-  it is an attempt to look like a browser, and `http2` stays mandatory on both.
-- **Header work aims at coherence, not disguise.** Instagram answers
-  `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so those are sent; `Accept` is `*/*`
-  because no browser sends `application/json` here; `sec-ch-ua` is computed from
-  the version rather than hardcoded, including the order of its three entries;
-  no `Origin` on a same-origin GET. The stored User-Agent follows the installed
-  browser's major version, at most daily, never when the user pinned one.
+  `crates/snob-ig/Cargo.toml` next to the two dependency tables. The choice is
+  about which crypto backend compiles on that target and nothing else, and
+  `http2` stays mandatory on both.
+- **Headers are sent so that the request is internally consistent, and for no
+  other reason.** Instagram answers `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so
+  those are sent; `Accept` is `*/*` because that is what `fetch()` sends when
+  the page sets nothing; `sec-ch-ua` is computed from the version rather than
+  hardcoded, including the order of its three entries; no `Origin` on a
+  same-origin GET, which the Fetch standard omits there. The stored User-Agent
+  follows the major version of a browser actually installed on the machine, at
+  most daily, and never when the user pinned one.
 - **`@someone` never reaches us on PowerShell.** `@` is the splatting operator,
   so the argument is gone before `main` runs and the tool answers about the
   user's own account. Nothing can detect it from here — do not write unquoted
@@ -238,8 +246,8 @@ Two judgement calls worth understanding before touching them:
 - **No biometric verification, on any platform.** Investigated in August 2026
   and rejected on the merits, not on difficulty. The principle: any prompt a
   local process of the same user can trigger, that same process can satisfy by
-  asking the user — and the attacker that matters, a stealer, never runs `snob`
-  at all, it reads the keyring directly with the same permissions. Concretely:
+  asking the user — and the attacker that matters never runs `snob` at all: it
+  reads the keyring directly, with the same permissions the user has. Concretely:
   Windows `KeyCredentialManager` gives an unpackaged binary **no per-application
   boundary** (Microsoft's own answer: without an AppContainer it scopes to the
   user account, and a second executable can open the same credential); the

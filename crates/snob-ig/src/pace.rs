@@ -3,8 +3,9 @@
 //! The numbers in [`Pace`] are copied from InstagramUnfollowers, which has
 //! years of real use without incident, and have only been changed to make
 //! *fewer* requests. **They are not changed without a documented reason** —
-//! each one carries below what it is for, and that is what stops a number
-//! being tuned into something that gets an account flagged.
+//! each one carries below what it is for, and that is what stops a number being
+//! quietly tuned down until the tool is asking far more of Instagram's service
+//! than answering the question needs.
 //!
 //! Two limits on what that provenance covers, both worth knowing before
 //! leaning on it:
@@ -75,10 +76,12 @@ impl Default for Pace {
 impl Pace {
     /// Cadence for walking somebody else's lists.
     ///
-    /// Enumerating an account that is not yours is the pattern Instagram's
-    /// detection watches most closely, so the walk is stretched out: every wait
-    /// is roughly two to three times the default and the long pause comes round
-    /// almost twice as often.
+    /// Reading an account that is not yours is a heavier thing to ask for than
+    /// reading your own, and Instagram is correspondingly readier to refuse it,
+    /// so the walk is stretched out: every wait is roughly two to three times
+    /// the default and the long pause comes round almost twice as often. Going
+    /// slower is the courtesy owed to whoever's service and whoever's account
+    /// this is, neither of them ours.
     ///
     /// `per_page` deliberately stays at 50. Asking for smaller pages could only
     /// mean more requests for the same users, and requests are the thing being

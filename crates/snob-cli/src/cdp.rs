@@ -1,11 +1,19 @@
 //! As much of the Chrome DevTools Protocol as capturing a login needs.
 //!
-//! The browser is launched by us, against a profile of ours, and hands its
-//! cookies over through its own debugging protocol. That is the line the
-//! project draws: we never read, copy or decrypt the browser's own cookie
-//! store. Since Chrome 127 that store is under App-Bound Encryption on Windows,
-//! and the only ways past it are process injection and direct syscalls —
-//! infostealer technique, not ours.
+//! **Nothing here touches the user's own browser, or the cookie store that
+//! belongs to it.** What this drives is a browser *this program started*,
+//! pointed at a profile directory under snob's own data directory — empty until
+//! the user logs into Instagram themselves, in the window that opens in front
+//! of them. The cookie then comes back from that browser, through the browser's
+//! own debugging protocol, and describes a session the user created a moment
+//! earlier.
+//!
+//! That boundary is deliberate, and it is where the project stops. Reading the
+//! real browser's store instead would mean defeating the encryption the
+//! operating system put around it — on Windows, App-Bound Encryption since
+//! Chrome 127 — which is the business credential-stealing malware is in. There
+//! is no need to go anywhere near it: a profile of our own answers the same
+//! question, with the user's knowledge, and that is the route taken.
 //!
 //! `Storage.getCookies` is the method that matters, because it returns
 //! `HttpOnly` cookies too. `sessionid` is `HttpOnly`, which is also why no
@@ -514,7 +522,7 @@ mod tests {
     /// Everything but `sessionid` is there from the moment the login page
     /// loads, so only `sessionid` means the login actually happened.
     #[test]
-    fn before_the_login_there_is_nothing_to_take() {
+    fn before_the_login_there_is_no_session_yet() {
         let cookies = vec![
             cookie("csrftoken", "tok", ".instagram.com"),
             cookie("mid", "m", ".instagram.com"),
@@ -532,7 +540,7 @@ mod tests {
     #[test]
     fn other_sites_are_left_alone() {
         let cookies = vec![
-            cookie("sessionid", "stolen", "notinstagram.com"),
+            cookie("sessionid", "someone-elses", "notinstagram.com"),
             cookie("sessionid", "also-not", "instagram.com.example.net"),
             cookie("sessionid", "nope", "example.com"),
         ];
