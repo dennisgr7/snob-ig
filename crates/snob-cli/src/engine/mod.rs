@@ -367,7 +367,7 @@ pub async fn ask_consent_with(
         "reading somebody else's lists is a heavier request than reading your own, \
          and Instagram is readier to refuse it",
     );
-    if !ui::confirm_off_thread(format!("Continue with @{shown}?"), false).await? {
+    if !ui::confirm_off_thread(app.progress(), format!("Continue with @{shown}?"), false).await? {
         // No mention of -y here. They have just said no, and answering that
         // with "pass the flag that skips the question" is telling them to do
         // it anyway.

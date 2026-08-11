@@ -164,8 +164,19 @@ pub fn prompt_line(prompt: &str) -> Result<String> {
 /// Only for the prompts that are asked while a run is under way. `purge` asks
 /// before there is anything else to schedule, so it calls [`confirm`] directly
 /// and this indirection would buy it nothing.
-pub async fn confirm_off_thread(question: String, default: bool) -> Result<bool> {
-    tokio::task::spawn_blocking(move || confirm(&question, default))
+///
+/// That is also why it takes the progress bar: being asked while a run is under
+/// way means being asked while something is drawing. The bar writes to standard
+/// error and so does the prompt, so the question landed on the line the
+/// animation owns and the next tick wiped it — leaving somebody watching a
+/// spinner and not knowing it was waiting for them.
+pub async fn confirm_off_thread(
+    progress: &crate::progress::Progress,
+    question: String,
+    default: bool,
+) -> Result<bool> {
+    let progress = progress.clone();
+    tokio::task::spawn_blocking(move || progress.while_paused(|| confirm(&question, default)))
         .await
         .context("the question could not be asked")?
 }
