@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use snob_core::Pk;
 use snob_core::filters::Filter;
-use snob_core::model::{ListKind, User};
+use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 
@@ -90,15 +90,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // hints can name it.
     let explicit_target = args.target.is_some();
     let viewer = app.viewer().clone();
-    let target = match &args.target {
-        Some(raw) => engine::target::clean(raw).to_string(),
-        // Filtered, because this one came from Instagram rather than from the
-        // command line. It becomes the `@{target}` heading in the markdown and
-        // the closing line on the terminal.
-        None => viewer
-            .safe_username()
-            .unwrap_or_else(|| viewer.pk.to_string()),
-    };
+    let target = summary_target(args.target.as_deref(), &viewer);
 
     // Followers first, mirroring the order `unfollowers` consumes the cache
     // in, and so an incomplete list is found out before the second walk is
@@ -166,6 +158,28 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
 /// Both lists have to be complete. The set commands only need the crossed-
 /// against list whole; here every one of the five counts leans on both lists,
 /// so a single missing account would bend the summary from partial to wrong.
+/// How this summary names the account it is about.
+///
+/// Filtered on both paths, for the reason `target::label` gives about the one
+/// that came off a keyboard: it is drawn, and `clean` only strips the at sign.
+/// Where a name came from decides whether it can be *trusted*, not whether a
+/// control character in it reaches a terminal — and this value reaches four of
+/// them: the `@{target}` heading in the markdown, the closing line on the
+/// terminal, a csv field, and an xlsx cell, where a character below 0x20 is not
+/// merely ugly but illegal XML.
+///
+/// A function of its own so that can be tested. It used to be a `match` inside
+/// `run`, where the arm for the name Instagram gave was filtered and the arm
+/// for the typed one was not.
+fn summary_target(typed: Option<&str>, viewer: &crate::app::Viewer) -> String {
+    match typed {
+        Some(raw) => printable(engine::target::clean(raw)),
+        None => viewer
+            .safe_username()
+            .unwrap_or_else(|| viewer.pk.to_string()),
+    }
+}
+
 fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     if outcome.is_complete() {
         return Ok(());
@@ -447,6 +461,31 @@ mod tests {
     // Only the tests go through the set helpers now: `summarize` counts instead
     // of collecting, and one of them checks the two still agree.
     use snob_core::sets;
+
+    /// Both halves of the heading, because only one of them used to be
+    /// filtered.
+    ///
+    /// The typed name is not trusted input just because somebody typed it:
+    /// `snob scan $'gh\e[2K\e[A'` reaches the terminal summary, the markdown
+    /// heading and — the reason this is not merely cosmetic — an xlsx cell,
+    /// where a character below 0x20 is illegal XML rather than invisible.
+    #[test]
+    fn the_heading_is_filtered_whoever_the_name_came_from() {
+        let viewer = crate::app::Viewer {
+            pk: 7,
+            username: Some("me\u{1b}[2K".into()),
+        };
+
+        assert_eq!(summary_target(Some("@gh\u{1b}[2K"), &viewer), "gh[2K");
+        assert_eq!(summary_target(None, &viewer), "me[2K");
+
+        // No name learned yet, so the id stands in for one.
+        let nameless = crate::app::Viewer {
+            pk: 7,
+            username: None,
+        };
+        assert_eq!(summary_target(None, &nameless), "7");
+    }
 
     fn user(pk: u64, name: &str) -> User {
         User {
