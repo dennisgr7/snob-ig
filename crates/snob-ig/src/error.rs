@@ -121,7 +121,15 @@ pub enum Reaction {
     Retry,
     /// Stop and put the account in cooldown.
     Cooldown,
-    /// Stop without a cooldown: waiting will not fix it.
+    /// Stop, because retrying within this run cannot help.
+    ///
+    /// It used to say "without a cooldown", and that stopped being true when a
+    /// challenge started recording one. The two questions are separate:
+    /// [`Reaction`] answers what the walk in progress should do, and
+    /// [`cooldown_for`] answers whether the account is left alone afterwards.
+    /// A challenge says yes to both — waiting is not what clears it, but
+    /// walking back in before the user has cleared it is exactly what turns a
+    /// checkpoint into something longer.
     Abort,
 }
 

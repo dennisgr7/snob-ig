@@ -270,6 +270,22 @@ Two judgement calls worth understanding before touching them:
   where they can *write*, and the v2 monitor is a background service that cannot
   prompt anybody. What is worth doing instead — keep the cookie out of the
   database and out of logs — is already done.
+- **A challenge's cooldown is not lifted by clearing the challenge, and that is
+  the accepted cost.** Someone who opens the link and passes the check in thirty
+  seconds still waits out the half hour: `whoami`, `pfp` and every walk refuse
+  until it lifts, and `login` stores a session without validating it because
+  during a cooldown not even that one request is spent. Two ways out were
+  considered and both were rejected. Letting a successful `login` clear it means
+  trusting a login that was never validated — the cooldown would be lifted by
+  the one command that cannot tell whether the account is still flagged.
+  Spending the validation request during the cooldown to find out is the retry
+  the rule above forbids, aimed at an account Instagram has just flagged, which
+  is precisely how a checkpoint becomes something longer. The escalation is
+  shared across causes for the same reason: a challenge arriving within a day of
+  a 429 is evidence the account is in worse shape, not better, so it starts at
+  the escalated length rather than at its own. `SNOB_IGNORE_COOLDOWN` exists for
+  the person who is certain, and stays undocumented so it is not the first thing
+  reached for.
 - **`snob purge` deletes the stored data and not the binary.** No package
   manager can do the first half: `winget uninstall`, `brew uninstall` and
   `apt remove` take away files the package owns, and the session, the database
