@@ -7,13 +7,10 @@ use crate::exit::ExitCode;
 use crate::ui;
 
 pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    // Anything but a clean "nothing there" counts as a session. A stored
-    // credential too corrupt to parse is still a credential on the disk, and
-    // reporting "there was no session" while deleting one also skips the line
-    // about it still being live on Instagram — which is exactly when the user
-    // needs it. `purge::survey` already reads it this way and has a test
-    // forbidding the other.
-    let had_session = !matches!(store.load(), Ok(None));
+    // Read through the store, which owns what counts as a stored session and why
+    // — a corrupt credential is still a credential. `purge::survey` asks the same
+    // question the same way.
+    let had_session = store.something_is_stored();
     // Not `?`. A keyring that refuses must not take the browser profile with
     // it: that profile holds a logged-in session too, and `purge` already
     // refuses to let one locked item hold the rest back for exactly this
