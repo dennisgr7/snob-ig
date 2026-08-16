@@ -41,12 +41,45 @@ const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(2 * 3600);
 const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
+
+/// After Instagram asks for the account to be verified.
+///
+/// Deliberately much shorter than the other two, because it is the only one
+/// waiting does not fix: a challenge is cleared by the user opening the link,
+/// and the account is usable again the moment they do. Twelve hours would
+/// punish someone who cleared it in thirty seconds, and nothing would punish
+/// the case this exists for — a scheduled run knocking again on an account
+/// Instagram has just flagged. Half an hour stops the second without
+/// stranding the first, and repeats still escalate.
+const CHALLENGE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 
 /// Escape hatch environment variable. Deliberately absent from the help: it
 /// exists so a bug of ours cannot lock anyone out, not for skipping the limit
 /// out of convenience.
 const IGNORE_COOLDOWN_ENV: &str = "SNOB_IGNORE_COOLDOWN";
+
+/// Whether the escape hatch is open.
+fn ignoring_cooldowns() -> bool {
+    std::env::var(IGNORE_COOLDOWN_ENV).is_ok_and(|value| is_affirmative(&value))
+}
+
+/// Whether a variable's value means yes.
+///
+/// The switch takes an answer rather than merely existing. This is the one
+/// thing that turns off the protection the whole project is built around, and
+/// `SNOB_IGNORE_COOLDOWN=0` meaning "yes, ignore it" is the kind of surprise
+/// that only shows up later as an account in trouble.
+///
+/// Split from the read above so a test can drive it without setting a variable
+/// the rest of the suite is reading at the same time.
+fn is_affirmative(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 /// How long to wait before firing a request.
 pub trait RateBudget: Send + Sync {
@@ -89,6 +122,10 @@ pub fn action_block_cooldown() -> Duration {
     ACTION_BLOCK_COOLDOWN
 }
 
+pub fn challenge_cooldown() -> Duration {
+    CHALLENGE_COOLDOWN
+}
+
 /// The core of the algorithm, isolated so it can be tested without a database.
 ///
 /// `emission` is what a request costs in time and `burst` how far ahead one may
@@ -108,17 +145,32 @@ pub struct SqliteRateBudget {
 }
 
 impl SqliteRateBudget {
-    /// Opens its **own** connection to the same file.
+    /// Opens its **own** connection to the same file, with the store's settings.
     ///
-    /// It deliberately does not share the store's: this way the two-process
-    /// case is the same as the two-connection case, so what runs is what gets
-    /// tested. It also keeps the budget's borrow from clashing with the
+    /// Not sharing the store's connection is deliberate: this way the
+    /// two-process case is the same as the two-connection case, so what runs is
+    /// what gets tested, and the budget's borrow cannot clash with the
     /// transaction that inserts pages.
+    ///
+    /// But separate must not mean differently configured. `trusted_schema` and
+    /// the defensive flag are about the file rather than about a handle, so one
+    /// undefended connection leaves the file undefended and cancels what the
+    /// store set. The same goes for `secure_delete` and the WAL size bound —
+    /// and this is the connection that enforces the bound, because it commits
+    /// an `IMMEDIATE` transaction before every single request and is therefore
+    /// the one that checkpoints.
     pub fn open(paths: &AppPaths) -> Result<Self, StoreError> {
         // The store must have been opened first: it is what creates the schema.
         let conn = Connection::open(paths.db_file())?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        super::configure(&conn)?;
+
+        // The one setting this connection does not want from `configure`.
+        // Under WAL, `synchronous = NORMAL` skips the fsync at commit, so a
+        // power cut can lose the last transactions. Here those are the cooldown
+        // writes, and losing one brings the account out of a block early — the
+        // single direction `start_cooldown` must never be wrong in. One fsync
+        // against a pace of one request every 2.4 seconds costs nothing.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self::over(conn))
     }
 
@@ -204,7 +256,7 @@ impl RateBudget for SqliteRateBudget {
     }
 
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-        if std::env::var(IGNORE_COOLDOWN_ENV).is_ok() {
+        if ignoring_cooldowns() {
             tracing::warn!("{IGNORE_COOLDOWN_ENV} is set: the cooldown is being ignored");
             return Ok(None);
         }
@@ -227,22 +279,35 @@ impl RateBudget for SqliteRateBudget {
         })
     }
 
+    /// Reads the previous cooldown and writes the next one in **one**
+    /// transaction, and never lets the result end sooner than what was already
+    /// there.
+    ///
+    /// Both halves matter for the same reason `reserve` takes the write lock up
+    /// front: the CLI and the v2 service share this file. Two processes reading
+    /// `strikes = 1` at the same instant both wrote `strikes = 2`, so one
+    /// escalation was lost. And the write was unconditional, so a two-hour
+    /// throttle recorded ten minutes into a twelve-hour action block replaced
+    /// it — the account came out of the more serious block early, which is the
+    /// one direction this table must never be wrong in.
     fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError> {
         let now = now_ms();
         let base = minimum.as_millis() as i64;
 
-        let previous: Option<(i64, i64)> = self
-            .conn()
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let previous: Option<(i64, i64, i64)> = tx
             .query_row(
-                "SELECT set_at_ms, strikes FROM cooldowns WHERE scope = ?1",
+                "SELECT set_at_ms, strikes, until_ms FROM cooldowns WHERE scope = ?1",
                 params![SESSION_SCOPE],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
 
         // Reoffending within the next day doubles the penalty.
         let (length, strikes) = match previous {
-            Some((set_at, strikes)) if now - set_at < MAX_COOLDOWN_MS => {
+            Some((set_at, strikes, _)) if now - set_at < MAX_COOLDOWN_MS => {
                 let next = strikes + 1;
                 let escalated = base.saturating_mul(1 << (next - 1).min(5));
                 (escalated.min(MAX_COOLDOWN_MS), next)
@@ -250,8 +315,10 @@ impl RateBudget for SqliteRateBudget {
             _ => (base.min(MAX_COOLDOWN_MS), 1),
         };
 
-        let until = now + length;
-        self.conn().execute(
+        let standing = previous.map_or(0, |(_, _, until)| until);
+        let until = (now + length).max(standing);
+
+        tx.execute(
             "INSERT INTO cooldowns (scope, until_ms, set_at_ms, reason, strikes)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(scope) DO UPDATE SET
@@ -261,6 +328,7 @@ impl RateBudget for SqliteRateBudget {
                  strikes = excluded.strikes",
             params![SESSION_SCOPE, until, now, reason, strikes],
         )?;
+        tx.commit()?;
 
         tracing::warn!(reason, minutes = length / 60_000, "account in cooldown");
         Ok(until)
@@ -344,13 +412,15 @@ mod tests {
         assert_eq!(tat, 1_000_000 + T);
     }
 
+    /// Built through the real constructor, not through `over`. The claim above
+    /// `open` is that what runs is what gets tested, and a helper that skipped
+    /// the configuration would have made that false for every test in here.
     fn temp_budget() -> (tempfile::TempDir, SqliteRateBudget) {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.db");
+        let paths = crate::paths::AppPaths::rooted_at(tmp.path());
         // The store creates the schema; the budget hooks in afterwards.
-        let _db = super::super::Store::open_at(&path).unwrap();
-        let conn = Connection::open(&path).unwrap();
-        (tmp, SqliteRateBudget::over(conn))
+        let _db = super::super::Store::open(&paths).unwrap();
+        (tmp, SqliteRateBudget::open(&paths).unwrap())
     }
 
     #[test]
@@ -361,16 +431,53 @@ mod tests {
         }
     }
 
+    /// Far enough past the burst that the disk cannot decide the answer.
+    ///
+    /// The bucket refills in real time, so every millisecond these reservations
+    /// take is a millisecond of throttling they undo. Twenty-one of them left a
+    /// margin of one emission — 2.4 seconds for twenty-one committed
+    /// transactions — and this connection runs with `synchronous = FULL`, so
+    /// each one waits for the platform to flush. A Windows runner spent that
+    /// margin and the test failed on a correct budget.
+    ///
+    /// Thirty is the same assertion with twenty-four seconds of slack: past the
+    /// burst is past the burst, and a machine slow enough to break this one is
+    /// slow enough that it was never going to outrun the pace anyway.
     #[test]
     fn the_budget_runs_out_and_starts_throttling() {
         let (_tmp, b) = temp_budget();
-        for _ in 0..21 {
+        for _ in 0..30 {
             b.reserve().unwrap();
         }
         assert!(
             b.reserve().unwrap() > Duration::ZERO,
             "past the burst it should throttle"
         );
+    }
+
+    /// The connection that writes most often gets everything the store sets on
+    /// itself. A second connection to one file, configured differently, is the
+    /// same as not configuring the file.
+    #[test]
+    fn the_budget_connection_is_protected_like_the_store() {
+        let (_tmp, budget) = temp_budget();
+        let conn = budget.conn();
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+                .unwrap()
+        };
+
+        assert_eq!(
+            pragma("trusted_schema"),
+            0,
+            "the schema is executable content"
+        );
+        assert_eq!(pragma("secure_delete"), 1);
+        assert_eq!(pragma("journal_size_limit"), 4 * 1024 * 1024);
+
+        // FULL, not the store's NORMAL: losing the last commit here would bring
+        // an account out of a cooldown early.
+        assert_eq!(pragma("synchronous"), 2, "cooldown writes must be fsynced");
     }
 
     #[test]
@@ -392,6 +499,42 @@ mod tests {
             second - now_ms() > first - now_ms(),
             "reoffending should lengthen the cooldown"
         );
+    }
+
+    /// The one direction this table must never be wrong in. A twelve-hour
+    /// action block, followed ten minutes later by a two-hour throttle, used to
+    /// end at the two-hour mark: the account came out of the more serious block
+    /// early.
+    #[test]
+    fn a_shorter_cause_never_cuts_a_standing_cooldown_short() {
+        let (_tmp, b) = temp_budget();
+
+        let long = b
+            .start_cooldown("feedback_required", Duration::from_secs(12 * 3600))
+            .unwrap();
+        let after_short = b
+            .start_cooldown("rate_limit", Duration::from_secs(2 * 3600))
+            .unwrap();
+
+        assert!(
+            after_short >= long,
+            "the cooldown was cut from {long} to {after_short}"
+        );
+        assert_eq!(b.cooldown().unwrap().unwrap(), after_short);
+    }
+
+    /// The switch that turns off the protection the whole project is built
+    /// around takes a yes, not merely a value. Setting it to `0` and getting
+    /// "cooldowns ignored" is a surprise that only surfaces later, as an
+    /// account in trouble.
+    #[test]
+    fn the_escape_hatch_needs_an_affirmative_value() {
+        for yes in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_affirmative(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "off", "", "  ", "maybe"] {
+            assert!(!is_affirmative(no), "{no:?}");
+        }
     }
 
     #[test]

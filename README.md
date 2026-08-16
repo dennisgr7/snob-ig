@@ -36,14 +36,16 @@ brew install snob
 [releases page][releases] and:
 
 ```bash
-sudo apt install ./snob-v0.1.1-x86_64-unknown-linux-musl.deb
+sudo apt install ./snob-v<version>-x86_64-unknown-linux-musl.deb
 ```
 
 The Linux builds are statically linked, so they carry no glibc version
 requirement and run on any distribution.
 
-**Without a package manager.** These download the release for your platform,
-check it against the published SHA256, and put it on your `PATH`:
+**Without a package manager.** These download the release for your platform and
+check it against the published SHA256. The PowerShell one adds the install
+directory to your user `PATH`; the shell one prints the line to add to your
+profile, because which file that is depends on the shell you use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dennisgr7/snob-ig/main/packaging/install.sh | sh
@@ -188,7 +190,7 @@ snob purge
 It shows you the list and asks before deleting anything. Then remove the binary
 however you installed it.
 
-## Staying out of trouble
+## The risk, and what the design does about it
 
 There is no official API for any of this — Meta removed the followers endpoint
 in 2018 — so snob uses the private web API with your own session. That goes
@@ -203,17 +205,52 @@ Most of the design exists to make that unlikely:
   [InstagramUnfollowers][iu], which has years of real use behind it, and only
   ever adjusted downwards. Nothing in snob can send a request without paying for
   it first.
-- **The first sign of trouble stops the run.** A 429, a `feedback_required` or a
-  challenge ends it immediately and puts the account in cooldown; there is no
-  retry loop, because a retry loop is how an account gets flagged.
+- **The first refusal stops the run.** A 429, a `feedback_required` or a
+  challenge ends it immediately and puts the account in cooldown. There is no
+  retry loop: when a service says no, the answer is to stop asking, and pushing
+  on is also how a momentary limit becomes a lasting one.
 - **Nothing is asked twice.** A recent list is reused from storage instead of
   walked again, and an interrupted walk resumes rather than starting over.
-- **The headers match a browser** that is actually installed on the machine,
-  rather than announcing something no browser sends.
+- **The requests are well-formed.** The headers are derived from a browser
+  actually installed on the machine, so they agree with each other instead of
+  describing something contradictory.
+
+One part of this is not snob's to control, and it is the part that matters
+most. The single strongest signal Instagram has is **where the requests come
+from**: a home connection is treated very differently from a datacenter one,
+and the same endpoint that answers normally from a laptop can answer 429 on the
+very first request from a cloud address. So:
+
+- Run it from the connection you normally browse from.
+- A VPS, a VPN or a public proxy raises the odds of a checkpoint and can
+  shorten the life of the session. Running it in a homelab is supported and
+  works; it is not risk-free in the way running it on your own desktop is.
+- Try not to have the session in two places at once — snob on a server while
+  you browse Instagram at home is the kind of split Instagram notices.
 
 None of that is a guarantee, and it is not offered as one. Walking a list of
 several thousand costs hundreds of requests however carefully they are spaced.
 Use it knowing that.
+
+## Exit codes
+
+Stable, and meant for scripts: the point of them is to tell "log in again"
+apart from "wait a while" without reading the message text.
+
+| Code | Meaning |
+|---|---|
+| 0 | It worked. A list cut short by `--limit` or `--max-pages` is still a 0. |
+| 1 | It failed, with nothing more specific to say — including a result refused because a list came back incomplete. |
+| 3 | No session stored, or the one there no longer works. Run `snob login`. |
+| 4 | Instagram wants the account verified. Open the address it prints. |
+| 5 | Instagram is throttling, or the account is in cooldown. Wait. |
+| 130 | Stopped by you: Ctrl+C, or a confirmation that was not given — including with no terminal to ask at, where `-y` confirms in advance. |
+
+`followers` and `following` print what they got and exit 0 even when the walk
+was cut short, because a partial list is still true as far as it goes.
+`unfollowers`, `fans`, `friends` and `scan` cross two lists, so an incomplete
+one there makes the answer wrong rather than short — those refuse, and exit
+with the code of whatever stopped them.
 
 ## Inspiration
 

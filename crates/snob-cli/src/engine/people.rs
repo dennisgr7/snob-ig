@@ -50,7 +50,14 @@ pub fn name_a_few(people: &[User], cap: usize) -> Option<String> {
         _ => (&people[..cap], people.len() - cap),
     };
 
-    let names: Vec<String> = first.iter().map(|u| format!("@{}", u.username)).collect();
+    // Filtered here rather than at each consumer: this line is the first thing
+    // `snob scan` prints, with no flag needed, and it also goes into the
+    // markdown summary, whose escaping is about table cells rather than about
+    // what a terminal obeys.
+    let names: Vec<String> = first
+        .iter()
+        .map(|u| format!("@{}", u.safe_username()))
+        .collect();
     let listed = match names.as_slice() {
         [one] => one.clone(),
         // The last one joins with "and" rather than a comma, because this is a
@@ -88,6 +95,17 @@ mod tests {
     #[test]
     fn nobody_is_not_a_sentence() {
         assert_eq!(name_a_few(&[], 3), None);
+    }
+
+    /// This line opens `snob scan` with no flag asked for, so a username is
+    /// the shortest route from somebody else's profile to the terminal.
+    #[test]
+    fn a_hostile_name_cannot_drive_the_terminal() {
+        let hostile = people(&["ana\u{1b}[2K", "lu\u{202e}is"]);
+        let line = name_a_few(&hostile, 3).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert_eq!(line, "@ana[2K and @luis");
     }
 
     #[test]

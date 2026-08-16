@@ -8,17 +8,30 @@
 
 use anyhow::{Result, bail};
 use snob_core::Pk;
-use snob_core::model::{ListKind, User};
+use snob_core::model::{ListKind, printable};
 use snob_core::store::{accounts, users};
 
 use crate::app::App;
 use crate::cli::ListArgs;
 
+#[derive(Debug, Clone)]
 pub struct Target {
     pub pk: Pk,
     /// As Instagram spells it, or as the store recorded it — never as it was
     /// typed. The upsert that follows writes this name back.
-    pub username: String,
+    ///
+    /// `None` when it has genuinely never been learned, which happens on your
+    /// own account whenever the session was stored without one: logging in
+    /// while the account is throttled leaves it unset, and only `whoami` ever
+    /// writes a resolved name back.
+    ///
+    /// It used to be a `String` holding `pk.to_string()` in that case, with a
+    /// comment saying it was only a label. It was not: `engine::decide` writes
+    /// it straight into `users.username`, so `--cache` clobbered a correct
+    /// stored name with the number, filed a rename that never happened, and
+    /// then told the user their own account had no stored list — because
+    /// `find_pk_by_username` no longer matched the real one.
+    pub username: Option<String>,
     pub is_self: bool,
     /// The counters, when resolving already asked for them.
     ///
@@ -45,23 +58,22 @@ impl Counters {
     }
 }
 
-impl From<&Target> for User {
-    fn from(t: &Target) -> Self {
-        Self {
-            pk: t.pk,
-            username: t.username.clone(),
-            full_name: None,
-            is_private: None,
-            is_verified: None,
-            pfp_url: None,
-        }
-    }
-}
-
 /// Strips the at sign people type out of habit. Both spellings mean the same
 /// account, and Instagram takes neither with the sign attached.
 pub fn clean(typed: &str) -> &str {
     typed.trim_start_matches('@')
+}
+
+/// How to name the account a run is about, before anything has resolved it.
+///
+/// The typed name when there is one, the viewer's own label otherwise. It goes
+/// through `printable` because it is drawn on a terminal and `clean` only
+/// strips the at sign.
+pub fn label(app: &App, args: &ListArgs) -> String {
+    match args.target.as_deref() {
+        Some(raw) => format!("@{}", snob_core::model::printable(clean(raw))),
+        None => app.viewer().label(),
+    }
 }
 
 /// Resolves against Instagram, spending one request when a name was given.
@@ -79,9 +91,9 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
 
         return Ok(Target {
             pk: viewer.pk,
-            // Standing in for a name we could not learn. It is only a label
-            // from here on: the counters below say not to look it up.
-            username: resolved.clone().unwrap_or_else(|| viewer.pk.to_string()),
+            // `None` when it was never learned, rather than the numeric id
+            // standing in for it. See the field.
+            username: resolved.clone(),
             is_self: true,
             counters: match resolved {
                 // Not asked for yet: your own account does not come through
@@ -106,16 +118,19 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
     // never turn into a refusal: with `None` the walk runs and fails, or does
     // not, on its own terms.
     if !is_self && profile.is_private == Some(true) && profile.followed_by_viewer == Some(false) {
+        // Filtered: it came off Instagram, not out of anybody's keyboard, and
+        // this sentence is written to a terminal. `pfp.rs` does the same with
+        // the same field in the same shape of refusal.
         if profile.requested_by_viewer == Some(true) {
             bail!(
                 "@{} is private and your follow request has not been accepted yet, \
                  so its lists cannot be read",
-                profile.username
+                printable(&profile.username)
             );
         }
         bail!(
             "@{} is a private account you do not follow, so its lists cannot be read",
-            profile.username
+            printable(&profile.username)
         );
     }
 
@@ -128,7 +143,7 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
             followers: profile.follower_count(),
             following: profile.following_count(),
         }),
-        username: profile.username,
+        username: Some(profile.username),
     })
 }
 
@@ -141,10 +156,7 @@ pub fn from_store(app: &App, typed: Option<&str>, kind: ListKind) -> Result<Targ
         let viewer = app.viewer();
         return Ok(Target {
             pk: viewer.pk,
-            username: viewer
-                .username
-                .clone()
-                .unwrap_or_else(|| viewer.pk.to_string()),
+            username: viewer.username.clone(),
             is_self: true,
             counters: None,
         });
@@ -157,9 +169,11 @@ pub fn from_store(app: &App, typed: Option<&str>, kind: ListKind) -> Result<Targ
 
     Ok(Target {
         pk,
-        username: users::find(app.db().conn(), pk)?
-            .map(|u| u.username)
-            .unwrap_or_else(|| typed.to_string()),
+        // Always a name: the account was found by the one that was typed, so the
+        // worst case is the typed spelling rather than nothing. Said with `Some`
+        // at the front, because the field means "never learned" and this path
+        // cannot express that.
+        username: Some(users::name(app.db().conn(), pk)?.unwrap_or_else(|| typed.to_string())),
         is_self: app.viewer().pk == pk,
         // Nothing was asked of Instagram, so there is nothing to carry.
         counters: None,
@@ -176,22 +190,5 @@ mod tests {
         assert_eq!(clean("someone"), "someone");
         // Only the leading one: it is not part of any username anyway.
         assert_eq!(clean("@@someone"), "someone");
-    }
-
-    #[test]
-    fn a_target_becomes_a_bare_user_row() {
-        let target = Target {
-            pk: 7,
-            username: "someone".into(),
-            is_self: false,
-            counters: None,
-        };
-        let user = User::from(&target);
-        assert_eq!(user.pk, 7);
-        assert_eq!(user.username, "someone");
-        // Nothing is invented: the metadata arrives with the walk, and the
-        // upsert leaves what it already had alone.
-        assert_eq!(user.is_private, None);
-        assert_eq!(user.is_verified, None);
     }
 }

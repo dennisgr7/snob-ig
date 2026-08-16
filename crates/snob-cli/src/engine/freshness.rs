@@ -14,7 +14,7 @@ use snob_core::store::{accounts, now, snapshots};
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::target::{Counters, Target};
-use crate::engine::{ListOutcome, walk};
+use crate::engine::{ListOutcome, Provenance, walk};
 
 /// Polls, compares, and either serves what is stored or walks.
 pub async fn decide_and_fetch(
@@ -33,7 +33,10 @@ pub async fn decide_and_fetch(
                 app.warn(&format!(
                     "could not check for changes ({e}); using the stored list"
                 ));
-                return serve(app, target, snapshot);
+                // Served, but with nothing said about whether it is still
+                // true. It is fine to print; it is not fine to cross against
+                // another list, and only the provenance can carry that.
+                return serve(app, snapshot, Provenance::PollFailed);
             }
             app.warn(&format!("could not read the profile ({e})"));
             None
@@ -44,7 +47,10 @@ pub async fn decide_and_fetch(
         && let Some(snapshot) = &stored
         && is_still_good(snapshot, declared, args.max_age.as_secs() as i64)
     {
-        return serve(app, target, snapshot);
+        // The counter was polled just now and had not moved, so this describes
+        // the account as it is however old the snapshot is. That is what makes
+        // it safe to cross.
+        return serve(app, snapshot, Provenance::CounterVerified);
     }
 
     walk::fetch(app, args, kind, target, declared).await
@@ -66,12 +72,12 @@ fn is_still_good(snapshot: &snapshots::Snapshot, declared: Option<u64>, max_age_
 
 fn serve(
     app: &App,
-    target: &Target,
     snapshot: &snapshots::Snapshot,
+    provenance: Provenance,
 ) -> Result<(Vec<User>, ListOutcome)> {
     Ok((
         snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), false),
+        ListOutcome::cached(snapshot, provenance),
     ))
 }
 
@@ -83,14 +89,24 @@ fn serve(
 /// hand and asking twice would only spend the request that the whole cache
 /// policy exists to save.
 async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u64>> {
-    let counters = match target.counters {
-        Some(counters) => counters,
-        None => {
-            let profile = app.client().web_profile_info(&target.username).await?;
-            Counters {
+    let counters = match (target.counters, target.username.as_deref()) {
+        (Some(counters), _) => counters,
+        // The profile endpoint takes a name, so without one there is nothing to
+        // ask with. Saying the counter is unknown costs nothing; asking about a
+        // numeric id would spend a request on a guaranteed 404 every run.
+        (None, None) => return Ok(None),
+        (None, Some(username)) => {
+            let profile = app.client().web_profile_info(username).await?;
+            let counters = Counters {
                 followers: profile.follower_count(),
                 following: profile.following_count(),
-            }
+            };
+            // One answer carries both counters, so the other list of a crossing
+            // does not have to ask again. Without this the memo held the
+            // identity and the second list still spent a request on the numbers
+            // it already had in hand.
+            app.remember_counters(counters);
+            counters
         }
     };
 

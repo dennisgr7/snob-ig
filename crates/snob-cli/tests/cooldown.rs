@@ -23,31 +23,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
-use snob_cli::engine::{self, ListOutcome, ResultSource};
+use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 use snob_cli::exit::ExitCode;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
-
-fn args() -> ListArgs {
-    ListArgs {
-        target: None,
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
-        limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
-        yes: true,
-    }
-}
+mod common;
+use common::{SID, UA, args};
 
 /// A budget over a database that exists.
 ///
@@ -186,9 +166,9 @@ async fn during_a_cooldown_the_stored_list_is_served_without_requests() {
         .unwrap();
 
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(outcome.requests, 0);
-    assert!(outcome.from_cooldown);
+    assert_eq!(outcome.provenance, Provenance::Cooldown);
     assert_eq!(
         requests(&server).await,
         seeded,
@@ -232,7 +212,7 @@ async fn an_old_snapshot_is_still_served_during_the_cooldown() {
         .unwrap();
 
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(outcome.requests, 0);
 }
 
@@ -307,7 +287,7 @@ async fn a_named_target_is_resolved_locally_and_case_insensitively() {
         .unwrap();
 
     assert_eq!(found.len(), 5);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(requests(&empty).await, 0);
 }
 

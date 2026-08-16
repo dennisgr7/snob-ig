@@ -98,7 +98,7 @@ pub fn refresh_user_agent(session: &mut Session) -> bool {
     // session created in Edge must not be handed Chrome's version number, and
     // on a machine with both that is exactly what the preference order gives.
     let installed = match &session.browser {
-        Some(name) => detect_all().into_iter().find(|b| b.name == name),
+        Some(name) => detect_named(name),
         None => detect(),
     };
     let Some(installed) = installed else {
@@ -164,8 +164,30 @@ pub fn detect() -> Option<Browser> {
 /// Chrome and Edge is ordinary, the Instagram session lives in exactly one of
 /// them, and picking for the user is picking wrong half the time.
 pub fn detect_all() -> Vec<Browser> {
+    probe(|_| true)
+}
+
+/// The one brand asked for, without launching the others.
+///
+/// `refresh_user_agent` wants exactly one — the browser the session belongs to
+/// — and used to get it by detecting everything and then filtering. Off Windows
+/// detection launches each candidate with `--version` and blocks on the answer,
+/// so reading one version cost three processes.
+///
+/// It keeps `detect_all`'s semantics deliberately: every path of that brand is
+/// tried and it stops on the first that yields a **version**, not on the first
+/// that exists. On Linux the candidates are `$PATH` crossed with several
+/// executable names, so a path can be there and answer nothing.
+pub fn detect_named(name: &str) -> Option<Browser> {
+    probe(|candidate| candidate == name).into_iter().next()
+}
+
+fn probe(wanted: impl Fn(&str) -> bool) -> Vec<Browser> {
     let mut found = Vec::new();
     for (name, suffix, paths) in candidates() {
+        if !wanted(name) {
+            continue;
+        }
         for path in paths {
             if !path.is_file() {
                 continue;

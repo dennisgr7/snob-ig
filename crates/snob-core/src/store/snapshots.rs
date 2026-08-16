@@ -45,24 +45,41 @@ pub struct SavedPage {
     pub renamed: Vec<(Pk, String)>,
 }
 
+/// The snapshot a walk has just opened: its id, and the moment it opened.
+///
+/// A struct rather than a pair because the caller needs both and they are not
+/// interchangeable. The timestamp is handed back rather than left in the row
+/// because it is one end of the interval the finished list describes, and the
+/// caller has to have the number the row actually holds — not one it read a
+/// moment before or after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opened {
+    pub id: i64,
+    pub started_at: i64,
+}
+
 /// Starts a new snapshot.
 pub fn begin(
     conn: &Connection,
     account_pk: Pk,
     kind: ListKind,
     declared_count: Option<u64>,
-) -> Result<i64, StoreError> {
+) -> Result<Opened, StoreError> {
+    let started_at = now();
     conn.execute(
         "INSERT INTO snapshots (account_pk, kind, source, started_at, declared_count)
          VALUES (?1, ?2, 'live', ?3, ?4)",
         params![
             pk_to_sql(account_pk),
             kind.as_str(),
-            now(),
+            started_at,
             declared_count.map(|v| v as i64),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(Opened {
+        id: conn.last_insert_rowid(),
+        started_at,
+    })
 }
 
 /// Looks for an interrupted walk that can still be continued.
@@ -117,24 +134,39 @@ pub fn save_page(
 
     let mut result = SavedPage::default();
 
-    for u in users {
-        if let Some(old) = super::users::upsert(&tx, u)? {
-            result.renamed.push((u.pk, old));
-        }
-
-        // The ordinal counts only the rows that go in, so it advances with
-        // `added` alone. Adding the position within the page as well used to
-        // inflate it on every repeat — and Instagram repeats accounts across
-        // pages, as the OR IGNORE below exists to absorb — which left later
-        // pages starting at a lower ordinal than earlier ones had reached, so
-        // `members` returned them out of the order Instagram served them in.
-        tx.execute(
+    {
+        // Compiled once for the whole page rather than once per account. This is
+        // the only per-account loop in the program, and `Connection::execute`
+        // prepares its statement every call.
+        let mut member = tx.prepare_cached(
             "INSERT OR IGNORE INTO snapshot_members (snapshot_id, user_pk, ordinal)
              VALUES (?1, ?2, ?3)",
-            params![id, pk_to_sql(u.pk), first_ordinal + result.added as i64],
         )?;
-        if tx.changes() > 0 {
-            result.added += 1;
+
+        for u in users {
+            if let Some(old) = super::users::upsert(&tx, u)? {
+                result.renamed.push((u.pk, old));
+            }
+
+            // The ordinal counts only the rows that go in, so it advances with
+            // `added` alone. Adding the position within the page as well used to
+            // inflate it on every repeat — and Instagram repeats accounts across
+            // pages, as the OR IGNORE above exists to absorb — which left later
+            // pages starting at a lower ordinal than earlier ones had reached, so
+            // `members` returned them out of the order Instagram served them in.
+            //
+            // The insert's own answer rather than `tx.changes()`: it is the count
+            // for this statement, where the connection-wide one is whatever ran
+            // last and would follow `upsert` if a statement were ever added
+            // between the two.
+            let inserted = member.execute(params![
+                id,
+                pk_to_sql(u.pk),
+                first_ordinal + result.added as i64
+            ])?;
+            if inserted > 0 {
+                result.added += 1;
+            }
         }
     }
 
@@ -262,7 +294,9 @@ mod tests {
     #[test]
     fn a_fresh_snapshot_is_not_complete() {
         let db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10)).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
         assert!(
             latest_complete(db.conn(), 1, ListKind::Followers)
                 .unwrap()
@@ -274,7 +308,9 @@ mod tests {
     #[test]
     fn saving_pages_accumulates_members_in_order() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(4)).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(4))
+            .unwrap()
+            .id;
 
         save_page(&mut db, id, &[user(10), user(11)], Some("c1")).unwrap();
         save_page(&mut db, id, &[user(12), user(13)], None).unwrap();
@@ -290,7 +326,7 @@ mod tests {
     #[test]
     fn repeats_across_pages_are_not_counted_twice() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
 
         let first = save_page(&mut db, id, &[user(10), user(11)], Some("c")).unwrap();
         // Instagram repeats accounts across pages when the list shifts.
@@ -308,7 +344,7 @@ mod tests {
     #[test]
     fn repeats_do_not_disturb_the_order_of_what_follows() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
 
         save_page(&mut db, id, &[user(10), user(11)], Some("c1")).unwrap();
         // The first two come round again, with one genuinely new behind them.
@@ -326,7 +362,7 @@ mod tests {
     #[test]
     fn saving_a_page_advances_the_cursor() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10)], Some("next")).unwrap();
 
         let pending = resumable(db.conn(), 1, ListKind::Followers)
@@ -342,7 +378,7 @@ mod tests {
         let mut db = base();
         users::upsert(db.conn(), &user(10)).unwrap();
 
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         let mut renamed = user(10);
         renamed.username = "brand_new_name".into();
 
@@ -365,7 +401,7 @@ mod tests {
             StopReason::SessionInvalid,
             StopReason::PageLimit,
         ] {
-            let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+            let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
             save_page(&mut db, id, &[user(10)], None).unwrap();
             close(db.conn(), id, reason).unwrap();
 
@@ -377,7 +413,7 @@ mod tests {
             );
         }
 
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10)], None).unwrap();
         close(db.conn(), id, StopReason::Completed).unwrap();
         assert!(
@@ -393,7 +429,7 @@ mod tests {
     fn every_stop_reason_is_accepted_by_the_schema() {
         let mut db = base();
         for reason in StopReason::ALL {
-            let id = begin(db.conn(), 1, ListKind::Following, None).unwrap();
+            let id = begin(db.conn(), 1, ListKind::Following, None).unwrap().id;
             save_page(&mut db, id, &[user(10)], None).unwrap();
             close(db.conn(), id, reason)
                 .unwrap_or_else(|e| panic!("the schema rejected {reason:?}: {e}"));
@@ -403,7 +439,7 @@ mod tests {
     #[test]
     fn closing_cleanly_clears_the_pending_cursor() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10)], Some("leftover")).unwrap();
         close(db.conn(), id, StopReason::Completed).unwrap();
 
@@ -421,7 +457,7 @@ mod tests {
     #[test]
     fn an_interrupted_one_keeps_its_cursor_to_resume() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10)], Some("from_here")).unwrap();
         close(db.conn(), id, StopReason::Canceled).unwrap();
 
@@ -434,7 +470,7 @@ mod tests {
     #[test]
     fn something_too_old_is_not_resumed() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10)], Some("stale")).unwrap();
 
         let long_ago = now() - RESUME_WINDOW_SECS - 1;
@@ -455,7 +491,7 @@ mod tests {
     #[test]
     fn the_two_lists_do_not_mix() {
         let mut db = base();
-        let followers = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let followers = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, followers, &[user(10)], None).unwrap();
         close(db.conn(), followers, StopReason::Completed).unwrap();
 
@@ -469,7 +505,7 @@ mod tests {
     #[test]
     fn deleting_a_snapshot_deletes_its_members() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, id, &[user(10), user(11)], None).unwrap();
 
         db.conn()
@@ -488,11 +524,11 @@ mod tests {
     #[test]
     fn deleting_partials_spares_the_complete_ones() {
         let mut db = base();
-        let good = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let good = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, good, &[user(10)], None).unwrap();
         close(db.conn(), good, StopReason::Completed).unwrap();
 
-        let bad = begin(db.conn(), 1, ListKind::Followers, None).unwrap();
+        let bad = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
         save_page(&mut db, bad, &[user(11)], Some("c")).unwrap();
 
         assert_eq!(

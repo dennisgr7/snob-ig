@@ -18,19 +18,37 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
-# No `webpki-roots`: in reqwest 0.13 the feature only turns on an optional
-# dependency that nothing in reqwest references, so it was a crate compiled for
-# no one. Verification goes through `rustls-platform-verifier`, the operating
-# system's own trust store, which is the right answer on a desktop anyway.
+# The TLS backend is **not** listed here. It is chosen per platform, in
+# crates/snob-ig/Cargo.toml, and the reason is written out there.
 # No `cookies`: nothing here keeps a cookie jar — the session travels as an
 # explicit header, and the CDN must never receive it. Leaving the feature on
 # meant a later `.cookie_store(true)` would silently start carrying cookies
 # across redirects; without it, that becomes a compile error. It also drops ten
 # crates from the tree.
-# `brotli` and `zstd` alongside `gzip` are not about speed: Chrome advertises
-# `gzip, deflate, br, zstd`, and a client that in 2026 announces gzip alone is
-# an anomaly that costs one line to remove.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip", "brotli", "zstd"] }
+# `http2` is not optional and not a performance choice: Instagram answers 429 to
+# HTTP/1.1 on these endpoints from some hosts and networks where the same
+# request over h2 succeeds, and a browser always negotiates h2 against
+# instagram.com. Both TLS backends below advertise `h2` through ALPN.
+# No `charset`: it exists to serve `Response::text()` and `text_with_charset`,
+# and nothing here calls either — the two read paths go through `chunk()` and
+# `from_utf8_lossy` on purpose, so that a body's size is bounded before it is
+# decoded. It was compiling `encoding_rs`, most of which is character tables,
+# for no one.
+# The four decoders are not about speed. Chrome advertises
+# `gzip, deflate, br, zstd`, the client sends exactly that string, and a codec
+# may only be advertised if it can be decoded — announcing one and then failing
+# to read the answer is worse than not announcing it. `deflate` was the one
+# missing, so the header did not match the comment that asked for it.
+
+reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "gzip", "deflate", "brotli", "zstd"] }
+# Depended on only to turn one feature back on. reqwest declares rustls with
+# `default-features = false`, which drops `prefer-post-quantum` — and without it
+# the client advertises the hybrid group X25519MLKEM768 in `supported_groups`
+# and then sends a plain X25519 key share. Announcing a group you have not
+# offered a share for is what a HelloRetryRequest is for, and it is not what
+# Chrome does: Chrome puts the hybrid first and sends its share. Enabling it
+# costs about a kilobyte on the handshake.
+rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 clap = { version = "4", features = ["derive"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.
@@ -60,10 +78,15 @@ url = "2"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 base64 = "0.23"
+# Already in the tree under `url`, so this costs no extra compilation. Used to
+# put a username into the profile address. Encoding rather than filtering,
+# because filtering removes characters and a name with one removed is the
+# address of a different account; the reasoning is on `User::profile_url`.
+percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization"] }
 
 # Test-only
 wiremock = "0.6"

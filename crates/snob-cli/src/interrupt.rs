@@ -22,8 +22,11 @@ pub fn install() -> CancelToken {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("\nForced exit.");
             // Nothing below this runs a destructor, so a browser started for a
-            // login would otherwise be left alive with its debugging port open.
+            // login would otherwise be left alive with its debugging port open,
+            // and a cursor hidden by the login menu would stay hidden for the
+            // rest of the user's shell session.
             crate::cdp::kill_launched();
+            crate::ui::restore_terminal();
             std::process::exit(130);
         }
     });

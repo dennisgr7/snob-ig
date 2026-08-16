@@ -1,16 +1,23 @@
 //! Spreadsheet workbooks.
 //!
-//! Same six columns as the csv, so the two formats answer alike, plus what a
-//! spreadsheet can carry and a text file cannot: real booleans, a numeric id,
-//! and a username that is a link to the profile.
+//! A list of accounts is the same six columns as the csv, so the two formats
+//! answer alike, plus what a spreadsheet can carry and a text file cannot: real
+//! booleans, a numeric id, and a username that is a link to the profile.
+//!
+//! `scan`'s summary is one row rather than a list, and there the two formats
+//! diverge in exactly one cell each: the moment a list was taken is epoch
+//! seconds in the csv, matching the JSON, and a real date here, because a
+//! column of epoch integers in a spreadsheet is unreadable. `scan::row_cells`
+//! is where that is decided and this is the claim it points at, so the two say
+//! the same thing about it.
 //!
 //! What goes in each cell is decided first, as plain data, and only then
 //! handed to the writer. A workbook is a zip archive, so that split is what
 //! makes the interesting half testable without unpacking anything.
 
 use anyhow::{Context, Result};
-use rust_xlsxwriter::{Format, FormatAlign, Workbook, Worksheet};
-use snob_core::model::User;
+use rust_xlsxwriter::{ExcelDateTime, Format, FormatAlign, Workbook, Worksheet};
+use snob_core::model::{User, printable};
 
 /// The column names. The same six frozen keys the csv uses.
 const HEADER: [&str; 6] = [
@@ -39,7 +46,15 @@ pub(crate) enum Cell {
     Number(f64),
     Text(String),
     Bool(bool),
-    Link { url: String, text: String },
+    Link {
+        url: String,
+        text: String,
+    },
+    /// A moment, as epoch seconds, written as a date the spreadsheet
+    /// understands. Only `scan` uses it, and only because a column of epoch
+    /// integers in a spreadsheet is unreadable where the same number in csv is
+    /// exactly what a script wants.
+    DateTime(i64),
     Empty,
 }
 
@@ -55,13 +70,18 @@ fn rows_with_url_cap(users: &[User], cap: usize) -> Vec<[Cell; 6]> {
         .iter()
         .enumerate()
         .map(|(index, user)| {
+            // Filtered like every other name that gets drawn. Not only because
+            // a workbook is opened and read: characters below 0x20 other than
+            // tab, newline and carriage return are **illegal in XML 1.0**, so a
+            // hostile name here produced a file that would not open at all.
+            // The address is `profile_url`'s problem, and it encodes.
             let username = if index < cap {
                 Cell::Link {
                     url: user.profile_url(),
-                    text: user.username.clone(),
+                    text: user.safe_username(),
                 }
             } else {
-                Cell::Text(user.username.clone())
+                Cell::Text(user.safe_username())
             };
             [
                 number(user.pk),
@@ -86,9 +106,16 @@ fn number(pk: u64) -> Cell {
     }
 }
 
+/// Filtered before it is measured, for the reason `csv::clean` gives: a full
+/// name is whatever its owner typed, and half of the control characters cannot
+/// legally appear in the XML a workbook is made of.
+///
+/// No leading apostrophe, unlike the csv. That defuses a *formula*, and a
+/// formula is a hazard the csv has because a spreadsheet re-parses the text it
+/// imports. `write_string` writes a string cell, which Excel never evaluates.
 fn text(value: Option<&str>) -> Cell {
     match value {
-        Some(value) => Cell::Text(truncate(value)),
+        Some(value) => Cell::Text(truncate(&printable(value))),
         None => Cell::Empty,
     }
 }
@@ -155,6 +182,17 @@ fn write_header(sheet: &mut Worksheet, header: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Turns epoch seconds into what the spreadsheet writer takes, in UTC like
+/// every other timestamp this tool prints.
+///
+/// The writer converts this itself, and range-checks it against the years a
+/// spreadsheet can hold (1900-9999) on the way. Doing the arithmetic here meant
+/// the "outside what a spreadsheet can hold" fallback rested on two chained
+/// `.ok()?` calls rather than on one documented check.
+fn datetime(epoch: i64) -> Option<ExcelDateTime> {
+    ExcelDateTime::from_timestamp(epoch).ok()
+}
+
 fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Result<()> {
     match cell {
         Cell::Number(value) => sheet.write_number(row, column, *value).map(|_| ()),
@@ -163,6 +201,18 @@ fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Resu
         Cell::Link { url, text } => sheet
             .write_url_with_text(row, column, url.as_str(), text.as_str())
             .map(|_| ()),
+        // A timestamp outside what a spreadsheet can hold is written as the
+        // number it is rather than dropped: wrong-looking beats absent, and
+        // nothing else in this file invents a value.
+        Cell::DateTime(epoch) => match datetime(*epoch) {
+            Some(value) => {
+                let format = Format::new().set_num_format("yyyy-mm-dd hh:mm");
+                sheet
+                    .write_datetime_with_format(row, column, &value, &format)
+                    .map(|_| ())
+            }
+            None => sheet.write_number(row, column, *epoch as f64).map(|_| ()),
+        },
         Cell::Empty => Ok(()),
     }
     .with_context(|| format!("could not write row {row}"))
@@ -203,6 +253,30 @@ mod tests {
                 text: "one".into(),
             }
         );
+    }
+
+    /// Not only about what a reader sees. Characters below 0x20 other than tab,
+    /// newline and carriage return are illegal in XML 1.0, and a workbook is
+    /// XML — so a name carrying one produced a file that would not open.
+    #[test]
+    fn a_name_that_would_break_the_file_is_filtered_before_it_is_written() {
+        let rows = rows(&[User {
+            pk: 1,
+            username: format!("one{esc}[2K", esc = '\x1b'),
+            full_name: Some(format!("A{esc}[A Person", esc = '\x1b')),
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        }]);
+
+        let Cell::Link { url, text } = &rows[0][1] else {
+            panic!("the username cell is a link: {:?}", rows[0][1]);
+        };
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(!url.contains('\x1b'), "{url:?}");
+        // The brackets stay, as text. `printable` removes what a terminal obeys
+        // and what XML forbids, not what either of them would happily print.
+        assert_eq!(rows[0][2], Cell::Text("A[A Person".into()));
     }
 
     #[test]

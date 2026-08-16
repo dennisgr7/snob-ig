@@ -29,32 +29,39 @@ pub async fn run(
         return Ok(ExitCode::NoSession);
     };
 
-    let result = engine::list(&mut app, &args, kind).await;
+    // Named before the engine runs, so the bar says what it is about during
+    // consent, resolution and the counter poll rather than only once pages
+    // start arriving.
+    let subject = engine::target::label(&app, &args);
+    let result = common::walk_named(&mut app, &args, kind, &subject, |_| Ok(())).await;
     app.progress().finish();
     let (found, outcome) = result?;
 
-    let before_filtering = found.len();
+    let total = found.len();
     let mut found = filter.apply(found);
+    let kept = found.len();
     if let Some(cap) = args.limit {
         found.truncate(cap);
     }
 
     destination.write(&found)?;
-    print_summary(&found, before_filtering, &outcome, kind);
+    print_summary(&found, kept, total, &outcome, kind);
     Ok(exit_code(&outcome))
 }
 
 /// A plain list is the one place a partial answer is still worth having: every
 /// account in it really is in the list, only some are missing. So it prints,
 /// says so, and reports what stopped it.
+///
+/// A stored list needs no arm of its own. `ListOutcome::cached` is the only way
+/// to a provenance other than `Walked` and it records `Completed`, so anything
+/// out of storage arrives at the first arm anyway — and an arm that reads as
+/// policy while deciding nothing is one a later change would edit to no effect.
 fn exit_code(outcome: &ListOutcome) -> ExitCode {
-    if outcome.source == ResultSource::Cached {
-        return ExitCode::Ok;
-    }
     match outcome.reason {
         // A cap was asked for by the user, so it is not a failure.
         StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        other => ExitCode::from_stop_reason(other),
+        _ => outcome.exit_code(),
     }
 }
 
@@ -68,15 +75,10 @@ fn one_of(kind: ListKind) -> &'static str {
     }
 }
 
-fn print_summary(found: &[User], before_filtering: usize, outcome: &ListOutcome, kind: ListKind) {
-    let mut line = report::counted(
-        found.len(),
-        before_filtering,
-        one_of(kind),
-        &kind.to_string(),
-    );
+fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcome, kind: ListKind) {
+    let mut line = report::counted(found.len(), kept, total, one_of(kind), &kind.to_string());
 
-    match outcome.source {
+    match outcome.source() {
         ResultSource::Cached => {
             line.push_str(&format!(
                 " - list stored on {}",
@@ -98,10 +100,10 @@ fn print_summary(found: &[User], before_filtering: usize, outcome: &ListOutcome,
 
     ui::info(&line);
 
-    if !outcome.is_complete() && outcome.source == ResultSource::Fetched {
+    if !outcome.is_complete() && outcome.source() == ResultSource::Fetched {
         ui::warn(&format!(
             "the list is incomplete, so it cannot be compared against another one. {}",
-            report::try_again_advice(outcome.reason)
+            report::try_again_advice(outcome.reason, outcome.resumable)
         ));
     }
 }
@@ -112,12 +114,17 @@ mod tests {
 
     fn outcome(source: ResultSource, reason: StopReason) -> ListOutcome {
         ListOutcome {
-            source,
+            provenance: match source {
+                ResultSource::Fetched => engine::Provenance::Walked,
+                ResultSource::Cached => engine::Provenance::CounterVerified,
+            },
             reason,
             requests: 1,
+            started_at: 0,
             taken_at: 0,
-            from_cooldown: false,
             account_pk: 1,
+            stopped_by: None,
+            resumable: false,
         }
     }
 

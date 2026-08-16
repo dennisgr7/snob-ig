@@ -92,11 +92,18 @@ pub async fn run(
     // The list being crossed against comes first. If it turns out incomplete
     // there is no result to give, so it is worth finding out before spending
     // the second walk.
-    let (against, against_outcome) = engine::list(&mut app, &args, op.against()).await?;
-    check_against_list(op, &against_outcome)?;
+    let subject = engine::target::label(&app, &args);
+    let (against, against_outcome) =
+        common::walk_named(&mut app, &args, op.against(), &subject, |outcome| {
+            check_against_list(op, outcome)
+        })
+        .await?;
 
-    let (base, base_outcome) = engine::list(&mut app, &args, op.base()).await?;
+    // The second walk renames the bar: a crossing is two lists, and without
+    // this the slower half looked exactly like the first.
+    let second = common::walk_named(&mut app, &args, op.base(), &subject, |_| Ok(())).await;
     app.progress().finish();
+    let (base, base_outcome) = second?;
 
     engine::cooldown::check_same_moment(&against_outcome, &base_outcome)?;
 
@@ -105,8 +112,9 @@ pub async fn run(
         SetOp::Friends => sets::intersection(&base, &against),
     };
 
-    let before_filtering = result.len();
+    let total = result.len();
     result = filter.apply(result);
+    let kept = result.len();
     if let Some(cap) = args.limit {
         result.truncate(cap);
     }
@@ -116,7 +124,8 @@ pub async fn run(
     print_summary(
         op,
         &result,
-        before_filtering,
+        kept,
+        total,
         &base,
         &base_outcome,
         &against_outcome,
@@ -142,7 +151,7 @@ fn check_against_list(op: SetOp, outcome: &ListOutcome) -> Result<()> {
     }
     Err(report::refuse_incomplete(
         op.against(),
-        outcome.reason,
+        outcome,
         op.misreads_as(),
     ))
 }
@@ -151,14 +160,15 @@ fn exit_code(base: &ListOutcome) -> ExitCode {
     if base.is_complete() {
         ExitCode::Ok
     } else {
-        ExitCode::from_stop_reason(base.reason)
+        base.exit_code()
     }
 }
 
 fn print_summary(
     op: SetOp,
     result: &[User],
-    before_filtering: usize,
+    kept: usize,
+    total: usize,
     base: &[User],
     base_outcome: &ListOutcome,
     against_outcome: &ListOutcome,
@@ -166,10 +176,12 @@ fn print_summary(
     let total_requests = base_outcome.requests + against_outcome.requests;
 
     let (one, many) = op.description();
-    let mut line = report::counted(result.len(), before_filtering, one, many);
+    let mut line = report::counted(result.len(), kept, total, one, many);
     line.push_str(&format!(
         " - {} - {}",
-        proportion(before_filtering, base.len()),
+        // The proportion describes the crossing, so it is the count before any
+        // filter or cap: "3 of 412 accounts you follow".
+        proportion(total, base.len()),
         report::requests(total_requests)
     ));
     ui::info(&line);
@@ -196,12 +208,14 @@ mod tests {
 
     fn outcome(reason: StopReason) -> ListOutcome {
         ListOutcome {
-            source: engine::ResultSource::Fetched,
+            provenance: engine::Provenance::Walked,
             reason,
             requests: 1,
+            started_at: 0,
             taken_at: 0,
-            from_cooldown: false,
             account_pk: 1,
+            stopped_by: None,
+            resumable: false,
         }
     }
 

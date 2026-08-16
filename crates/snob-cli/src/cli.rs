@@ -51,7 +51,16 @@ Examples:
   snob unfollowers --format csv -o unfollowers.csv
 
 A username may be written with or without a leading @. If you write the @, quote
-it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.";
+it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.
+
+Exit codes:
+  0   it worked; a list cut short by --limit or --max-pages is still a 0
+  1   it failed, or a result was refused because a list came back incomplete
+  3   no session, or the stored one no longer works -- run \"snob login\"
+  4   Instagram wants the account verified -- open the address it prints
+  5   Instagram is throttling, or the account is in cooldown -- wait
+  130 stopped by you: Ctrl+C, or a confirmation not given -- including with
+      no terminal to ask at, where -y confirms in advance";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -155,11 +164,16 @@ pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
     pub target: Option<String>,
 
-    /// Hide accounts with these attributes
+    /// Hide accounts with any of these attributes
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub hide: Vec<Attr>,
 
-    /// Show only accounts with these attributes
+    /// Show only accounts with all of these attributes
+    // Written out because the two combine in opposite ways and used to be
+    // described as a symmetric pair: `--only verified,private` reads as "the
+    // verified ones and the private ones" and returns neither — it means
+    // verified AND private. See `Filter::allows` for why that is the useful
+    // reading of `only`.
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub only: Vec<Attr>,
 

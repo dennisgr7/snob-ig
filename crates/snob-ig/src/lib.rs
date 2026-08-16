@@ -7,8 +7,8 @@
 //! Each endpoint is documented above the method that calls it, in `client.rs`.
 
 pub mod client;
+pub mod client_hints;
 pub mod error;
-pub mod fingerprint;
 pub mod login;
 pub mod model;
 pub mod pace;
