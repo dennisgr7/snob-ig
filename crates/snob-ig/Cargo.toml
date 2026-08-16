@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 snob-core.workspace = true
-reqwest.workspace = true
 tokio.workspace = true
 fastrand.workspace = true
 serde.workspace = true
@@ -17,6 +16,58 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+# Which TLS stack the client is built on. `rustls` everywhere except one
+# target, and that target is the whole reason this is split at all.
+#
+# **Windows on ARM64 cannot build rustls without LLVM.** reqwest's `rustls`
+# feature selects aws-lc-rs, whose build script requires clang-cl there; the
+# alternative provider, ring, hard-codes clang for the same target, and its
+# tracking issue is closed as not planned. The cause is the same for both: the
+# pre-generated assembly is GNU syntax, MSVC's armasm64 does not accept it, and
+# neither crate has an MSVC path. Every escape hatch is x86-only — aws-lc's
+# `prebuilt-nasm` ships x86_64 objects, and `AWS_LC_SYS_NO_ASM` is asserted away
+# above opt-level 2, which is what this project releases at.
+#
+# Verified on a Windows 11 ARM64 machine with only Build Tools installed:
+# aws-lc-sys and ring each fail in their build script, native-tls builds, and
+# the resulting binary completes a real request to Instagram.
+#
+# **x86_64 Windows is deliberately not included.** It has never had the
+# problem: rustls turns on aws-lc's `prebuilt-nasm`, which ships compiled
+# objects for exactly that architecture, so bare Build Tools are enough. It
+# also has users on Windows 10, where schannel negotiates TLS 1.2 at best —
+# a client claiming to be a current Chrome while speaking 1.2 is the kind of
+# incoherence this project spends its effort avoiding. Windows 10 on ARM64 is
+# out of support, so that case does not arise here.
+#
+# What the split costs: two TLS stacks, so the ARM64 Windows binary is not
+# byte-for-byte the others. CI builds and runs all five. schannel compiles no
+# C, involves no OpenSSL, reaches the same trust store rustls-platform-verifier
+# was using, and still advertises `h2` over ALPN — which is the property that
+# matters, because HTTP/1.1 draws 429s from these endpoints where h2 does not.
+#
+# The two tables are mutually exclusive, and under resolver v2 or later the
+# features of a target-specific dependency are ignored for targets not being
+# built, so exactly one backend is ever compiled. Cargo.lock is target-agnostic
+# and therefore lists the union, openssl-sys included: it is resolved for a
+# `cfg(unix)` native-tls this manifest never selects, and nothing compiles it
+# on any of the five targets. Read the tree with `cargo tree --target ...` or
+# it will show both.
+[target.'cfg(not(all(windows, target_arch = "aarch64")))'.dependencies]
+reqwest = { workspace = true, features = ["rustls"] }
+# Never named in the code: it is here to turn `prefer-post-quantum` on, and it
+# is under this cfg rather than in `[dependencies]` so that the target which
+# does not use rustls does not pull it in.
+rustls.workspace = true
+
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+
+# Only for the user's language preference, which Windows keeps in an API
+# rather than in the environment. Already in the tree through snob-core.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

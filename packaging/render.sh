@@ -13,8 +13,22 @@
 
 set -euo pipefail
 
-version="${1:?usage: render.sh VERSION SHA256SUMS}"
-sums="${2:?usage: render.sh VERSION SHA256SUMS}"
+version="${1:?usage: render.sh VERSION SHA256SUMS [RELEASE_DATE]}"
+sums="${2:?usage: render.sh VERSION SHA256SUMS [RELEASE_DATE]}"
+
+# Everything below writes to paths relative to the repository root, so the
+# script has to stand there rather than wherever it was called from. Run as
+# `packaging/render.sh ... ` from anywhere else it used to create a second,
+# parallel Formula/ and bucket/ tree there and report success, while the real
+# manifests went untouched and CI's `git diff` reported them clean.
+#
+# The checksum file is resolved first: it is the one argument that is a path,
+# and CI passes an absolute one but a person will not.
+case "$sums" in
+  /* | ?:[\\/]*) ;;
+  *) sums="$PWD/$sums" ;;
+esac
+cd "$(dirname "$0")/.."
 
 repo="https://github.com/dennisgr7/snob-ig"
 base="$repo/releases/download/v$version"
@@ -149,7 +163,26 @@ EOF
 # a zip installer with a nested portable rather than a portable one. WinGet
 # wants its checksums in upper case.
 mkdir -p packaging/winget
-release_date=$(date -u +%F)
+installer_manifest=packaging/winget/dennisgr7.snob.installer.yaml
+
+# The release date is an input, not "today".
+#
+# CI re-renders the committed manifests and diffs them, which only means
+# anything if this script is deterministic. Stamping the current date made it
+# fail on every push from the day after a release onwards: the committed file
+# said the 5th, the rerun wrote the 6th, and the lint job went red for the
+# whole repository until the next release reset it for exactly one day.
+#
+# So: whatever was passed, else whatever the manifest already records for this
+# same version, else today — which is only reached when the version is new,
+# and is the one case where today is the right answer.
+release_date="${3:-}"
+if [ -z "$release_date" ] &&
+  [ -f "$installer_manifest" ] &&
+  grep -qx "PackageVersion: $version" "$installer_manifest"; then
+  release_date=$(grep -m1 '^ReleaseDate: ' "$installer_manifest" | cut -d' ' -f2)
+fi
+[ -n "$release_date" ] || release_date=$(date -u +%F)
 
 cat > packaging/winget/dennisgr7.snob.yaml <<EOF
 # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
@@ -160,7 +193,7 @@ ManifestType: version
 ManifestVersion: 1.6.0
 EOF
 
-cat > packaging/winget/dennisgr7.snob.installer.yaml <<EOF
+cat > "$installer_manifest" <<EOF
 # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: dennisgr7.snob
 PackageVersion: $version

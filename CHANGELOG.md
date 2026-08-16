@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+Four things here change what a script sees, so they come first:
+
+- **`snob purge` with no terminal to ask at now exits 130 instead of 1**, and
+  says so on standard error rather than standard output. 130 is what the
+  exit-code table has always documented for a confirmation that was not given;
+  `purge` was the one command answering with the generic failure instead.
+- **`snob logout` and `snob purge` can now exit 1 where they exited 0.** A
+  keyring that refuses to delete the credential used to be reported as a
+  session that went. It is now reported as one that did not, because a tool
+  whose promise is to leave no live cookie behind must not claim to have kept
+  it when it has not.
+- **`scan --format csv` and `--format xlsx` have four more columns.** Where each
+  list came from and when it was taken were in the JSON and missing from the
+  other two. They are appended, after the existing ones, and the header row
+  names them — but anything appending rows to a sheet written by an older
+  version will find them wider.
+- **A run with standard error redirected now receives the warnings, pauses and
+  countdowns it used to lose.** They were suppressed along with the progress
+  bar, which meant `snob followers 2>log` recorded nothing about why a walk
+  stopped.
+
+And the corrections worth knowing about:
+
+- A crossing of two stored lists compares the gap between the two walks rather
+  than between the moments they finished, so `unfollowers --cache` on an
+  account large enough for a walk to take twenty minutes no longer refuses its
+  own cache every time.
+- A redirect is held to the same rule at every hop, and the exception that let
+  the test server be reached over plain `http` can no longer be reached in a
+  release build.
+- `purge` deletes only directories it owns. The check that a parent was ours
+  compared the folder name and not much else, which on Linux and macOS put
+  `~/.config` and `~/Library/Application Support` within reach of it.
+- The stored username is no longer overwritten with the numeric id when a
+  command resolves an account it has seen before, which also stops a rename
+  that never happened being filed in the history the monitor will read.
+- A challenge now puts the account in cooldown, as the documentation has always
+  said it does. It has its own shorter length: waiting is not what clears one.
+- Names that came off Instagram are filtered before anything draws them on
+  every output path, not most of them, and a name inside a profile link is
+  percent-encoded rather than pasted in. A csv or spreadsheet field starting
+  with `=`, `+`, `-` or `@` is defused even when whitespace hides it.
+- The session is kept out of freed memory: the cookie header is built in a
+  buffer that clears itself, and the plaintext of the protected file no longer
+  outlives the read.
+- The wait before the next request counts down instead of insisting it has
+  fifteen seconds left, and the progress bar keeps drawing through the second
+  half of a crossing.
+
 ## 0.1.1 — 2026-08-05
 
 - The Linux builds are statically linked against musl. The 0.1.0 ones were

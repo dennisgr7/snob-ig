@@ -64,6 +64,14 @@ pub fn record_poll(
 /// old name — so the join keeps the lookup to tracked accounts, and the most
 /// recently polled one wins. Case-insensitive, so `@Ghost` finds `ghost`.
 pub fn find_pk_by_username(conn: &Connection, username: &str) -> Result<Option<Pk>, StoreError> {
+    // The empty name is `users::ensure`'s placeholder for "seen but never
+    // named", not a username — no Instagram account has one. Without this,
+    // `snob followers "" --cache` matches whichever unnamed account was polled
+    // last and answers about somebody else's lists.
+    if username.is_empty() {
+        return Ok(None);
+    }
+
     let pk = conn
         .query_row(
             "SELECT u.pk FROM users u JOIN accounts a ON a.pk = u.pk

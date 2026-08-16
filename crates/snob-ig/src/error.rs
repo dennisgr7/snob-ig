@@ -64,9 +64,18 @@ fn url_suffix(url: &Option<String>) -> String {
 
 /// A 404 names what was being looked for whenever the caller knows it. Only
 /// the endpoints that ask about one account can fill it in.
+///
+/// Filtered, for the reason [`body_excerpt`] gives: this sentence is printed to a
+/// terminal by `report::print_error`, and the name in it is whatever was typed on
+/// the command line. `snob followers $'gh\e[2K\e[A'` reaches this arm, so without
+/// the filter the refusal erased the line above itself — the same hole every
+/// sibling refusal closes at the point it names an account.
 fn missing_message(what: &Option<String>) -> String {
     match what {
-        Some(name) => format!("the account \"{name}\" does not exist"),
+        Some(name) => format!(
+            "the account \"{}\" does not exist",
+            snob_core::model::printable(name)
+        ),
         None => "Instagram answered 404: what was asked for does not exist".into(),
     }
 }
@@ -79,11 +88,24 @@ fn missing_message(what: &Option<String>) -> String {
 /// single-request command reaching it directly. Two copies of this table is one
 /// copy too many — the second would be the one passing a length of zero.
 pub fn cooldown_for(error: &IgError) -> Option<(&'static str, std::time::Duration)> {
-    use snob_core::store::rate_budget::{action_block_cooldown, rate_limit_cooldown};
+    use snob_core::store::rate_budget::{
+        action_block_cooldown, challenge_cooldown, rate_limit_cooldown,
+    };
 
     match error {
         IgError::FeedbackRequired => Some(("feedback_required", action_block_cooldown())),
         IgError::RateLimited => Some(("rate_limit", rate_limit_cooldown())),
+        // The rule says a challenge is a hard stop **and** a cooldown, and only
+        // the first half was implemented: nothing was written down, so the next
+        // run walked straight back into an account Instagram had just flagged.
+        //
+        // Its own length, not the action block's, because it is the one cause
+        // waiting does not fix — the user clears it by opening the link. Long
+        // enough that an unattended rerun cannot knock again, short enough that
+        // someone who dealt with it in a minute is not locked out for the day.
+        IgError::Challenge { .. } | IgError::Checkpoint { .. } => {
+            Some(("challenge", challenge_cooldown()))
+        }
         _ => None,
     }
 }
@@ -99,11 +121,33 @@ pub enum Reaction {
     Retry,
     /// Stop and put the account in cooldown.
     Cooldown,
-    /// Stop without a cooldown: waiting will not fix it.
+    /// Stop, because retrying within this run cannot help.
+    ///
+    /// It used to say "without a cooldown", and that stopped being true when a
+    /// challenge started recording one. The two questions are separate:
+    /// [`Reaction`] answers what the walk in progress should do, and
+    /// [`cooldown_for`] answers whether the account is left alone afterwards.
+    /// A challenge says yes to both — waiting is not what clears it, but
+    /// walking back in before the user has cleared it is exactly what turns a
+    /// checkpoint into something longer.
     Abort,
 }
 
 impl IgError {
+    /// The address that clears a security check, when Instagram gave one.
+    ///
+    /// Lives here rather than in the command that reports it, next to the
+    /// validation that decides whether the address may be repeated at all: the
+    /// two variants that can carry one are the two this has to know about, and a
+    /// copy of the list in another crate is one that keeps compiling after a
+    /// third variant gains a URL and simply stops mentioning it.
+    pub fn challenge_url(&self) -> Option<&str> {
+        match self {
+            Self::Challenge { url } | Self::Checkpoint { url } => url.as_deref(),
+            _ => None,
+        }
+    }
+
     /// What to do with this error during a walk.
     pub fn reaction(&self) -> Reaction {
         match self {
@@ -190,6 +234,13 @@ struct ChallengeBody {
 /// and every good answer already carries `"status":"ok"` so the first half of
 /// that test was always true.
 ///
+/// Three fields rather than one, because this is the gate in front of
+/// [`classify`] and therefore in front of the cooldown. `status` alone meant a
+/// 200 carrying `spam: true` without it went to the deserializer instead: the
+/// run stopped, which is safe, but nothing was written down, so the next run
+/// walked straight back into the same wall. All three are typed fields, so the
+/// follower named `fail` stays fixed.
+///
 /// A body that is not JSON is not a declared failure. Deciding what it is
 /// instead is the deserializer's job, and it says so more precisely.
 pub fn declares_failure(body: &str) -> bool {
@@ -197,12 +248,18 @@ pub fn declares_failure(body: &str) -> bool {
     struct Envelope {
         #[serde(default)]
         status: Option<String>,
+        #[serde(default)]
+        spam: Option<bool>,
+        #[serde(default)]
+        require_login: Option<bool>,
     }
 
-    serde_json::from_str::<Envelope>(body)
-        .ok()
-        .and_then(|e| e.status)
-        .is_some_and(|status| status == "fail")
+    let Ok(envelope) = serde_json::from_str::<Envelope>(body) else {
+        return false;
+    };
+    envelope.status.as_deref() == Some("fail")
+        || envelope.spam == Some(true)
+        || envelope.require_login == Some(true)
 }
 
 /// Translates an Instagram error response into the matching error.
@@ -234,16 +291,18 @@ pub fn classify(status: u16, body: &str) -> IgError {
     }
     if message.contains("checkpoint_required") {
         return IgError::Checkpoint {
-            url: parsed.checkpoint_url.map(absolutize),
+            url: parsed.checkpoint_url.and_then(checked_url),
         };
     }
     if message.contains("challenge_required")
         || parsed.error_type.as_deref() == Some("checkpoint_challenge_required")
     {
-        let url = parsed
-            .challenge
-            .as_ref()
-            .and_then(|c| c.url.clone().or_else(|| c.api_path.clone().map(absolutize)));
+        let url = parsed.challenge.as_ref().and_then(|c| {
+            c.url
+                .clone()
+                .and_then(checked_url)
+                .or_else(|| c.api_path.clone().and_then(checked_url))
+        });
         return IgError::Challenge { url };
     }
     if message.contains("feedback_required") {
@@ -272,19 +331,42 @@ pub fn classify(status: u16, body: &str) -> IgError {
 /// What an unexpected body contributes to the message. An HTML page is a
 /// firewall or an error page: naming it says as much as spilling it over the
 /// terminal would.
-fn body_excerpt(body: &str) -> String {
+///
+/// What is left goes through the same filter a username does. This excerpt is
+/// printed to a terminal by `main`, and a response body is no more trustworthy
+/// than a profile field — less, when the thing answering is a captive portal
+/// rather than Instagram.
+pub(crate) fn body_excerpt(body: &str) -> String {
     if body.trim_start().starts_with('<') {
         return "(an HTML page, not the API's JSON)".into();
     }
-    body.chars().take(300).collect()
+    snob_core::model::printable(&body.chars().take(300).collect::<String>())
 }
 
-fn absolutize(path: String) -> String {
-    if path.starts_with("http") {
-        path
+/// Hosts a security check can legitimately live on.
+const CHALLENGE_HOSTS: [&str; 3] = ["instagram.com", "www.instagram.com", "i.instagram.com"];
+
+/// The address the user is told to open, if the body named one we would follow
+/// ourselves.
+///
+/// The tool's own words are "Open it in a browser to clear it", so whatever
+/// comes back here carries this program's authority. Instagram naming its own
+/// challenge page is the only case that is worth anything, and it is also the
+/// only case that is safe: a body that names somewhere else gets the generic
+/// wording instead, which loses a convenience rather than sending someone to a
+/// login form that is not Instagram's.
+fn checked_url(value: String) -> Option<String> {
+    let absolute = if value.starts_with("http") {
+        value
+    } else if value.starts_with('/') {
+        format!("https://www.instagram.com{value}")
     } else {
-        format!("https://www.instagram.com{path}")
-    }
+        return None;
+    };
+
+    let parsed = url::Url::parse(&absolute).ok()?;
+    let host = parsed.host_str()?;
+    (parsed.scheme() == "https" && CHALLENGE_HOSTS.contains(&host)).then_some(absolute)
 }
 
 #[cfg(test)]
@@ -406,6 +488,18 @@ mod tests {
         assert!(declares_failure(r#"{"status":"fail","message":"x"}"#));
     }
 
+    /// This gate is what stands in front of the cooldown. A throttling answer
+    /// that skips it stops the run — which is safe — without writing anything
+    /// down, so the next run walks straight back into the same wall.
+    #[test]
+    fn throttling_without_the_status_field_is_still_a_failure() {
+        assert!(declares_failure(r#"{"spam":true}"#));
+        assert!(declares_failure(r#"{"require_login":true,"message":"x"}"#));
+
+        // And the flags being false is not a failure.
+        assert!(!declares_failure(r#"{"spam":false,"status":"ok"}"#));
+    }
+
     /// A body with no status, or one that is not JSON at all, is not a
     /// declared failure. What it is instead is the deserializer's to say.
     #[test]
@@ -429,6 +523,31 @@ mod tests {
         assert!(matches!(e, IgError::RateLimited));
         assert!(e.is_login_tolerable());
         assert!(!e.invalidates_session());
+    }
+
+    /// The three causes that leave a mark, and the shape of each. A challenge
+    /// is the one waiting does not fix, so it gets its own much shorter
+    /// length rather than the action block's.
+    #[test]
+    fn every_pushback_records_a_cooldown_of_its_own_size() {
+        let length = |e: &IgError| cooldown_for(e).map(|(_, d)| d);
+
+        let throttle = length(&IgError::RateLimited).unwrap();
+        let block = length(&IgError::FeedbackRequired).unwrap();
+        let challenge = length(&IgError::Challenge { url: None }).unwrap();
+        let checkpoint = length(&IgError::Checkpoint { url: None }).unwrap();
+
+        assert_eq!(challenge, checkpoint, "both mean the same thing");
+        assert!(
+            challenge < throttle,
+            "waiting is not what clears a challenge"
+        );
+        assert!(throttle < block);
+
+        // A dead session is not push-back and must not put the account in
+        // cooldown: logging in again is what fixes it.
+        assert_eq!(length(&IgError::SessionExpired), None);
+        assert_eq!(length(&IgError::Decode("x".into())), None);
     }
 
     #[test]
@@ -480,6 +599,46 @@ mod tests {
                 assert!(!body.contains('<'), "{body}");
                 assert!(body.contains("HTML"), "{body}");
             }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    /// The message says "Open it in a browser to clear it", so the address
+    /// carries this tool's authority. A body that names somewhere else loses
+    /// the convenience rather than sending someone to a login form that is not
+    /// Instagram's.
+    #[test]
+    fn a_challenge_url_that_is_not_instagram_is_not_offered() {
+        for elsewhere in [
+            "https://evil.test/challenge/",
+            "http://www.instagram.com/challenge/",
+            "https://www.instagram.com.evil.test/challenge/",
+            "https://evil.test/#www.instagram.com",
+            "javascript:alert(1)",
+        ] {
+            let body = format!(
+                r#"{{"message":"challenge_required","challenge":{{"url":"{elsewhere}"}},"status":"fail"}}"#
+            );
+            match classify(400, &body) {
+                IgError::Challenge { url } => {
+                    assert_eq!(url, None, "{elsewhere} should not have been offered")
+                }
+                other => panic!("expected a challenge, got {other:?}"),
+            }
+        }
+
+        // The generic wording still tells the user what to do.
+        let message = IgError::Challenge { url: None }.to_string();
+        assert!(message.contains("Open Instagram in a browser"), "{message}");
+    }
+
+    /// A response body is no more trustworthy than a profile field, and this
+    /// excerpt is printed to a terminal.
+    #[test]
+    fn an_unexpected_body_cannot_drive_the_terminal() {
+        let hostile = format!("{esc}[2K{esc}[A gone", esc = '\x1b');
+        match classify(500, &hostile) {
+            IgError::Unexpected { body, .. } => assert!(!body.contains('\x1b'), "{body:?}"),
             other => panic!("expected Unexpected, got {other:?}"),
         }
     }

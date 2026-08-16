@@ -9,13 +9,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use snob_core::filters::{Attribute, Filter, parse_username_list};
-use snob_core::model::User;
+use snob_core::model::{ListKind, User};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 
 use crate::app::App;
 use crate::cli::{Attr, Format, ListArgs};
+use crate::engine::{self, ListOutcome};
 use crate::output::{self, Presentation, Rendered};
+use crate::report;
+use crate::ui;
 
 /// What opening a session produced.
 ///
@@ -38,7 +41,7 @@ pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<
     match App::open(secrets, paths, with_progress)? {
         Some(app) => Ok(Session::Open(Box::new(app))),
         None => {
-            eprintln!("No session stored. Run \"snob login\".");
+            ui::no_session();
             Ok(Session::Missing)
         }
     }
@@ -120,6 +123,47 @@ fn attribute(a: Attr) -> Attribute {
         Attr::Private => Attribute::Private,
         Attr::NoPfp => Attribute::NoPfp,
     }
+}
+
+/// One walk, with the bar named while it runs and taken down before anything
+/// gives up.
+///
+/// The rule this holds is "finish the bar before the `?`". `indicatif` leaves
+/// its last line on screen when it is dropped, so a run ending in a cooldown
+/// refusal, a private account or an incomplete list printed the error
+/// underneath a spinner that had stopped spinning. It was written out at four
+/// call sites, twice as a seven-line `match` whose only job was to call
+/// `finish` on the way past — the kind of rule AGENTS.md says belongs in the
+/// one place that cannot be bypassed, because the fifth caller is the one that
+/// forgets.
+///
+/// `check` runs inside the guarded region rather than after it. A crossing has
+/// to know its first list is complete before spending the second walk, and that
+/// refusal leaves through the same door as any other.
+///
+/// It does **not** finish on success: a crossing walks two lists through one
+/// bar, and clearing it in between would make the second half start from a
+/// blank line. The caller ends it when the run is over.
+pub async fn walk_named(
+    app: &mut App,
+    args: &ListArgs,
+    kind: ListKind,
+    subject: &str,
+    check: impl FnOnce(&ListOutcome) -> Result<()>,
+) -> Result<(Vec<User>, ListOutcome)> {
+    app.progress().begin(&report::walking(kind, subject));
+
+    // Both failures leave through one door, so the rule this function exists to
+    // hold is written once inside it too. Two copies of `finish()` here would
+    // make a third failure point added between them one more place to remember.
+    let result = engine::list(app, args, kind).await.and_then(|pair| {
+        check(&pair.1)?;
+        Ok(pair)
+    });
+    if result.is_err() {
+        app.progress().finish();
+    }
+    result
 }
 
 #[cfg(test)]

@@ -11,13 +11,14 @@
 
 use snob_cli::cli::PurgeArgs;
 use snob_cli::commands::purge;
+use snob_cli::exit::ExitCode;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_core::session::{Session, SessionOrigin};
 use snob_core::store::Store;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
+mod common;
+use common::{SID, UA};
 
 fn setup(name: &str) -> (tempfile::TempDir, AppPaths, SecretStore) {
     let tmp = tempfile::tempdir().unwrap();
@@ -142,5 +143,93 @@ fn a_corrupt_session_is_still_something_to_remove() {
     assert!(purge::survey(&store, &paths).session);
 
     purge::run(purge_now(), store, &paths).unwrap();
+    assert!(!paths.session_file().exists());
+}
+
+/// A session that would not go is the one failure this command cannot report as
+/// success.
+///
+/// `SecretStore::delete` used to discard the keyring's answer, so a refusal
+/// there reached `execute` as `Ok` and `run` printed "snob's files are gone from
+/// this computer" and exited 0 over a live cookie. An uninstall script keyed on
+/// that code then carried on to remove the binary. The keyring branch cannot be
+/// driven from a test, but it and the file branch return through the same place,
+/// which is what this pins — along with the other half: the rest goes even
+/// though the credential refused.
+///
+/// A directory standing where the session file goes is how the refusal is
+/// arranged: `remove_file` fails on one everywhere, unlike a permission bit.
+#[test]
+fn a_session_that_will_not_go_is_reported_and_the_exit_is_not_zero() {
+    let (_tmp, paths, store) = setup("refused");
+    populate(&paths, &store);
+
+    let holding = paths.session_file();
+    std::fs::remove_file(&holding).unwrap();
+    std::fs::create_dir(&holding).unwrap();
+
+    assert!(
+        purge::survey(&store, &paths).session,
+        "a session that cannot be read is still one to remove"
+    );
+
+    let error = purge::run(purge_now(), store, &paths)
+        .expect_err("a credential that survived is not a success");
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Error));
+
+    // And the other half: one item refusing does not spare the rest. The
+    // browser profile holds a logged-in session of its own, so leaving it
+    // because the keyring said no would be a second credential kept alive by
+    // the first one's failure.
+    assert!(!paths.browser_profile().exists());
+}
+
+/// With nobody to confirm at, nothing is deleted **and** it is not called a
+/// success.
+///
+/// `confirm` keeps its default when nobody can answer, and the default here is
+/// no — so an uninstall script used to be shown the whole plan, told "Nothing
+/// was deleted.", and given exit 0. The one command whose purpose is that a live
+/// credential does not outlive the tool reported success over an untouched
+/// keyring.
+#[test]
+fn an_unattended_run_without_yes_is_refused_rather_than_assumed_no() {
+    let (_tmp, paths, store) = setup("unattended");
+    populate(&paths, &store);
+
+    let args = PurgeArgs {
+        yes: false,
+        dry_run: false,
+    };
+    let error = purge::run_with(args, store, &paths, false)
+        .expect_err("silence is not consent, and it is not success either");
+
+    // The code the README's table and `--help` both promise for a confirmation
+    // that was not given. It used to be the generic failure, so a script
+    // branching on 130 to re-run with `--yes` never fired.
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Interrupted));
+    assert!(
+        error.to_string().contains("terminal"),
+        "it has to say why it could not ask: {error}"
+    );
+    assert!(
+        error.to_string().contains("--yes"),
+        "and how to do it unattended: {error}"
+    );
+    assert!(
+        paths.session_file().exists(),
+        "nothing may be deleted without an answer"
+    );
+    assert!(paths.browser_profile().exists());
+}
+
+/// The other side of the same gate. `--yes` is the documented way to run this on
+/// a machine with no terminal at all, which is the only machine that needs it.
+#[test]
+fn a_typed_yes_needs_nobody_to_confirm_at() {
+    let (_tmp, paths, store) = setup("typed-yes");
+    populate(&paths, &store);
+
+    purge::run_with(purge_now(), store, &paths, false).unwrap();
     assert!(!paths.session_file().exists());
 }

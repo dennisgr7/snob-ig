@@ -3,8 +3,24 @@
 //! The numbers in [`Pace`] are copied from InstagramUnfollowers, which has
 //! years of real use without incident, and have only been changed to make
 //! *fewer* requests. **They are not changed without a documented reason** —
-//! each one carries below what it is for, and that is what stops a number
-//! being tuned into something that gets an account flagged.
+//! each one carries below what it is for, and that is what stops a number being
+//! quietly tuned down until the tool is asking far more of Instagram's service
+//! than answering the question needs.
+//!
+//! Two limits on what that provenance covers, both worth knowing before
+//! leaning on it:
+//!
+//! - **It covers the cadence, not the error handling.** The reference project
+//!   has none: its whole failure path is `catch { continue; }`, which re-enters
+//!   the loop without advancing the cursor and without sleeping — an unbounded
+//!   retry against Instagram on any failure, and precisely the pattern this
+//!   project forbids. The hard stop here is a deliberate improvement on it, not
+//!   a copy of it, and nobody should "restore fidelity" by removing it.
+//! - **It covers the cadence, not the total volume.** The reference walks one
+//!   list: it reads who you follow and derives the rest from a per-account flag
+//!   in the same response. This walks both lists, so for a symmetric account it
+//!   spends roughly twice the requests for the same answer. What offsets that is
+//!   a budget that persists across runs, which the reference also does not have.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,9 +31,16 @@ use snob_core::store::rate_budget::RateBudget;
 /// Request cadence during a walk.
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
-    /// Users per page. The reference project asks for 24 over GraphQL; we ask
-    /// for 50 over REST, which is the same users in half the requests, and
-    /// requests are what gets measured.
+    /// Users per page. The reference project asks for 24 over GraphQL; this
+    /// asks for 50 over REST.
+    ///
+    /// **It does not halve the requests.** Independent measurement in 2026 puts
+    /// the followers endpoint at about 25 accounts per response whatever is
+    /// asked for — a thousand followers costs around forty requests either way
+    /// — which is what the settled note in AGENTS.md already says and what this
+    /// comment used to contradict. It is kept at 50 because it costs nothing,
+    /// it is honoured on the following list, and asking for less would only
+    /// ever mean more requests.
     pub per_page: u32,
     /// Short pause before each request.
     pub micro_pause_ms: (u64, u64),
@@ -53,13 +76,15 @@ impl Default for Pace {
 impl Pace {
     /// Cadence for walking somebody else's lists.
     ///
-    /// Enumerating an account that is not yours is the pattern Instagram's
-    /// detection watches most closely, so the walk is stretched out: every wait
-    /// is roughly two to three times the default and the long pause comes round
-    /// almost twice as often.
+    /// Reading an account that is not yours is a heavier thing to ask for than
+    /// reading your own, and Instagram is correspondingly readier to refuse it,
+    /// so the walk is stretched out: every wait is roughly two to three times
+    /// the default and the long pause comes round almost twice as often. Going
+    /// slower is the courtesy owed to whoever's service and whoever's account
+    /// this is, neither of them ours.
     ///
-    /// `per_page` deliberately stays at 50. Asking for smaller pages would mean
-    /// more requests for the same users, and requests are the thing being
+    /// `per_page` deliberately stays at 50. Asking for smaller pages could only
+    /// mean more requests for the same users, and requests are the thing being
     /// counted — slowing down must not turn into knocking more often.
     ///
     /// The cost is that a walk takes about three times as long, and the resume
@@ -204,12 +229,27 @@ impl Pacer {
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
+    /// Charges the budget for one request, off the async worker.
+    ///
+    /// `reserve` opens an immediate transaction against a database this process
+    /// does not have to itself — the v2 service is meant to share it — so under
+    /// contention it sits on the five-second busy timeout. That is a long time
+    /// to hold a runtime worker, and this runs before every single request.
+    async fn reserve(&self) -> Result<Duration, crate::error::IgError> {
+        let budget = Arc::clone(&self.budget);
+        // `spawn_blocking` rather than `block_in_place`, which would be simpler
+        // and needs no clone: `block_in_place` panics on a current-thread
+        // runtime, and that is what `#[tokio::test]` builds by default. A tool
+        // whose tests cannot run it is not a tool this code can use.
+        tokio::task::spawn_blocking(move || budget.reserve())
+            .await
+            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+    }
+
     /// Takes a slot and waits for it. Every request goes through here.
     pub(crate) async fn clear_to_send(&self) -> Result<(), crate::error::IgError> {
-        let owed = self
-            .budget
-            .reserve()
-            .map_err(|e| crate::error::IgError::Budget(e.to_string()))?;
+        let owed = self.reserve().await?;
         // Counted at the reservation rather than at the answer: the budget has
         // been charged by now whatever the server goes on to say.
         self.spent.fetch_add(1, Ordering::Relaxed);

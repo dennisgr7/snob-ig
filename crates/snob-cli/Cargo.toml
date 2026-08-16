@@ -37,6 +37,10 @@ futures-util.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used so a typed sessionid does not sit in freed memory after the prompt that
+# read it.
+zeroize.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
@@ -65,8 +69,9 @@ assets = [
 ]
 
 [lints.rust]
-# Linking this binary makes MSVC announce that it is creating an import
-# library, because aws-lc -- rustls's crypto provider, four levels down from
-# reqwest -- exports its jitterentropy symbols. There is nothing to act on, and
-# it is the first thing printed on every build.
+# Linking this binary has made MSVC announce that it is creating an import
+# library, because a native dependency exports symbols. There is nothing to act
+# on, and it was the first thing printed on every build. Kept even though
+# Windows no longer links aws-lc: the message belongs to the linker, not to any
+# one dependency.
 linker_messages = "allow"

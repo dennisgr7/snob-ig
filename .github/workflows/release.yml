@@ -11,6 +11,15 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# Read-only unless a job asks for more, and two of them do: `publish` creates
+# the release and `packaging` pushes the manifests. Without this the rest
+# inherit whatever the repository defaults to, which on a repository that has
+# not been switched over is read-write -- and `build` is the job that runs
+# every dependency's build script, so it is the last one that should hold a
+# token it never uses.
+permissions:
+  contents: read
+
 jobs:
   # Runs before anything is built. A tag that disagrees with the manifest, or a
   # version with no changelog entry, is a release nobody can interpret later --
@@ -83,12 +92,12 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - run: cargo build --release --target ${{ matrix.target }} -p snob-cli
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p snob-cli
 
       # Every runner here is native, so this really runs the binary being
       # shipped rather than checking that a file exists.
       - name: Check the binary runs
-        run: cargo run --release --target ${{ matrix.target }} -p snob-cli -- --version
+        run: cargo run --release --locked --target ${{ matrix.target }} -p snob-cli -- --version
 
       # Two archive formats because the platforms disagree about what is
       # ordinary: a .tar.gz keeps the executable bit that a .zip would lose on
@@ -119,7 +128,11 @@ jobs:
       - name: Debian package
         if: runner.os == 'Linux'
         run: |
-          cargo install cargo-deb --locked
+          # Pinned. The comment below says this is the line the release runs,
+          # and that is only true if both resolve the same tool: unpinned, CI
+          # could pass on one version on Monday and the release build a .deb
+          # with a different one on Wednesday.
+          cargo install cargo-deb@3.7.0 --locked
           cargo deb --no-build --no-strip -p snob-cli \
             --target ${{ matrix.target }} \
             --output "snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}.deb"
@@ -223,6 +236,26 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula bucket packaging/winget
           git commit -m "Point the formula and the manifest at $GITHUB_REF_NAME"
-          # Both branches, because they are kept identical at a release and a
-          # commit landing on only one of them is how they stop being so.
-          git push origin HEAD:main HEAD:dev
+          sha=$(git rev-parse HEAD)
+
+          # main first, and on its own. Two refspecs in one push are not
+          # atomic, so a rejected second one leaves the first already landed --
+          # and this job checks out main, so HEAD:dev is rejected as a
+          # non-fast-forward whenever dev holds commits main does not, which is
+          # dev's ordinary state between releases. The failure therefore hit
+          # every release except the ones where the branches happened to be
+          # equal, and left them diverged: the state the dual push exists to
+          # prevent.
+          git push origin "$sha:refs/heads/main"
+
+          # dev gets the change carried onto its own history rather than main's
+          # laid over it. If that conflicts, the release has still succeeded
+          # and only this needs a hand, so it warns instead of failing.
+          git fetch origin dev
+          git checkout -B dev origin/dev
+          if git cherry-pick "$sha" && git push origin dev; then
+            echo "the manifests are on main and dev"
+          else
+            git cherry-pick --abort || true
+            echo "::warning::the manifests landed on main only; carry them to dev by hand"
+          fi

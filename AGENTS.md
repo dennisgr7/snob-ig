@@ -6,8 +6,9 @@ instruction document.
 **Detailed reasoning lives in the doc-comment above the code it governs, not
 here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
 schema in `store/sql/`, the cookie boundary in `cdp.rs`, the headers in
-`fingerprint.rs`. Read those before changing any of them — they explain what a
-number is for, which is what stops it being tuned into something harmful.
+`client_hints.rs`. Read those before changing any of them — they explain what a
+number is for, which is what stops it being changed into something that no
+longer does the job it was there to do.
 
 ## What this is
 
@@ -45,15 +46,18 @@ risk:
 
 - **No write operations against Instagram.** `snob` only reads. No follow,
   unfollow, block or remove-follower, ever.
-- **Never decrypt the user's browser cookie store.** Chrome and Edge on Windows
-  have used App-Bound Encryption since v127, and the only ways past it are
-  process injection and direct syscalls: infostealer territory. What is allowed,
-  and is the main route, is a browser **we launched with our own profile**
-  handing its cookies over through its debugging protocol. The boundary is whose
-  profile it is and who hands the data over, not whether the cookie is encrypted.
+- **Never read or decrypt the user's browser cookie store.** Chrome and Edge on
+  Windows have protected it with App-Bound Encryption since v127, and getting
+  past that protection is what credential-stealing malware is built to do. This
+  project does not go there, and has no reason to. What is allowed, and is the
+  main route, is a browser **we launched against our own profile**, which the
+  user logs into themselves and which then hands the cookies over through its
+  debugging protocol. The boundary is whose profile it is and who hands the data
+  over, not whether the cookie happens to be encrypted.
 - **On the first 429, `spam:true`, `feedback_required` or `challenge_required`:
-  hard stop.** No retry within that run, and the account goes into cooldown. A
-  retry loop without backoff is how an account gets flagged.
+  hard stop.** No retry within that run, and the account goes into cooldown.
+  When a service says no, the answer is to stop asking — and a retry loop is
+  also how a momentary limit becomes a lasting restriction.
 - **Request pacing is not changed without a documented reason.** The numbers are
   copied from `InstagramUnfollowers`, which has years of incident-free real use,
   and have only ever been changed to make *fewer* requests. They are in
@@ -152,10 +156,13 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
 | Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
-| Control characters from a profile never reach a terminal | `User::safe_username` / `safe_full_name` |
+| A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target`. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too |
+| A name inside a URL is encoded, never filtered | `User::profile_url` — filtering removes characters, and a name with one removed is the address of a different account |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
+| A session is never reported gone unless it went | `SecretStore::delete`, which carries the keyring's own answer back |
+| Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers |
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
 
@@ -176,6 +183,14 @@ line when standard input is not a TTY, the progress bar hides itself, `table`
 becomes one name per line down a pipe, and the output format defaults to JSON.
 The login **method** must be given explicitly there (`--paste`), since there is
 no menu to show.
+
+**Redirecting the results does not turn a question into a refusal.** Every
+prompt is written to standard error and answered on standard input, so
+`ui::can_be_asked` asks about standard input alone and nothing gates on standard
+output: `snob scan someone | jq` reaches the consent question and can answer it.
+The one exception is `ui::can_show_a_menu`, which also needs standard **error**
+to be a terminal, because that is where `dialoguer` draws — not standard output,
+which no prompt here touches.
 
 Two judgement calls worth understanding before touching them:
 
@@ -201,23 +216,35 @@ Two judgement calls worth understanding before touching them:
   1080x1080 comes from `/api/v1/users/{pk}/info/`.
 - **`count=50` is accepted**, the cursor advances without repeating, and
   resuming works. Followers are served ~25 per page anyway; budget accordingly.
-- **There is no useful anonymous mode.** Without cookies, `web_profile_info`
-  answers 429 on the very first request from the edge, username-to-id cannot be
-  resolved by any surviving route, and the one endpoint that does answer gives a
-  stub with no counters and a 150x150 picture whose URL is signed for that size.
-  Everything needs a session; that is Instagram, not a gap here.
-- **The TLS stack is not to be touched.** Chrome has randomized its ClientHello
-  extension order since v110, so there is no fixed fingerprint left to match and
-  a stable one is more anomalous than any particular one. Matching it would mean
-  leaving `rustls` and the clean static cross-compilation with it. What actually
-  gets an account throttled, in order: IP reputation, request volume and pace,
-  header coherence.
-- **Header work aims at coherence, not disguise.** Instagram answers
-  `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so those are sent; `Accept` is `*/*`
-  because no browser sends `application/json` here; `sec-ch-ua` is computed from
-  the version rather than hardcoded, including the order of its three entries;
-  no `Origin` on a same-origin GET. The stored User-Agent follows the installed
-  browser's major version, at most daily, never when the user pinned one.
+- **There is no useful logged-out mode.** Signed out, `web_profile_info` answers
+  429 on the very first request from the edge, username-to-id cannot be resolved
+  by any surviving route, and the one endpoint that does answer gives a stub
+  with no counters and a 150x150 picture whose URL is signed for that size.
+  Everything needs a session; that is how Instagram has built it, not a gap
+  here.
+- **The TLS stack is chosen for portability, and is not to be tuned to imitate
+  anything.** There would be nothing to imitate in any case: Chrome has
+  randomized its ClientHello extension order since v110. Trying would mean
+  leaving `rustls`, and the clean static cross-compilation with it, and would
+  buy nothing — what determines whether Instagram throttles an account is, in
+  order, the address the requests come from, how many there are, and how fast.
+  **One target picks a different backend, and that is purely a build concern**:
+  Windows on ARM64 uses schannel, because neither of
+  rustls's crypto providers builds there without LLVM — the pre-generated
+  assembly is GNU syntax and both shell out to clang. Everything else, x86_64
+  Windows included, stays on `rustls`. The reasoning, why it is deliberately
+  not widened to all of Windows, and what it costs is in
+  `crates/snob-ig/Cargo.toml` next to the two dependency tables. The choice is
+  about which crypto backend compiles on that target and nothing else, and
+  `http2` stays mandatory on both.
+- **Headers are sent so that the request is internally consistent, and for no
+  other reason.** Instagram answers `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so
+  those are sent; `Accept` is `*/*` because that is what `fetch()` sends when
+  the page sets nothing; `sec-ch-ua` is computed from the version rather than
+  hardcoded, including the order of its three entries; no `Origin` on a
+  same-origin GET, which the Fetch standard omits there. The stored User-Agent
+  follows the major version of a browser actually installed on the machine, at
+  most daily, and never when the user pinned one.
 - **`@someone` never reaches us on PowerShell.** `@` is the splatting operator,
   so the argument is gone before `main` runs and the tool answers about the
   user's own account. Nothing can detect it from here — do not write unquoted
@@ -230,8 +257,8 @@ Two judgement calls worth understanding before touching them:
 - **No biometric verification, on any platform.** Investigated in August 2026
   and rejected on the merits, not on difficulty. The principle: any prompt a
   local process of the same user can trigger, that same process can satisfy by
-  asking the user — and the attacker that matters, a stealer, never runs `snob`
-  at all, it reads the keyring directly with the same permissions. Concretely:
+  asking the user — and the attacker that matters never runs `snob` at all: it
+  reads the keyring directly, with the same permissions the user has. Concretely:
   Windows `KeyCredentialManager` gives an unpackaged binary **no per-application
   boundary** (Microsoft's own answer: without an AppContainer it scopes to the
   user account, and a second executable can open the same credential); the
@@ -243,6 +270,22 @@ Two judgement calls worth understanding before touching them:
   where they can *write*, and the v2 monitor is a background service that cannot
   prompt anybody. What is worth doing instead — keep the cookie out of the
   database and out of logs — is already done.
+- **A challenge's cooldown is not lifted by clearing the challenge, and that is
+  the accepted cost.** Someone who opens the link and passes the check in thirty
+  seconds still waits out the half hour: `whoami`, `pfp` and every walk refuse
+  until it lifts, and `login` stores a session without validating it because
+  during a cooldown not even that one request is spent. Two ways out were
+  considered and both were rejected. Letting a successful `login` clear it means
+  trusting a login that was never validated — the cooldown would be lifted by
+  the one command that cannot tell whether the account is still flagged.
+  Spending the validation request during the cooldown to find out is the retry
+  the rule above forbids, aimed at an account Instagram has just flagged, which
+  is precisely how a checkpoint becomes something longer. The escalation is
+  shared across causes for the same reason: a challenge arriving within a day of
+  a 429 is evidence the account is in worse shape, not better, so it starts at
+  the escalated length rather than at its own. `SNOB_IGNORE_COOLDOWN` exists for
+  the person who is certain, and stays undocumented so it is not the first thing
+  reached for.
 - **`snob purge` deletes the stored data and not the binary.** No package
   manager can do the first half: `winget uninstall`, `brew uninstall` and
   `apt remove` take away files the package owns, and the session, the database
@@ -272,10 +315,27 @@ deliberately unfinished:
   crossed against a live list, and whether it belongs in the store at all.
   Shipping the subcommand would answer those by accident.
 - **The monitor** (`snob watch`, the scheduled service, snapshot diffs and
-  webhooks) is v2. The schema already reserves `events` and `webhook_queue`, and
-  `lost`/`gained` are reserved words for its temporal diff — `unfollowers` is the
-  static set and must never drift to mean `lost`.
+  webhooks) is v2. `lost`/`gained` are reserved words for its temporal diff —
+  `unfollowers` is the static set and must never drift to mean `lost`. The
+  table it will read is **`username_history`**, which exists and is written on
+  every walk; nothing consumes it yet, so it looks orphaned and is not. No other
+  table is reserved for it — `001_initial.sql` is the whole schema.
 
-Not exercised live, and worth knowing before trusting either: a walk over a list
-of several thousand, and real behavior on a 429, which has never been provoked
-on purpose and is verified against a recorded body instead.
+## Known walls
+
+- **A list of tens of thousands does not come back.** On an account declaring
+  21631 followers, Instagram served 39 on the first page and offered no cursor.
+  `pager::verdict` catches that — the shortfall is far past what deleted
+  accounts explain — and `scan` and the set commands refuse rather than cross a
+  list that is 0.2% of the account. This walk cannot be resumed either: the
+  pagination ended, so there is no cursor to store. That is a property of
+  **this** wall and not of `Truncated`, which also arrives from four guards
+  that stop in the middle of the pagination with a cursor saved — so
+  `try_again_advice` asks the store what was kept rather than reading the stop
+  reason as an answer.
+  Whether the limit is the account, the session or the endpoint is not known;
+  what is known is that the tool reports it instead of answering wrongly.
+- **Real behavior on a 429 has never been provoked on purpose.** The handling is
+  verified against a recorded body. Everything downstream of it — the cooldown,
+  the hard stop, the exit code — is tested; the classification of a live one is
+  not.

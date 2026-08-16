@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::paths::{AppPaths, PathError};
 use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
@@ -47,6 +47,15 @@ const KEYRING_PROBE_USER: &str = "write-probe";
 pub enum SecretsError {
     #[error("the system keyring is unavailable: {0}")]
     KeyringUnavailable(String),
+    /// The keyring answered, and would not give the entry up.
+    ///
+    /// Deliberately not [`SecretsError::KeyringUnavailable`], which means there
+    /// is no backend to talk to at all — ordinary on a server, a container or
+    /// WSL, and never a reason to say a session survived. Here there **is** one,
+    /// it is holding the session, and it refused. That is the one case where
+    /// "the session was deleted" is false, so it needs a sentence of its own.
+    #[error("the system keyring would not delete the stored session: {0}")]
+    KeyringRefused(String),
     #[error("could not read {path}: {source}")]
     Read {
         path: String,
@@ -236,13 +245,33 @@ impl SecretStore {
                 self.entry()?
                     .set_password(&json)
                     .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))?;
-                // Do not leave two different sessions lying around.
-                let _ = std::fs::remove_file(self.paths.session_file());
+                // Do not leave two different sessions lying around. Every
+                // location, not just the current one: `load` checks the
+                // keyring first, so once an entry exists the rescue path that
+                // would have found and removed the legacy file is never
+                // reached again, and an older account's live cookie stays in
+                // the roaming profile — where it roams — until someone happens
+                // to run `logout` or `purge`.
+                for stale in self.paths.session_files() {
+                    let _ = std::fs::remove_file(stale);
+                }
             }
             Backend::File => {
                 self.write_file(&json)?;
-                if let Ok(entry) = self.entry() {
-                    let _ = entry.delete_credential();
+                // Not a reason to fail the save: the backend the user asked for
+                // has the session. But not something to pass over in silence
+                // either — `load` reads the keyring **first**, so an entry that
+                // will not go is the session every later run picks up, and the
+                // file just written is never reached.
+                if let Ok(entry) = self.entry()
+                    && let Err(e) = entry.delete_credential()
+                    && !matches!(e, keyring::Error::NoEntry)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "the session was written to the file, but the keyring would not give up \
+                         its own copy; that copy is the one later runs will read"
+                    );
                 }
             }
         }
@@ -262,24 +291,73 @@ impl SecretStore {
         Ok(None)
     }
 
+    /// Whether there is a credential on this machine at all.
+    ///
+    /// **Anything but a clean "nothing there" counts as one.** A stored session
+    /// too corrupt to parse is still a session on the disk, so treating the parse
+    /// failure as absence would let `logout` print "there was no session stored"
+    /// while deleting one — and skip the line about it still being live on
+    /// Instagram, which is exactly the case where the user needs it.
+    ///
+    /// It lives here rather than in the two commands that ask because the reading
+    /// is the non-obvious part: `!matches!(load(), Ok(None))` written out at a
+    /// call site looks like an oversight, and the obvious `load().is_ok()` is
+    /// wrong in the one way that matters.
+    pub fn something_is_stored(&self) -> bool {
+        !matches!(self.load(), Ok(None))
+    }
+
+    /// Removes the session from everywhere it can be, and says so only if it
+    /// went.
+    ///
+    /// **Every location is attempted even after one of them refuses.** Stopping
+    /// at the first failure would leave the copies behind it alive, and this
+    /// call does not promise to have tried — it promises that no live cookie
+    /// survives it.
+    ///
+    /// The keyring's answer used to be discarded, so a refusal there was
+    /// indistinguishable from success: `logout` printed "Session deleted." and
+    /// `purge` printed "snob's files are gone from this computer" over a
+    /// credential that was still in the store, which is the outcome `purge`
+    /// exists to prevent. `NoEntry` is not a refusal — it means there was
+    /// nothing to take away, which is the result being asked for — and neither
+    /// is having no keyring at all, for the same reason: there is no copy there
+    /// to leave behind.
+    ///
+    /// One error comes back where two can happen, and the file's wins. Both
+    /// give the same exit code and both withhold the same claim, so the choice
+    /// only decides which sentence is printed — and the file's names a path
+    /// somebody can go and delete by hand.
     pub fn delete(&self) -> Result<(), SecretsError> {
-        if let Ok(entry) = self.entry() {
-            let _ = entry.delete_credential();
+        let mut keyring_refused = None;
+        match self.entry() {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => keyring_refused = Some(SecretsError::KeyringRefused(e.to_string())),
+            },
+            Err(e) => tracing::debug!(error = %e, "there is no keyring to delete from"),
         }
-        let file = self.paths.session_file();
-        if file.exists()
-            && let Err(source) = std::fs::remove_file(&file)
-        {
-            return Err(SecretsError::Write {
-                path: file.display().to_string(),
-                source,
-            });
+
+        // The legacy copy is not housekeeping: it is a working session in the
+        // directory that roams with the profile, so a failure to remove it is
+        // a live cookie left behind exactly like the current one.
+        let mut file_refused = None;
+        for file in self.paths.session_files() {
+            if file.exists()
+                && let Err(source) = std::fs::remove_file(&file)
+                && file_refused.is_none()
+            {
+                file_refused = Some(SecretsError::Write {
+                    path: file.display().to_string(),
+                    source,
+                });
+            }
         }
-        // Make sure a delete does not leave the legacy copy alive.
-        if let Some(previous) = self.paths.legacy_session_file() {
-            let _ = std::fs::remove_file(previous);
+
+        match file_refused.or(keyring_refused) {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn entry(&self) -> Result<keyring::Entry, SecretsError> {
@@ -320,14 +398,35 @@ impl SecretStore {
     fn load_from_keyring(&self) -> Result<Option<Zeroizing<String>>, SecretsError> {
         let entry = match self.entry() {
             Ok(e) => e,
-            Err(_) => return Ok(None),
+            // No keyring backend at all. Ordinary on a server, a container or
+            // WSL, and the session may still be in the fallback file.
+            Err(e) => {
+                tracing::debug!(error = %e, "there is no keyring to read from");
+                return Ok(None);
+            }
         };
         match entry.get_password() {
             Ok(json) => Ok(Some(Zeroizing::new(json))),
+            // The entry is simply not there.
             Err(keyring::Error::NoEntry) => Ok(None),
-            // A missing keyring is not a read error: the session may be in the
-            // fallback file.
-            Err(_) => Ok(None),
+            // The keyring is there and refused. Every error used to land here
+            // silently alongside `NoEntry`, and the two are not the same
+            // claim: a credential that cannot be read this once became "no
+            // session stored", which sends the user to log in again over a
+            // session that is still there — and `save` removes the file
+            // fallback once a keyring entry exists, so there is nothing behind
+            // it to catch them.
+            //
+            // It still falls through to the file, because that is the right
+            // thing to try next. What it no longer does is fall through in
+            // silence.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "the keyring refused to hand the session over; trying the file instead"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -365,14 +464,23 @@ impl SecretStore {
         Ok(Some(json))
     }
 
+    /// Reads a stored session, clearing what it read on the way out.
+    ///
+    /// On Unix the payload **is** the session in the clear — the protection
+    /// there is the file's 0600 permissions, not encryption — so the bytes read
+    /// off the disk and the payload parsed out of them are both the cookie.
+    /// This runs on every command, so an unzeroized copy of each is left in
+    /// freed memory every time the tool starts.
     fn read_file(&self, path: &std::path::Path) -> Result<Zeroizing<String>, SecretsError> {
-        let raw = std::fs::read(path).map_err(|source| SecretsError::Read {
+        let raw = Zeroizing::new(std::fs::read(path).map_err(|source| SecretsError::Read {
             path: path.display().to_string(),
             source,
-        })?;
-        let stored: StoredSession = serde_json::from_slice(&raw)
+        })?);
+        let mut stored: StoredSession = serde_json::from_slice(&raw)
             .map_err(|e| SecretsError::Corrupt(format!("the session file is not valid: {e}")))?;
-        unprotect(&stored)
+        let session = unprotect(&stored);
+        stored.payload.zeroize();
+        session
     }
 
     fn write_file(&self, json: &str) -> Result<(), SecretsError> {
@@ -561,7 +669,18 @@ mod dpapi {
         let output = unsafe {
             std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
         };
-        unsafe { LocalFree(out_blob.pbData as *mut core::ffi::c_void) };
+        // On the decrypt path this buffer is the session in the clear, and it
+        // is Windows's memory rather than ours: nothing else will wipe it, and
+        // `LocalFree` only returns it to the heap with the cookie still in it.
+        // The copy above is what the caller wraps in `Zeroizing`; this is the
+        // original.
+        //
+        // SAFETY: same pointer and length the read above used, still owned by
+        // this function and not yet freed.
+        unsafe {
+            std::ptr::write_bytes(out_blob.pbData, 0, out_blob.cbData as usize);
+            LocalFree(out_blob.pbData as *mut core::ffi::c_void)
+        };
 
         Ok(output)
     }
@@ -643,12 +762,44 @@ mod tests {
             landed == Backend::File,
             "the file should exist exactly when the probe named the file"
         );
+        let read_back = load_settled(&store);
         assert_eq!(
-            store.load().unwrap().unwrap().sessionid.expose(),
+            read_back
+                .expect("the session was just written and has to read back")
+                .sessionid
+                .expose(),
             session.sessionid.expose()
         );
 
         store.delete().unwrap();
+    }
+
+    /// Reads the session back, waiting out the credential store if it needs it.
+    ///
+    /// Not a retry bolted on to make a red test green. What it waits for was
+    /// measured: this suite creates and deletes dozens of credentials in
+    /// parallel, and two or three runs in fifty ended with `save` reporting the
+    /// write to the Windows Credential Manager as successful and the read
+    /// immediately after it answering `NoEntry` — the credential is not
+    /// missing, it is not visible yet.
+    ///
+    /// The delay is the whole mechanism, which is why an immediate second
+    /// attempt did not help: both landed inside the same window, microseconds
+    /// apart. Adding any tracing to the path made it stop reproducing, which is
+    /// the other reason to believe it is a timing window rather than logic.
+    ///
+    /// The real store is deliberately kept rather than faked. What this test is
+    /// for is that the answer `probe_writable` gave and the place `save` put it
+    /// cannot disagree, and against an in-memory double that proves nothing
+    /// about the platform it is asserting.
+    fn load_settled(store: &SecretStore) -> Option<Session> {
+        for attempt in 0..5 {
+            if let Some(session) = store.load().unwrap() {
+                return Some(session);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+        }
+        store.load().unwrap()
     }
 
     #[test]
@@ -666,8 +817,14 @@ mod tests {
         assert!(store.load().unwrap().is_none());
     }
 
+    /// Having nothing to delete is the result being asked for, not a refusal.
+    ///
+    /// The guard against the honesty fix going too far: `delete` now reports
+    /// what would not go, and the keyring's way of saying "there was nothing
+    /// here" is `keyring::Error::NoEntry` — an answer, not a failure. Reading
+    /// it as one would make every `logout` on a clean machine exit non-zero.
     #[test]
-    fn delete_with_nothing_to_delete_does_not_fail() {
+    fn nothing_stored_is_not_a_refusal() {
         let (_tmp, store) = file_store();
         store.delete().unwrap();
     }
@@ -702,6 +859,53 @@ mod tests {
 
         store.delete().unwrap();
         assert!(!previous.exists());
+    }
+
+    /// One copy refusing must not spare the others, and must still be reported.
+    ///
+    /// The keyring branch cannot be driven from a test — reaching a fake store
+    /// means depending on `keyring-core` directly, which `entry_for` documents
+    /// as the thing not to do, and no test may touch the real one. So the shape
+    /// is pinned through the filesystem, which the keyring branch shares: every
+    /// location is attempted, and the refusal comes back at the end rather than
+    /// short-circuiting. Returning early was the tempting fix and the wrong
+    /// one: it would leave the copies after the failure alive.
+    ///
+    /// A directory standing where the file goes is how the refusal is arranged:
+    /// `remove_file` fails on one on every platform, which a permission bit
+    /// does not — Windows governs deletion by the file's read-only attribute
+    /// and Unix by the parent's write bit. What is being tested is the
+    /// reporting, not the reason the operating system said no.
+    #[test]
+    fn a_copy_that_will_not_go_is_reported_and_does_not_stop_the_others() {
+        let (_tmp, store) = file_store();
+        let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        store.save(&s).unwrap();
+
+        // An earlier install's copy, in the other directory. It is the one
+        // after the refusal, and it still has to go.
+        let previous = store.paths.legacy_session_file().unwrap();
+        std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+        std::fs::write(&previous, b"{}").unwrap();
+
+        let holding = store.paths.session_file();
+        std::fs::remove_file(&holding).unwrap();
+        std::fs::create_dir(&holding).unwrap();
+
+        let result = store.delete();
+
+        assert!(
+            matches!(result, Err(SecretsError::Write { .. })),
+            "the refusal has to reach the caller, or purge claims the session is gone"
+        );
+        assert!(
+            holding.exists(),
+            "the test did not arrange what it meant to"
+        );
+        assert!(
+            !previous.exists(),
+            "the copy after the refusal was skipped, which is the failure the loop exists to avoid"
+        );
     }
 
     #[test]

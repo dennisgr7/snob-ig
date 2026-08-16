@@ -5,10 +5,8 @@
 //! here it is an empty field. That keeps every row the same width, which is
 //! the whole point of the format.
 
-use std::borrow::Cow;
-
 use anyhow::{Context, Result};
-use snob_core::model::User;
+use snob_core::model::{User, printable};
 
 /// The column names. Frozen along with the JSON keys they mirror.
 const HEADER: [&str; 6] = [
@@ -28,17 +26,17 @@ pub(crate) fn rows(users: &[User]) -> Result<String> {
         .context("could not write the csv header")?;
 
     for user in users {
-        let fields: [Cow<'_, str>; 6] = [
-            Cow::Owned(user.pk.to_string()),
-            defuse(&user.username),
+        let fields: [String; 6] = [
+            user.pk.to_string(),
+            clean(&user.username),
             optional(user.full_name.as_deref()),
             flag(user.is_private),
             flag(user.is_verified),
             optional(user.pfp_url.as_deref()),
         ];
         writer
-            .write_record(fields.iter().map(Cow::as_ref))
-            .with_context(|| format!("could not write the row for {}", user.username))?;
+            .write_record(&fields)
+            .with_context(|| format!("could not write the row for {}", user.safe_username()))?;
     }
 
     finish(writer)
@@ -51,9 +49,9 @@ pub(crate) fn single_row(header: &[&str], row: &[String]) -> Result<String> {
     writer
         .write_record(header)
         .context("could not write the csv header")?;
-    let fields: Vec<Cow<'_, str>> = row.iter().map(|field| defuse(field)).collect();
+    let fields: Vec<String> = row.iter().map(|field| clean(field)).collect();
     writer
-        .write_record(fields.iter().map(Cow::as_ref))
+        .write_record(&fields)
         .context("could not write the csv row")?;
     finish(writer)
 }
@@ -68,30 +66,50 @@ fn finish(writer: csv::Writer<Vec<u8>>) -> Result<String> {
 
 /// An unknown attribute is an empty field, never `false`: not knowing whether
 /// an account is private is not the same as knowing it is not.
-fn flag(value: Option<bool>) -> Cow<'static, str> {
+fn flag(value: Option<bool>) -> String {
     match value {
-        Some(true) => Cow::Borrowed("true"),
-        Some(false) => Cow::Borrowed("false"),
-        None => Cow::Borrowed(""),
+        Some(true) => "true".into(),
+        Some(false) => "false".into(),
+        None => String::new(),
     }
 }
 
-fn optional(value: Option<&str>) -> Cow<'_, str> {
-    value.map(defuse).unwrap_or(Cow::Borrowed(""))
+fn optional(value: Option<&str>) -> String {
+    value.map(clean).unwrap_or_default()
 }
 
-/// Stops a spreadsheet from reading a name as a formula.
+/// What a field from a profile has to survive before it is written.
 ///
-/// Excel and LibreOffice evaluate any cell that opens with `=`, `+`, `-` or
-/// `@`, and a full name is whatever its owner typed. A leading apostrophe is
-/// the marker both of them read as "this is text"; it costs one character of
-/// fidelity in a field that is decoration anyway. The tab and carriage return
-/// are here because they can slip past a naive check and still reach the
-/// parser as the start of a cell.
-fn defuse(field: &str) -> Cow<'_, str> {
-    match field.chars().next() {
-        Some('=' | '+' | '-' | '@' | '\t' | '\r') => Cow::Owned(format!("'{field}")),
-        _ => Cow::Borrowed(field),
+/// Two hazards live in the same value, and a csv meets both: it is the one
+/// machine format that routinely goes to a terminal, because `--format csv`
+/// with no `-o` writes to standard output, and it is also the one that gets
+/// opened in a spreadsheet.
+///
+/// So the control characters come out first — the terminal obeys those, and
+/// this file used to be the way past `safe_username`, which every other format
+/// already went through. Then the formula is defused: Excel and LibreOffice
+/// evaluate any cell that opens with `=`, `+`, `-` or `@`, and a full name is
+/// whatever its owner typed. A leading apostrophe is the marker both of them
+/// read as "this is text", and it costs one character of fidelity in a field
+/// that is decoration anyway.
+///
+/// Order matters, and this way round. Defusing first would look at the control
+/// character, decide the field is not a formula, and only then take that
+/// character out — handing the spreadsheet a bare `=1+1` that nothing marked.
+///
+/// The **first non-blank** character, not the first, and that is the other half
+/// of the same trap. `printable` turns whitespace into a space rather than
+/// removing it, deliberately, so that deleting a newline does not join two
+/// words — which means `"\t=1+1"` survives as `" =1+1"`, whose first character
+/// is a space. Excel and LibreOffice both trim leading whitespace when they
+/// import, so what they then evaluate is the formula that nothing marked. The
+/// existing test used an escape, which `printable` does remove, so it never saw
+/// this.
+fn clean(field: &str) -> String {
+    let field = printable(field);
+    match field.chars().find(|c| !c.is_whitespace()) {
+        Some('=' | '+' | '-' | '@') => format!("'{field}"),
+        _ => field,
     }
 }
 
@@ -153,15 +171,24 @@ mod tests {
         assert_eq!(unknown[5], "");
     }
 
+    /// Commas and quotes are the writer's problem and it handles them. A
+    /// newline is not: quoted or not, it draws a second row on a terminal, and
+    /// one account must not be able to look like two. It becomes a space here
+    /// exactly as it does in the drawn table and the markdown one. Whoever
+    /// needs the name byte-for-byte has `--format json`, where a newline
+    /// travels as `\n` and no terminal acts on it.
     #[test]
-    fn a_full_name_with_commas_quotes_and_newlines_survives() {
+    fn commas_and_quotes_survive_but_a_newline_becomes_a_space() {
         let awkward = "Comma, \"quote\" and\na newline";
         let user = User {
             full_name: Some(awkward.into()),
             ..users()[0].clone()
         };
-        let records = parse(&rows(&[user]).unwrap());
-        assert_eq!(records[1][2], awkward);
+        let out = rows(&[user]).unwrap();
+        assert_eq!(out.lines().count(), 2, "one account, one row: {out:?}");
+
+        let records = parse(&out);
+        assert_eq!(records[1][2], "Comma, \"quote\" and a newline");
     }
 
     #[test]
@@ -173,6 +200,67 @@ mod tests {
             };
             let records = parse(&rows(&[user]).unwrap());
             assert_eq!(records[1][2], format!("'{dangerous}"), "{dangerous}");
+        }
+    }
+
+    /// `--format csv` with no `-o` writes to the terminal, so this file is an
+    /// output path like any other and the same filter has to apply. It used to
+    /// be the way past it.
+    #[test]
+    fn a_hostile_name_cannot_drive_the_terminal() {
+        let user = User {
+            username: "someone".into(),
+            full_name: Some(format!(
+                "{esc}]8;;http://evil.test{esc}\\Official{esc}]8;;{esc}\\",
+                esc = '\x1b'
+            )),
+            pfp_url: Some(format!("https://example.test/a.jpg{}[2K", '\x1b')),
+            ..users()[0].clone()
+        };
+        let out = rows(&[user]).unwrap();
+        assert!(!out.contains('\x1b'), "{out:?}");
+        // The address survives as text — it is characters in a name now — but
+        // not as a sequence the terminal obeys.
+        assert!(out.contains("evil.test"), "{out}");
+    }
+
+    /// The summary shares the writer, and its cells come from the same places.
+    #[test]
+    fn the_single_row_is_filtered_too() {
+        let out = single_row(&["a"], &[format!("x{}[2K", '\x1b')]).unwrap();
+        assert!(!out.contains('\x1b'), "{out:?}");
+    }
+
+    /// A formula hiding behind a control character. Defusing before filtering
+    /// would clear it as harmless and then strip the character that was hiding
+    /// it, which is how `=1+1` reaches a spreadsheet unmarked.
+    #[test]
+    fn a_formula_behind_a_control_character_is_still_defused() {
+        let user = User {
+            full_name: Some(format!("{}=1+1", '\x1b')),
+            ..users()[0].clone()
+        };
+        let records = parse(&rows(&[user]).unwrap());
+        assert_eq!(records[1][2], "'=1+1");
+    }
+
+    /// The half the test above could not see. An escape is *removed* by
+    /// `printable`, so the `=` ends up first and the old check caught it; a tab
+    /// or a carriage return is turned into a **space**, on purpose, and left the
+    /// `=` in second place where nothing looked. Both spreadsheets trim leading
+    /// whitespace on import, so what they evaluated was a formula nobody marked.
+    #[test]
+    fn a_formula_behind_whitespace_is_defused_too() {
+        for hidden in ['\t', '\r', '\n', ' '] {
+            let user = User {
+                full_name: Some(format!("{hidden}=1+1")),
+                ..users()[0].clone()
+            };
+            let records = parse(&rows(&[user]).unwrap());
+            assert_eq!(
+                records[1][2], "' =1+1",
+                "a formula behind {hidden:?} reached the spreadsheet"
+            );
         }
     }
 
