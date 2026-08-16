@@ -16,27 +16,12 @@ use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
 use snob_cli::engine::{self, ListOutcome};
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
+mod common;
+use common::{SID, UA};
 
+/// The account every test here asks about.
 fn args() -> ListArgs {
-    ListArgs {
-        target: Some("@ghost".into()),
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
-        limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
-        yes: true,
-    }
+    common::args_for("@ghost")
 }
 
 /// The profile endpoint answering with whatever user object each test needs.

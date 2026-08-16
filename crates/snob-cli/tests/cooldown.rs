@@ -26,28 +26,8 @@ use snob_cli::cli::ListArgs;
 use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 use snob_cli::exit::ExitCode;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
-
-fn args() -> ListArgs {
-    ListArgs {
-        target: None,
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
-        limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
-        yes: true,
-    }
-}
+mod common;
+use common::{SID, UA, args};
 
 /// A budget over a database that exists.
 ///
