@@ -531,6 +531,7 @@ mod tests {
             started_at: 1_722_699_000,
             taken_at: 1_722_700_000,
             account_pk: 1,
+            snapshot_id: 1,
             stopped_by: None,
             resumable: false,
         }

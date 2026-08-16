@@ -1,9 +1,13 @@
 //! `snob watch`: the monitor.
 //!
-//! What is here so far is the read half — `snob watch diff`, which answers
-//! "what has changed since the last time anything was reported" out of storage
-//! alone, without spending a request. The scheduled half is built on top of the
-//! same report.
+//! Two ways to ask the same question. `diff` answers out of storage and leaves
+//! everything as it found it, so it can be run as often as anybody likes and
+//! costs nothing. `once` goes and looks, reports, and remembers having
+//! reported — which is the difference that matters, because what a run reports
+//! it does not report again.
+//!
+//! The scheduled mode is what remains: it is `once` on a timer, and the report
+//! it produces is the same one.
 //!
 //! Wording, dates and exit codes live here. What actually changed is
 //! [`crate::engine::watch`]'s answer, and this never recomputes any of it.
@@ -14,11 +18,13 @@ use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_core::watch::{Basis, ListDiff, Rename};
 
-use crate::cli::{WatchCommand, WatchDiffArgs};
+use crate::cli::{WatchCommand, WatchDiffArgs, WatchOnceArgs};
 use crate::commands::common::{self, Session};
-use crate::engine::watch::{ListReport, WatchReport};
+use crate::engine::Provenance;
+use crate::engine::watch::{ListReport, Skipped, TickReport, WatchReport, Watched};
 use crate::exit::ExitCode;
 use crate::report;
+use crate::ui;
 
 pub async fn run(
     command: WatchCommand,
@@ -27,6 +33,82 @@ pub async fn run(
 ) -> Result<ExitCode> {
     match command {
         WatchCommand::Diff(args) => diff(args, secrets, paths),
+        WatchCommand::Once(args) => once(args, secrets, paths).await,
+    }
+}
+
+/// One run of the monitor: look, report, and remember having reported.
+async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
+    else {
+        return Ok(ExitCode::NoSession);
+    };
+
+    let watched = match args.target.clone() {
+        None => Watched::own(),
+        // Asked, not assumed. `engine::list` puts the question the same way it
+        // does for every other command, and with no terminal to ask at it
+        // refuses — which is the right answer for a cron entry aimed at
+        // somebody else's account and no recorded agreement.
+        Some(name) => Watched::asking(name),
+    };
+
+    let tick = crate::engine::watch::tick(&mut app, &watched).await;
+    app.progress().finish();
+    let tick = tick?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&tick_json(&tick))?);
+    } else {
+        for line in describe(&tick.report) {
+            println!("{line}");
+        }
+    }
+
+    // What was refused goes to standard error, so it does not land in the
+    // middle of a report something else is parsing — and it is said even in
+    // JSON, where a caller reading `looked` would otherwise have to guess why.
+    for skipped in tick
+        .lists
+        .iter()
+        .filter_map(|l| l.skipped.map(|s| (l.kind, s)))
+    {
+        ui::warn(&refusal_line(skipped.0, skipped.1));
+    }
+
+    ui::info(&format!(
+        "{} - {}",
+        report::stored_on(snob_core::store::now()),
+        report::requests(tick.requests)
+    ));
+
+    Ok(ExitCode::Ok)
+}
+
+/// Why a list was not compared, said in a sentence.
+///
+/// `engine` handed over what happened and nothing else; which words that
+/// deserves is this module's question, which is why the tokens are matched
+/// here rather than carried as strings.
+fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
+    match skipped {
+        Skipped::NobodyLooked(provenance) => format!(
+            "the {kind} list was served from storage and nothing checked whether it is still \
+             true{}, so it was not compared and the monitor did not move on",
+            match provenance {
+                Provenance::Cooldown => " (the account is in cooldown)",
+                Provenance::PollFailed => " (the check failed)",
+                _ => "",
+            }
+        ),
+        // The same half-sentence the summary uses for the same situation.
+        // Writing a second one here is how two commands end up describing one
+        // event in two ways.
+        Skipped::Incomplete(reason) => format!(
+            "the {kind} list could not be read in full ({}), so it was not compared: the \
+             accounts missing from it would have been reported as people who left",
+            report::why_incomplete(reason).unwrap_or("it stopped early")
+        ),
     }
 }
 
@@ -89,6 +171,33 @@ fn as_json(report: &WatchReport) -> serde_json::Value {
             "renamed": report.renamed.len(),
         },
     })
+}
+
+/// A tick's answer, which is the report plus what the run itself did.
+///
+/// `looked` is the field an automation branches on and the one that cannot be
+/// derived from the arrays: empty changes mean "nothing happened" when the run
+/// looked and "I could not see" when it did not, and something watching for
+/// silence reads those as the same thing.
+fn tick_json(tick: &TickReport) -> serde_json::Value {
+    let mut out = as_json(&tick.report);
+    out["run"] = serde_json::json!({
+        "looked": tick.looked(),
+        "requests": tick.requests,
+        "lists": tick.lists.iter().map(|l| serde_json::json!({
+            "kind": l.kind.as_str(),
+            "skipped": l.skipped.map(skipped_token),
+        })).collect::<Vec<_>>(),
+    });
+    out
+}
+
+/// The stable name of why a list was left out.
+fn skipped_token(skipped: Skipped) -> &'static str {
+    match skipped {
+        Skipped::NobodyLooked(_) => "not_verified",
+        Skipped::Incomplete(_) => "incomplete",
+    }
 }
 
 fn count(report: Option<&ListReport>, of: impl Fn(&ListDiff) -> usize) -> usize {

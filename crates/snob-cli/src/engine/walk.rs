@@ -117,6 +117,7 @@ pub async fn fetch(
             started_at: opened.started_at,
             taken_at: now(),
             account_pk: target.pk,
+            snapshot_id: id,
             stopped_by,
             resumable,
         },

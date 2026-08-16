@@ -230,6 +230,26 @@ pub fn latest_complete(
     Ok(snapshot)
 }
 
+/// One usable snapshot by id.
+///
+/// From the view, like [`latest_complete`], so a caller holding the id of a
+/// walk that stopped short gets `None` rather than a capture with accounts
+/// missing from it. That is the difference between a monitor saying nothing and
+/// a monitor announcing two hundred departures that never happened, and it is
+/// held here rather than by whoever remembers to check `complete`.
+pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, StoreError> {
+    let snapshot = conn
+        .query_row(
+            "SELECT id, account_pk, kind, started_at, taken_at, complete, member_count,
+                    declared_count, pages, requests, next_cursor, resumes
+             FROM usable_snapshots WHERE id = ?1",
+            params![id],
+            row_to_snapshot,
+        )
+        .optional()?;
+    Ok(snapshot)
+}
+
 /// The users in a snapshot, in the order Instagram served them.
 pub fn members(conn: &Connection, id: i64) -> Result<Vec<User>, StoreError> {
     let mut stmt = conn.prepare(

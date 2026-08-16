@@ -168,6 +168,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A temporal diff never compares an incomplete capture, or one against itself | `watch::Basis::decide`, over ids read from `usable_snapshots` |
 | A first run reports nothing rather than announcing the whole list as arrivals | `watch::Basis::Baseline`, which has no diff to take out of it |
 | A change is reported once: not twice, and not never | `store::watch::Mark` — the receipt, written where the report was made |
+| A list nothing verified is neither compared nor marked | `engine::watch::refusal`, over `Provenance::describes_now` |
+| An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 
 ## Running headless
 
@@ -317,23 +319,33 @@ deliberately unfinished:
   what an import should be allowed to do once it is in — whether it can be
   crossed against a live list, and whether it belongs in the store at all.
   Shipping the subcommand would answer those by accident.
-- **The monitor** (`snob watch`) is half built. What works is the read half:
-  `snob watch diff` answers what has changed since the last time anything was
-  reported, out of storage alone and without spending a request. What is not
-  built is the scheduled run, the webhook and the retention of old captures.
-  `lost`/`gained` are its words for the temporal diff — `unfollowers` is the
-  static set and must never drift to mean `lost`.
+- **The monitor** (`snob watch`) works and is not finished. `once` looks and
+  reports; `diff` answers the same question out of storage without moving
+  anything on. What is not built is the scheduled mode, the webhook, the
+  configuration file and the retention of old captures. `lost`/`gained` are its
+  words for the temporal diff — `unfollowers` is the static set and must never
+  drift to mean `lost`.
 
-  Two things about it are worth knowing before changing any of it. The
-  comparison is against **what was last reported**, which is `watch_marks`, and
-  not against the previous capture: those come apart the moment somebody runs
-  `snob followers` by hand between two runs, and reading the capture instead
-  silently swallows everything that happened before it. And both of its windows
-  are bounded by **ids rather than timestamps** — `snapshots.id` for the
-  captures, `username_history.id` for the renames — because `changed_at` and
-  `taken_at` are in whole seconds, so two events inside one second are neither
-  clearly before a report nor clearly after it, and a timestamp bound there
-  either announces something twice or loses it for good.
+  Four things about it are worth knowing before changing any of it:
+
+  - **It compares against what was last *reported*** — `watch_marks` — and not
+    against the previous capture. Those come apart the moment somebody runs
+    `snob followers` by hand between two runs, and reading the capture instead
+    silently swallows everything that happened before it.
+  - **Both of its windows are bounded by ids, not timestamps**: `snapshots.id`
+    for the captures, `username_history.id` for the renames. `taken_at` and
+    `changed_at` are in whole seconds, so two events inside one second are
+    neither clearly before a report nor clearly after it, and a timestamp bound
+    there either announces something twice or loses it for good. Three separate
+    defects came from this before the ids went in.
+  - **`Provenance::describes_now()` is what decides whether a run may conclude
+    anything.** A list served during a cooldown, after a failed poll, or under
+    `--cache` was not verified by this run, so it is neither compared nor
+    marked — and not marking it is the half that matters, because a mark moved
+    over an unreported change loses it permanently.
+  - **A run with nothing to report costs one request, not two.**
+    `web_profile_info` answers with both counters and `App::remember_counters`
+    keeps them, so the second list asks nothing. A test asserts it.
 
 ## Known walls
 

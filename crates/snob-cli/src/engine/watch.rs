@@ -1,21 +1,27 @@
-//! What the monitor can say from storage alone.
+//! What the monitor found, and what it was allowed to conclude from it.
 //!
-//! This is the read half of `snob watch`: given what is already on disk, work
-//! out what has changed since the last time anything was reported. It spends no
-//! request and opens no socket, which is what makes `snob watch diff` free to
-//! run as often as anybody likes.
+//! Two ways in. [`from_store`] answers out of what is already on disk and
+//! spends nothing, which is what makes `snob watch diff` free to run as often
+//! as anybody likes. [`tick`] goes and looks first.
 //!
-//! It returns data and the interval that data covers. What any of it looks like
-//! is [`crate::commands::watch`]'s question.
+//! `tick` does not have a caching policy of its own, and that is deliberate:
+//! it calls [`crate::engine::list`], which is the one place every list in this
+//! tool comes out of and which already holds the whole order — cooldown,
+//! consent, counter poll, freshness, walk. A second policy here would be a
+//! second policy to keep in agreement with the first.
+//!
+//! Both return data and the interval it covers. What any of it looks like is
+//! [`crate::commands::watch`]'s question.
 
 use anyhow::{Result, bail};
 use snob_core::Pk;
-use snob_core::model::{ListKind, User};
+use snob_core::model::{ListKind, StopReason, User};
 use snob_core::store::{accounts, snapshots, users, watch as store};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 
 use crate::app::App;
-use crate::engine::target;
+use crate::cli::ListArgs;
+use crate::engine::{self, ListOutcome, Provenance, target};
 
 /// What one list has to report.
 #[derive(Debug, Clone)]
@@ -94,6 +100,202 @@ impl WatchReport {
     }
 }
 
+/// An account this monitor watches.
+///
+/// The consent is a field rather than a flag the caller passes, because it is
+/// the one thing that decides whether a run may go ahead with nobody at the
+/// keyboard. A person typing `snob watch once someone` gets asked, the way
+/// every other command asks. An unattended run cannot be asked, so it needs an
+/// answer that was already given — and [`Watched::may_run_unattended`] is what
+/// says whether it has one. A `yes` the program grants itself is not consent,
+/// and there is no constructor here that produces one.
+#[derive(Debug, Clone)]
+pub struct Watched {
+    /// `None` is the account the session belongs to: nothing to agree to.
+    target: Option<String>,
+    consent: Option<Consent>,
+}
+
+/// A recorded answer to "may this walk somebody else's lists?".
+///
+/// Deliberately not a `bool`. A bool can be set to `true` by whatever needs it
+/// to be true; this carries when it was given, so what reaches the walk is a
+/// record of an answer rather than a decision made at the point of use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Consent {
+    /// When it was given, in epoch seconds.
+    pub given_at: i64,
+}
+
+impl Watched {
+    /// The account the session belongs to.
+    pub fn own() -> Self {
+        Self {
+            target: None,
+            consent: None,
+        }
+    }
+
+    /// Somebody else, with the question still to be asked. What a person
+    /// typing the command gets: the prompt is where the answer comes from.
+    pub fn asking(username: String) -> Self {
+        Self {
+            target: Some(username),
+            consent: None,
+        }
+    }
+
+    /// Somebody else, with an answer already on record.
+    pub fn consented(username: String, consent: Consent) -> Self {
+        Self {
+            target: Some(username),
+            consent: Some(consent),
+        }
+    }
+
+    /// Whether this may run with nobody there to answer a question.
+    ///
+    /// Your own account always may. Somebody else's may only when the answer
+    /// was already given, because the alternative is a scheduled service
+    /// enumerating a stranger's lists on nobody's say-so.
+    pub fn may_run_unattended(&self) -> bool {
+        self.target.is_none() || self.consent.is_some()
+    }
+
+    /// The arguments a tick runs a list command with.
+    ///
+    /// The only place `yes` is ever set, and only when a [`Consent`] is on
+    /// record. `refresh` stays off because the counter poll is what decides
+    /// whether to walk, and `cache` stays off because a promise not to look is
+    /// not a monitor.
+    fn list_args(&self) -> ListArgs {
+        ListArgs {
+            target: self.target.clone(),
+            yes: self.consent.is_some(),
+            hide: vec![],
+            only: vec![],
+            no_verified: false,
+            exclude_list: None,
+            format: None,
+            output: None,
+            limit: None,
+            refresh: false,
+            cache: false,
+            // A stored capture whose counter has not moved is still current, so
+            // reusing it is right and costs nothing. It reads as `Unchanged`
+            // against the mark, which is exactly the answer.
+            max_age: std::time::Duration::from_secs(6 * 3600),
+            no_resume: false,
+            max_pages: None,
+            no_progress: true,
+        }
+    }
+}
+
+/// One list, as this run found it.
+#[derive(Debug)]
+pub struct TickList {
+    pub kind: ListKind,
+    pub provenance: Provenance,
+    pub reason: StopReason,
+    /// Why this list could not be compared, when it could not.
+    pub skipped: Option<Skipped>,
+}
+
+/// Why a run declined to draw a conclusion from a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skipped {
+    /// Nothing in this run established that the list still describes the
+    /// account. That is the three storage paths where no request was spent
+    /// finding out: a cooldown, a failed poll, and `--cache`.
+    NobodyLooked(Provenance),
+    /// The walk did not finish, so accounts are missing from it — and every one
+    /// of them would be reported as somebody who left.
+    Incomplete(StopReason),
+}
+
+/// What a tick did.
+#[derive(Debug)]
+pub struct TickReport {
+    pub report: WatchReport,
+    pub requests: u32,
+    pub lists: Vec<TickList>,
+}
+
+impl TickReport {
+    /// Whether this run established anything at all.
+    ///
+    /// A caller that sends the result somewhere has to be able to say "nothing
+    /// changed" apart from "I could not look", because an automation watching
+    /// for silence reads them as the same thing and they are opposites.
+    pub fn looked(&self) -> bool {
+        self.lists.iter().any(|l| l.skipped.is_none())
+    }
+}
+
+/// Goes and looks, then reports what changed since the last time it did.
+///
+/// The order is the whole of it:
+///
+/// 1. Get both lists through [`crate::engine::list`], which decides on its own
+///    whether anything has to be fetched. Two requests when nothing moved.
+/// 2. Refuse to conclude anything from a list this run did not verify, or one
+///    that came back short. **The mark does not move for a refused list**: what
+///    was never reported stays unreported, and the next run says it.
+/// 3. Compare what is left against the receipt, and move it.
+pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
+    let args = watched.list_args();
+    let before = app.client().pacer().spent();
+
+    let mut lists = Vec::new();
+    let mut usable = Vec::new();
+    // Whose account this turned out to be, taken from the engine's answer
+    // rather than from the viewer: on a third party they are different, and the
+    // id the engine reports is the one that cannot be wrong about it.
+    let mut pk = app.viewer().pk;
+
+    for kind in [ListKind::Followers, ListKind::Following] {
+        let (_, outcome) = engine::list(app, &args, kind).await?;
+        pk = outcome.account_pk;
+
+        let skipped = refusal(&outcome);
+        if skipped.is_none() {
+            usable.push((kind, outcome.snapshot_id));
+        }
+        lists.push(TickList {
+            kind,
+            provenance: outcome.provenance,
+            reason: outcome.reason,
+            skipped,
+        });
+    }
+
+    let report = compare(app, pk, &usable, true)?;
+
+    Ok(TickReport {
+        report,
+        requests: app.client().pacer().spent().saturating_sub(before),
+        lists,
+    })
+}
+
+/// Whether a list may be the basis of a comparison, and why not when it may not.
+///
+/// Both questions are asked of the outcome rather than worked out here.
+/// `describes_now` is the existing answer to "did anything in this run
+/// establish that this list is still true", and the three provenances that say
+/// no are the three where no request was spent finding out — which is what
+/// makes them safe to print and unsafe to compare.
+fn refusal(outcome: &ListOutcome) -> Option<Skipped> {
+    if !outcome.provenance.describes_now() {
+        return Some(Skipped::NobodyLooked(outcome.provenance));
+    }
+    if !outcome.is_complete() {
+        return Some(Skipped::Incomplete(outcome.reason));
+    }
+    None
+}
+
 /// Reads the report without touching the network.
 ///
 /// `advance` decides whether the marks move. `snob watch diff` looks and leaves
@@ -103,19 +305,50 @@ impl WatchReport {
 pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<WatchReport> {
     let (pk, username) = resolve(app, typed)?;
 
-    // One reading of each, taken once for the whole report. Every list marked
-    // by this report carries the same two numbers, so there is no sliver
-    // between two marks in which a rename is filed and then belongs to neither
-    // this report nor the next.
+    // From the view, so an interrupted walk cannot become a basis for
+    // comparison. It is the same guard the static crossings already lean on,
+    // and it matters more here: the accounts missing from a half-walked list
+    // would be reported as people who left.
+    let mut usable = Vec::new();
+    for kind in [ListKind::Followers, ListKind::Following] {
+        if let Some(latest) = snapshots::latest_complete(app.db().conn(), pk, kind)? {
+            usable.push((kind, latest.id));
+        }
+    }
+
+    let mut report = compare(app, pk, &usable, advance)?;
+    report.username = username;
+    Ok(report)
+}
+
+/// Compares each named capture against its receipt, and optionally moves it.
+///
+/// The one place a comparison is made, so that a tick and a plain look cannot
+/// disagree about what "since the last report" means. The captures are named by
+/// the caller because the two callers know them differently: a tick has the id
+/// the walk it just ran produced, which is the only id that is certainly the
+/// one those users came from, while a look asks the store for the newest.
+fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], advance: bool) -> Result<WatchReport> {
+    // One reading of each, taken once for the whole report, so every list
+    // marked by it carries the same two numbers. Read per list, two marks
+    // written a moment apart would leave a sliver between them in which a
+    // rename is filed and then belongs to neither this report nor the next.
     //
     // The head is read **before** anything is compared, so a rename filed while
     // this runs stays on the next report's side rather than being marked as
-    // said without having been.
+    // said without having been said.
     let at = snob_core::store::now();
     let head = store::history_head(app.db().conn())?;
 
-    let followers = list_report(app, pk, ListKind::Followers)?;
-    let following = list_report(app, pk, ListKind::Following)?;
+    let mut followers = None;
+    let mut following = None;
+    for &(kind, snapshot_id) in usable {
+        let report = list_report(app, pk, kind, snapshot_id)?;
+        match kind {
+            ListKind::Followers => followers = report,
+            ListKind::Following => following = report,
+        }
+    }
 
     // Looked for in one capture, not both. An account can be in the followers
     // list and the following list at once — that is what a friend is — and
@@ -130,6 +363,10 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
     };
 
     if advance {
+        // Only the lists that made it this far. A list the caller left out was
+        // refused — nobody looked, or the walk came back short — and moving its
+        // mark would file it as reported when nothing was said about it, which
+        // loses whatever changed in it for good.
         for report in [followers.as_ref(), following.as_ref()]
             .into_iter()
             .flatten()
@@ -147,7 +384,7 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
 
     Ok(WatchReport {
         account_pk: pk,
-        username,
+        username: users::name(app.db().conn(), pk)?,
         is_self: app.viewer().pk == pk,
         followers,
         following,
@@ -155,21 +392,19 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
     })
 }
 
-fn list_report(app: &App, pk: Pk, kind: ListKind) -> Result<Option<ListReport>> {
+fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Option<ListReport>> {
     let conn = app.db().conn();
-
-    // From the view, so an interrupted walk cannot become a basis for
-    // comparison. It is the same guard the static crossings already lean on,
-    // and it matters more here: the accounts missing from a half-walked list
-    // would be reported as people who left.
-    let Some(latest) = snapshots::latest_complete(conn, pk, kind)? else {
+    // `find_usable`, not `find`: an id that names a walk which stopped short
+    // answers `None` here rather than handing back a capture with accounts
+    // missing from it.
+    let Some(latest) = snapshots::find_usable(conn, snapshot_id)? else {
         return Ok(None);
     };
 
     let mark = store::mark(conn, pk, kind)?;
     // A receipt whose capture has been pruned carries no baseline, so it is
     // handed to `decide` as the absence it is and the next report starts over.
-    // What survives is `compared_at`, which is where the rename window starts.
+    // What survives is the history cursor, so the renames are not re-announced.
     let Some(basis) = Basis::decide(mark.and_then(|m| m.snapshot_id), Some(latest.id)) else {
         return Ok(None);
     };
