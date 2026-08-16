@@ -17,12 +17,14 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
     };
 
     let mut alive = None;
-    // Why the session was not checked, when it was not, and the two facts the
-    // command holds and used to throw away: when a cooldown ends, and what
-    // Instagram actually said. The address in a challenge is held exactly once
-    // ever — nothing stores it — so dropping it means the user has to provoke
-    // the error again to see it.
-    let mut not_checked: Option<&'static str> = Some("offline");
+    // The two facts the command holds and used to throw away: when a cooldown
+    // ends, and what Instagram actually said. The address in a challenge is held
+    // exactly once ever — nothing stores it — so dropping it means the user has
+    // to provoke the error again to see it.
+    //
+    // Why the session was not checked is not a third variable. It is these two
+    // read back at the point it is reported, so a return added inside the block
+    // below cannot leave it claiming a check that never happened.
     let mut cooldown_until: Option<i64> = None;
     let mut failure: Option<serde_json::Value> = None;
     // The code the command exits with, held rather than returned so the JSON
@@ -40,13 +42,11 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
         // A cooldown means nothing is spent, and checking a session is a
         // request like any other. `--offline` is the way to ask anyway, and it
         // is what this falls back to.
-        not_checked = None;
         if let Some(until_ms) = pacer.cooldown()? {
-            not_checked = Some("cooldown");
             // Seconds, like `created_at` and `validated_at` in the same object.
-            // `pacer.cooldown()` answers in milliseconds, and `div_euclid`
-            // rather than `/` for the reason pinned in `report`.
-            cooldown_until = Some(until_ms.div_euclid(1000));
+            // The conversion comes from `report`, which owns the rule and prints
+            // the same cooldown as a date on the next line.
+            cooldown_until = Some(crate::report::cooldown_ends_at_secs(until_ms));
             eprintln!(
                 "The account is in cooldown until {}, so the session was not checked.",
                 crate::report::cooldown_ends_at(until_ms)
@@ -76,7 +76,9 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
                     code = ExitCode::from_ig_error(&e);
                     failure = Some(serde_json::json!({
                         "code": code.as_str(),
-                        "url": challenge_url(&e),
+                        // Validated against instagram.com before it ever reached
+                        // an `IgError`, so handing it to a caller adds no trust.
+                        "url": e.challenge_url(),
                         "message": e.to_string(),
                     }));
                     // The detail goes to standard error either way, so the JSON
@@ -105,7 +107,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
             "created_at": session.created_at,
             "validated_at": session.validated_at,
             "alive": alive,
-            "not_checked": not_checked,
+            "not_checked": not_checked(args.offline, cooldown_until),
             "cooldown_until": cooldown_until,
             "error": failure,
         });
@@ -117,17 +119,18 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
     Ok(code)
 }
 
-/// The address that clears a check, when Instagram gave one.
+/// Why the session was not checked, when it was not.
 ///
-/// `IgError` carries it precisely so it can be shown, and `whoami` is the one
-/// command that can hand it to a caller rather than only to a person: it is
-/// validated against instagram.com before it ever reaches an `IgError`, so
-/// passing it on adds no trust.
-fn challenge_url(e: &snob_ig::error::IgError) -> Option<&str> {
-    use snob_ig::error::IgError;
-    match e {
-        IgError::Challenge { url } | IgError::Checkpoint { url } => url.as_deref(),
-        _ => None,
+/// Derived rather than tracked. Both inputs are already held for their own sake
+/// — `--offline` is the request not to look, and a cooldown end only exists when
+/// one was found — so there is nothing here that can disagree with them.
+fn not_checked(offline: bool, cooldown_until: Option<i64>) -> Option<&'static str> {
+    if offline {
+        Some("offline")
+    } else if cooldown_until.is_some() {
+        Some("cooldown")
+    } else {
+        None
     }
 }
 
@@ -176,12 +179,12 @@ mod tests {
                 url: Some(url.into()),
             },
         ] {
-            assert_eq!(challenge_url(&e), Some(url));
+            assert_eq!(e.challenge_url(), Some(url));
         }
 
         // Everything else has no address, and must not invent one.
-        assert_eq!(challenge_url(&IgError::SessionExpired), None);
-        assert_eq!(challenge_url(&IgError::Challenge { url: None }), None);
+        assert_eq!(IgError::SessionExpired.challenge_url(), None);
+        assert_eq!(IgError::Challenge { url: None }.challenge_url(), None);
     }
 
     /// The tokens in the JSON are the ones the README's exit-code table uses,
@@ -206,13 +209,30 @@ mod tests {
     /// `pacer.cooldown()` answers in milliseconds while `created_at` next to it
     /// in the same object is in seconds. Emitting the raw value would put two
     /// units in one object with nothing saying so.
+    ///
+    /// Asserted through the function that owns the conversion, not against the
+    /// arithmetic copied out of it: pinning `div_euclid` here would keep passing
+    /// while `report` did something else and the date on screen disagreed with
+    /// the field beside it.
     #[test]
     fn the_cooldown_is_emitted_in_the_same_unit_as_the_timestamps() {
-        let until_ms = 1_786_310_990_123_i64;
-        assert_eq!(until_ms.div_euclid(1000), 1_786_310_990);
+        use crate::report::cooldown_ends_at_secs;
 
-        // And `div_euclid` rather than `/`, so a value before the epoch does
-        // not round towards zero into the wrong second.
-        assert_eq!((-1_500_i64).div_euclid(1000), -2);
+        assert_eq!(cooldown_ends_at_secs(1_786_310_990_123), 1_786_310_990);
+
+        // And flooring rather than rounding towards zero, so a value before the
+        // epoch does not land in the wrong second.
+        assert_eq!(cooldown_ends_at_secs(-1_500), -2);
+    }
+
+    /// The three states, and the one that matters: `--offline` is why nothing
+    /// was checked even when a cooldown is also in force, because the user asked
+    /// not to look before anything went to find out.
+    #[test]
+    fn why_nothing_was_checked_is_read_back_off_the_two_facts() {
+        assert_eq!(not_checked(true, None), Some("offline"));
+        assert_eq!(not_checked(true, Some(1)), Some("offline"));
+        assert_eq!(not_checked(false, Some(1)), Some("cooldown"));
+        assert_eq!(not_checked(false, None), None);
     }
 }
