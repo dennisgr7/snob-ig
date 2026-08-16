@@ -201,6 +201,16 @@ pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), Store
 ///
 /// Reads from the view, not the table, so it is impossible to return an
 /// incomplete one even if someone gets the condition wrong.
+///
+/// `id DESC` breaks the tie, and it is not decoration. `taken_at` is in whole
+/// seconds, so two walks that close inside the same second are equally recent
+/// as far as the sort is concerned and SQLite may hand back either — which
+/// makes "the newest capture" a question with two answers. Nothing noticed
+/// while the only readers were the cache and the crossings, where either answer
+/// is the same list; the monitor compares this id against the one it last
+/// reported, so an arbitrary answer means a run that silently finds no changes.
+/// `id` is the rowid, so it increases with every insert and orders the two the
+/// way they actually happened.
 pub fn latest_complete(
     conn: &Connection,
     account_pk: Pk,
@@ -212,7 +222,7 @@ pub fn latest_complete(
                     declared_count, pages, requests, next_cursor, resumes
              FROM usable_snapshots
              WHERE account_pk = ?1 AND kind = ?2
-             ORDER BY taken_at DESC LIMIT 1",
+             ORDER BY taken_at DESC, id DESC LIMIT 1",
             params![pk_to_sql(account_pk), kind.as_str()],
             row_to_snapshot,
         )
@@ -420,6 +430,49 @@ mod tests {
             latest_complete(db.conn(), 1, ListKind::Followers)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// "The newest capture" has to have one answer, not either of two.
+    ///
+    /// `taken_at` is in whole seconds, so two walks closing inside the same
+    /// second are equally recent as far as the sort can tell, and without the
+    /// tie-break SQLite may hand back the older one. Nothing noticed while the
+    /// only readers were the cache and the crossings, where either answer is
+    /// the same list. The monitor compares this id against the one it last
+    /// reported, so an arbitrary answer is a run that finds no changes and says
+    /// nothing about why.
+    #[test]
+    fn the_newest_of_two_captures_taken_in_one_second_is_the_later_one() {
+        let mut db = base();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+            save_page(&mut db, id, &[user(10)], None).unwrap();
+            close(db.conn(), id, StopReason::Completed).unwrap();
+            ids.push(id);
+        }
+
+        let both_at_once: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(DISTINCT taken_at) FROM snapshots WHERE complete = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            both_at_once, 1,
+            "the two have to share a second to be a test"
+        );
+
+        assert_eq!(
+            latest_complete(db.conn(), 1, ListKind::Followers)
+                .unwrap()
+                .unwrap()
+                .id,
+            ids[1]
         );
     }
 

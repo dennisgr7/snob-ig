@@ -7,4 +7,5 @@ pub mod pfp;
 pub mod purge;
 pub mod scan;
 pub mod sets;
+pub mod watch;
 pub mod whoami;

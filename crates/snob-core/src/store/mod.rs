@@ -10,6 +10,7 @@ pub mod migrations;
 pub mod rate_budget;
 pub mod snapshots;
 pub mod users;
+pub mod watch;
 
 use std::path::Path;
 use std::time::Duration;
