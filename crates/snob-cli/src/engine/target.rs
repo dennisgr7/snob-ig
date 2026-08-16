@@ -169,10 +169,11 @@ pub fn from_store(app: &App, typed: Option<&str>, kind: ListKind) -> Result<Targ
 
     Ok(Target {
         pk,
-        username: users::find(app.db().conn(), pk)?
-            .map(|u| u.username)
-            .filter(|name| !name.is_empty())
-            .or_else(|| Some(typed.to_string())),
+        // Always a name: the account was found by the one that was typed, so the
+        // worst case is the typed spelling rather than nothing. Said with `Some`
+        // at the front, because the field means "never learned" and this path
+        // cannot express that.
+        username: Some(users::name(app.db().conn(), pk)?.unwrap_or_else(|| typed.to_string())),
         is_self: app.viewer().pk == pk,
         // Nothing was asked of Instagram, so there is nothing to carry.
         counters: None,

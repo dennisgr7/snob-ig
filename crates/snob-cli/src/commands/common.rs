@@ -153,20 +153,17 @@ pub async fn walk_named(
 ) -> Result<(Vec<User>, ListOutcome)> {
     app.progress().begin(&report::walking(kind, subject));
 
-    let (found, outcome) = match engine::list(app, args, kind).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            app.progress().finish();
-            return Err(e);
-        }
-    };
-
-    if let Err(e) = check(&outcome) {
+    // Both failures leave through one door, so the rule this function exists to
+    // hold is written once inside it too. Two copies of `finish()` here would
+    // make a third failure point added between them one more place to remember.
+    let result = engine::list(app, args, kind).await.and_then(|pair| {
+        check(&pair.1)?;
+        Ok(pair)
+    });
+    if result.is_err() {
         app.progress().finish();
-        return Err(e);
     }
-
-    Ok((found, outcome))
+    result
 }
 
 #[cfg(test)]

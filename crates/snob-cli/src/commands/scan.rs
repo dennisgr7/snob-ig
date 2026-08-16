@@ -8,12 +8,14 @@
 //! the line you actually read first — and it costs nothing, because the answer
 //! is already in the database.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
+use snob_core::Pk;
 use snob_core::filters::Filter;
 use snob_core::model::{ListKind, User};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
-use snob_core::sets;
 
 use crate::cli::{Format, ListArgs};
 use crate::commands::common::{self, Destination, Session};
@@ -173,8 +175,7 @@ fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     // them at once.
     Err(report::refuse_incomplete(
         kind,
-        outcome.reason,
-        outcome.exit_code(),
+        outcome,
         "they were not there at all",
     ))
 }
@@ -184,10 +185,29 @@ fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
 /// command prints with the same flags. The displayed totals are the sums of
 /// their regions, which keeps the identity true even if an account's
 /// attributes changed between the two walks.
+///
+/// Counted rather than collected. `sets::intersection` and `sets::difference`
+/// build a `Vec<User>`, and going through them here cloned both lists three times
+/// over — twelve thousand accounts on a six-thousand-follower run — to read three
+/// lengths off the results and drop them. The rule is unchanged: cross on the pk,
+/// then ask the filter, which is what `Filter::apply` does one account at a time.
 fn summarize(followers: &[User], following: &[User], filter: &Filter) -> ScanCounts {
-    let friends = filter.apply(sets::intersection(followers, following)).len();
-    let fans = filter.apply(sets::difference(followers, following)).len();
-    let unfollowers = filter.apply(sets::difference(following, followers)).len();
+    let in_following: HashSet<Pk> = following.iter().map(|u| u.pk).collect();
+    let in_followers: HashSet<Pk> = followers.iter().map(|u| u.pk).collect();
+
+    let friends = followers
+        .iter()
+        .filter(|u| in_following.contains(&u.pk) && filter.allows(u))
+        .count();
+    let fans = followers
+        .iter()
+        .filter(|u| !in_following.contains(&u.pk) && filter.allows(u))
+        .count();
+    let unfollowers = following
+        .iter()
+        .filter(|u| !in_followers.contains(&u.pk) && filter.allows(u))
+        .count();
+
     ScanCounts {
         followers: fans + friends,
         following: unfollowers + friends,
@@ -424,6 +444,9 @@ mod tests {
     use super::*;
     use snob_core::filters::Attribute;
     use snob_core::model::StopReason;
+    // Only the tests go through the set helpers now: `summarize` counts instead
+    // of collecting, and one of them checks the two still agree.
+    use snob_core::sets;
 
     fn user(pk: u64, name: &str) -> User {
         User {
