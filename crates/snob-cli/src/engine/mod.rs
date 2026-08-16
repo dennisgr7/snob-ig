@@ -106,6 +106,15 @@ pub struct ListOutcome {
     /// spelling Instagram uses, and — for your own account — may not be known
     /// at all until something goes and looks it up.
     pub account_pk: Pk,
+    /// The stored capture these users came out of.
+    ///
+    /// Carried rather than looked up afterwards. The monitor has to know which
+    /// row this is to compare it against the one it last reported, and asking
+    /// the store for "the newest one" after the fact is a different question:
+    /// another process sharing this database — the very thing the request
+    /// budget is built to expect — can have closed a walk in between, and the
+    /// answer would then name a capture these users did not come from.
+    pub snapshot_id: i64,
     /// What Instagram actually said, when a walk stopped because it said
     /// something.
     ///
@@ -159,6 +168,7 @@ impl ListOutcome {
             // call sites.
             taken_at: snapshot.taken_at.unwrap_or_default(),
             account_pk: snapshot.account_pk,
+            snapshot_id: snapshot.id,
             stopped_by: None,
             // A stored list is a finished one — the view this comes from cannot
             // return anything else — so there is nothing left to continue.

@@ -2,21 +2,32 @@
 
 ## Unreleased
 
-**`snob watch diff` says what has changed since the last time it was asked.**
-The first half of the monitor. It reads what is already stored, so it spends no
-requests and costs nothing to run: who has started following you and who has
-stopped, who you have followed and unfollowed, and who now goes by a different
-name. That last one comes out of a history the tool has been keeping on every
-walk since the first release and had never shown anybody.
+**`snob watch` says what has changed since the last time it looked.** The
+monitor, in two commands. Who has started following you and who has stopped,
+who you have followed and unfollowed, and who now goes by a different name —
+that last one out of a history the tool has been keeping on every walk since
+the first release and had never shown anybody.
 
-It needs something to compare against, so the first run on an account reports
-nothing and says so rather than announcing your whole follower list as new
-arrivals. Walk a list once — `snob followers`, `snob unfollowers`, anything —
-and it has something to say from then on. `--json` for a script; down a pipe,
-`snob watch diff --json | jq`. Looking does not count as reporting: ask twice
-and you get the same answer.
+- **`snob watch once`** looks and reports. It reads your counters and only
+  walks a list if its counter moved, so a run with nothing to report costs a
+  single request — cheap enough to put on a cron entry or a systemd timer every
+  few hours. Whatever it reports, it does not report again.
+- **`snob watch diff`** answers the same question out of what is already
+  stored, without touching the network and without moving anything on. Ask
+  twice, get the same answer.
 
-The scheduled run and the webhook are not built yet.
+Both take `--json`, and down a pipe `snob watch diff --json | jq` works without
+being told to.
+
+Three things it will not do. The first run on an account has nothing to compare
+against, so it reports nothing and says so rather than announcing your whole
+follower list as new arrivals. A list served from storage during a cooldown, or
+when the check failed, is not compared against anything — nothing established
+that it is still true — and the monitor stays where it was, so what happened is
+reported by the next run that can see. And a walk that came back short is never
+a basis either: the accounts missing from it would read as people who left.
+
+The scheduled mode and the webhook are not built yet.
 
 Four things here change what a script sees, so they come first:
 

@@ -272,7 +272,7 @@ pub struct WatchArgs {
 /// A subcommand is required for now. The scheduled run — `snob watch` on its
 /// own, with the interval either on the command line or in its configuration
 /// file — makes this optional when it lands, which is an addition rather than a
-/// change: nothing written against `snob watch diff` stops working.
+/// change: nothing written against these stops working.
 #[derive(Subcommand, Debug)]
 pub enum WatchCommand {
     /// What has changed since the last time the monitor reported
@@ -284,6 +284,18 @@ pub enum WatchCommand {
                       \"snob followers\" or \"snob following\" once first."
     )]
     Diff(WatchDiffArgs),
+
+    /// Look now, report what changed, and remember having reported it
+    #[command(
+        after_help = "One run of the monitor. Meant for cron, a systemd timer or Windows Task \
+                      Scheduler until the scheduled mode lands.\n\n\
+                      It reads the account's counters and only walks a list if its counter moved, \
+                      so a run with nothing to report costs a single request. Unlike \"diff\", \
+                      this moves the monitor on: whatever it reports is not reported again.\n\n\
+                      The first run on an account has nothing to compare against, so it reports \
+                      nothing and says so."
+    )]
+    Once(WatchOnceArgs),
 }
 
 #[derive(Args, Debug)]
@@ -294,6 +306,25 @@ pub struct WatchDiffArgs {
     /// Return the data as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchOnceArgs {
+    /// Account to watch. Defaults to your own.
+    // No -y here, and deliberately. Consent to enumerate somebody else's lists
+    // is a thing a person gives, and an unattended run that could be handed one
+    // on the command line is one whose consent came from whoever wrote the cron
+    // entry. Reading another account needs a terminal to ask at until the
+    // configuration file lands, which is where a recorded answer will live.
+    pub target: Option<String>,
+
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 #[derive(Args, Debug)]
