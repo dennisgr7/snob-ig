@@ -60,10 +60,10 @@ impl Plan {
 /// Looks at the machine and reports what there is to remove.
 pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
     Plan {
-        // `Ok(None)` is the only answer that means there is nothing there. A
-        // session too corrupt to parse is still a session on this disk, and
-        // this command's promise is that afterwards there is none.
-        session: !matches!(store.load(), Ok(None)),
+        // This command's promise is that afterwards there is no session on the
+        // machine, so it asks the store the question that covers a credential too
+        // corrupt to parse as well as a readable one.
+        session: store.something_is_stored(),
         directories: app_paths
             .owned_dirs()
             .into_iter()
@@ -152,7 +152,9 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
 /// this command was asked to do.
 fn remove_if_empty(dir: Option<&Path>) {
     if let Some(dir) = dir
-        && dir.file_name().is_some_and(|name| name == "snob-ig")
+        && dir
+            .file_name()
+            .is_some_and(|name| name == paths::app_dir_name())
         && paths::is_safe_to_remove(dir)
     {
         let _ = std::fs::remove_dir(dir);

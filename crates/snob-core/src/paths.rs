@@ -100,6 +100,22 @@ impl AppPaths {
         self.legacy_data.as_ref().map(|d| d.join("session.json"))
     }
 
+    /// Every file a session can be sitting in, for the same reason
+    /// [`Self::owned_dirs`] exists: the list is assembled here so that a
+    /// location added later cannot be forgotten by one of the callers whose
+    /// whole job is to leave no live cookie behind.
+    ///
+    /// Both `SecretStore::save` and `SecretStore::delete` walk it. `save` is on
+    /// the list because `load` checks the keyring first, so once an entry exists
+    /// the rescue path that would have found the legacy file is never reached
+    /// again and an older account's cookie stays in the roaming profile.
+    pub fn session_files(&self) -> Vec<PathBuf> {
+        [Some(self.session_file()), self.legacy_session_file()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Browser profile used by `snob login`. Never the user's real profile.
     pub fn browser_profile(&self) -> PathBuf {
         self.data.join("browser-profile")
@@ -141,6 +157,17 @@ impl AppPaths {
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         create_private_dir(&self.data)
     }
+}
+
+/// The folder name every path here is built from.
+///
+/// Exposed so that a caller recognising one of our own directories compares
+/// against the value `ProjectDirs` was given rather than against a copy of it.
+/// `snob purge` needs exactly that, and a second spelling of this string is one
+/// that stops matching the day the application is renamed — silently, because
+/// the guard simply never fires again.
+pub fn app_dir_name() -> &'static str {
+    APPLICATION
 }
 
 /// Whether a directory is plausible as one of ours, and so may be deleted whole.

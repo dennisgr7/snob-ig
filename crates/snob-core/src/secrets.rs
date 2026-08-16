@@ -245,20 +245,14 @@ impl SecretStore {
                 self.entry()?
                     .set_password(&json)
                     .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))?;
-                // Do not leave two different sessions lying around. Both
-                // locations, not just the current one: `load` checks the
+                // Do not leave two different sessions lying around. Every
+                // location, not just the current one: `load` checks the
                 // keyring first, so once an entry exists the rescue path that
                 // would have found and removed the legacy file is never
                 // reached again, and an older account's live cookie stays in
                 // the roaming profile — where it roams — until someone happens
                 // to run `logout` or `purge`.
-                for stale in [
-                    Some(self.paths.session_file()),
-                    self.paths.legacy_session_file(),
-                ]
-                .into_iter()
-                .flatten()
-                {
+                for stale in self.paths.session_files() {
                     let _ = std::fs::remove_file(stale);
                 }
             }
@@ -297,6 +291,22 @@ impl SecretStore {
         Ok(None)
     }
 
+    /// Whether there is a credential on this machine at all.
+    ///
+    /// **Anything but a clean "nothing there" counts as one.** A stored session
+    /// too corrupt to parse is still a session on the disk, so treating the parse
+    /// failure as absence would let `logout` print "there was no session stored"
+    /// while deleting one — and skip the line about it still being live on
+    /// Instagram, which is exactly the case where the user needs it.
+    ///
+    /// It lives here rather than in the two commands that ask because the reading
+    /// is the non-obvious part: `!matches!(load(), Ok(None))` written out at a
+    /// call site looks like an oversight, and the obvious `load().is_ok()` is
+    /// wrong in the one way that matters.
+    pub fn something_is_stored(&self) -> bool {
+        !matches!(self.load(), Ok(None))
+    }
+
     /// Removes the session from everywhere it can be, and says so only if it
     /// went.
     ///
@@ -332,13 +342,7 @@ impl SecretStore {
         // directory that roams with the profile, so a failure to remove it is
         // a live cookie left behind exactly like the current one.
         let mut file_refused = None;
-        for file in [
-            Some(self.paths.session_file()),
-            self.paths.legacy_session_file(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for file in self.paths.session_files() {
             if file.exists()
                 && let Err(source) = std::fs::remove_file(&file)
                 && file_refused.is_none()
