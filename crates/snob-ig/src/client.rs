@@ -5,7 +5,7 @@
 //! browser. That consistency between cookie, User-Agent and endpoint is what
 //! Instagram evaluates, and breaking it is what produces `useragent mismatch`.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::de::DeserializeOwned;
 use snob_core::Pk;
@@ -116,6 +116,23 @@ fn cdn_policy(base: Url) -> reqwest::redirect::Policy {
     })
 }
 
+/// One HTTP client under a given redirect policy.
+///
+/// The timeouts are not optional. Without them, a server that accepts the
+/// connection and then says nothing hangs the process for good: neither the
+/// cancel token nor any deadline above reaches a socket that is simply waiting.
+fn build_client(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+) -> Result<reqwest::Client, IgError> {
+    Ok(reqwest::Client::builder()
+        .user_agent(user_agent.to_string())
+        .redirect(redirect)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
+
 /// Reads a response body, refusing one that will not fit.
 ///
 /// `text()` would buffer whatever arrives, which lets the far end decide how
@@ -173,7 +190,12 @@ pub struct IgClient {
     /// be allowed to move between CDN hosts. One client can only have one
     /// redirect policy, so sharing it meant the looser of the two governed the
     /// requests carrying the credentials.
-    cdn: reqwest::Client,
+    ///
+    /// Built on first use, which is `snob pfp` and nothing else. A
+    /// `reqwest::Client` is a connection pool and a TLS configuration — the
+    /// platform trust store is read to assemble one — and every other command
+    /// paid for that on the startup path to never send a request through it.
+    cdn: OnceLock<reqwest::Client>,
     base: Url,
     session: Session,
     /// Reserving budget lives here rather than in each caller, so a request
@@ -193,30 +215,28 @@ impl IgClient {
     }
 
     fn pointed_at(session: Session, pacer: Pacer, base: Url) -> Result<Self, IgError> {
-        // Both policies close over the base URL, so which server this client
-        // talks to has to be settled before either client is built.
-        let build = |redirect| {
-            reqwest::Client::builder()
-                .user_agent(session.user_agent.clone())
-                .redirect(redirect)
-                // Without these, a server that accepts the connection and then
-                // says nothing hangs the process for good: neither the cancel
-                // token nor any deadline above reaches a socket that is simply
-                // waiting.
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-        };
-
         Ok(Self {
             hints: ClientHints::from_user_agent(&session.user_agent),
-            api: build(api_policy(base.clone()))?,
-            cdn: build(cdn_policy(base.clone()))?,
+            api: build_client(&session.user_agent, api_policy(base.clone()))?,
+            cdn: OnceLock::new(),
             base,
             session,
             pacer,
             claim: Mutex::new(INITIAL_CLAIM.to_string()),
         })
+    }
+
+    /// The CDN client, built the first time a picture is downloaded.
+    ///
+    /// Everything the policy needs is already a field, so nothing has to be
+    /// captured at construction time to make this work — which is what lets the
+    /// two-policy boundary stay exactly as it was while only `pfp` pays for it.
+    fn cdn(&self) -> Result<&reqwest::Client, IgError> {
+        if let Some(cdn) = self.cdn.get() {
+            return Ok(cdn);
+        }
+        let built = build_client(&self.session.user_agent, cdn_policy(self.base.clone()))?;
+        Ok(self.cdn.get_or_init(|| built))
     }
 
     /// The current `X-IG-WWW-Claim`.
@@ -433,7 +453,7 @@ impl IgClient {
         // Deliberately not paced: the CDN is a different host with its own
         // limits, and charging a picture against Instagram's budget would make
         // the number mean two things at once.
-        let mut response = self.cdn.get(url).send().await?;
+        let mut response = self.cdn()?.get(url).send().await?;
         let status = response.status();
 
         // Deliberately not `classify`: that reads Instagram's API vocabulary,
