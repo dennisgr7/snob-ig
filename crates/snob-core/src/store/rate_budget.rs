@@ -431,10 +431,22 @@ mod tests {
         }
     }
 
+    /// Far enough past the burst that the disk cannot decide the answer.
+    ///
+    /// The bucket refills in real time, so every millisecond these reservations
+    /// take is a millisecond of throttling they undo. Twenty-one of them left a
+    /// margin of one emission — 2.4 seconds for twenty-one committed
+    /// transactions — and this connection runs with `synchronous = FULL`, so
+    /// each one waits for the platform to flush. A Windows runner spent that
+    /// margin and the test failed on a correct budget.
+    ///
+    /// Thirty is the same assertion with twenty-four seconds of slack: past the
+    /// burst is past the burst, and a machine slow enough to break this one is
+    /// slow enough that it was never going to outrun the pace anyway.
     #[test]
     fn the_budget_runs_out_and_starts_throttling() {
         let (_tmp, b) = temp_budget();
-        for _ in 0..21 {
+        for _ in 0..30 {
             b.reserve().unwrap();
         }
         assert!(

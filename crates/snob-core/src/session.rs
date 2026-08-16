@@ -382,7 +382,7 @@ mod tests {
         let header = s.cookie_header();
         for pair in header.split("; ") {
             let (name, value) = pair.split_once('=').expect("every cookie is a pair");
-            assert!(!value.is_empty(), "{name} went out empty: {}", &*header);
+            assert!(!value.is_empty(), "{name} went out empty: {}", *header);
         }
     }
 
