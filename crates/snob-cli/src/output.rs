@@ -229,15 +229,23 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
         None => {
             let stdout = std::io::stdout();
             let mut locked = stdout.lock();
-            locked
-                .write_all(rendered.as_bytes())
-                .context("could not write the result")?;
-            // Not `.ok()`. Standard output is line-buffered, so at this point
-            // the tail of the result is still in the buffer and this is where
-            // a full disk reports itself. Discarded, `snob pfp someone >
-            // face.jpg` on a full filesystem printed nothing, exited 0, and
-            // left a truncated JPEG behind.
-            locked.flush().context("could not write the result")?;
+            // Not `.ok()` on either call. Standard output is line-buffered, so
+            // at this point the tail of the result is still in the buffer and
+            // the flush is where a full disk reports itself. Discarded, `snob
+            // pfp someone > face.jpg` on a full filesystem printed nothing,
+            // exited 0, and left a truncated JPEG behind.
+            //
+            // A closed reader is the one exception, and it is not a failure:
+            // `snob followers | head -20` is a reader that has finished, and on
+            // Windows there is no SIGPIPE to end the process the way it does on
+            // Unix. Reporting "could not write the result" and exiting non-zero
+            // there would make a normal shell idiom look like an error.
+            for step in [locked.write_all(rendered.as_bytes()), locked.flush()] {
+                match step {
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    other => other.context("could not write the result")?,
+                }
+            }
         }
     }
     Ok(())
