@@ -119,7 +119,7 @@ pub fn refuse_incomplete(
              the accounts missing from it would appear as if {misreading}."
         ),
     )
-    .with_hint(try_again_advice(outcome.reason))
+    .with_hint(try_again_advice(outcome.reason, outcome.resumable))
     .into()
 }
 
@@ -281,7 +281,17 @@ pub fn requests(n: u32) -> String {
 /// A dead session and a checkpoint are worse than a lie: running it again is
 /// the one thing that cannot help, and against an account Instagram has just
 /// flagged it is what turns a checkpoint into something longer.
-pub fn try_again_advice(reason: StopReason) -> &'static str {
+///
+/// Everything else is told by `resumable`, which the store answered rather than
+/// this module guessing from the reason. `Truncated` used to be treated as
+/// proof that nothing was left to continue from, and that is true of exactly
+/// one of the five ways it arrives: the reclassification `pager::verdict` makes
+/// once pagination has already ended, where there is no cursor to save. The
+/// other four — the hard page cap, a cursor that came back unchanged, two empty
+/// pages, and several pages with nothing new — stop in the **middle** of the
+/// pagination with a cursor stored, and a run within the resume window
+/// continues from it. So the advice asks instead of assuming.
+pub fn try_again_advice(reason: StopReason, resumable: bool) -> &'static str {
     match reason {
         StopReason::RateLimit => {
             "Run it again once the cooldown lifts; a walk stopped by throttling starts over."
@@ -290,15 +300,16 @@ pub fn try_again_advice(reason: StopReason) -> &'static str {
             "Deal with what Instagram asked for first. Running it again before that cannot get \
              any further."
         }
-        // Nothing was left off. This reason is reached after the pagination has
-        // already ended — `pager::verdict` reclassifies a walk that finished
-        // far short of the declared count — so the snapshot closes with no
-        // cursor, and `snapshots::resumable` requires one. There is nothing for
-        // a second run to continue from, and it will usually be served the same
-        // short list again.
-        StopReason::Truncated => {
+        StopReason::Truncated if !resumable => {
             "Instagram stopped serving this account's list; there is nothing to continue from, \
              so running it again starts over. Try later."
+        }
+        StopReason::Truncated => {
+            "Instagram stopped serving pages. Run it again in the next few minutes and it \
+             continues from where it stopped; after that it starts over."
+        }
+        _ if !resumable => {
+            "Run it again; there is nothing stored to continue from, so it starts over."
         }
         _ => "Run it again to continue where it left off.",
     }
@@ -333,6 +344,7 @@ mod tests {
             taken_at: 0,
             account_pk: 1,
             stopped_by,
+            resumable: false,
         }
     }
 
@@ -399,9 +411,13 @@ mod tests {
     /// one piece of advice that cannot help and can make it worse.
     #[test]
     fn a_dead_session_is_not_told_to_try_again() {
-        let advice = try_again_advice(StopReason::SessionInvalid);
-        assert!(!advice.contains("continue where it left off"), "{advice}");
-        assert!(advice.contains("Instagram asked for"), "{advice}");
+        // Both ways: a checkpoint can land mid-pagination with a cursor stored,
+        // and continuing is still the wrong thing to offer.
+        for resumable in [false, true] {
+            let advice = try_again_advice(StopReason::SessionInvalid, resumable);
+            assert!(!advice.contains("continue where it left off"), "{advice}");
+            assert!(advice.contains("Instagram asked for"), "{advice}");
+        }
     }
 
     fn hint_of(error: &anyhow::Error) -> Option<String> {
@@ -563,30 +579,62 @@ third",
 
     #[test]
     fn the_advice_depends_on_the_stop_reason() {
-        assert!(try_again_advice(StopReason::RateLimit).contains("starts over"));
-        // These three leave a cursor behind, so there is something to continue.
+        assert!(try_again_advice(StopReason::RateLimit, false).contains("starts over"));
+        // These three stop mid-pagination, so the store has a cursor.
         for reason in [
             StopReason::Canceled,
             StopReason::PageLimit,
             StopReason::Network,
         ] {
-            assert!(try_again_advice(reason).contains("continue where it left off"));
+            assert!(try_again_advice(reason, true).contains("continue where it left off"));
         }
     }
 
-    /// A truncated walk has nothing to continue from, so it must not say it
-    /// has.
+    /// The offer to continue follows what the store kept, not what the reason
+    /// suggests.
     ///
-    /// `pager::verdict` reaches this reason **after** the pagination has ended,
-    /// by reclassifying a walk that finished far short of the declared count.
-    /// The snapshot therefore closes with no cursor, and
-    /// `snapshots::resumable` will not return a row without one — so the offer
-    /// to continue was for a walk that could never be found again.
+    /// Every reason here can arrive either way. A `Canceled` walk normally has
+    /// a cursor, but one interrupted more than fifteen minutes after it began
+    /// has already aged out of the resume window — and the advice must not
+    /// offer a continuation the next run cannot make.
+    /// The two ways this module offers one. Both are matched, because saying
+    /// "nothing to continue from" also contains the word.
+    fn offers_a_continuation(advice: &str) -> bool {
+        advice.contains("continue where it left off") || advice.contains("continues from")
+    }
+
     #[test]
-    fn a_truncated_walk_does_not_promise_to_continue() {
-        let advice = try_again_advice(StopReason::Truncated);
-        assert!(!advice.contains("continue where it left off"), "{advice}");
-        assert!(advice.contains("starts over"), "{advice}");
+    fn nothing_is_offered_to_continue_when_there_is_nothing_stored() {
+        for reason in [
+            StopReason::Canceled,
+            StopReason::PageLimit,
+            StopReason::Network,
+            StopReason::Truncated,
+        ] {
+            let advice = try_again_advice(reason, false);
+            assert!(
+                !offers_a_continuation(advice),
+                "{reason:?} offered a continuation: {advice}"
+            );
+            assert!(advice.contains("starts over"), "{reason:?}: {advice}");
+        }
+    }
+
+    /// The reclassified truncation is the one that really has nothing left.
+    ///
+    /// `pager::verdict` reaches it **after** the pagination has ended, so the
+    /// snapshot closes with no cursor and `snapshots::resumable` will not
+    /// return a row without one. The four guards that stop in the middle of the
+    /// pagination do leave one, which is why the reason alone cannot answer
+    /// this and `resumable` is asked separately.
+    #[test]
+    fn a_truncated_walk_says_which_of_the_two_it_was() {
+        let ended = try_again_advice(StopReason::Truncated, false);
+        assert!(!offers_a_continuation(ended), "{ended}");
+        assert!(ended.contains("starts over"), "{ended}");
+
+        let stopped_short = try_again_advice(StopReason::Truncated, true);
+        assert!(stopped_short.contains("continues from where it stopped"));
     }
 
     /// Only a full walk has nothing to explain. Every other ending owes the

@@ -103,7 +103,7 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
     if !outcome.is_complete() && outcome.source() == ResultSource::Fetched {
         ui::warn(&format!(
             "the list is incomplete, so it cannot be compared against another one. {}",
-            report::try_again_advice(outcome.reason)
+            report::try_again_advice(outcome.reason, outcome.resumable)
         ));
     }
 }
@@ -124,6 +124,7 @@ mod tests {
             taken_at: 0,
             account_pk: 1,
             stopped_by: None,
+            resumable: false,
         }
     }
 

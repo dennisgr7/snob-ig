@@ -493,6 +493,7 @@ mod tests {
             taken_at: 1_722_700_000,
             account_pk: 1,
             stopped_by: None,
+            resumable: false,
         }
     }
 

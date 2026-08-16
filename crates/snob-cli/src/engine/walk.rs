@@ -92,6 +92,11 @@ pub async fn fetch(
 
     snapshots::close(app.db().conn(), id, summary.reason)?;
 
+    // Asked of the store rather than inferred from the stop reason, and asked
+    // with the same function the next run will use — so "it can be continued"
+    // means the next run really would, cursor and resume window included.
+    let resumable = snapshots::resumable(app.db().conn(), target.pk, kind)?.is_some();
+
     // What Instagram said, said out loud. The walker keeps the error next to
     // the stop reason and nothing used to read it, so a checkpoint arrived as
     // "the session stopped working" — with the address that would have cleared
@@ -113,6 +118,7 @@ pub async fn fetch(
             taken_at: now(),
             account_pk: target.pk,
             stopped_by,
+            resumable,
         },
     ))
 }
