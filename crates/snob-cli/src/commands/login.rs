@@ -6,8 +6,6 @@
 //! anything, so nobody completes a two-factor login only to be told afterwards
 //! that there was nowhere to put the result.
 
-use std::io::IsTerminal;
-
 use anyhow::{Result, bail};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::{Backend, SecretStore};
@@ -141,25 +139,25 @@ fn choose_method(args: &LoginArgs) -> Result<Option<LoginMethod>> {
 /// count that decides whether to ask "is that the right browser?" came from a
 /// different snapshot than the browser actually chosen.
 fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<browser::Browser> {
-    match installed {
-        [] => None,
-        [only] => Some(only.clone()),
-        _ if !ui::can_show_a_menu() => installed.first().cloned(),
-        _ => {
-            let labels: Vec<String> = installed
-                .iter()
-                .map(|b| format!("{} {}", b.name, b.major_version))
-                .collect();
-            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-            match ui::choose(purpose, &refs) {
-                // `get` rather than `nth`: total where the old one relied on the
-                // index being in range.
-                Ok(Some(i)) => installed.get(i).cloned(),
-                // Esc, or no menu to show: the preferred one still beats
-                // refusing to continue.
-                _ => installed.first().cloned(),
-            }
-        }
+    // Nothing to ask about: `first` is already `None` on an empty list and
+    // already the only entry on a list of one, so the two cases that have no
+    // question in them and the case where there is nobody to ask are one line.
+    if installed.len() < 2 || !ui::can_show_a_menu() {
+        return installed.first().cloned();
+    }
+
+    let labels: Vec<String> = installed
+        .iter()
+        .map(|b| format!("{} {}", b.name, b.major_version))
+        .collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    match ui::choose(purpose, &refs) {
+        // `get` rather than `nth`: total where the old one relied on the index
+        // being in range.
+        Ok(Some(i)) => installed.get(i).cloned(),
+        // Esc, or the menu failing to draw: the preferred one still beats
+        // refusing to continue.
+        _ => installed.first().cloned(),
     }
 }
 
@@ -269,10 +267,13 @@ async fn collect(
             // be overdrawn by a bar already running. The countdown is
             // deadline-driven, so one call covers the whole wait.
             //
-            // `stderr().is_terminal()` rather than `true`, because that is
-            // where the bar draws — and rather than `ui::is_interactive()`,
-            // which asks about stdin and stdout.
-            let progress = Progress::new(std::io::stderr().is_terminal());
+            // `true` means "a bar was wanted", which is all this flag says.
+            // Whether one can be drawn is `Progress`'s own question, and it
+            // already asks it: the bar hides itself when standard error is not a
+            // terminal, and `quiet` is read back off the bar rather than off the
+            // flag. Probing stderr here as well would be a second answer to a
+            // question that has one.
+            let progress = Progress::new(true);
             progress.waiting("waiting for you to log in", cdp::LOGIN_TIMEOUT);
             let captured = cdp::wait_for_login(cdp, cancel).await;
             // Before the `?`, so both the Ctrl+C bail and a broken socket leave
