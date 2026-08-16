@@ -26,8 +26,12 @@ use std::sync::LazyLock;
 
 use rusqlite_migration::{M, Migrations};
 
-pub static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(include_str!("sql/001_initial.sql"))]));
+pub static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(include_str!("sql/001_initial.sql")),
+        M::up(include_str!("sql/002_watch.sql")),
+    ])
+});
 
 #[cfg(test)]
 mod tests {

@@ -107,6 +107,9 @@ pub enum Command {
 
     /// Download a profile picture in high resolution
     Pfp(PfpArgs),
+
+    /// Track an account over time and report what changed
+    Watch(WatchArgs),
     // `import dyi` is written and tested but not wired up here on purpose: the
     // reader works, and what is unfinished is the question of what an import
     // should be able to do once it is in. Leaving it out of the CLI keeps the
@@ -256,6 +259,41 @@ fn duration(text: &str) -> Result<std::time::Duration, String> {
         .ok_or_else(|| format!("\"{text}\" is too long to be a duration"))?;
 
     Ok(std::time::Duration::from_secs(seconds))
+}
+
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    #[command(subcommand)]
+    pub command: WatchCommand,
+}
+
+/// The monitor.
+///
+/// A subcommand is required for now. The scheduled run — `snob watch` on its
+/// own, with the interval either on the command line or in its configuration
+/// file — makes this optional when it lands, which is an addition rather than a
+/// change: nothing written against `snob watch diff` stops working.
+#[derive(Subcommand, Debug)]
+pub enum WatchCommand {
+    /// What has changed since the last time the monitor reported
+    #[command(
+        after_help = "Reads what is already stored and spends no requests, so it costs nothing \
+                      to run as often as you like and it never moves the monitor on: ask twice \
+                      and you get the same answer.\n\n\
+                      With nothing walked yet there is nothing to compare against. Run \
+                      \"snob followers\" or \"snob following\" once first."
+    )]
+    Diff(WatchDiffArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct WatchDiffArgs {
+    /// Account to report on. Defaults to your own.
+    pub target: Option<String>,
+
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

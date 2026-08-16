@@ -13,6 +13,7 @@ pub mod freshness;
 pub mod people;
 pub mod target;
 pub mod walk;
+pub mod watch;
 
 use anyhow::{Result, bail};
 use snob_core::Pk;

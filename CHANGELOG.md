@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**`snob watch diff` says what has changed since the last time it was asked.**
+The first half of the monitor. It reads what is already stored, so it spends no
+requests and costs nothing to run: who has started following you and who has
+stopped, who you have followed and unfollowed, and who now goes by a different
+name. That last one comes out of a history the tool has been keeping on every
+walk since the first release and had never shown anybody.
+
+It needs something to compare against, so the first run on an account reports
+nothing and says so rather than announcing your whole follower list as new
+arrivals. Walk a list once — `snob followers`, `snob unfollowers`, anything —
+and it has something to say from then on. `--json` for a script; down a pipe,
+`snob watch diff --json | jq`. Looking does not count as reporting: ask twice
+and you get the same answer.
+
+The scheduled run and the webhook are not built yet.
+
 Four things here change what a script sees, so they come first:
 
 - **`snob purge` with no terminal to ask at now exits 130 instead of 1**, and

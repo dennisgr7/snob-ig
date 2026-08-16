@@ -12,6 +12,7 @@ pub mod secrets;
 pub mod session;
 pub mod sets;
 pub mod store;
+pub mod watch;
 
 /// Stable numeric identifier of an Instagram account.
 pub type Pk = u64;
