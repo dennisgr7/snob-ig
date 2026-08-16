@@ -16,8 +16,8 @@ use wiremock::MockServer;
 use snob_cli::app::{App, Viewer};
 use snob_cli::engine::people;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
+mod common;
+use common::{SID, UA};
 
 const ME: u64 = 42;
 

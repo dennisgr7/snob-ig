@@ -17,8 +17,8 @@ use snob_core::secrets::SecretStore;
 use snob_core::session::{Session, SessionOrigin};
 use snob_core::store::Store;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
+mod common;
+use common::{SID, UA};
 
 fn setup(name: &str) -> (tempfile::TempDir, AppPaths, SecretStore) {
     let tmp = tempfile::tempdir().unwrap();

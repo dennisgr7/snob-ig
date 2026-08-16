@@ -26,27 +26,17 @@ use snob_cli::cli::ListArgs;
 use snob_cli::engine;
 use snob_cli::exit::ExitCode;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
+mod common;
+use common::{SID, UA, args_for};
 
 /// Someone else's account, and no `-y`: the case that needs a question.
+///
+/// `yes` is the one field that has to differ from the shared fixture — the tests
+/// there would hang on the prompt, and these exist to reach it.
 fn args(target: &str) -> ListArgs {
     ListArgs {
-        target: Some(target.into()),
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
-        limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
         yes: false,
+        ..args_for(target)
     }
 }
 
