@@ -64,9 +64,18 @@ fn url_suffix(url: &Option<String>) -> String {
 
 /// A 404 names what was being looked for whenever the caller knows it. Only
 /// the endpoints that ask about one account can fill it in.
+///
+/// Filtered, for the reason [`body_excerpt`] gives: this sentence is printed to a
+/// terminal by `report::print_error`, and the name in it is whatever was typed on
+/// the command line. `snob followers $'gh\e[2K\e[A'` reaches this arm, so without
+/// the filter the refusal erased the line above itself — the same hole every
+/// sibling refusal closes at the point it names an account.
 fn missing_message(what: &Option<String>) -> String {
     match what {
-        Some(name) => format!("the account \"{name}\" does not exist"),
+        Some(name) => format!(
+            "the account \"{}\" does not exist",
+            snob_core::model::printable(name)
+        ),
         None => "Instagram answered 404: what was asked for does not exist".into(),
     }
 }
@@ -117,6 +126,20 @@ pub enum Reaction {
 }
 
 impl IgError {
+    /// The address that clears a security check, when Instagram gave one.
+    ///
+    /// Lives here rather than in the command that reports it, next to the
+    /// validation that decides whether the address may be repeated at all: the
+    /// two variants that can carry one are the two this has to know about, and a
+    /// copy of the list in another crate is one that keeps compiling after a
+    /// third variant gains a URL and simply stops mentioning it.
+    pub fn challenge_url(&self) -> Option<&str> {
+        match self {
+            Self::Challenge { url } | Self::Checkpoint { url } => url.as_deref(),
+            _ => None,
+        }
+    }
+
     /// What to do with this error during a walk.
     pub fn reaction(&self) -> Reaction {
         match self {
