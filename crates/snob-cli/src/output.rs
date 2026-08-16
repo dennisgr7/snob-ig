@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use snob_core::model::User;
+use snob_core::model::{User, printable};
 
 use crate::cli::Format;
 use crate::ui;
@@ -162,9 +162,15 @@ pub fn default_path(stem: &str, extension: &str) -> Result<PathBuf> {
         && !RESERVED.contains(&device.as_str());
 
     if !usable {
+        // Filtered where it is quoted, not where it is checked: the test above
+        // has to see the name Instagram sent, and this sentence is printed to a
+        // terminal by `report::print_error`. Every name that fails the test for
+        // carrying a control character reaches exactly this line, so it was the
+        // one refusal guaranteed to hand one straight through.
         return Err(anyhow!(
-            "\"{stem}\" cannot be used as a file name here. \
-             Use -o to say where the result should go"
+            "\"{}\" cannot be used as a file name here. \
+             Use -o to say where the result should go",
+            printable(stem)
         ));
     }
 
@@ -465,6 +471,22 @@ mod tests {
         for good in ["someone", "some.one", "some_one", "user123"] {
             assert!(default_path(good, "jpg").is_ok(), "{good:?} should be fine");
         }
+    }
+
+    /// The refusal every unusable name arrives at must not carry the name
+    /// through unfiltered.
+    ///
+    /// A control character is one of the things that makes a name unusable
+    /// here, so this refusal is where such a name always ends up — and it is
+    /// printed to a terminal. `snob pfp` takes the stem from what Instagram
+    /// sent, which is the side of the boundary nothing on this machine chose.
+    #[test]
+    fn the_refusal_does_not_print_the_name_it_is_refusing() {
+        let error = default_path("gh\u{1b}[2K\u{1b}[A", "jpg")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains('\u{1b}'), "{error:?}");
+        assert!(error.contains("gh[2K[A"), "{error:?}");
     }
 
     #[test]

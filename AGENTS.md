@@ -156,7 +156,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
 | Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
-| A name from a profile is filtered before anything draws it | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username` and `error::body_excerpt` |
+| A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target`. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too |
 | A name inside a URL is encoded, never filtered | `User::profile_url` — filtering removes characters, and a name with one removed is the address of a different account |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
