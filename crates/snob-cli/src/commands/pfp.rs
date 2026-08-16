@@ -185,7 +185,7 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
 /// no dimensions, which would collapse into the same `None` as not having
 /// answered at all — and those are the two cases the whole command turns on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Source {
+enum Source {
     /// The by-id endpoint answered. The size is what it declared, not what was
     /// measured: nothing here decodes the image.
     FullSize { size: Option<(u32, u32)> },
@@ -202,9 +202,7 @@ impl Source {
     /// "Written to picture.jpg" after the fact.
     fn announce(&self) {
         match self {
-            Self::FullSize {
-                size: Some((w, h)), ..
-            } => ui::info(&format!("Full size: {w}x{h}.")),
+            Self::FullSize { size: Some((w, h)) } => ui::info(&format!("Full size: {w}x{h}.")),
             Self::FullSize { size: None } => {}
             Self::Smaller { why } => {
                 let mut line = "the full-size lookup did not answer, so this is the smaller \

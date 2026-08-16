@@ -49,7 +49,7 @@ impl Progress {
         };
         let waiting_until: Deadline = Arc::new(Mutex::new(None));
         let rich = rich_glyphs();
-        bar.set_style(style_without_total(&waiting_until, rich));
+        bar.set_style(style(TEMPLATE_WITHOUT_TOTAL, &waiting_until, rich));
 
         let progress = Self {
             // Asked from the bar, not taken from the flag. `indicatif` hides
@@ -142,16 +142,22 @@ impl Progress {
                 match estimated {
                     Some(total) => {
                         self.bar.set_length(*total);
-                        self.bar
-                            .set_style(style_with_total(&self.waiting_until, self.rich));
+                        self.bar.set_style(style(
+                            TEMPLATE_WITH_TOTAL,
+                            &self.waiting_until,
+                            self.rich,
+                        ));
                     }
                     // Not "leave it as it was": after a list that had a total,
                     // that would keep drawing `{pos}/{len}` against the
                     // previous list's length.
                     None => {
                         self.bar.unset_length();
-                        self.bar
-                            .set_style(style_without_total(&self.waiting_until, self.rich));
+                        self.bar.set_style(style(
+                            TEMPLATE_WITHOUT_TOTAL,
+                            &self.waiting_until,
+                            self.rich,
+                        ));
                     }
                 }
 
@@ -326,15 +332,14 @@ fn progress_chars(rich: bool) -> &'static str {
     }
 }
 
-fn style_without_total(deadline: &Deadline, rich: bool) -> ProgressStyle {
-    ProgressStyle::with_template(TEMPLATE_WITHOUT_TOTAL)
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .tick_chars(tick_chars(rich))
-        .with_key("countdown", countdown(deadline, rich))
-}
-
-fn style_with_total(deadline: &Deadline, rich: bool) -> ProgressStyle {
-    ProgressStyle::with_template(TEMPLATE_WITH_TOTAL)
+/// The style for either template.
+///
+/// One function rather than one per template: the glyphs and the countdown key
+/// are the same in both, and those are exactly the pair a test exists to catch
+/// drifting apart. `progress_chars` is set unconditionally — indicatif only
+/// consults it to draw a `{bar}`, so on the template that has none it is inert.
+fn style(template: &str, deadline: &Deadline, rich: bool) -> ProgressStyle {
+    ProgressStyle::with_template(template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .tick_chars(tick_chars(rich))
         .progress_chars(progress_chars(rich))
@@ -412,8 +417,9 @@ mod tests {
     fn every_glyph_set_builds() {
         let deadline: Deadline = Arc::new(Mutex::new(None));
         for rich in [true, false] {
-            let _ = style_without_total(&deadline, rich);
-            let _ = style_with_total(&deadline, rich);
+            for template in [TEMPLATE_WITHOUT_TOTAL, TEMPLATE_WITH_TOTAL] {
+                let _ = style(template, &deadline, rich);
+            }
         }
     }
 

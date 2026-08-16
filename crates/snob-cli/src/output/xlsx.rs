@@ -177,14 +177,13 @@ fn write_header(sheet: &mut Worksheet, header: &[&str]) -> Result<()> {
 
 /// Turns epoch seconds into what the spreadsheet writer takes, in UTC like
 /// every other timestamp this tool prints.
+///
+/// The writer converts this itself, and range-checks it against the years a
+/// spreadsheet can hold (1900-9999) on the way. Doing the arithmetic here meant
+/// the "outside what a spreadsheet can hold" fallback rested on two chained
+/// `.ok()?` calls rather than on one documented check.
 fn datetime(epoch: i64) -> Option<ExcelDateTime> {
-    use chrono::{Datelike, Timelike};
-
-    let t = chrono::DateTime::from_timestamp(epoch, 0)?;
-    ExcelDateTime::from_ymd(t.year().try_into().ok()?, t.month() as u8, t.day() as u8)
-        .ok()?
-        .and_hms(t.hour() as u16, t.minute() as u8, t.second() as u16)
-        .ok()
+    ExcelDateTime::from_timestamp(epoch).ok()
 }
 
 fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Result<()> {
