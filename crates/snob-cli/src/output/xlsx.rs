@@ -1,8 +1,15 @@
 //! Spreadsheet workbooks.
 //!
-//! Same six columns as the csv, so the two formats answer alike, plus what a
-//! spreadsheet can carry and a text file cannot: real booleans, a numeric id,
-//! and a username that is a link to the profile.
+//! A list of accounts is the same six columns as the csv, so the two formats
+//! answer alike, plus what a spreadsheet can carry and a text file cannot: real
+//! booleans, a numeric id, and a username that is a link to the profile.
+//!
+//! `scan`'s summary is one row rather than a list, and there the two formats
+//! diverge in exactly one cell each: the moment a list was taken is epoch
+//! seconds in the csv, matching the JSON, and a real date here, because a
+//! column of epoch integers in a spreadsheet is unreadable. `scan::row_cells`
+//! is where that is decided and this is the claim it points at, so the two say
+//! the same thing about it.
 //!
 //! What goes in each cell is decided first, as plain data, and only then
 //! handed to the writer. A workbook is a zip archive, so that split is what
