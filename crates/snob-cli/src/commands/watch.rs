@@ -18,23 +18,263 @@ use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_core::watch::{Basis, ListDiff, Rename};
 
-use crate::cli::{WatchCommand, WatchDiffArgs, WatchOnceArgs};
+use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
+
+use crate::cli::{WatchArgs, WatchCommand, WatchDiffArgs, WatchOnceArgs, WatchRunArgs};
 use crate::commands::common::{self, Session};
 use crate::engine::Provenance;
 use crate::engine::watch::{ListReport, Skipped, TickReport, WatchReport, Watched};
-use crate::exit::ExitCode;
+use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui;
 
-pub async fn run(
-    command: WatchCommand,
-    secrets: SecretStore,
-    paths: &AppPaths,
-) -> Result<ExitCode> {
-    match command {
-        WatchCommand::Diff(args) => diff(args, secrets, paths),
-        WatchCommand::Once(args) => once(args, secrets, paths).await,
+pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    match args.command {
+        Some(WatchCommand::Diff(args)) => diff(args, secrets, paths),
+        Some(WatchCommand::Once(args)) => once(args, secrets, paths).await,
+        None => scheduled(args.run, secrets, paths).await,
     }
+}
+
+/// Stays up and runs on a schedule until it is stopped.
+///
+/// The loop is deliberately thin. Everything with a rule in it — when the next
+/// run is due, how many were missed, how far jitter may push one — is
+/// `snob_core::watch::schedule`, which reads no clock and is tested with
+/// literal timestamps. What is left here is sleeping and asking again, which
+/// is the part no test can usefully drive.
+async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    let schedule = schedule_from(&args)?;
+    let watched = watched_from(args.target.clone());
+
+    // Refused here rather than at the first tick. A service that starts, waits
+    // six hours and then exits because it was never allowed to read that
+    // account is a service that looked healthy all afternoon.
+    if !watched.may_run_unattended() {
+        return Err(ExitError::new(
+            ExitCode::Interrupted,
+            format!(
+                "reading {}'s lists needs confirmation, and a scheduled run has nobody to ask.\n\
+                 Use \"snob watch once {}\" while you are here to answer it.",
+                target_label(args.target.as_deref()),
+                args.target.as_deref().unwrap_or_default(),
+            ),
+        )
+        .into());
+    }
+
+    ui::info(&format!(
+        "Watching {}. {} Stop with Ctrl+C.",
+        target_label(args.target.as_deref()),
+        describe_schedule(&schedule, args.now),
+    ));
+
+    // Installed once for the process, which is what lets this open an `App` per
+    // run without leaving a signal listener behind on each one.
+    let cancel = crate::interrupt::install();
+
+    // `None` means "nothing has run", which is what makes the first run
+    // immediate. Without `--now` the schedule decides the first one instead.
+    let mut last_run: Option<i64> = if args.now {
+        None
+    } else {
+        Some(snob_core::store::now())
+    };
+
+    // The moment this is waiting for, and how many scheduled runs it stands
+    // for. Held across iterations rather than recomputed, because the loop
+    // wakes every minute to re-check the wall clock and rolling the jitter each
+    // time would make the wake-up wander instead of settling on one instant.
+    let mut waiting_for: Option<(i64, u32)> = None;
+    // `--now` means now. Jitter is there so a *schedule* does not land on the
+    // same second every day; delaying the run somebody just asked for by up to
+    // a quarter of an hour would only look broken.
+    let mut skip_jitter = args.now;
+
+    loop {
+        let now = snob_core::store::now();
+
+        let (wake_at, missed) = match waiting_for {
+            Some(pending) => pending,
+            None => {
+                let (due_at, missed) = match schedule::due(&schedule, last_run, now, &chrono::Local)
+                {
+                    Due::Now { missed } => (now, missed),
+                    Due::At(i64::MAX) => {
+                        return Err(anyhow::anyhow!(
+                            "this schedule can never come round: nothing matches it"
+                        ));
+                    }
+                    Due::At(at) => (at, 0),
+                };
+
+                // Rolled once per due moment. The roll is made here rather than
+                // inside `with_jitter` so that function reads no randomness and
+                // its bounds stay testable.
+                let wake_at = if skip_jitter {
+                    due_at
+                } else {
+                    schedule::with_jitter(due_at, schedule.jitter(), fastrand::f64())
+                };
+                let pending = (wake_at, missed);
+                waiting_for = Some(pending);
+                pending
+            }
+        };
+
+        if now >= wake_at {
+            if missed > 0 {
+                ui::warn(&format!(
+                    "{missed} scheduled runs were missed while this was not running. They are \
+                     reported as one: there is only one present state, so there is nothing to \
+                     catch up on"
+                ));
+            }
+            // Recorded before the work, so a run that fails cannot turn into a
+            // tight loop retrying it.
+            last_run = Some(now);
+            waiting_for = None;
+            skip_jitter = false;
+
+            // A scheduled service does not exit because one run failed. A
+            // cooldown lifts, a network comes back, and a session that is gone
+            // gets reported every time until somebody fixes it — which is the
+            // point of something that watches.
+            if let Err(e) = run_one(&args, &watched, &secrets, paths).await {
+                report::print_error(&e);
+            }
+            continue;
+        }
+
+        // Slept in bounded stretches and re-checked against the wall clock each
+        // time round, rather than in one long sleep. A laptop that suspends for
+        // eight hours makes a single long timer wrong by eight hours, and
+        // asking "is it time yet?" costs nothing.
+        let nap = (wake_at - now).clamp(1, 60) as u64;
+        if cancel
+            .sleep_or_cancel(std::time::Duration::from_secs(nap))
+            .await
+        {
+            ui::info("Stopped.");
+            return Ok(ExitCode::Interrupted);
+        }
+    }
+}
+
+/// One run inside the loop: open, tick, print, close.
+///
+/// A fresh `App` per run rather than one held open for weeks. It picks up a
+/// session that was replaced and a refreshed User-Agent, and — the reason that
+/// matters on Windows — it holds no SQLite connection while the loop sleeps, so
+/// `snob purge` in another terminal is not blocked by a file this has open.
+async fn run_one(
+    args: &WatchRunArgs,
+    watched: &Watched,
+    secrets: &SecretStore,
+    paths: &AppPaths,
+) -> Result<()> {
+    let Session::Open(mut app) = common::open_with_progress(!args.no_progress, secrets, paths)?
+    else {
+        // Said by `common::open`, and there is nothing this run can do about it
+        // — but the loop keeps going, because a session restored later should
+        // be picked up without the service having to be restarted.
+        return Ok(());
+    };
+
+    let tick = crate::engine::watch::tick(&mut app, watched).await;
+    app.progress().finish();
+    let tick = tick?;
+
+    // One line per run down a pipe, so `snob watch >> events.ndjson` is a
+    // complete way to use this without a webhook.
+    if args.json {
+        println!("{}", serde_json::to_string(&tick_json(&tick))?);
+    } else if !tick.report.changes().is_empty() {
+        for line in describe(&tick.report) {
+            println!("{line}");
+        }
+    }
+
+    for (kind, skipped) in tick
+        .lists
+        .iter()
+        .filter_map(|l| l.skipped.map(|s| (l.kind, s)))
+    {
+        ui::warn(&refusal_line(kind, skipped));
+    }
+    Ok(())
+}
+
+fn watched_from(target: Option<String>) -> Watched {
+    match target {
+        None => Watched::own(),
+        Some(name) => Watched::asking(name),
+    }
+}
+
+fn target_label(target: Option<&str>) -> String {
+    match target {
+        Some(name) => format!("@{}", printable(name)),
+        None => "your account".to_string(),
+    }
+}
+
+/// Builds the schedule from the flags, or explains what is missing.
+fn schedule_from(args: &WatchRunArgs) -> Result<Schedule> {
+    let mut schedule = if let Some(expression) = &args.cron {
+        Schedule::cron(expression)?
+    } else if !args.at.is_empty() || !args.on.is_empty() {
+        let days = args
+            .on
+            .iter()
+            .map(|d| {
+                Weekday::parse(d)
+                    .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let times = args
+            .at
+            .iter()
+            .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        Schedule::calendar(&days, &times)?
+    } else if let Some(every) = args.every {
+        Schedule::every(every)?
+    } else {
+        return Err(anyhow::anyhow!(
+            "how often should this run?\n\
+             Try \"--every 6h\", or \"--on mon,thu --at 09:00\", or \"--cron '0 9 * * 1,4'\"."
+        ));
+    };
+
+    // An interval given alongside a calendar is a floor on it, not a second
+    // schedule. `--every 2w --on mon` is "one Monday in every two weeks".
+    if let Some(every) = args.every
+        && (args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty())
+    {
+        schedule = schedule.and_every(every)?;
+    }
+    if let Some(jitter) = args.jitter {
+        schedule = schedule.with_jitter(jitter);
+    }
+    Ok(schedule)
+}
+
+/// The opening line, so somebody starting this can see it understood them.
+fn describe_schedule(schedule: &Schedule, now: bool) -> String {
+    let jitter = schedule.jitter();
+    let mut line = if jitter.is_zero() {
+        "Running exactly on schedule.".to_string()
+    } else {
+        format!(
+            "Each run is pushed up to {} later, so it does not land on the same second every time.",
+            snob_core::duration::format(jitter)
+        )
+    };
+    if now {
+        line.push_str(" Starting with one now.");
+    }
+    line
 }
 
 /// One run of the monitor: look, report, and remember having reported.

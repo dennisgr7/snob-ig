@@ -8,8 +8,10 @@
 //! presented.
 
 pub mod diff;
+pub mod schedule;
 
 pub use diff::{Basis, ListDiff, Rename};
+pub use schedule::{Due, Schedule, ScheduleError, Weekday};
 
 use crate::model::ListKind;
 

@@ -319,14 +319,14 @@ deliberately unfinished:
   what an import should be allowed to do once it is in — whether it can be
   crossed against a live list, and whether it belongs in the store at all.
   Shipping the subcommand would answer those by accident.
-- **The monitor** (`snob watch`) works and is not finished. `once` looks and
-  reports; `diff` answers the same question out of storage without moving
-  anything on. What is not built is the scheduled mode, the webhook, the
-  configuration file and the retention of old captures. `lost`/`gained` are its
-  words for the temporal diff — `unfollowers` is the static set and must never
-  drift to mean `lost`.
+- **The monitor** (`snob watch`) works and is not finished. Bare, it stays up
+  and runs on a schedule; `once` does one run and exits; `diff` answers the same
+  question out of storage without moving anything on. What is not built is the
+  webhook, the configuration file and the retention of old captures.
+  `lost`/`gained` are its words for the temporal diff — `unfollowers` is the
+  static set and must never drift to mean `lost`.
 
-  Four things about it are worth knowing before changing any of it:
+  Five things about it are worth knowing before changing any of it:
 
   - **It compares against what was last *reported*** — `watch_marks` — and not
     against the previous capture. Those come apart the moment somebody runs
@@ -346,6 +346,17 @@ deliberately unfinished:
   - **A run with nothing to report costs one request, not two.**
     `web_profile_info` answers with both counters and `App::remember_counters`
     keeps them, so the second list asks nothing. A test asserts it.
+  - **The schedule reads no clock.** `watch::schedule` takes `now` as an
+    argument everywhere, the shape `rate_budget::decide` set, so all of it is
+    tested with literal timestamps and nothing waits. Its cron parser produces
+    the same `Calendar` `--on mon --at 09:00` does — one evaluator, two
+    syntaxes, so "Monday at nine" cannot come to mean two things — and that is
+    why there is a parser rather than a dependency: the hard part of cron is
+    that the two day fields combine with OR when both are restricted and AND
+    when either is `*`, and getting it wrong fires on the wrong days silently.
+    Missed runs are **folded into one and never replayed**: firing twelve to
+    catch up is the burst the pacing exists to prevent, and they would all
+    report the same present state anyway.
 
 ## Known walls
 

@@ -230,41 +230,71 @@ pub struct ListArgs {
     pub yes: bool,
 }
 
-/// Parses durations written like `30m`, `6h`, `2d`.
+/// Parses durations written like `30m`, `6h`, `2d`, `2w`.
+///
+/// A thin wrapper because clap wants this exact signature. The parser itself
+/// lives in `snob-core`: the monitor's schedule and its configuration file read
+/// the same durations, and a second copy that understood `w` while this one did
+/// not is how `--max-age 2w` comes to mean two seconds.
 fn duration(text: &str) -> Result<std::time::Duration, String> {
-    let text = text.trim();
-    let (number, factor) = match text.chars().last() {
-        Some('s') => (&text[..text.len() - 1], 1),
-        Some('m') => (&text[..text.len() - 1], 60),
-        Some('h') => (&text[..text.len() - 1], 3600),
-        Some('d') => (&text[..text.len() - 1], 86400),
-        // With no suffix, seconds are assumed.
-        Some(c) if c.is_ascii_digit() => (text, 1),
-        _ => {
-            return Err(format!(
-                "\"{text}\" is not a valid duration (try 30m, 6h or 2d)"
-            ));
-        }
-    };
-
-    let value: u64 = number
-        .trim()
-        .parse()
-        .map_err(|_| format!("\"{text}\" is not a valid duration (try 30m, 6h or 2d)"))?;
-
-    // A number long enough to overflow is not a duration anyone means, and
-    // wrapping it would silently turn "never expire" into "expire at once".
-    let seconds = value
-        .checked_mul(factor)
-        .ok_or_else(|| format!("\"{text}\" is too long to be a duration"))?;
-
-    Ok(std::time::Duration::from_secs(seconds))
+    snob_core::duration::parse(text)
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct WatchArgs {
+    /// Absent means "run on a schedule".
     #[command(subcommand)]
-    pub command: WatchCommand,
+    pub command: Option<WatchCommand>,
+
+    #[command(flatten)]
+    pub run: WatchRunArgs,
+}
+
+/// `snob watch` with no subcommand: stay up and run on a schedule.
+#[derive(Args, Debug)]
+pub struct WatchRunArgs {
+    /// Account to watch. Defaults to your own.
+    pub target: Option<String>,
+
+    /// How often to run: 6h, 2d, 2w
+    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    pub every: Option<std::time::Duration>,
+
+    /// Times of day to run at: 09:00,21:00
+    #[arg(long, value_delimiter = ',', value_name = "HH:MM")]
+    pub at: Vec<String>,
+
+    /// Days to run on: mon,thu. Defaults to every day.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "DAYS",
+        conflicts_with = "cron"
+    )]
+    pub on: Vec<String>,
+
+    /// A five-field cron expression, for a schedule you already have written
+    #[arg(long, value_name = "EXPR", conflicts_with = "at")]
+    pub cron: Option<String>,
+
+    /// How far a run may be pushed later, so it does not land on the same
+    /// second every day. Worked out from the interval if not given; 0 turns it
+    /// off.
+    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    pub jitter: Option<std::time::Duration>,
+
+    /// Run once at start, then follow the schedule
+    #[arg(long)]
+    pub now: bool,
+
+    /// Emit one JSON object per run, on standard output
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 /// The monitor.

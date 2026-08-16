@@ -41,6 +41,13 @@ tracing-subscriber.workspace = true
 # Used so a typed sessionid does not sit in freed memory after the prompt that
 # read it.
 zeroize.workspace = true
+# Already in the tree through snob-ig, where it jitters the pace between
+# requests. Used here for the same reason at a larger scale: `snob watch` moves
+# each scheduled run a little later, so the walks do not start on the same
+# second every day. Not a security decision, so the fast generator is the right
+# one — but the roll is made here and handed to `schedule::with_jitter`, which
+# reads no randomness of its own and can therefore be tested.
+fastrand.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

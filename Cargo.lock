@@ -2584,6 +2584,7 @@ dependencies = [
  "console",
  "csv",
  "dialoguer",
+ "fastrand",
  "futures-util",
  "indicatif",
  "rust_xlsxwriter",
