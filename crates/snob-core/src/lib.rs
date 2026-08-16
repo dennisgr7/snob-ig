@@ -4,6 +4,7 @@
 //! its username. Usernames change, and detecting that change is itself an event
 //! the tool reports.
 
+pub mod duration;
 pub mod filters;
 pub mod model;
 pub mod paths;

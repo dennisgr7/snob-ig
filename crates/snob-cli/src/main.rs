@@ -89,7 +89,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Fans(args) => commands::sets::run(args, store, &paths, SetOp::Fans).await,
         Command::Friends(args) => commands::sets::run(args, store, &paths, SetOp::Friends).await,
         Command::Pfp(args) => commands::pfp::run(args, store, &paths).await,
-        Command::Watch(args) => commands::watch::run(args.command, store, &paths).await,
+        Command::Watch(args) => commands::watch::run(args, store, &paths).await,
     }
 }
 

@@ -8,26 +8,39 @@ who you have followed and unfollowed, and who now goes by a different name —
 that last one out of a history the tool has been keeping on every walk since
 the first release and had never shown anybody.
 
-- **`snob watch once`** looks and reports. It reads your counters and only
-  walks a list if its counter moved, so a run with nothing to report costs a
-  single request — cheap enough to put on a cron entry or a systemd timer every
-  few hours. Whatever it reports, it does not report again.
+- **`snob watch`** stays up and runs on a schedule you choose. `--every 6h`, or
+  `--on mon,thu --at 09:00`, or a cron expression if you already have one
+  written: `--cron "0 9 * * 1,4"`. The two combine, so `--every 2w --on mon` is
+  one Monday in every two — the interval cron cannot express. Times are your
+  local ones. Each run is pushed a little later than its due moment so the
+  walks do not start on the same second every day; `--jitter 0` turns that off.
+  `snob watch --json >> events.ndjson` is a complete way to use it with no
+  webhook at all.
+- **`snob watch once`** does one run and exits, for a cron entry or a systemd
+  timer. It reads your counters and only walks a list if its counter moved, so
+  a run with nothing to report costs a single request. Whatever it reports, it
+  does not report again.
 - **`snob watch diff`** answers the same question out of what is already
   stored, without touching the network and without moving anything on. Ask
   twice, get the same answer.
 
-Both take `--json`, and down a pipe `snob watch diff --json | jq` works without
-being told to.
+All three take `--json`, and down a pipe `snob watch diff --json | jq` works
+without being told to.
 
-Three things it will not do. The first run on an account has nothing to compare
+Four things it will not do. The first run on an account has nothing to compare
 against, so it reports nothing and says so rather than announcing your whole
 follower list as new arrivals. A list served from storage during a cooldown, or
 when the check failed, is not compared against anything — nothing established
 that it is still true — and the monitor stays where it was, so what happened is
-reported by the next run that can see. And a walk that came back short is never
-a basis either: the accounts missing from it would read as people who left.
+reported by the next run that can see. A walk that came back short is never a
+basis either: the accounts missing from it would read as people who left. And a
+scheduled run that was down for a day does not fire the runs it missed when it
+comes back: it runs once and says how many it is standing in for, because there
+is only one present state and nothing to catch up on.
 
-The scheduled mode and the webhook are not built yet.
+`--every` will not go below fifteen minutes, and says why.
+
+The webhook is not built yet.
 
 Four things here change what a script sees, so they come first:
 
