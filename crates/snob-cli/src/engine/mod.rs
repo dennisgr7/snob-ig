@@ -71,13 +71,6 @@ impl Provenance {
         matches!(self, Self::Walked | Self::CounterVerified)
     }
 
-    /// Whether the cause was Instagram pushing back rather than the user
-    /// asking for storage. It decides which of two pieces of advice to give
-    /// and which exit code goes with it.
-    pub fn is_cooldown(self) -> bool {
-        self == Self::Cooldown
-    }
-
     fn source(self) -> ResultSource {
         match self {
             Self::Walked => ResultSource::Fetched,
@@ -334,10 +327,11 @@ pub async fn ask_consent_with(
         return Ok(());
     }
 
-    // Drawn, so filtered. `target::label` already runs this very value through
-    // `printable` — with a doc-comment saying it does so because it is drawn on
-    // a terminal — and the three sentences below did not.
-    let shown = snob_core::model::printable(name);
+    // How an account is named on screen is `target::label`'s question, and it is
+    // the same question here: `args.target` is `Some` at this point, so `label`
+    // returns exactly the at sign and the filtered name these three sentences
+    // want. Repeating the rule was how one of them ended up unfiltered.
+    let shown = target::label(app, args);
 
     // Being unable to ask and being told no are two different events, and they
     // were reported as one. `confirm` answers with its default the moment
@@ -356,7 +350,7 @@ pub async fn ask_consent_with(
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
-                "reading @{shown}'s lists needs confirmation, and there is no terminal to \
+                "reading {shown}'s lists needs confirmation, and there is no terminal to \
                  ask at. Pass -y to confirm in advance."
             ),
         )
@@ -367,13 +361,13 @@ pub async fn ask_consent_with(
         "reading somebody else's lists is a heavier request than reading your own, \
          and Instagram is readier to refuse it",
     );
-    if !ui::confirm_off_thread(app.progress(), format!("Continue with @{shown}?"), false).await? {
+    if !ui::confirm_off_thread(app.progress(), format!("Continue with {shown}?"), false).await? {
         // No mention of -y here. They have just said no, and answering that
         // with "pass the flag that skips the question" is telling them to do
         // it anyway.
         return Err(ExitError::new(
             ExitCode::Interrupted,
-            format!("nothing was done: @{shown} was not confirmed"),
+            format!("nothing was done: {shown} was not confirmed"),
         )
         .into());
     }

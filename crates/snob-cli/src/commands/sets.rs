@@ -151,8 +151,7 @@ fn check_against_list(op: SetOp, outcome: &ListOutcome) -> Result<()> {
     }
     Err(report::refuse_incomplete(
         op.against(),
-        outcome.reason,
-        outcome.exit_code(),
+        outcome,
         op.misreads_as(),
     ))
 }

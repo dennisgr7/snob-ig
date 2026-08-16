@@ -52,10 +52,12 @@ pub async fn run(
 /// A plain list is the one place a partial answer is still worth having: every
 /// account in it really is in the list, only some are missing. So it prints,
 /// says so, and reports what stopped it.
+///
+/// A stored list needs no arm of its own. `ListOutcome::cached` is the only way
+/// to a provenance other than `Walked` and it records `Completed`, so anything
+/// out of storage arrives at the first arm anyway — and an arm that reads as
+/// policy while deciding nothing is one a later change would edit to no effect.
 fn exit_code(outcome: &ListOutcome) -> ExitCode {
-    if outcome.source() == ResultSource::Cached {
-        return ExitCode::Ok;
-    }
     match outcome.reason {
         // A cap was asked for by the user, so it is not a failure.
         StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,

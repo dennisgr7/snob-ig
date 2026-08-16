@@ -70,7 +70,20 @@ pub fn stored_on(taken_at: i64) -> String {
 
 /// "04/08 at 16:30", from a cooldown end in epoch milliseconds.
 pub fn cooldown_ends_at(until_ms: i64) -> String {
-    format_epoch(until_ms.div_euclid(1000), "later")
+    format_epoch(cooldown_ends_at_secs(until_ms), "later")
+}
+
+/// A cooldown end in the unit every timestamp this tool reports uses.
+///
+/// `Pacer::cooldown` answers in milliseconds while `created_at` and
+/// `validated_at` next to it in `whoami`'s object are in seconds, so something
+/// has to convert — and both the printed date above and that JSON field are the
+/// same cooldown, which is why they may not do their own arithmetic.
+///
+/// `div_euclid` rather than `/`, so a moment before the epoch floors instead of
+/// rounding towards zero into the wrong second.
+pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
+    until_ms.div_euclid(1000)
 }
 
 fn format_epoch(seconds: i64, unknown: &str) -> String {
@@ -88,20 +101,25 @@ fn format_epoch(seconds: i64, unknown: &str) -> String {
 ///
 /// `misreading` completes "the accounts missing from it would appear as if …",
 /// which is the only part that differs between them.
+///
+/// The outcome rather than a reason and a code picked out of it. The two have to
+/// describe the same walk, and `ListOutcome::exit_code` exists precisely because
+/// what Instagram said beats what the store recorded — a caller passing
+/// `outcome.reason` next to a bare `ExitCode::from_stop_reason` would undo that
+/// precedence while still compiling.
 pub fn refuse_incomplete(
     list: ListKind,
-    reason: StopReason,
-    code: ExitCode,
+    outcome: &crate::engine::ListOutcome,
     misreading: &str,
 ) -> anyhow::Error {
     ExitError::new(
-        code,
+        outcome.exit_code(),
         format!(
             "the {list} list could not be read in full, so the answer would be wrong: \
              the accounts missing from it would appear as if {misreading}."
         ),
     )
-    .with_hint(try_again_advice(reason))
+    .with_hint(try_again_advice(outcome.reason))
     .into()
 }
 
@@ -129,12 +147,17 @@ pub fn refuse_different_moments(
     a_at: i64,
     b_at: i64,
 ) -> anyhow::Error {
-    let (code, hint) = if a.is_cooldown() || b.is_cooldown() {
+    // Each arm asks the same question of the same pair, so each one asks it the
+    // same way. The cooldown arm used to go through a method of its own while its
+    // sibling compared the variant inline, which left the next cause to need a
+    // hint with two precedents and no reason to prefer either.
+    let either = |wanted: Provenance| a == wanted || b == wanted;
+    let (code, hint) = if either(Provenance::Cooldown) {
         (
             ExitCode::RateLimited,
             "Run it again once the cooldown lifts.",
         )
-    } else if a == Provenance::CacheFlag || b == Provenance::CacheFlag {
+    } else if either(Provenance::CacheFlag) {
         (
             ExitCode::Error,
             "Run it again without --cache, so both lists are checked against the account.",
@@ -297,6 +320,21 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ListOutcome;
+
+    /// A walk that stopped for `reason`, and what Instagram said about it when
+    /// that is more specific than the reason.
+    fn stopped(reason: StopReason, stopped_by: Option<ExitCode>) -> ListOutcome {
+        ListOutcome {
+            provenance: Provenance::Walked,
+            reason,
+            requests: 1,
+            started_at: 0,
+            taken_at: 0,
+            account_pk: 1,
+            stopped_by,
+        }
+    }
 
     /// A timestamp that makes no sense still has to read as something, because
     /// the alternative is a message with a hole in the middle of it.
@@ -316,8 +354,7 @@ mod tests {
     fn refusing_names_the_list_the_misreading_and_the_code() {
         let error = refuse_incomplete(
             ListKind::Followers,
-            StopReason::RateLimit,
-            ExitCode::RateLimited,
+            &stopped(StopReason::RateLimit, None),
             "they did not follow you",
         );
         let text = error.to_string();
@@ -338,8 +375,9 @@ mod tests {
             (StopReason::SessionInvalid, ExitCode::NoSession),
             (StopReason::Truncated, ExitCode::Error),
         ] {
-            let code = ExitCode::from_stop_reason(reason);
-            let error = refuse_incomplete(ListKind::Following, reason, code, "whatever");
+            // Nothing more specific than the stop reason, so the code comes off
+            // the reason — which is `ListOutcome::exit_code`'s fallback.
+            let error = refuse_incomplete(ListKind::Following, &stopped(reason, None), "whatever");
             assert_eq!(ExitCode::from_chain(&error), Some(expected), "{reason:?}");
         }
     }
@@ -351,8 +389,7 @@ mod tests {
     fn a_challenge_keeps_its_own_code_under_a_session_invalid_stop() {
         let error = refuse_incomplete(
             ListKind::Followers,
-            StopReason::SessionInvalid,
-            ExitCode::Challenge,
+            &stopped(StopReason::SessionInvalid, Some(ExitCode::Challenge)),
             "whatever",
         );
         assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Challenge));
@@ -382,8 +419,7 @@ mod tests {
     fn a_refusal_keeps_its_advice_apart_from_what_happened() {
         let error = refuse_incomplete(
             ListKind::Followers,
-            StopReason::RateLimit,
-            ExitCode::RateLimited,
+            &stopped(StopReason::RateLimit, None),
             "they did not follow you",
         );
         assert!(error.to_string().contains("would be wrong"), "{error}");
