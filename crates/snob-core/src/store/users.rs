@@ -44,19 +44,23 @@ pub fn ensure(conn: &Connection, pk: Pk) -> Result<(), StoreError> {
 /// account was seen but never named, and filing `"" -> realname` in
 /// `username_history` would put a change that never happened into the table the
 /// monitor is meant to read.
+/// `prepare_cached` throughout, and that is not a micro-optimization here: this
+/// runs once per account inside `snapshots::save_page`, which is the only
+/// per-account loop in the program. `Connection::execute` and `query_row`
+/// compile their statement every call, so a six-thousand-follower walk was
+/// paying twelve thousand `sqlite3_prepare_v2` calls for two distinct statements.
+/// The cache lives on the connection, so they survive across pages and
+/// transactions.
 pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError> {
     let pk = pk_to_sql(u.pk);
     let now = now();
 
     let previous: Option<String> = conn
-        .query_row(
-            "SELECT username FROM users WHERE pk = ?1",
-            params![pk],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT username FROM users WHERE pk = ?1")?
+        .query_row(params![pk], |row| row.get(0))
         .optional()?;
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO users (pk, username, full_name, is_verified, is_private, pfp_url,
                             first_seen, last_seen)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
@@ -69,19 +73,21 @@ pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError>
              is_private  = coalesce(excluded.is_private,  users.is_private),
              pfp_url     = coalesce(excluded.pfp_url,     users.pfp_url),
              last_seen   = excluded.last_seen",
-        params![
-            pk,
-            u.username,
-            u.full_name,
-            u.is_verified,
-            u.is_private,
-            u.pfp_url,
-            now,
-        ],
-    )?;
+    )?
+    .execute(params![
+        pk,
+        u.username,
+        u.full_name,
+        u.is_verified,
+        u.is_private,
+        u.pfp_url,
+        now,
+    ])?;
 
     match previous {
         Some(old) if !old.is_empty() && old != u.username => {
+            // Not cached: a rename is rare, so keeping a third statement in the
+            // cache would only push out one of the two that run every account.
             conn.execute(
                 "INSERT INTO username_history (pk, username, changed_at) VALUES (?1, ?2, ?3)",
                 params![pk, old, now],
@@ -90,6 +96,19 @@ pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError>
         }
         _ => Ok(None),
     }
+}
+
+/// The stored name, when one was ever learned.
+///
+/// The translation from the empty-string placeholder to `None` happens here, at
+/// the boundary that writes it, so callers never have to know the encoding.
+/// [`find`] hands the raw row back — it is the metadata cache — and every reader
+/// that wanted a *name* was doing its own `is_empty` check against a placeholder
+/// documented on [`ensure`] in another crate.
+pub fn name(conn: &Connection, pk: Pk) -> Result<Option<String>, StoreError> {
+    Ok(find(conn, pk)?
+        .map(|u| u.username)
+        .filter(|name| !name.is_empty()))
 }
 
 pub fn find(conn: &Connection, pk: Pk) -> Result<Option<User>, StoreError> {
