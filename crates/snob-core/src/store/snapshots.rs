@@ -134,24 +134,39 @@ pub fn save_page(
 
     let mut result = SavedPage::default();
 
-    for u in users {
-        if let Some(old) = super::users::upsert(&tx, u)? {
-            result.renamed.push((u.pk, old));
-        }
-
-        // The ordinal counts only the rows that go in, so it advances with
-        // `added` alone. Adding the position within the page as well used to
-        // inflate it on every repeat — and Instagram repeats accounts across
-        // pages, as the OR IGNORE below exists to absorb — which left later
-        // pages starting at a lower ordinal than earlier ones had reached, so
-        // `members` returned them out of the order Instagram served them in.
-        tx.execute(
+    {
+        // Compiled once for the whole page rather than once per account. This is
+        // the only per-account loop in the program, and `Connection::execute`
+        // prepares its statement every call.
+        let mut member = tx.prepare_cached(
             "INSERT OR IGNORE INTO snapshot_members (snapshot_id, user_pk, ordinal)
              VALUES (?1, ?2, ?3)",
-            params![id, pk_to_sql(u.pk), first_ordinal + result.added as i64],
         )?;
-        if tx.changes() > 0 {
-            result.added += 1;
+
+        for u in users {
+            if let Some(old) = super::users::upsert(&tx, u)? {
+                result.renamed.push((u.pk, old));
+            }
+
+            // The ordinal counts only the rows that go in, so it advances with
+            // `added` alone. Adding the position within the page as well used to
+            // inflate it on every repeat — and Instagram repeats accounts across
+            // pages, as the OR IGNORE above exists to absorb — which left later
+            // pages starting at a lower ordinal than earlier ones had reached, so
+            // `members` returned them out of the order Instagram served them in.
+            //
+            // The insert's own answer rather than `tx.changes()`: it is the count
+            // for this statement, where the connection-wide one is whatever ran
+            // last and would follow `upsert` if a statement were ever added
+            // between the two.
+            let inserted = member.execute(params![
+                id,
+                pk_to_sql(u.pk),
+                first_ordinal + result.added as i64
+            ])?;
+            if inserted > 0 {
+                result.added += 1;
+            }
         }
     }
 
