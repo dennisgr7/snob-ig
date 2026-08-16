@@ -311,9 +311,12 @@ deliberately unfinished:
   21631 followers, Instagram served 39 on the first page and offered no cursor.
   `pager::verdict` catches that — the shortfall is far past what deleted
   accounts explain — and `scan` and the set commands refuse rather than cross a
-  list that is 0.2% of the account. The walk cannot be resumed either: the
-  pagination ended, so there is no cursor to store, which is why
-  `try_again_advice` tells the user it starts over rather than continues.
+  list that is 0.2% of the account. This walk cannot be resumed either: the
+  pagination ended, so there is no cursor to store. That is a property of
+  **this** wall and not of `Truncated`, which also arrives from four guards
+  that stop in the middle of the pagination with a cursor saved — so
+  `try_again_advice` asks the store what was kept rather than reading the stop
+  reason as an answer.
   Whether the limit is the account, the session or the endpoint is not known;
   what is known is that the tool reports it instead of answering wrongly.
 - **Real behavior on a 429 has never been provoked on purpose.** The handling is

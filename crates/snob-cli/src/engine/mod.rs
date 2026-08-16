@@ -114,6 +114,17 @@ pub struct ListOutcome {
     /// account verified", and those are exit code 3 and exit code 4, which the
     /// v2 service is meant to be able to tell apart without reading English.
     pub stopped_by: Option<ExitCode>,
+    /// Whether a second run would continue this walk rather than start it
+    /// again.
+    ///
+    /// Asked of the store once the snapshot is closed, rather than worked out
+    /// from [`Self::reason`], because the reason does not know: `Truncated`
+    /// arrives both from the reclassification that happens after pagination has
+    /// already ended — no cursor to store — and from the four guards that stop
+    /// in the middle of it with one saved. Only the store can tell those apart,
+    /// and only the store knows whether the partial has already aged out of the
+    /// resume window.
+    pub resumable: bool,
 }
 
 impl ListOutcome {
@@ -148,6 +159,9 @@ impl ListOutcome {
             taken_at: snapshot.taken_at.unwrap_or_default(),
             account_pk: snapshot.account_pk,
             stopped_by: None,
+            // A stored list is a finished one — the view this comes from cannot
+            // return anything else — so there is nothing left to continue.
+            resumable: false,
         }
     }
 
