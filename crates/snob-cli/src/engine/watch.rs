@@ -470,8 +470,13 @@ fn refusal(outcome: &ListOutcome) -> Option<Skipped> {
 ///
 /// `advance` decides whether the marks move. `snob watch diff` looks and leaves
 /// them alone — a question whose answer changes when it is asked is one nobody
-/// can check.
-pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<WatchReport> {
+/// can check — so every production caller passes `false`, and what `true` is for
+/// is a test that wants a comparison recorded without a network to fetch it
+/// from. It writes through [`crate::engine::watch::commit`]'s function rather
+/// than its own statements, so there is one writer of marks in the program: the
+/// two paths used to disagree about which lists a report had spoken about, and
+/// the tests were then proving something about a path production never took.
+pub fn from_store(app: &mut App, typed: Option<&str>, advance: bool) -> Result<WatchReport> {
     let (pk, username) = resolve(app, typed)?;
 
     // From the view, so an interrupted walk cannot become a basis for
@@ -492,13 +497,19 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
     let compared = compare(app, pk, &usable, head)?;
 
     if advance {
-        let at = snob_core::store::now();
-        for &(kind, snapshot_id) in &compared.marks {
-            store::set_mark(app.db().conn(), pk, kind, snapshot_id, at)?;
-        }
-        if let Some(cursor) = compared.rename_cursor {
-            store::set_rename_cursor(app.db().conn(), pk, cursor, at)?;
-        }
+        // Through `commit_report`, the same function a tick writes with, so
+        // there is one writer of marks in the program rather than two that can
+        // come to disagree. No report is queued: this path is for a caller that
+        // wants the answer recorded without sending anything.
+        let (_, db, _) = app.parts();
+        store::commit_report(
+            db,
+            pk,
+            &compared.marks,
+            snob_core::store::now(),
+            compared.rename_cursor,
+            None,
+        )?;
     }
 
     let mut report = compared.report;

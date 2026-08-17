@@ -125,12 +125,7 @@ fn build_client(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, IgError> {
-    Ok(reqwest::Client::builder()
-        .user_agent(user_agent.to_string())
-        .redirect(redirect)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()?)
+    Ok(crate::http::builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()?)
 }
 
 /// Reads a response body, refusing one that will not fit.

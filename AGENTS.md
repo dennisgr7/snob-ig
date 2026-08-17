@@ -155,6 +155,17 @@ closed complete while the other was still paging into it, or the slower one
 threw the finished capture back to incomplete, or one process's
 `delete_partials` deleted a walk the other was writing to.
 
+Three rules keep the lease honest, and each closed a defect the lease itself
+caused. `CLAIM_TTL_SECS` is **strictly shorter** than `RESUME_WINDOW_SECS`:
+`claimed_at` is never earlier than `started_at`, so with the two equal "the
+claim went stale" and "the partial is still worth resuming" could not both hold
+and no interrupted walk could ever be adopted. `save_page` **refuses** a
+snapshot this process does not hold, so a walk whose claim was taken stops
+instead of interleaving its pages with the adopter's. And a caller that only
+wants to *know* whether a walk could be continued asks `is_resumable`, which
+does not claim — asking with `resumable` handed the claim back to the process
+that was exiting.
+
 Configuration is the other half, and it goes in the **roaming** directory where
 it belongs — one file, `watch.toml`, written by `snob watch setup`. Nothing else
 writes there and `ensure_dirs` still does not create it, so somebody who never
@@ -190,14 +201,19 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
-| Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete` |
+| Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all` — `logout` calls `delete`, which takes the session and nothing else |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
-| Owed reports are retried by any run, not only by one that had news | `deliver` drains the queue outside the branch that needs a report of its own |
-| A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every compared list from the oldest cursor and deduplicates by `pk` |
+| Owed reports are retried by any run, not only by one that had news | `run_one` and `once` drain the queue once per run, after every account, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not |
+| A queued report can only go to the address it was addressed to | `watch_deliveries.destination`, which `deliveries::due` filters on |
+| A credential set up for one host is not sent to another | `delivery_from` compares origins before attaching the keyring token or the file's headers |
+| A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every list this run verified, from the account's one cursor, and deduplicates by `pk` |
+| The rename cursor moves only when a window was read | `commit_report` takes `Option<i64>`; a run that compared nothing passes `None` |
 | A resolved account is reused only for the account it was resolved for | `App::resolved_target` keys on the question, not only the answer |
-| Two runs never happen inside the minimum gap, whatever moved them | `schedule::due`, which refuses before it declares one due |
+| Two runs never happen inside the minimum gap, whatever moved them | `schedule::next_after`, which starts its search at `last + MIN_GAP_SECS` — so the answer is both far enough away and on the calendar |
 | What a receiver deduplicates on is unique | `run_id`, which is `UNIQUE` — not the rowid, which SQLite reuses |
 | A configured header cannot be one the request could not carry | `webhook::check`, which builds every name and value before accepting the address |
+| A configured header cannot frame the message or forge the protocol | `webhook::check` refuses `Content-Length` and the rest of the framing set, and the whole `X-Snob-` prefix |
+| A walk in progress has exactly one writer | `snapshots::save_page` refuses a snapshot this process does not hold; `is_resumable` asks without claiming |
 | Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
 | A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
 
@@ -356,12 +372,20 @@ deliberately unfinished:
   address the user chose. `lost`/`gained` are its words for the temporal diff —
   `unfollowers` is the static set and must never drift to mean `lost`.
 
-  Seven things about it are worth knowing before changing any of it:
+  Nine things about it are worth knowing before changing any of it:
 
   - **It compares against what was last *reported*** — `watch_marks` — and not
     against the previous capture. Those come apart the moment somebody runs
     `snob followers` by hand between two runs, and reading the capture instead
     silently swallows everything that happened before it.
+  - **The rename window has one cursor per account, and it moves only when the
+    window was read.** It was a column on `watch_marks`, so an account had one
+    per list and they could disagree — reading the older re-announced renames a
+    refused list had already had sent, reading the newer would have skipped the
+    gap for anybody in only one list. And it advanced for every list a run did
+    not refuse, including a run that compared nothing, which stepped over
+    anything filed in between. The window covers every list the run *verified*,
+    which includes an unchanged one: a rename moves nobody in or out of a list.
   - **Both of its windows are bounded by ids, not timestamps**: `snapshots.id`
     for the captures, `username_history.id` for the renames. `taken_at` and
     `changed_at` are in whole seconds, so two events inside one second are
@@ -394,20 +418,32 @@ deliberately unfinished:
     against whatever decides the schedule, not against the interval — with a
     calendar, dividing elapsed time by `--every` gives a number that is simply
     false, and it is printed at the user.
-  - **`MIN_GAP_SECS` binds every syntax, not just `--every`.** `Schedule::cron`
-    did not validate at all and `validated` only looked at the interval, so the
-    tool refused `--every 5m` while accepting `--cron "*/5 * * * *"` and
-    `--at 09:00,09:05`, which run exactly as often. `Calendar::tightest_gap` is
-    what closes it, and it counts the wrap around midnight.
+  - **`MIN_GAP_SECS` binds every syntax, and it binds the runs rather than the
+    grid.** `Schedule::cron` did not validate at all and `validated` only looked
+    at the interval, so the tool refused `--every 5m` while accepting
+    `--cron "*/5 * * * *"` and `--at 09:00,09:05`, which run exactly as often;
+    `Calendar::tightest_gap` closes that, counting the wrap around midnight only
+    when two allowed days can actually be consecutive. But validating the grid is
+    not enough, because jitter moves each run off it and the next moment is
+    computed from where the run really landed. So the floor lives in
+    `next_after`'s **search start**, not in a check after the answer: put after
+    it, a calendar never reached it, and when it was reached it answered
+    `last + MIN_GAP_SECS` — an instant the calendar forbids.
   - **The webhook is queued before the mark moves, in one transaction.** A
     change that has been reported is one the next run will not find, so if the
     mark moved without the queue row the change would be gone. Delivery is
     therefore at-least-once, which is what `X-Snob-Delivery` is for. Retrying
     here does **not** contradict the hard-stop rule: that rule is about
     Instagram, a service that did not ask to be talked to; this is the user's
-    own server. A refusal — anything but 408 and 429 — is still not retried.
-    The body is stored as the exact string that was signed, because the
-    signature covers bytes and a second rendering could differ.
+    own server. **Every answer the far end gives is retried**, 4xx included: a
+    4xx was treated as final, and because the mark has already moved by then,
+    one 404 from a workflow that happened not to be registered threw away the
+    only copy of a set of arrivals and departures. What bounds the retrying is
+    the attempt count and the age, not a guess about a status. The body is
+    stored as the exact string that was signed, because the signature covers
+    bytes and a second rendering could differ — and `watch_deliveries.destination`
+    records where it was addressed, so a run pointed somewhere else by
+    `--webhook` cannot flush the backlog to a host nobody configured.
   - **Retention keeps three things whatever their age**, and each is
     load-bearing: the capture every mark points at (it is the next diff's
     baseline, and taking it costs one silently missed report), the newest

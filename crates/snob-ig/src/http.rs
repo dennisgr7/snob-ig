@@ -33,8 +33,32 @@ pub use reqwest;
 /// server that accepts the connection and then says nothing hangs the process
 /// for good, and neither a cancel token nor any deadline above reaches a socket
 /// that is simply waiting.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The builder every client in this program starts from.
+///
+/// Shared rather than written twice, which it was: `client::build_client` was
+/// this statement for statement, differing only in its two numbers and in the
+/// error it returns. A setting that has to hold for every client this program
+/// makes now has one place to go, instead of two that can be half updated.
+///
+/// The timeouts are arguments rather than constants here because the two callers
+/// really do want different ones — Instagram's walk is slower than a POST to a
+/// webhook on the same network — and because a builder that chose for them would
+/// be a third opinion about it.
+pub fn builder(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(user_agent.to_string())
+        .redirect(redirect)
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+}
 
 /// A client that carries no credential.
 ///
@@ -46,12 +70,7 @@ pub fn plain(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
 ) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(user_agent.to_string())
-        .redirect(redirect)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
+    builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()
 }
 
 /// Reads a response body, stopping at `cap`.
