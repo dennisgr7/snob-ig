@@ -226,8 +226,14 @@ mod tests {
         assert!(paths.browser_profile().starts_with(paths.data_dir()));
     }
 
-    /// Only what gets written to. A directory for a configuration file that
-    /// does not exist is litter left on every machine the tool runs on.
+    /// Only what gets written to. A directory for a configuration file nobody
+    /// has written is litter left on every machine the tool runs on.
+    ///
+    /// There *is* a configuration file now — `snob watch setup` writes one —
+    /// and this still holds, because that command creates the directory itself
+    /// rather than `ensure_dirs` creating it for everybody. Somebody who never
+    /// runs the monitor still gets no empty folder in their roaming profile,
+    /// which is what this has always been about.
     #[test]
     fn only_the_data_directory_is_created() {
         let tmp = tempfile::tempdir().unwrap();
@@ -237,7 +243,7 @@ mod tests {
         assert!(paths.data_dir().is_dir());
         assert!(
             !paths.config_dir().exists(),
-            "nothing writes configuration yet, so nothing should create its home"
+            "the directory belongs to whatever writes configuration, not to every run"
         );
     }
 

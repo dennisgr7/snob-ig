@@ -85,6 +85,11 @@ base64 = "0.23"
 # alternatives and are exactly the two crates that do not build there.
 # On Linux both are already in the tree, through the keyring's Secret Service
 # backend; on Windows and macOS they are a few hundred lines of new code.
+# The monitor's configuration file. Reading only: the file is written by hand
+# from a template, because a serializer cannot put the reason for a value next
+# to it and this project puts the reason next to the thing it governs.
+# `default-features = false` drops the serializing half and `toml_edit` with it.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 hmac = "0.12"
 sha2 = { version = "0.10", default-features = false }
 # Already in the tree under `url`, so this costs no extra compilation. Used to

@@ -354,6 +354,33 @@ pub enum WatchCommand {
                       nothing and says so."
     )]
     Once(WatchOnceArgs),
+
+    /// Write the configuration file, step by step
+    #[command(
+        after_help = "Asks how often to run, where to send the reports, and which accounts to \
+                      watch, then writes a file you can edit afterwards.\n\n\
+                      A token or a signing key goes into the system keyring, never into the \
+                      file: it sits at a guessable path and would end up in every backup of \
+                      your home directory. \"snob purge\" removes both."
+    )]
+    Setup(WatchSetupArgs),
+
+    /// What is configured, when it last ran, and what is still owed
+    Status(WatchStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct WatchSetupArgs {
+    /// Print what would be written and write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchStatusArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

@@ -47,6 +47,52 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
     Ok(mark)
 }
 
+/// One receipt, with what it is a receipt for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountMark {
+    pub account_pk: Pk,
+    pub kind: ListKind,
+    pub snapshot_id: Option<i64>,
+    pub compared_at: i64,
+}
+
+/// Every receipt there is, newest first.
+///
+/// What `snob watch status` reads. It is the only way to tell a monitor that
+/// has been running and finding nothing from one that stopped weeks ago, and
+/// those look identical from outside.
+pub fn all_marks(conn: &Connection) -> Result<Vec<AccountMark>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT account_pk, kind, snapshot_id, compared_at
+         FROM watch_marks ORDER BY compared_at DESC, account_pk, kind",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(1)?;
+        Ok((row.get::<_, i64>(0)?, kind, row.get(2)?, row.get(3)?))
+    })?;
+
+    let mut marks = Vec::new();
+    for row in rows {
+        let (pk, kind, snapshot_id, compared_at) = row?;
+        // The column has a CHECK that only allows the two, so anything else
+        // means the file was written by something that is not this program.
+        // Skipped rather than guessed at: reporting a row as "followers"
+        // because it could not be read would answer about a list nobody asked
+        // about.
+        let Ok(kind) = kind.parse::<ListKind>() else {
+            tracing::warn!(kind, "a watch mark names a list this version does not know");
+            continue;
+        };
+        marks.push(AccountMark {
+            account_pk: pk_from_sql(pk),
+            kind,
+            snapshot_id,
+            compared_at,
+        });
+    }
+    Ok(marks)
+}
+
 /// The newest row in the rename history, as an id.
 ///
 /// Read once when a report is made and stored on the mark, so that the next
