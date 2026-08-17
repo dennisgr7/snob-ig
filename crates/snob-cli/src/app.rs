@@ -62,8 +62,8 @@ pub struct App {
     cancel: CancelToken,
     viewer: Viewer,
     consented: bool,
-    /// The account this run is about, once something has worked it out, and the
-    /// request count at the moment it did.
+    /// What was asked for, what it resolved to, and the request count at the
+    /// moment it did.
     ///
     /// A crossing calls `engine::list` twice, and each call used to resolve from
     /// scratch: two identical `web_profile_info` requests about the same account
@@ -71,12 +71,31 @@ pub struct App {
     /// four, because resolving the name and polling the counters are separate
     /// requests there.
     ///
-    /// The count is what makes reuse safe. Anything that spends a request may
-    /// have changed the account — a walk, a retry, a `--refresh` — so the memo
-    /// is only good while `Pacer::spent()` has not moved. That is strictly
-    /// stronger than asking whether the previous list came from cache, and it
-    /// reuses the number AGENTS.md already names as the truth about requests.
-    resolved: Option<(target::Target, u32)>,
+    /// **The question is part of the key, not just the answer.** This used to
+    /// hold the target alone, which was indistinguishable from correct while
+    /// one `App` meant one account. `snob watch` broke that: it walks several
+    /// configured accounts through a single `App`, and the second account was
+    /// silently handed the first one's target — never resolved, never walked,
+    /// and its changes committed under the first account's marks. Keying on what
+    /// was asked makes reuse mean "the same question", which is what the memo
+    /// was always for.
+    ///
+    /// The count is what makes reuse safe in time. Anything that spends a
+    /// request may have changed the account — a walk, a retry, a `--refresh` —
+    /// so the memo is only good while `Pacer::spent()` has not moved. That is
+    /// strictly stronger than asking whether the previous list came from cache,
+    /// and it reuses the number AGENTS.md already names as the truth about
+    /// requests.
+    resolved: Option<Memo>,
+}
+
+/// One resolution, and the question it answers.
+struct Memo {
+    /// The `--target` this was resolved for, exactly as it was given. `None` is
+    /// the viewer's own account, which is a different question from any name.
+    asked: Option<String>,
+    target: target::Target,
+    spent: u32,
 }
 
 impl App {
@@ -226,19 +245,31 @@ impl App {
     /// fine — the first list already passed it, and the account cannot have
     /// become private in between in a way that matters — but it is a skip, not
     /// an oversight.
-    pub fn resolved_target(&self) -> Option<target::Target> {
-        let (target, at) = self.resolved.as_ref()?;
-        let mut target = target.clone();
-        if *at != self.client.pacer().spent() {
+    /// What `asked` resolved to earlier in this run, if it was the same
+    /// question.
+    ///
+    /// Compared raw, on the string that was given. Two spellings of one account
+    /// simply miss the memo and resolve again, which costs a request; a memo
+    /// handed to the wrong account costs correctness, and that is not a trade.
+    pub fn resolved_target(&self, asked: Option<&str>) -> Option<target::Target> {
+        let memo = self.resolved.as_ref()?;
+        if memo.asked.as_deref() != asked {
+            return None;
+        }
+        let mut target = memo.target.clone();
+        if memo.spent != self.client.pacer().spent() {
             target.counters = None;
         }
         Some(target)
     }
 
-    /// Remembers what the run is about, stamped with what had been spent.
-    pub fn remember_target(&mut self, target: target::Target) {
-        let spent = self.client.pacer().spent();
-        self.resolved = Some((target, spent));
+    /// Remembers what a question resolved to, stamped with what had been spent.
+    pub fn remember_target(&mut self, asked: Option<&str>, target: target::Target) {
+        self.resolved = Some(Memo {
+            asked: asked.map(str::to_string),
+            target,
+            spent: self.client.pacer().spent(),
+        });
     }
 
     /// Adds the counters a poll just obtained, and re-stamps.
@@ -251,9 +282,9 @@ impl App {
     /// have moved.
     pub fn remember_counters(&mut self, counters: target::Counters) {
         let spent = self.client.pacer().spent();
-        if let Some((target, at)) = &mut self.resolved {
-            target.counters = Some(counters);
-            *at = spent;
+        if let Some(memo) = &mut self.resolved {
+            memo.target.counters = Some(counters);
+            memo.spent = spent;
         }
     }
 

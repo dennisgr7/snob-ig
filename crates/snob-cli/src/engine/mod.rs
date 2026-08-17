@@ -241,7 +241,7 @@ async fn decide(
     // A crossing asks for two lists, and resolving is a request. Reusing what
     // the first call worked out is what stops the second asking Instagram the
     // identical question about the identical account seconds later.
-    let target = match app.resolved_target() {
+    let target = match app.resolved_target(args.target.as_deref()) {
         Some(target) => target,
         None => {
             let target = if args.cache {
@@ -249,7 +249,7 @@ async fn decide(
             } else {
                 target::resolve(app, args).await?
             };
-            app.remember_target(target.clone());
+            app.remember_target(args.target.as_deref(), target.clone());
             target
         }
     };

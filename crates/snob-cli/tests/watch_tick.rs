@@ -325,6 +325,75 @@ async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
     assert_eq!(last.changes, 0);
 }
 
+/// Two watched accounts are two accounts.
+///
+/// `run_one` shares one `App` across every configured `[[account]]`, and the
+/// resolution memo on it used to be keyed on nothing at all. So the second
+/// account silently reused the first one's target: never resolved, never
+/// walked, and its report committed under the first account's marks. Every
+/// change on every account after the first was lost, while `status` showed a
+/// healthy mark and the webhook got the first account's report twice.
+///
+/// The assertion is the one that would have caught it: two distinct account ids.
+#[tokio::test]
+async fn a_second_watched_account_is_walked_as_itself() {
+    let server = MockServer::start().await;
+
+    // Two profiles, answering on the name each is asked about.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/web_profile_info/"))
+        .and(wiremock::matchers::query_param("username", "other"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"99","username":"other",
+                "edge_followed_by":{"count":1},"edge_follow":{"count":1}}}}"#,
+        ))
+        .mount(&server)
+        .await;
+    mount_profile(&server, 2, 2).await;
+
+    mount_list(&server, "followers", &[1, 2]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+    for kind in ["followers", "following"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/friendships/99/{kind}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"users":[{"pk":7,"username":"u7"}]}"#),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+
+    let mut seen = Vec::new();
+    for watched in [
+        Watched::own(),
+        Watched::consented("other".into(), watch::Consent { given_at: 1 }),
+    ] {
+        seen.push(run(&mut app, &watched).await.report.account_pk);
+    }
+
+    assert_eq!(
+        seen,
+        vec![42, 99],
+        "the second account was handed the first one's target"
+    );
+
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.to_string())
+        .collect();
+    assert!(
+        asked.iter().any(|u| u.contains("/friendships/99/")),
+        "the second account's lists were never requested: {asked:?}"
+    );
+}
+
 /// Your own account needs nobody's permission; somebody else's does, and a
 /// scheduled run has nobody to ask.
 #[tokio::test]
