@@ -154,6 +154,11 @@ impl Watched {
         }
     }
 
+    /// Whose account this is, when it is not the session's.
+    pub fn name(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
     /// Whether this may run with nobody there to answer a question.
     ///
     /// Your own account always may. Somebody else's may only when the answer
@@ -499,17 +504,39 @@ fn compare(
         }
     }
 
-    // Looked for in one capture, not both. An account can be in the followers
-    // list and the following list at once — that is what a friend is — and
-    // asking about each list separately would report their rename twice.
-    let renamed = match followers.as_ref().or(following.as_ref()) {
-        Some(report) if report.compared() => store::renames_since(
-            app.db().conn(),
-            report.basis.mark_to(),
-            report.history_cursor,
-        )?,
-        _ => Vec::new(),
-    };
+    // Renames are looked for across **every** list that was compared, and
+    // deduplicated afterwards.
+    //
+    // This used to ask about one capture — followers when there was one — and
+    // that was wrong three ways, all of them silent. Somebody only in the
+    // following list, which is exactly the `unfollowers` set, had their rename
+    // dropped and the cursor advanced past it, so it was never reported by
+    // anybody. A run where followers was `Unchanged` and following was compared
+    // reported none at all, for the same reason. And when one list was refused
+    // its cursor stayed behind, so the next run read from the older of the two
+    // and announced renames it had already sent.
+    //
+    // The window starts at the **oldest** cursor among the lists being marked,
+    // so nothing between the two is skipped; anything that produces is
+    // deduplicated by `pk` below, which is what the old single-capture reading
+    // was really trying to achieve. A friend is in both lists and is one person.
+    let compared: Vec<&ListReport> = [followers.as_ref(), following.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|report| report.compared())
+        .collect();
+
+    let mut renamed: Vec<Rename> = Vec::new();
+    if let Some(since) = compared.iter().map(|r| r.history_cursor).min() {
+        let mut seen = std::collections::HashSet::new();
+        for report in &compared {
+            for rename in store::renames_since(app.db().conn(), report.basis.mark_to(), since)? {
+                if seen.insert(rename.pk) {
+                    renamed.push(rename);
+                }
+            }
+        }
+    }
 
     if let Some((at, head)) = advance {
         // Only the lists that made it this far. A list the caller left out was

@@ -306,6 +306,97 @@ async fn a_rename_is_reported_as_a_rename_and_nothing_else() {
     assert_eq!(changes.renamed[0].to, "after");
 }
 
+/// The defect that made renames useless for exactly the people this tool is
+/// about.
+///
+/// Somebody you follow who does not follow you back is in `following` and not
+/// in `followers` — the `unfollowers` set, the whole point of the program. The
+/// rename window used to be read from the followers capture alone, so their
+/// rename was never found, and the cursor moved past it anyway: not reported
+/// then, and not reported ever.
+#[tokio::test]
+async fn a_rename_of_somebody_only_in_the_following_list_is_reported() {
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "a_follower")]));
+    walked(&mut db, ListKind::Following, &users(&[(2, "before")]));
+
+    let mut app = app(&server, db);
+    watch::from_store(&app, None, true).unwrap();
+
+    walked_in(&mut app, ListKind::Followers, &users(&[(1, "a_follower")]));
+    walked_in(&mut app, ListKind::Following, &users(&[(2, "after")]));
+
+    let report = watch::from_store(&app, None, true).unwrap();
+    let changes = report.changes();
+
+    assert_eq!(changes.renamed.len(), 1, "they are in a list this watches");
+    assert_eq!(changes.renamed[0].from, "before");
+    assert_eq!(changes.renamed[0].to, "after");
+}
+
+/// The same defect from the other side: with followers unchanged and only the
+/// following list walked, no rename was reported at all.
+#[tokio::test]
+async fn a_rename_is_reported_when_only_the_following_list_moved() {
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "a_follower")]));
+    walked(&mut db, ListKind::Following, &users(&[(2, "before")]));
+
+    let mut app = app(&server, db);
+    watch::from_store(&app, None, true).unwrap();
+
+    // Only the following list is walked again — what happens when the followers
+    // counter has not moved.
+    walked_in(&mut app, ListKind::Following, &users(&[(2, "after")]));
+
+    let report = watch::from_store(&app, None, true).unwrap();
+    assert_eq!(
+        report.changes().renamed.len(),
+        1,
+        "the list that was walked had a rename in it"
+    );
+}
+
+/// And the third: a rename must not be announced twice because one list was
+/// refused and its cursor stayed behind.
+#[tokio::test]
+async fn a_rename_is_not_repeated_when_one_list_was_refused() {
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
+    walked(&mut db, ListKind::Following, &users(&[(1, "before")]));
+
+    let mut app = app(&server, db);
+    watch::from_store(&app, None, true).unwrap();
+
+    // A rename, seen by a followers walk that finished and a following walk
+    // that did not — so only the followers mark moves.
+    walked_in(&mut app, ListKind::Followers, &users(&[(1, "after")]));
+    cut_short_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
+
+    assert_eq!(
+        watch::from_store(&app, None, true)
+            .unwrap()
+            .changes()
+            .renamed
+            .len(),
+        1,
+        "reported once"
+    );
+
+    walked_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
+    assert!(
+        watch::from_store(&app, None, true)
+            .unwrap()
+            .changes()
+            .renamed
+            .is_empty(),
+        "and not again once the other list catches up"
+    );
+}
+
 /// Somebody in both lists is one person. Asking each list separately would file
 /// their rename twice.
 #[tokio::test]

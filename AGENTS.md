@@ -181,6 +181,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 | Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete` |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
+| Owed reports are retried by any run, not only by one that had news | `deliver` drains the queue outside the branch that needs a report of its own |
+| A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every compared list from the oldest cursor and deduplicates by `pk` |
 
 ## Running headless
 
@@ -359,15 +361,27 @@ deliberately unfinished:
     keeps them, so the second list asks nothing. A test asserts it.
   - **The schedule reads no clock.** `watch::schedule` takes `now` as an
     argument everywhere, the shape `rate_budget::decide` set, so all of it is
-    tested with literal timestamps and nothing waits. Its cron parser produces
-    the same `Calendar` `--on mon --at 09:00` does — one evaluator, two
-    syntaxes, so "Monday at nine" cannot come to mean two things — and that is
-    why there is a parser rather than a dependency: the hard part of cron is
-    that the two day fields combine with OR when both are restricted and AND
-    when either is `*`, and getting it wrong fires on the wrong days silently.
+    tested with literal timestamps and nothing waits. One evaluator, two
+    syntaxes — but they are not the same reading: cron crosses its hour and
+    minute fields, which is what `0,30 9,21 * * *` means, while `--at
+    09:00,21:30` is two exact moments and not the four that crossing gives. A
+    `Calendar` from `--at` carries the pairs; one from cron does not. What the
+    two must agree on is the moments they fire at, and a test compares those
+    rather than the fields. The parser is written here rather than depended on
+    because the hard part of cron is that the two day fields combine with OR
+    when both are restricted and AND when either is `*`, and getting it wrong
+    fires on the wrong days silently.
     Missed runs are **folded into one and never replayed**: firing twelve to
     catch up is the burst the pacing exists to prevent, and they would all
-    report the same present state anyway.
+    report the same present state anyway. How many were missed is counted
+    against whatever decides the schedule, not against the interval — with a
+    calendar, dividing elapsed time by `--every` gives a number that is simply
+    false, and it is printed at the user.
+  - **`MIN_GAP_SECS` binds every syntax, not just `--every`.** `Schedule::cron`
+    did not validate at all and `validated` only looked at the interval, so the
+    tool refused `--every 5m` while accepting `--cron "*/5 * * * *"` and
+    `--at 09:00,09:05`, which run exactly as often. `Calendar::tightest_gap` is
+    what closes it, and it counts the wrap around midnight.
   - **The webhook is queued before the mark moves, in one transaction.** A
     change that has been reported is one the next run will not find, so if the
     mark moved without the queue row the change would be gone. Delivery is
