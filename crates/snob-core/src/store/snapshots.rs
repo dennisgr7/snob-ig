@@ -8,7 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Store, StoreError, now, pk_from_sql, pk_to_sql};
+use super::{Store, StoreError, now, now_ms, pk_from_sql, pk_to_sql};
 use crate::Pk;
 use crate::model::{ListKind, StopReason, User};
 
@@ -18,6 +18,35 @@ use crate::model::{ListKind, StopReason, User};
 /// produces a list that reflects no single instant, and comparing it against
 /// another invents arrivals and departures that never happened.
 pub const RESUME_WINDOW_SECS: i64 = 15 * 60;
+
+/// How long a claim on a walk outlives the last page it saved.
+///
+/// A different question from [`RESUME_WINDOW_SECS`], and deliberately its own
+/// number: that one asks whether a partial still describes one moment, this one
+/// asks whether anybody is still working on it. A walk that keeps saving pages
+/// keeps its claim however long the list is, because `save_page` refreshes it;
+/// what this bounds is how long a walk whose process was killed goes on looking
+/// busy.
+///
+/// Fifteen minutes rather than something tighter because the pacer can
+/// legitimately be quiet for a long time: `Pace::third_party` waits up to thirty
+/// seconds between pages, and the request budget can ration for minutes on top
+/// of that. Being slow to release an abandoned claim costs one resume; releasing
+/// a live one costs two processes writing into one capture, which is the whole
+/// thing this prevents.
+pub const CLAIM_TTL_SECS: i64 = 15 * 60;
+
+/// Who this process is, for the length of this process.
+///
+/// The pid and the moment it was first asked. Neither alone is enough — pids are
+/// reused, and two processes can start in the same second — but a process that
+/// has the same pid as an earlier one necessarily started later, so the pair is
+/// unique among the processes that can be running at once. That is all a claim
+/// needs: it is not an identity, it is "not me".
+pub fn this_process() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| format!("{}-{}", std::process::id(), now_ms()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -58,7 +87,7 @@ pub struct Opened {
     pub started_at: i64,
 }
 
-/// Starts a new snapshot.
+/// Starts a new snapshot, claimed by this process.
 pub fn begin(
     conn: &Connection,
     account_pk: Pk,
@@ -67,13 +96,15 @@ pub fn begin(
 ) -> Result<Opened, StoreError> {
     let started_at = now();
     conn.execute(
-        "INSERT INTO snapshots (account_pk, kind, source, started_at, declared_count)
-         VALUES (?1, ?2, 'live', ?3, ?4)",
+        "INSERT INTO snapshots
+            (account_pk, kind, source, started_at, declared_count, claimed_by, claimed_at)
+         VALUES (?1, ?2, 'live', ?3, ?4, ?5, ?3)",
         params![
             pk_to_sql(account_pk),
             kind.as_str(),
             started_at,
             declared_count.map(|v| v as i64),
+            this_process(),
         ],
     )?;
     Ok(Opened {
@@ -82,22 +113,58 @@ pub fn begin(
     })
 }
 
-/// Looks for an interrupted walk that can still be continued.
+/// Looks for an interrupted walk this process may continue, and takes it.
+///
+/// **The claim is taken in the same statement that finds the row**, which is
+/// what makes it safe between processes: `UPDATE … WHERE` is atomic under
+/// SQLite's write lock, so two processes racing for one partial cannot both
+/// win. Reading first and claiming afterwards would leave exactly the window
+/// this exists to close.
+///
+/// A partial is available when nobody holds it, when this process already does
+/// — resuming its own work after a restart within the window — or when whoever
+/// held it has not saved a page for [`CLAIM_TTL_SECS`] and is taken to be gone.
 pub fn resumable(
     conn: &Connection,
     account_pk: Pk,
     kind: ListKind,
 ) -> Result<Option<Snapshot>, StoreError> {
-    let cutoff = now() - RESUME_WINDOW_SECS;
+    let now = now();
+    let claimed = conn.execute(
+        "UPDATE snapshots
+         SET claimed_by = ?4, claimed_at = ?5
+         WHERE id = (
+           SELECT id FROM snapshots
+           WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
+             AND next_cursor IS NOT NULL AND started_at >= ?3
+             AND (claimed_by IS NULL OR claimed_by = ?4
+                  OR claimed_at IS NULL OR claimed_at < ?6)
+           ORDER BY started_at DESC LIMIT 1
+         )",
+        params![
+            pk_to_sql(account_pk),
+            kind.as_str(),
+            now - RESUME_WINDOW_SECS,
+            this_process(),
+            now,
+            now - CLAIM_TTL_SECS,
+        ],
+    )?;
+
+    if claimed == 0 {
+        return Ok(None);
+    }
+
+    // Read back the row this process now holds. Nothing else can be writing to
+    // it: the claim above is what says so.
     let snapshot = conn
         .query_row(
             "SELECT id, account_pk, kind, started_at, taken_at, complete, member_count,
                     declared_count, pages, requests, next_cursor, resumes
              FROM snapshots
-             WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-               AND next_cursor IS NOT NULL AND started_at >= ?3
+             WHERE account_pk = ?1 AND kind = ?2 AND complete = 0 AND claimed_by = ?3
              ORDER BY started_at DESC LIMIT 1",
-            params![pk_to_sql(account_pk), kind.as_str(), cutoff],
+            params![pk_to_sql(account_pk), kind.as_str(), this_process()],
             row_to_snapshot,
         )
         .optional()?;
@@ -170,14 +237,19 @@ pub fn save_page(
         }
     }
 
+    // `claimed_at` moves with every page, which is what lets a claim outlive a
+    // long walk without outliving a dead process: progress is the evidence that
+    // somebody is still here.
     tx.execute(
         "UPDATE snapshots
          SET member_count = member_count + ?2,
              pages        = pages + 1,
              requests     = requests + 1,
-             next_cursor  = ?3
+             next_cursor  = ?3,
+             claimed_by   = ?4,
+             claimed_at   = ?5
          WHERE id = ?1",
-        params![id, result.added as i64, cursor],
+        params![id, result.added as i64, cursor, this_process(), now()],
     )?;
 
     tx.commit()?;
@@ -185,13 +257,25 @@ pub fn save_page(
 }
 
 /// Closes the snapshot. Only a full walk leaves it usable for comparison.
+///
+/// **A finished capture is never unfinished again.** The `complete = 0` guard
+/// is what says so, and it is not defensive coding: two processes that had
+/// adopted one row could have the faster one close it `Completed` and the
+/// slower one, throttled seconds later, close the same row `RateLimit` — and
+/// the account's only usable capture disappeared, while the monitor's mark had
+/// already moved past it. Claims make that pair unreachable now; this makes the
+/// outcome unreachable regardless of how the pair arises.
+///
+/// The claim is released either way. The walk is over, so anything else may
+/// have the row.
 pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), StoreError> {
     let complete = reason.yields_complete_list();
     conn.execute(
         "UPDATE snapshots
          SET complete = ?2, taken_at = ?3, stopped_by = ?4,
-             next_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE next_cursor END
-         WHERE id = ?1",
+             next_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE next_cursor END,
+             claimed_by = NULL, claimed_at = NULL
+         WHERE id = ?1 AND complete = 0",
         params![id, complete, now(), reason.as_str()],
     )?;
     Ok(())
@@ -269,9 +353,25 @@ pub fn delete_partials(
     account_pk: Pk,
     kind: ListKind,
 ) -> Result<usize, StoreError> {
+    // Anything another process is actively writing to is left alone. This used
+    // to delete every incomplete row, so one process starting a walk removed a
+    // walk another was in the middle of — the victim's next `save_page` then
+    // failed against a row that no longer existed, having spent its requests
+    // for nothing.
+    //
+    // A claim that has gone stale is not protection: whoever held it is gone,
+    // and the row is exactly the abandoned partial this is here to clear.
     let deleted = conn.execute(
-        "DELETE FROM snapshots WHERE account_pk = ?1 AND kind = ?2 AND complete = 0",
-        params![pk_to_sql(account_pk), kind.as_str()],
+        "DELETE FROM snapshots
+         WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
+           AND (claimed_by IS NULL OR claimed_by = ?3
+                OR claimed_at IS NULL OR claimed_at < ?4)",
+        params![
+            pk_to_sql(account_pk),
+            kind.as_str(),
+            this_process(),
+            now() - CLAIM_TTL_SECS,
+        ],
     )?;
     Ok(deleted)
 }
@@ -319,6 +419,154 @@ mod tests {
         users::upsert(db.conn(), &user(1)).unwrap();
         accounts::upsert(db.conn(), 1, true).unwrap();
         db
+    }
+
+    /// Pretends to be another process by writing its claim directly.
+    ///
+    /// `this_process` is a per-process constant, so a test cannot be a second
+    /// process — but every read of a claim compares against that constant, and
+    /// a row claimed by anything else is exactly what the other process leaves
+    /// behind. `at` is when that process last saved a page.
+    fn claimed_by_somebody_else(db: &Store, id: i64, at: i64) {
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET claimed_by = 'another-process', claimed_at = ?2
+                 WHERE id = ?1",
+                params![id, at],
+            )
+            .unwrap();
+    }
+
+    /// A walk somebody else is in the middle of is not adopted.
+    ///
+    /// This is the whole point of the claim. One `snob watch` running while
+    /// somebody types `snob followers` used to have both processes continue the
+    /// same partial and write into one capture.
+    #[test]
+    fn a_walk_another_process_is_working_on_is_left_alone() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, id, now());
+
+        assert!(
+            resumable(db.conn(), 1, ListKind::Followers)
+                .unwrap()
+                .is_none(),
+            "somebody else is walking this one"
+        );
+    }
+
+    /// And one they abandoned is. Nothing can tell us a process died, so the
+    /// evidence is that it has stopped saving pages.
+    #[test]
+    fn a_walk_abandoned_long_enough_is_adopted() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, id, now() - CLAIM_TTL_SECS - 1);
+
+        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+            .unwrap()
+            .expect("whoever held it is gone");
+        assert_eq!(adopted.id, id);
+    }
+
+    /// Taking it is what `resumable` does, not something the caller remembers
+    /// to do afterwards — so asking twice from two places cannot hand it out
+    /// twice.
+    #[test]
+    fn resuming_takes_the_claim_in_the_same_breath() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        // Free for anybody.
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET claimed_by = NULL, claimed_at = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        assert!(
+            resumable(db.conn(), 1, ListKind::Followers)
+                .unwrap()
+                .is_some()
+        );
+
+        let holder: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT claimed_by FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder.as_deref(), Some(this_process()));
+    }
+
+    /// A finished capture is never unfinished again.
+    ///
+    /// Two processes on one row could have the faster close it `Completed` and
+    /// the slower, throttled seconds later, close the same row `RateLimit` —
+    /// and the account's only usable capture vanished while the monitor's mark
+    /// had already moved past it.
+    #[test]
+    fn closing_a_finished_capture_again_cannot_unfinish_it() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], None).unwrap();
+        close(db.conn(), id, StopReason::Completed).unwrap();
+
+        close(db.conn(), id, StopReason::RateLimit).unwrap();
+
+        assert!(
+            find_usable(db.conn(), id).unwrap().is_some(),
+            "a capture that was finished stopped being usable"
+        );
+    }
+
+    /// Starting a walk clears abandoned partials and leaves live ones alone.
+    /// It used to delete every incomplete row, so one process starting a walk
+    /// removed one another was actively writing to.
+    #[test]
+    fn clearing_partials_spares_the_one_somebody_is_writing_to() {
+        let mut db = base();
+
+        let live = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, live, &[user(10)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, live, now());
+
+        let abandoned = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, abandoned, &[user(11)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, abandoned, now() - CLAIM_TTL_SECS - 1);
+
+        assert_eq!(
+            delete_partials(db.conn(), 1, ListKind::Followers).unwrap(),
+            1
+        );
+
+        let left: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM snapshots WHERE id = ?1",
+                params![live],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "the walk somebody is in the middle of was deleted");
     }
 
     #[test]

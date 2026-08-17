@@ -587,10 +587,27 @@ fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Op
         // capture, and an unchanged list has nothing new in it. Not reading the
         // members is the whole reason the common case is cheap.
         Basis::Baseline { .. } | Basis::Unchanged { .. } => ListDiff::default(),
-        Basis::Compare { before, after } => ListDiff::between(
-            &snapshots::members(conn, before)?,
-            &snapshots::members(conn, after)?,
-        ),
+        Basis::Compare { before, after } => {
+            // The baseline is read through `find_usable` too, not just the
+            // newer capture. `members` answers `Ok([])` for an id that is no
+            // longer there, which is indistinguishable from a capture that was
+            // genuinely empty — so a baseline pruned by another process between
+            // reading the mark and reading its members would make every member
+            // of the newer capture look like an arrival. Somebody would be told
+            // three hundred people had just followed them.
+            //
+            // Within one process this is impossible: pruning a marked capture
+            // sets the mark to NULL and `Basis::decide` answers `Baseline`. It
+            // takes a second process's `prune` landing in between, which is
+            // exactly the interleaving this branch has to survive.
+            let Some(_) = snapshots::find_usable(conn, before)? else {
+                return Ok(None);
+            };
+            ListDiff::between(
+                &snapshots::members(conn, before)?,
+                &snapshots::members(conn, after)?,
+            )
+        }
     };
 
     Ok(Some(ListReport {
