@@ -84,57 +84,95 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     ui::info(&format!(
         "Watching {}. {} Stop with Ctrl+C.",
         watching_label(&watched),
-        describe_schedule(&schedule, args.now),
+        describe_schedule(&when_from(&args, configured.as_ref()), &schedule, args.now),
     ));
 
     // Installed once for the process, which is what lets this open an `App` per
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
 
-    // `None` means "nothing has run", which is what makes the first run
-    // immediate. Without `--now` the schedule decides the first one instead.
-    let mut last_run: Option<i64> = if args.now {
-        None
-    } else {
-        Some(snob_core::store::now())
-    };
+    // Seeded from the run log, not from this process's start.
+    //
+    // The clock used to begin again on every start, so `--every 24h` on a
+    // machine that is powered on from eight to six, or under a supervisor with
+    // `Restart=always` restarting more often than the interval, never reached
+    // its first run at all — while `snob watch status`, reading the very same
+    // table, said "It has not run yet."
+    //
+    // `Some(now)` when nothing has ever run: a fresh install waits for its first
+    // scheduled moment rather than walking the moment it is set up. `--now` is
+    // what asks for a run at start, and it is spent below.
+    let mut last_run = last_started(paths)?.or_else(|| Some(snob_core::store::now()));
 
-    // The moment this is waiting for, and how many scheduled runs it stands
-    // for. Held across iterations rather than recomputed, because the loop
-    // wakes every minute to re-check the wall clock and rolling the jitter each
-    // time would make the wake-up wander instead of settling on one instant.
+    if args.now {
+        // Run one, here, rather than by pretending nothing has ever run.
+        //
+        // `--now` was `last_run = None`, which means "due immediately" only for
+        // an interval: with `--on`, `--at` or `--cron` the search simply
+        // returned the next moment on the grid, and the banner said "Starting
+        // with one now." before sleeping until nine o'clock tomorrow. It also
+        // means the run happens with no jitter, which is right — jitter exists
+        // so a *schedule* does not land on the same second every day, and
+        // delaying a run somebody just asked for would only look broken.
+        last_run = Some(snob_core::store::now());
+        if let Err(e) = run_one(&args, &watched, delivery.as_ref(), &secrets, paths).await {
+            report::print_error(&e);
+        }
+    }
+
+    // The moment being waited for, the number of runs it stands for, and the
+    // jitter roll that shifted it.
+    //
+    // Held across iterations rather than recomputed: `next_after` searches from
+    // `max(floor, now)`, so once `now` has passed the grid minute it would
+    // answer with the *next* one and the wake-up would creep forward instead of
+    // arriving. Recomputed when the clock stops ticking and starts jumping —
+    // see `CLOCK_JUMP_SECS`.
     let mut waiting_for: Option<(i64, u32)> = None;
-    // `--now` means now. Jitter is there so a *schedule* does not land on the
-    // same second every day; delaying the run somebody just asked for by up to
-    // a quarter of an hour would only look broken.
-    let mut skip_jitter = args.now;
+    // The previous time round's clock reading, which is how a clock that jumped
+    // is told from one that ticked.
+    let mut clock_was: Option<i64> = None;
 
     loop {
         let now = snob_core::store::now();
 
+        // A clock that moved by more than a nap did not tick: it was corrected,
+        // or the machine was suspended. Either way the moment being waited for
+        // was computed against a reading that no longer applies. A machine that
+        // booted a year ahead and then had its clock corrected inwards parked
+        // the monitor for the whole year — `due` clamps a stored future to the
+        // present precisely so that cannot happen, and the cached moment was
+        // what kept it from ever being asked.
+        if let Some(before) = clock_was
+            && !(0..=CLOCK_JUMP_SECS).contains(&(now - before))
+        {
+            waiting_for = None;
+        }
+        clock_was = Some(now);
+
         let (wake_at, missed) = match waiting_for {
             Some(pending) => pending,
             None => {
-                let (due_at, missed) = match schedule::due(&schedule, last_run, now, &chrono::Local)
-                {
+                let pending = match schedule::due(&schedule, last_run, now, &chrono::Local) {
+                    // Already owed, so it goes now. Jitter is not applied to a
+                    // run that is already late: it is off the grid by however
+                    // late it is, and shifting it further would move the target
+                    // every time round the loop, since the target would be
+                    // computed from a `now` that keeps advancing.
                     Due::Now { missed } => (now, missed),
                     Due::At(i64::MAX) => {
                         return Err(anyhow::anyhow!(
                             "this schedule can never come round: nothing matches it"
                         ));
                     }
-                    Due::At(at) => (at, 0),
+                    // Rolled once per due moment. The roll is made here rather
+                    // than inside `with_jitter` so that function reads no
+                    // randomness and its bounds stay testable.
+                    Due::At(at) => (
+                        schedule::with_jitter(at, schedule.jitter(), fastrand::f64()),
+                        0,
+                    ),
                 };
-
-                // Rolled once per due moment. The roll is made here rather than
-                // inside `with_jitter` so that function reads no randomness and
-                // its bounds stay testable.
-                let wake_at = if skip_jitter {
-                    due_at
-                } else {
-                    schedule::with_jitter(due_at, schedule.jitter(), fastrand::f64())
-                };
-                let pending = (wake_at, missed);
                 waiting_for = Some(pending);
                 pending
             }
@@ -152,7 +190,6 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             // tight loop retrying it.
             last_run = Some(now);
             waiting_for = None;
-            skip_jitter = false;
 
             // A scheduled service does not exit because one run failed. A
             // cooldown lifts, a network comes back, and a session that is gone
@@ -177,6 +214,24 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             return Ok(ExitCode::Interrupted);
         }
     }
+}
+
+/// How far the clock may move between two turns of the loop and still be
+/// ticking.
+///
+/// A nap is at most sixty seconds, so anything past two minutes is a
+/// correction, a suspend, or a resume — none of which the moment being waited
+/// for was computed against.
+const CLOCK_JUMP_SECS: i64 = 120;
+
+/// When the monitor last started a run, for any account.
+///
+/// Opened and closed here rather than held: the loop deliberately keeps no
+/// SQLite connection while it sleeps, so `snob purge` in another terminal is not
+/// blocked by a file this has open.
+fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
+    let store = snob_core::store::Store::open(paths)?;
+    Ok(snob_core::store::watch::last_started(store.conn())?)
 }
 
 /// One run inside the loop: open, tick, print, close.
@@ -343,30 +398,63 @@ fn watching_label(watched: &[Watched]) -> String {
 /// file and half from the command line is a schedule nobody can read back: the
 /// only honest reading of `--every 6h` against a configured `--on mon` is the
 /// one the person typing meant, and there is no way to know which.
-fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Result<Schedule> {
+/// The schedule as written, before it is built: whichever of the two sources
+/// won, in the words it was given in.
+///
+/// The flags win as a set rather than field by field, because a schedule half
+/// from the file and half from the command line is one nobody can read.
+struct When {
+    cron: Option<String>,
+    at: Vec<String>,
+    on: Vec<String>,
+    every: Option<std::time::Duration>,
+    jitter: Option<std::time::Duration>,
+}
+
+/// Resolves which source the schedule comes from.
+///
+/// Asked by [`schedule_from`] and by the line printed at startup, so the
+/// sentence on screen cannot describe a different schedule from the one that
+/// runs.
+fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
     let given =
         args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty() || args.every.is_some();
 
-    let (cron, at, on, every, jitter) = if given {
-        (
-            args.cron.clone(),
-            args.at.clone(),
-            args.on.clone(),
-            args.every,
-            args.jitter,
-        )
-    } else {
-        match configured {
-            Some(c) => (
-                c.cron.clone(),
-                c.at.clone(),
-                c.on.clone(),
-                c.every,
-                c.jitter,
-            ),
-            None => (None, vec![], vec![], None, None),
-        }
-    };
+    if given {
+        return When {
+            cron: args.cron.clone(),
+            at: args.at.clone(),
+            on: args.on.clone(),
+            every: args.every,
+            jitter: args.jitter,
+        };
+    }
+    match configured {
+        Some(c) => When {
+            cron: c.cron.clone(),
+            at: c.at.clone(),
+            on: c.on.clone(),
+            every: c.every,
+            jitter: c.jitter,
+        },
+        None => When {
+            cron: None,
+            at: vec![],
+            on: vec![],
+            every: None,
+            jitter: None,
+        },
+    }
+}
+
+fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Result<Schedule> {
+    let When {
+        cron,
+        at,
+        on,
+        every,
+        jitter,
+    } = when_from(args, configured);
 
     let mut schedule = if let Some(expression) = &cron {
         Schedule::cron(expression)?
@@ -407,16 +495,35 @@ fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Resul
 }
 
 /// The opening line, so somebody starting this can see it understood them.
-fn describe_schedule(schedule: &Schedule, now: bool) -> String {
+///
+/// It names the schedule, which is what its own doc used to promise while both
+/// branches read nothing but the jitter — so a monitor about to sit for a
+/// fortnight opened with a sentence about seconds.
+fn describe_schedule(when: &When, schedule: &Schedule, now: bool) -> String {
+    let mut parts = Vec::new();
+    if let Some(every) = when.every {
+        parts.push(format!("every {}", snob_core::duration::format(every)));
+    }
+    if !when.on.is_empty() {
+        parts.push(format!("on {}", printable(&when.on.join(", "))));
+    }
+    if !when.at.is_empty() {
+        parts.push(format!("at {}", printable(&when.at.join(", "))));
+    }
+    if let Some(cron) = &when.cron {
+        parts.push(format!("on the schedule \"{}\"", printable(cron)));
+    }
+
+    let mut line = format!("Running {}.", parts.join(", "));
+
     let jitter = schedule.jitter();
-    let mut line = if jitter.is_zero() {
-        "Running exactly on schedule.".to_string()
-    } else {
-        format!(
-            "Each run is pushed up to {} later, so it does not land on the same second every time.",
+    if !jitter.is_zero() {
+        line.push_str(&format!(
+            " Each run is pushed up to {} later, so it does not land on the same second every \
+             time.",
             snob_core::duration::format(jitter)
-        )
-    };
+        ));
+    }
     if now {
         line.push_str(" Starting with one now.");
     }
