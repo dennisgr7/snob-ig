@@ -213,35 +213,42 @@ pub fn write(paths: &AppPaths, contents: &str) -> Result<PathBuf, ConfigError> {
 }
 
 /// Writes a file only its owner can read.
+///
+/// The same recipe as `secrets::write_private`, and for the reasons written out
+/// there. It was `create(true).truncate(true)` here, which differs in two ways
+/// that matter: an existing file at this predictable name is **opened with
+/// whatever permissions it already had**, since `mode` only applies at creation,
+/// and the open follows a symlink — which the rename then moves into place.
+/// `create_private_dir` chmods the directory to 0700 but removes nothing already
+/// inside it, so a link planted while it was lax outlives the tightening.
 fn write_private(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    use std::io::Write;
+
     let failed = |source| ConfigError::Write {
         path: path.to_path_buf(),
         source,
     };
 
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-
-        // The mode goes on at creation rather than afterwards, so there is no
-        // window in which the file exists and is world-readable.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(failed)?;
-        file.write_all(contents.as_bytes()).map_err(failed)?;
+        // At creation, not afterwards: a later chmod leaves a window in which
+        // the file is readable by others.
+        options.mode(0o600);
     }
 
-    #[cfg(not(unix))]
-    {
-        // Windows inherits the directory's ACL, and the directory is under the
-        // user's own profile.
-        std::fs::write(path, contents).map_err(failed)?;
-    }
+    // Anything left over from a failed run is cleared rather than reused, which
+    // is what makes `create_new` usable at a fixed name.
+    let _ = std::fs::remove_file(path);
+    let mut file = options.open(path).map_err(failed)?;
+    // Flushed before the caller renames it. A temporary that is renamed into
+    // place with its contents still in the page cache is not the protection
+    // against a half-written file that writing to a temporary is for.
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(failed)?;
 
     Ok(())
 }

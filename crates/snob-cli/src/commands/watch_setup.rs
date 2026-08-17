@@ -289,16 +289,13 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // Per account, and reported per account: a run covers every configured one,
     // so one unqualified "last ran" line is whichever account happened to be
     // last in the file.
-    let mut last_runs = Vec::new();
-    for account in marks
-        .iter()
-        .map(|m| m.account_pk)
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        if let Some(run) = watch_store::last_run(db.conn(), account)? {
-            last_runs.push((account, run));
-        }
-    }
+    //
+    // Asked of the run log rather than of the marks. A mark only moves when a
+    // list was compared, so an account whose every tick was refused — a fresh
+    // setup whose first runs met a cooldown, a stranger who went private — has
+    // no mark and plenty of runs, and this said "It has not run yet." about a
+    // monitor that had been running all week.
+    let last_runs = watch_store::last_runs(db.conn())?;
 
     if args.json {
         println!(
@@ -310,8 +307,8 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 // Told apart from the marks below on purpose. A run that could
                 // not look moves no mark, so without this a monitor sitting in
                 // a cooldown is indistinguishable from one that was killed.
-                "last_runs": last_runs.iter().map(|(pk, run)| serde_json::json!({
-                    "pk": pk,
+                "last_runs": last_runs.iter().map(|run| serde_json::json!({
+                    "pk": run.account_pk,
                     "at": run.started_at,
                     "outcome": run.outcome,
                     "requests": run.requests,
@@ -349,8 +346,9 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     if last_runs.is_empty() {
         println!("It has not run yet.");
     } else {
-        for (pk, run) in &last_runs {
-            let who = snob_core::store::users::name(db.conn(), *pk)?
+        for run in &last_runs {
+            let pk = run.account_pk;
+            let who = snob_core::store::users::name(db.conn(), pk)?
                 .map(|n| format!("@{}", printable(&n)))
                 .unwrap_or_else(|| format!("account {pk}"));
 
@@ -372,17 +370,6 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         }
     }
 
-    // A queue with nothing configured to send it is not going to move, and
-    // saying "the next run tries it" would be false.
-    if owed > 0 && config.as_ref().and_then(|c| c.webhook.as_ref()).is_none() {
-        println!();
-        println!(
-            "{owed} report{} queued, but no webhook is configured, so nothing will send              {}. They expire on their own.",
-            if owed == 1 { " is" } else { "s are" },
-            if owed == 1 { "it" } else { "them" }
-        );
-    }
-
     println!();
     if marks.is_empty() {
         println!("The monitor has not reported on anything yet.");
@@ -399,13 +386,27 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         }
     }
 
+    // One block, because there used to be two and they contradicted each other:
+    // one said a queue with no webhook would never move, the other said the next
+    // run would try it, and both printed in that order on the same run. The
+    // first also carried fourteen literal spaces before its pronoun, so the line
+    // read "nothing will send              it."
     if owed > 0 {
         println!();
-        println!(
-            "{owed} report{} waiting to be delivered; the next run tries {}.",
-            if owed == 1 { "" } else { "s" },
-            if owed == 1 { "it" } else { "them" }
-        );
+        let (subject, it) = if owed == 1 {
+            ("report is", "it")
+        } else {
+            ("reports are", "them")
+        };
+        if config.as_ref().and_then(|c| c.webhook.as_ref()).is_none() {
+            println!(
+                "{owed} {subject} queued, but no webhook is configured, so nothing will send                  {it}. {} expire on {} own.",
+                if owed == 1 { "It" } else { "They" },
+                if owed == 1 { "its" } else { "their" }
+            );
+        } else {
+            println!("{owed} {subject} waiting to be delivered; the next run tries {it}.");
+        }
     }
 
     Ok(ExitCode::Ok)
