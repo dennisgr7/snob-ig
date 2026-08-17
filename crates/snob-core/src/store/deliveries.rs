@@ -56,17 +56,22 @@ pub struct Delivery {
 /// Takes a `&Connection` rather than opening its own transaction on purpose:
 /// the caller has to be able to put this and the mark it makes stale in **one**
 /// transaction, and a function that begins its own makes that impossible.
+/// `destination` is where it is addressed, and it is what [`due`] filters on.
+/// `None` when this run has no webhook at all, where the report is only ever
+/// printed.
 pub fn enqueue(
     conn: &Connection,
     run_id: &str,
     account_pk: Pk,
     body: &str,
     at: i64,
+    destination: Option<&str>,
 ) -> Result<i64, StoreError> {
     conn.execute(
-        "INSERT INTO watch_deliveries (run_id, account_pk, created_at, body, next_try_at)
-         VALUES (?1, ?2, ?3, ?4, ?3)",
-        params![run_id, pk_to_sql(account_pk), at, body],
+        "INSERT INTO watch_deliveries
+            (run_id, account_pk, created_at, body, next_try_at, destination)
+         VALUES (?1, ?2, ?3, ?4, ?3, ?5)",
+        params![run_id, pk_to_sql(account_pk), at, body, destination],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -82,24 +87,45 @@ pub fn enqueue(
 /// webhook was removed from the configuration — aged without limit and then
 /// went out as news. A row past the bound is simply not due; `store::watch::prune`
 /// is what settles it.
-pub fn due(conn: &Connection, now: i64, limit: usize) -> Result<Vec<Delivery>, StoreError> {
+///
+/// `destination` is the address the caller can post to, and only reports
+/// addressed there come back. There was no such predicate and no such column, so
+/// the queue was drained through whichever client this invocation happened to
+/// build: `snob watch once --webhook https://webhook.site/<id>`, run to see what
+/// the payload looks like, sent the reports queued for the team's receiver to the
+/// request bin with the team's token on them, and marked them delivered. Leaked,
+/// and lost for the address they were made for.
+///
+/// A row with no destination was queued before the column existed. It matches
+/// whatever is asked — the old behavior, kept for those rows rather than a guess
+/// about where they belong.
+pub fn due(
+    conn: &Connection,
+    now: i64,
+    limit: usize,
+    destination: &str,
+) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, body, attempts, created_at
          FROM watch_deliveries
          WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
            AND created_at >= ?3
+           AND (destination IS NULL OR destination = ?4)
          ORDER BY created_at, id
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![now, limit as i64, now - MAX_AGE_SECS], |row| {
-        Ok(Delivery {
-            id: row.get(0)?,
-            run_id: row.get(1)?,
-            body: row.get(2)?,
-            attempts: row.get(3)?,
-            created_at: row.get(4)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![now, limit as i64, now - MAX_AGE_SECS, destination],
+        |row| {
+            Ok(Delivery {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                body: row.get(2)?,
+                attempts: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -127,8 +153,14 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GaveUp {
-    /// The far end refused in a way that retrying cannot change: a bad token,
-    /// an address that is not there. Waiting does not fix a 401.
+    /// There was no request to send, so there is none to send again: a header
+    /// the builder cannot construct from what was configured.
+    ///
+    /// **Not "the far end said no."** It used to mean that, and it cost changes:
+    /// the mark has already moved by the time a delivery fails, so a 4xx here
+    /// expired the report after zero attempts and what it described was never
+    /// reported by anything. A 401 or a 404 from a webhook is very often
+    /// transient, and the far end is the user's own server.
     Refused,
     OutOfAttempts,
     TooOld,
@@ -136,10 +168,13 @@ pub enum GaveUp {
 
 /// Records a failed attempt and decides what happens next.
 ///
-/// `permanent` is the caller's reading of the response — the store does not
-/// know what an HTTP status means — and it is what separates "the server was
-/// restarting" from "the token is wrong". Retrying the second is knocking on a
-/// door that has been answered.
+/// `permanent` is the caller's reading of the attempt — the store does not know
+/// what an HTTP status means — and it separates "there was no request to send"
+/// from everything else. It is deliberately narrow: it used to mean "the far end
+/// answered 4xx", and because the mark has already moved by the time this runs,
+/// that expired the report after zero retries and the window it described was
+/// never reported by anything. What bounds the retrying is [`MAX_ATTEMPTS`] and
+/// [`MAX_AGE_SECS`], not a guess about a status code.
 pub fn failed(
     conn: &Connection,
     id: i64,
@@ -229,6 +264,8 @@ mod tests {
     use crate::store::{Store, accounts, users};
 
     const ME: Pk = 42;
+    /// The address these reports are addressed to.
+    const HERE: &str = "https://receiver.example";
 
     fn store() -> Store {
         let db = Store::in_memory().unwrap();
@@ -238,7 +275,7 @@ mod tests {
     }
 
     fn queued(db: &Store, run_id: &str, at: i64) -> i64 {
-        enqueue(db.conn(), run_id, ME, r#"{"a":1}"#, at).unwrap()
+        enqueue(db.conn(), run_id, ME, r#"{"a":1}"#, at, Some(HERE)).unwrap()
     }
 
     /// The property the signature depends on. A retry sends the string that was
@@ -247,9 +284,9 @@ mod tests {
     fn the_body_that_comes_back_is_the_body_that_went_in() {
         let db = store();
         let body = r#"{"schema":1,"events":{"followers_gained":[]}}"#;
-        enqueue(db.conn(), "run-1", ME, body, 1_000).unwrap();
+        enqueue(db.conn(), "run-1", ME, body, 1_000, Some(HERE)).unwrap();
 
-        let waiting = due(db.conn(), 1_000, 10).unwrap();
+        let waiting = due(db.conn(), 1_000, 10, HERE).unwrap();
         assert_eq!(waiting[0].body, body);
     }
 
@@ -257,7 +294,7 @@ mod tests {
     fn a_queued_report_is_due_at_once() {
         let db = store();
         queued(&db, "run-1", 1_000);
-        assert_eq!(due(db.conn(), 1_000, 10).unwrap().len(), 1);
+        assert_eq!(due(db.conn(), 1_000, 10, HERE).unwrap().len(), 1);
         assert_eq!(pending(db.conn()).unwrap(), 1);
     }
 
@@ -267,7 +304,7 @@ mod tests {
         let id = queued(&db, "run-1", 1_000);
 
         delivered(db.conn(), id, 200, 1_010).unwrap();
-        assert!(due(db.conn(), 2_000, 10).unwrap().is_empty());
+        assert!(due(db.conn(), 2_000, 10, HERE).unwrap().is_empty());
         assert_eq!(state(db.conn(), id).unwrap().unwrap(), "delivered");
         assert_eq!(pending(db.conn()).unwrap(), 0);
     }
@@ -285,22 +322,28 @@ mod tests {
             panic!("a 503 is worth another try");
         };
         assert_eq!(next, 1_000 + FIRST_BACKOFF_SECS);
-        assert!(due(db.conn(), next - 1, 10).unwrap().is_empty());
-        assert_eq!(due(db.conn(), next, 10).unwrap().len(), 1);
+        assert!(due(db.conn(), next - 1, 10, HERE).unwrap().is_empty());
+        assert_eq!(due(db.conn(), next, 10, HERE).unwrap().len(), 1);
     }
 
-    /// Waiting does not fix a wrong token, and knocking again on a door that
-    /// has been answered is the pattern this project avoids everywhere else.
+    /// A request that could not be sent at all is not sent again.
+    ///
+    /// `permanent` used to mean "the far end answered 4xx", and that lost
+    /// changes: the mark has moved by the time this is called, so a single 404
+    /// from an n8n workflow that was not registered expired the row after zero
+    /// retries and the arrivals it described were gone. It means "there is no
+    /// request to retry" now — a header the builder cannot construct — which is
+    /// the only failure retrying genuinely cannot change.
     #[test]
-    fn a_refusal_is_not_retried_at_all() {
+    fn a_request_that_cannot_be_sent_is_not_retried_at_all() {
         let db = store();
         let id = queued(&db, "run-1", 1_000);
 
         assert_eq!(
-            failed(db.conn(), id, Some(401), "unauthorized", true, 1_000).unwrap(),
+            failed(db.conn(), id, Some(0), "not a header", true, 1_000).unwrap(),
             Outcome::GaveUp(GaveUp::Refused)
         );
-        assert!(due(db.conn(), 999_999, 10).unwrap().is_empty());
+        assert!(due(db.conn(), 999_999, 10, HERE).unwrap().is_empty());
         assert_eq!(state(db.conn(), id).unwrap().unwrap(), "expired");
     }
 
@@ -335,7 +378,7 @@ mod tests {
             failed(db.conn(), id, Some(500), "boom", false, now).unwrap(),
             Outcome::GaveUp(GaveUp::OutOfAttempts)
         );
-        assert!(due(db.conn(), now + 999_999, 10).unwrap().is_empty());
+        assert!(due(db.conn(), now + 999_999, 10, HERE).unwrap().is_empty());
     }
 
     /// The other bound, and it catches a different failure: a process stopped
@@ -368,12 +411,51 @@ mod tests {
         queued(&db, "later", 2_000);
         queued(&db, "earlier", 1_000);
 
-        let order: Vec<String> = due(db.conn(), 3_000, 10)
+        let order: Vec<String> = due(db.conn(), 3_000, 10, HERE)
             .unwrap()
             .into_iter()
             .map(|d| d.run_id)
             .collect();
         assert_eq!(order, vec!["earlier", "later"]);
+    }
+
+    /// A report belongs to the address it was addressed to.
+    ///
+    /// The table recorded no destination and `due` had no predicate, so the queue
+    /// was drained through whichever client the current invocation built. Running
+    /// `snob watch once --webhook https://webhook.site/<id>` to see what the
+    /// payload looks like therefore sent the reports queued for the team's
+    /// receiver to the request bin, with the team's token on them, and marked them
+    /// delivered.
+    #[test]
+    fn a_report_is_only_due_at_the_address_it_was_addressed_to() {
+        let db = store();
+        let mine = enqueue(db.conn(), "run-1", ME, "{}", 1_000, Some(HERE)).unwrap();
+        let elsewhere = enqueue(
+            db.conn(),
+            "run-2",
+            ME,
+            "{}",
+            1_000,
+            Some("https://bin.example"),
+        )
+        .unwrap();
+        // Queued before the column existed, so nothing can say where it belongs.
+        let legacy = enqueue(db.conn(), "run-3", ME, "{}", 1_000, None).unwrap();
+
+        let here: Vec<i64> = due(db.conn(), 1_000, 10, HERE)
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(here, vec![mine, legacy]);
+
+        let there: Vec<i64> = due(db.conn(), 1_000, 10, "https://bin.example")
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(there, vec![elsewhere, legacy]);
     }
 
     /// The id the receiver deduplicates on has to be unique, or two runs could
@@ -383,7 +465,7 @@ mod tests {
         let db = store();
         queued(&db, "run-1", 1_000);
         assert!(
-            enqueue(db.conn(), "run-1", ME, "{}", 2_000).is_err(),
+            enqueue(db.conn(), "run-1", ME, "{}", 2_000, None).is_err(),
             "the id a receiver deduplicates on must be unique"
         );
     }

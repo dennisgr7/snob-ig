@@ -199,6 +199,42 @@ async fn a_configured_header_is_sent() {
     );
 }
 
+/// A configured header snob also sends replaces snob's, rather than travelling
+/// beside it.
+///
+/// Two rounds of getting this wrong. `RequestBuilder::header` appends, so a
+/// configured `Authorization` and the keyring token both went out; building the
+/// user's list into a map with `insert` fixed that among the user's own headers
+/// and then replayed the map with `header` again, so a configured
+/// `Content-Type` still went out twice. A receiver reading the ordinary
+/// single-value accessor sees the first, so the override silently did nothing —
+/// and a strict one answers 400, which is a refusal rather than a retry.
+#[tokio::test]
+async fn a_configured_header_replaces_the_one_snob_would_have_sent() {
+    let server = MockServer::start().await;
+    mount_hook(&server, 200).await;
+
+    client_for(
+        &server,
+        None,
+        vec![(
+            "Content-Type".into(),
+            "application/json; charset=utf-8".into(),
+        )],
+    )
+    .post(BODY, "watch.changes", "7", 1)
+    .await;
+
+    let requests = server.received_requests().await.unwrap();
+    let sent: Vec<_> = last(&requests)
+        .headers
+        .get_all("content-type")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    assert_eq!(sent, ["application/json; charset=utf-8"]);
+}
+
 /// The guard the whole module is arranged around: this client cannot carry the
 /// session, and it does not claim to be a browser at somebody else's server.
 #[tokio::test]
@@ -225,33 +261,28 @@ async fn the_session_never_reaches_the_webhook() {
     );
 }
 
-/// A server that was restarting comes back. A token that is wrong does not.
+/// Every answer the far end can give is worth another try — a 4xx included.
+///
+/// A 4xx used to come back as `Refused`, which the outbox expires with **zero**
+/// retries, and the mark has already moved by then: one 404 threw away the only
+/// copy of a set of arrivals and departures, and the line printed said to check
+/// the address. And the 4xx a webhook actually gives are mostly transient — n8n
+/// answers 404 for a workflow that is not currently registered, a reverse proxy
+/// answers 403 while it reloads, an expired token answers 401. The attempt and
+/// age bounds are what stop the retrying, not a guess about the status.
 #[tokio::test]
-async fn a_server_error_is_worth_retrying_and_a_refusal_is_not() {
-    for (status, retryable) in [
-        (500, true),
-        (502, true),
-        (503, true),
-        (408, true),
-        (429, true),
-        (401, false),
-        (403, false),
-        (404, false),
-        (422, false),
-    ] {
+async fn every_answer_from_the_far_end_is_worth_another_try() {
+    for status in [500, 502, 503, 408, 429, 400, 401, 403, 404, 410, 422] {
         let server = MockServer::start().await;
         mount_hook(&server, status).await;
 
         let outcome = client_for(&server, None, vec![])
             .post(BODY, "watch.changes", "7", 1)
             .await;
-        match (&outcome, retryable) {
-            (Attempt::Failed { .. }, true) | (Attempt::Refused { .. }, false) => {}
-            _ => panic!(
-                "{status} should {}be retried: {outcome:?}",
-                if retryable { "" } else { "not " }
-            ),
-        }
+        assert!(
+            matches!(outcome, Attempt::Failed { .. }),
+            "{status} was not queued for another try: {outcome:?}"
+        );
     }
 }
 
@@ -318,7 +349,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
     // so a synthetic timestamp from 1970 would simply never be due.
     let queued_at = 1_000_000;
-    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, queued_at).unwrap();
+    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, queued_at, None).unwrap();
 
     // First attempt: the receiver is down.
     let down = MockServer::start().await;
@@ -330,7 +361,13 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     deliveries::failed(app.db().conn(), id, Some(503), "busy", false, queued_at).unwrap();
 
     // Still owed, and the bytes are the ones that were signed.
-    let owed = deliveries::due(app.db().conn(), queued_at + 3_600, 10).unwrap();
+    let owed = deliveries::due(
+        app.db().conn(),
+        queued_at + 3_600,
+        10,
+        "https://receiver.example",
+    )
+    .unwrap();
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].body, BODY);
 

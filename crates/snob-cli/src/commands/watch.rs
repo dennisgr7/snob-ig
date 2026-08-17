@@ -274,6 +274,8 @@ async fn run_one(
     if let Some(delivery) = delivery {
         drain(&app, delivery).await;
     }
+    // And once whatever the accounts did, for the reason on `settle`.
+    crate::engine::watch::settle(&app, snob_core::store::now());
 
     match failed {
         Some(e) if watched.len() == 1 => Err(e),
@@ -579,6 +581,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     if let Some(delivery) = delivery.as_ref() {
         drain(&app, delivery).await;
     }
+    crate::engine::watch::settle(&app, snob_core::store::now());
 
     ui::info(&format!(
         "{} - {}",
@@ -586,13 +589,21 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
         report::requests(tick.requests)
     ));
 
-    Ok(ExitCode::Ok)
+    // The run's own verdict, which was computed, written into `watch_runs`, and
+    // then thrown away in favor of a literal zero. The exit codes exist so a
+    // caller on a timer can tell "wait" from "log in again" without parsing
+    // text, and `once` is the mode that is put on a timer.
+    Ok(tick.outcome())
 }
 
 /// Where reports go, once the arguments have been checked.
 struct Delivery {
     client: WebhookClient,
     heartbeat: bool,
+    /// The origin this run posts to. Written onto every report it queues and used
+    /// to filter the outbox, so a queued report can only ever be sent to the
+    /// address it was addressed to.
+    destination: String,
 }
 
 /// Reads the webhook arguments, or explains what is wrong with them.
@@ -618,9 +629,34 @@ fn delivery_from(
         return Ok(None);
     };
 
+    let url = Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?;
+
+    // Whether this run is posting to the address the configuration was written
+    // for.
+    //
+    // Nothing used to ask. `--webhook` replaced the URL and the file's headers
+    // and the keyring token came along regardless, so
+    // `snob watch once --webhook https://webhook.site/<id>` — which is precisely
+    // what somebody does to see what the payload looks like — sent the team's
+    // `X-Api-Key` and the bearer token `setup` had stored to a host nobody had
+    // configured. Not malice, debugging. `check` was happy because the new
+    // address was https.
+    //
+    // Compared by origin rather than by string, so a path or a query on the same
+    // host is still the same destination. The project already has the pattern:
+    // `IgClient::check_downloadable` exists so the CDN cannot be handed a
+    // credential meant for somewhere else.
+    let configured_origin = from_file
+        .and_then(|w| Url::parse(&w.url).ok())
+        .map(|configured| configured.origin());
+    let same_destination = configured_origin
+        .as_ref()
+        .is_none_or(|origin| *origin == url.origin());
+
     // Headers from the file first, then the ones typed, so a flag can override
     // a configured one of the same name — the last one wins at the request.
     let mut headers: Vec<(String, String)> = from_file
+        .filter(|_| same_destination)
         .map(|w| {
             w.headers
                 .iter()
@@ -628,6 +664,13 @@ fn delivery_from(
                 .collect()
         })
         .unwrap_or_default();
+    if !same_destination && from_file.is_some_and(|w| !w.headers.is_empty()) {
+        ui::warn(&format!(
+            "{} is not the address in the configuration, so the headers configured there are not \
+             sent with it. Pass what this one needs with --header.",
+            url
+        ));
+    }
 
     for raw in &args.header {
         let (name, value) = raw.split_once(':').ok_or_else(|| {
@@ -644,11 +687,27 @@ fn delivery_from(
     // The guard looks at the **merged** list, not only at the flags. Inspecting
     // `args.header` alone meant a configured `Authorization` and a stored token
     // both went out — and the second one was the secret `setup` had put away.
+    //
+    // And only to the address it was stored for. A token is a credential like
+    // the session cookie, and the one guard this module is arranged around — the
+    // client cannot carry the session — said nothing about this one.
     let authorization_given = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
     if !authorization_given && let Some(token) = secrets.load_secret(Kind::WatchToken)? {
-        headers.push(("Authorization".to_string(), token.expose().to_string()));
+        if same_destination {
+            headers.push(("Authorization".to_string(), token.expose().to_string()));
+        } else {
+            ui::warn(&format!(
+                "the stored token was set up for {}, so it is not sent to {}. Pass one with \
+                 --header \"Authorization: ...\" if this address needs it.",
+                configured_origin
+                    .as_ref()
+                    .map(|o| o.ascii_serialization())
+                    .unwrap_or_default(),
+                url
+            ));
+        }
     }
 
     let key = match args.sign_with.clone() {
@@ -668,17 +727,25 @@ fn delivery_from(
         None => secrets.load_secret(Kind::WatchSigningKey)?,
     };
 
-    let webhook = Webhook {
-        url: Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?,
-        headers,
-        key,
-    };
+    let webhook = Webhook { url, headers, key };
     webhook::check(&webhook)?;
 
     Ok(Some(Delivery {
+        // The origin this run posts to, kept beside the client so the outbox can
+        // be filtered by it: a queued report belongs to the address it was
+        // addressed to, and `--webhook` must not flush a backlog somewhere else.
+        destination: destination_of(&webhook.url),
         client: WebhookClient::new(webhook)?,
         heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
     }))
+}
+
+/// The address a report is addressed to, as the outbox records it.
+///
+/// The origin, not the whole URL: a path that changed is the same destination
+/// and the same credential, where a host that changed is neither.
+fn destination_of(url: &Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 /// Commits the report and gets it to the webhook, if there is one.
@@ -721,7 +788,11 @@ async fn deliver(
     let queued = crate::engine::watch::commit(
         app,
         tick,
-        body.as_ref().map(|(run_id, body)| Queued { run_id, body }),
+        body.as_ref().map(|(run_id, body)| Queued {
+            run_id,
+            body,
+            destination: delivery.map(|d| d.destination.as_str()),
+        }),
     )?;
 
     let Some(delivery) = delivery else {
@@ -769,29 +840,83 @@ async fn send_one(
     // Failing to write down what happened is not worth failing the run over:
     // the report either arrived or it did not, and the row is still there.
     let recorded = match &outcome {
-        Attempt::Delivered { status } => deliveries::delivered(app.db().conn(), id, *status, now),
-        Attempt::Failed { status, error } => {
-            deliveries::failed(app.db().conn(), id, *status, error, false, now).map(|_| ())
+        Attempt::Delivered { status } => {
+            deliveries::delivered(app.db().conn(), id, *status, now).map(|()| None)
         }
+        Attempt::Failed { status, error } => {
+            deliveries::failed(app.db().conn(), id, *status, error, false, now).map(Some)
+        }
+        // `permanent` is for a request that could not be sent at all, and
+        // nothing else. Every HTTP answer is retried within the attempt and age
+        // budget now, because a 4xx used to expire the row after **zero**
+        // retries — and the mark had already moved, so the arrivals and
+        // departures in that report were gone for good. Many 4xx are transient:
+        // n8n answers 404 for a workflow that is not currently registered, a
+        // reverse proxy answers 404 or 403 while it reloads, and an expired
+        // bearer token answers 401. None of those is a reason to throw the only
+        // copy of a change away, and the far end is the user's own server, so
+        // knocking again costs nothing that matters.
         Attempt::Refused { status, error } => {
-            deliveries::failed(app.db().conn(), id, Some(*status), error, true, now).map(|_| ())
+            deliveries::failed(app.db().conn(), id, Some(*status), error, true, now).map(Some)
         }
     };
-    if let Err(e) = recorded {
-        ui::warn(&format!(
-            "could not record what happened to the report: {e}"
-        ));
-    }
+    let settled = match recorded {
+        Ok(settled) => settled,
+        Err(e) => {
+            ui::warn(&format!(
+                "could not record what happened to the report: {e}"
+            ));
+            None
+        }
+    };
 
-    match outcome {
-        Attempt::Delivered { .. } => {}
-        Attempt::Failed { error, .. } => ui::warn(&format!(
-            "the report could not be delivered ({error}); it is queued and will be tried again"
+    // What `failed` decided, said out loud. Its answer used to be dropped and
+    // the sentence written from the HTTP result instead, so the eighth failure
+    // — the one that throws the report away — was announced as "it is queued
+    // and will be tried again", and `status` then showed nothing owed.
+    match (&outcome, settled) {
+        (Attempt::Delivered { .. }, _) => {}
+        (_, Some(deliveries::Outcome::Retrying(at))) => ui::warn(&format!(
+            "the report could not be delivered ({}); it is queued and will be tried again {}",
+            error_of(&outcome),
+            describe_when(at, now)
         )),
-        Attempt::Refused { error, .. } => ui::warn(&format!(
-            "the webhook refused the report ({error}). Waiting will not change that, so it was \
-             not queued for another try -- check the address and any token it needs"
+        (_, Some(deliveries::Outcome::GaveUp(reason))) => ui::warn(&format!(
+            "the report could not be delivered ({}). {} It will not be tried again, and what it \
+             said is not reported a second time: the next run compares against what this one \
+             already counted.",
+            error_of(&outcome),
+            match reason {
+                deliveries::GaveUp::Refused => "The request could not be sent at all.",
+                deliveries::GaveUp::OutOfAttempts => "Every attempt was refused.",
+                deliveries::GaveUp::TooOld => "It is too old to be news now.",
+            }
         )),
+        // `failed` itself would not record. The row is untouched, so the next
+        // run tries it again.
+        (_, None) => ui::warn(&format!(
+            "the report could not be delivered ({})",
+            error_of(&outcome)
+        )),
+    }
+}
+
+/// The far end's answer, whatever shape the attempt came back in.
+fn error_of(attempt: &Attempt) -> &str {
+    match attempt {
+        Attempt::Delivered { .. } => "",
+        Attempt::Failed { error, .. } | Attempt::Refused { error, .. } => error,
+    }
+}
+
+/// "in 4m", for a moment in the near future.
+fn describe_when(at: i64, now: i64) -> String {
+    match at.checked_sub(now) {
+        Some(seconds) if seconds > 0 => format!(
+            "in {}",
+            snob_core::duration::format(std::time::Duration::from_secs(seconds as u64))
+        ),
+        _ => "on the next run".to_string(),
     }
 }
 
@@ -831,7 +956,7 @@ fn event_of(body: &str) -> &str {
 /// `DRAIN_LIMIT` exists to bound.
 async fn drain(app: &crate::app::App, delivery: &Delivery) {
     let now = snob_core::store::now();
-    let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT) {
+    let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT, &delivery.destination) {
         Ok(owed) => owed,
         Err(e) => {
             ui::warn(&format!("could not read the queue of owed reports: {e}"));
