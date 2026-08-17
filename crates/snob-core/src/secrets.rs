@@ -412,14 +412,33 @@ impl SecretStore {
     /// only decides which sentence is printed — and the file's names a path
     /// somebody can go and delete by hand.
     pub fn delete(&self) -> Result<(), SecretsError> {
+        self.remove(&[Kind::Session])
+    }
+
+    /// Removes every secret this tool has ever written, and says so only if they
+    /// all went.
+    ///
+    /// What [`SecretStore::delete`] used to be, and the split is the whole
+    /// point. `Kind::ALL` is the one list, for the same reason
+    /// `AppPaths::session_files` and `owned_dirs` are: a secret added later must
+    /// not be forgotten by the one command whose entire job is to leave nothing
+    /// behind, and a webhook token still in the keyring after `snob purge` is
+    /// exactly the failure that command exists to prevent.
+    ///
+    /// But `delete` had a second caller, and for `logout` the same list was
+    /// wrong: `snob logout` says "This removes the session and nothing else",
+    /// and it was taking the monitor's webhook token and signing key with it.
+    /// The monitor then went on running from `watch.toml`, found nothing in the
+    /// keyring, and posted reports with neither `Authorization` nor
+    /// `X-Snob-Signature` — where a receiver that requires the token answers
+    /// 401, a 401 is a refusal, and the change in that report is gone.
+    pub fn delete_all(&self) -> Result<(), SecretsError> {
+        self.remove(&Kind::ALL)
+    }
+
+    fn remove(&self, kinds: &[Kind]) -> Result<(), SecretsError> {
         let mut keyring_refused = None;
-        // Every entry this tool writes, not only the session's. `Kind::ALL` is
-        // the one list, for the same reason `AppPaths::session_files` and
-        // `owned_dirs` are: a secret added later must not be forgotten by the
-        // one command whose entire job is to leave nothing behind, and a
-        // webhook token still in the keyring after `snob purge` is exactly the
-        // failure that command exists to prevent.
-        for kind in Kind::ALL {
+        for &kind in kinds {
             match self.entry_for(kind.entry_name()) {
                 Ok(entry) => match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -840,24 +859,17 @@ mod tests {
     /// later is covered by this test the moment it joins the list — the same
     /// shape as the test that walks every `StopReason`.
     #[test]
-    fn deleting_takes_every_kind_of_secret_with_it() {
+    fn purging_takes_every_kind_of_secret_with_it() {
         let (_tmp, store) = file_store();
         store
             .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
             .unwrap();
 
-        for kind in Kind::ALL {
-            if kind == Kind::Session {
-                continue;
-            }
-            // A machine with no keyring cannot store these at all, which is
-            // documented on `save_secret` and is not what this is testing.
-            if store.save_secret(kind, &Secret::new("a secret")).is_err() {
-                return;
-            }
+        if !save_the_monitors_secrets(&store) {
+            return;
         }
 
-        store.delete().unwrap();
+        store.delete_all().unwrap();
 
         assert!(
             store.load().unwrap().is_none(),
@@ -866,7 +878,59 @@ mod tests {
         for kind in Kind::ALL {
             assert!(
                 store.load_secret(kind).unwrap().is_none(),
-                "{kind:?} survived a delete"
+                "{kind:?} survived a purge"
+            );
+        }
+    }
+
+    /// Stores one secret for every kind but the session. Returns false when
+    /// there is no keyring to store them in, which `save_secret` documents and
+    /// is not what any of these tests are about.
+    fn save_the_monitors_secrets(store: &SecretStore) -> bool {
+        for kind in Kind::ALL {
+            if kind == Kind::Session {
+                continue;
+            }
+            if store.save_secret(kind, &Secret::new("a secret")).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `snob logout` takes the session and nothing else, which is what its help
+    /// says in those words.
+    ///
+    /// It shared one function with `purge`, so logging out silently took the
+    /// monitor's webhook token and signing key. The monitor kept running from
+    /// `watch.toml`, found nothing in the keyring, and posted reports with
+    /// neither `Authorization` nor `X-Snob-Signature`; a receiver that requires
+    /// the token answers 401, a 401 is a refusal, and the change in that report
+    /// is lost with no retry.
+    #[test]
+    fn logging_out_leaves_the_monitors_secrets_alone() {
+        let (_tmp, store) = file_store();
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        if !save_the_monitors_secrets(&store) {
+            return;
+        }
+
+        store.delete().unwrap();
+
+        assert!(
+            store.load().unwrap().is_none(),
+            "the session should be gone"
+        );
+        for kind in Kind::ALL {
+            if kind == Kind::Session {
+                continue;
+            }
+            assert!(
+                store.load_secret(kind).unwrap().is_some(),
+                "logout took {kind:?} with it"
             );
         }
     }

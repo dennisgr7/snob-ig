@@ -109,8 +109,11 @@ pub struct Failure {
 pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
     let mut failures = Vec::new();
 
+    // `delete_all`, not `delete`: this is the command whose whole promise is
+    // that nothing of snob's is left, so it takes the monitor's webhook token
+    // and signing key too. `logout` is the caller that must not.
     if plan.session
-        && let Err(e) = store.delete()
+        && let Err(e) = store.delete_all()
     {
         failures.push(Failure {
             what: "the stored session".to_string(),
