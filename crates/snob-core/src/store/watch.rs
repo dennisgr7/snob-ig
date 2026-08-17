@@ -209,6 +209,42 @@ pub fn last_run(conn: &Connection, account_pk: Pk) -> Result<Option<Run>, StoreE
     Ok(run)
 }
 
+/// The most recent run of every account that has ever run, newest row per
+/// account.
+///
+/// The set of accounts comes from this table and not from the marks, which is
+/// the point. A mark only moves when a list was actually compared, so an account
+/// whose every tick was refused — a fresh setup whose first runs met a cooldown,
+/// a stranger who went private, a first tick where both walks came back short —
+/// has rows here and no mark at all, and asking about the marks' accounts
+/// answered "it has not run yet" about a monitor that had been running all week.
+/// That is the exact inversion of what this table exists for.
+///
+/// One query rather than one per account, which is also what the index on
+/// `(account_pk, started_at DESC)` was added for.
+pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT account_pk, started_at, finished_at, requests, outcome, changes FROM (
+           SELECT *, row_number() OVER (
+             PARTITION BY account_pk ORDER BY started_at DESC, id DESC
+           ) AS rank
+           FROM watch_runs
+         ) WHERE rank = 1
+         ORDER BY account_pk",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Run {
+            account_pk: pk_from_sql(row.get(0)?),
+            started_at: row.get(1)?,
+            finished_at: row.get(2)?,
+            requests: row.get(3)?,
+            outcome: row.get(4)?,
+            changes: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// When the monitor last started a run, for any account.
 ///
 /// Not per account, unlike [`last_run`], and that is the question being asked:

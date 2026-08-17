@@ -300,7 +300,7 @@ async fn tick_one(
     if args.json {
         println!("{}", serde_json::to_string(&tick_json(&tick))?);
     } else if !tick.report.changes().is_empty() {
-        for line in describe(&tick.report) {
+        for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             println!("{line}");
         }
     }
@@ -561,7 +561,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     if args.json {
         println!("{}", serde_json::to_string_pretty(&tick_json(&tick))?);
     } else {
-        for line in describe(&tick.report) {
+        for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             println!("{line}");
         }
     }
@@ -1044,7 +1044,7 @@ fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<E
         return Ok(ExitCode::Ok);
     }
 
-    for line in describe(&report) {
+    for line in describe(&report, false) {
         println!("{line}");
     }
     Ok(ExitCode::Ok)
@@ -1242,13 +1242,23 @@ fn basis_token(basis: Basis) -> &'static str {
 ///
 /// Returned as lines rather than printed, so a test can read them without
 /// capturing standard output.
-fn describe(report: &WatchReport) -> Vec<String> {
+fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
     let who = match report.username.as_deref() {
         Some(name) => format!("@{}", printable(name)),
         None => format!("account {}", report.account_pk),
     };
 
     if !report.has_anything_stored() {
+        // A run in which every list was refused concluded nothing, and that is
+        // not the same as an account nothing has ever been walked for. It used
+        // to print "Nothing has been walked for @me yet -- run \"snob
+        // followers\" once" two lines above the warnings saying both lists had
+        // just been served from storage during a cooldown, with two complete
+        // captures on disk. The reason comes from the refusal lines the caller
+        // prints next, so this only has to stop claiming the opposite.
+        if refused {
+            return vec![format!("Nothing could be looked at for {who} this time.")];
+        }
         return vec![format!(
             "Nothing has been walked for {who} yet, so there is nothing to compare.\n\
              Run \"snob followers\" once and this will have something to say from then on."
@@ -1415,22 +1425,40 @@ mod tests {
     /// nothing changed — which would be true and useless.
     #[test]
     fn an_account_with_nothing_stored_is_told_what_to_run() {
-        let lines = describe(&report_with(None, vec![]));
+        let lines = describe(&report_with(None, vec![]), false);
         assert!(lines.join("\n").contains("snob followers"), "{lines:?}");
+    }
+
+    /// A run that could not look at either list is not an account nothing has
+    /// been walked for.
+    ///
+    /// Both are "no report to show", and they were printed the same way — so a
+    /// tick during a cooldown, with two complete captures on disk, said "Nothing
+    /// has been walked for @me yet" and told the reader to run `snob followers`,
+    /// two lines above the warnings saying both lists had just been served from
+    /// storage.
+    #[test]
+    fn a_run_that_could_not_look_does_not_claim_the_account_is_unknown() {
+        let lines = describe(&report_with(None, vec![]), true).join("\n");
+        assert!(!lines.contains("snob followers"), "{lines}");
+        assert!(lines.contains("could be looked at"), "{lines}");
     }
 
     /// The worst thing this feature could print. A first look has no earlier
     /// capture, so it must say so rather than report an empty diff as calm.
     #[test]
     fn a_first_look_says_so_instead_of_saying_nothing_changed() {
-        let lines = describe(&report_with(
-            Some(list(
-                Basis::Baseline { snapshot_id: 1 },
-                ListDiff::default(),
-                None,
-            )),
-            vec![],
-        ));
+        let lines = describe(
+            &report_with(
+                Some(list(
+                    Basis::Baseline { snapshot_id: 1 },
+                    ListDiff::default(),
+                    None,
+                )),
+                vec![],
+            ),
+            false,
+        );
         let text = lines.join("\n");
         assert!(text.contains("never been reported"), "{text}");
         assert!(
@@ -1461,7 +1489,7 @@ mod tests {
             renamed: vec![],
         };
 
-        let text = describe(&report).join("\n");
+        let text = describe(&report, false).join("\n");
         assert!(text.contains("lists have never been reported"), "{text}");
         assert!(!text.contains("list has never"), "{text}");
     }
@@ -1472,17 +1500,20 @@ mod tests {
             gained: vec![user(1, "arrived")],
             lost: vec![user(2, "left")],
         };
-        let lines = describe(&report_with(
-            Some(list(
-                Basis::Compare {
-                    before: 1,
-                    after: 2,
-                },
-                diff,
-                Some(1_000),
-            )),
-            vec![],
-        ));
+        let lines = describe(
+            &report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    diff,
+                    Some(1_000),
+                )),
+                vec![],
+            ),
+            false,
+        );
 
         let text = lines.join("\n");
         assert!(text.contains("@arrived"), "{text}");
@@ -1495,22 +1526,25 @@ mod tests {
     /// check to swallow a run whose only change was somebody's name.
     #[test]
     fn a_rename_on_its_own_is_still_reported() {
-        let lines = describe(&report_with(
-            Some(list(
-                Basis::Compare {
-                    before: 1,
-                    after: 2,
-                },
-                ListDiff::default(),
-                Some(1_000),
-            )),
-            vec![Rename {
-                pk: 7,
-                from: "before".into(),
-                to: "after".into(),
-                at: 1_500,
-            }],
-        ));
+        let lines = describe(
+            &report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    ListDiff::default(),
+                    Some(1_000),
+                )),
+                vec![Rename {
+                    pk: 7,
+                    from: "before".into(),
+                    to: "after".into(),
+                    at: 1_500,
+                }],
+            ),
+            false,
+        );
 
         let text = lines.join("\n");
         assert!(text.contains("@before is now @after"), "{text}");
@@ -1631,20 +1665,23 @@ mod tests {
     /// like any other, so it goes through the same filter.
     #[test]
     fn a_name_is_filtered_before_it_is_drawn() {
-        let lines = describe(&report_with(
-            Some(list(
-                Basis::Compare {
-                    before: 1,
-                    after: 2,
-                },
-                ListDiff {
-                    gained: vec![user(1, "bad\u{202e}name")],
-                    lost: vec![],
-                },
-                Some(1_000),
-            )),
-            vec![],
-        ));
+        let lines = describe(
+            &report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    ListDiff {
+                        gained: vec![user(1, "bad\u{202e}name")],
+                        lost: vec![],
+                    },
+                    Some(1_000),
+                )),
+                vec![],
+            ),
+            false,
+        );
         assert!(
             !lines.join("\n").contains('\u{202e}'),
             "a bidi override reached the terminal"
