@@ -21,25 +21,22 @@ pub struct Mark {
     /// which means the baseline is gone and the next run has to lay a new one.
     pub snapshot_id: Option<i64>,
     /// When the report was made. What gets shown to a person; the rename window
-    /// is bounded by [`Mark::history_cursor`] instead, for the reason the
+    /// is bounded by [`rename_cursor`] instead, for the reason the
     /// column's comment in `002_watch.sql` gives.
     pub compared_at: i64,
-    /// The last `username_history` row that has been reported.
-    pub history_cursor: i64,
 }
 
 /// The receipt for this account and list, if there is one.
 pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<Mark>, StoreError> {
     let mark = conn
         .query_row(
-            "SELECT snapshot_id, compared_at, history_cursor FROM watch_marks
+            "SELECT snapshot_id, compared_at FROM watch_marks
              WHERE account_pk = ?1 AND kind = ?2",
             params![pk_to_sql(account_pk), kind.as_str()],
             |row| {
                 Ok(Mark {
                     snapshot_id: row.get(0)?,
                     compared_at: row.get(1)?,
-                    history_cursor: row.get(2)?,
                 })
             },
         )
@@ -304,32 +301,70 @@ pub fn history_head(conn: &Connection) -> Result<i64, StoreError> {
 /// transaction, and a function that begins its own makes that impossible. What
 /// order they go in, and why, is `engine::watch`'s to explain.
 ///
-/// `at` and `history_cursor` are passed in rather than read here, so that every
-/// list marked by one report carries the same two numbers. Read inside, two
-/// lists marked a moment apart would leave a sliver between them in which a
-/// rename is filed and then belongs to neither report.
+/// `at` is passed in rather than read here, so that every list marked by one
+/// report carries the same moment. Read inside, two lists marked a moment apart
+/// would leave a sliver between them in which a rename is filed and then belongs
+/// to neither report.
 pub fn set_mark(
     conn: &Connection,
     account_pk: Pk,
     kind: ListKind,
     snapshot_id: i64,
     at: i64,
-    history_cursor: i64,
 ) -> Result<(), StoreError> {
     conn.execute(
-        "INSERT INTO watch_marks (account_pk, kind, snapshot_id, compared_at, history_cursor)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO watch_marks (account_pk, kind, snapshot_id, compared_at)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(account_pk, kind) DO UPDATE SET
              snapshot_id    = excluded.snapshot_id,
-             compared_at    = excluded.compared_at,
-             history_cursor = excluded.history_cursor",
-        params![
-            pk_to_sql(account_pk),
-            kind.as_str(),
-            snapshot_id,
-            at,
-            history_cursor
-        ],
+             compared_at    = excluded.compared_at",
+        params![pk_to_sql(account_pk), kind.as_str(), snapshot_id, at],
+    )?;
+    Ok(())
+}
+
+/// How far along the rename history this account has been reported.
+///
+/// Zero when it never has, which is also what an empty history reads as -- so
+/// the first window is "everything", with no special case.
+///
+/// One number per account, not one per list. It used to be a column on
+/// `watch_marks`, so an account had two, and both ways of reading two numbers
+/// that should be one were wrong: the oldest re-announced a window a list
+/// refused for a week had already had sent, and the newest would have skipped
+/// that window for anybody in only one list.
+pub fn rename_cursor(conn: &Connection, account_pk: Pk) -> Result<i64, StoreError> {
+    let cursor = conn
+        .query_row(
+            "SELECT cursor FROM watch_renames WHERE account_pk = ?1",
+            params![pk_to_sql(account_pk)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(cursor.unwrap_or(0))
+}
+
+/// Records that the rename history has been reported up to `cursor`.
+///
+/// Called **only when a window was actually read**, which is the other half of
+/// what the per-list cursors got wrong: the cursor advanced for every list a run
+/// did not refuse, so a run with two unmoved counters -- the documented common
+/// case, one request and nothing to report -- compared nothing, looked for no
+/// renames, and still jumped to the global head. A rename filed in between by
+/// another walk was stepped over and could never be reported by anything.
+pub fn set_rename_cursor(
+    conn: &Connection,
+    account_pk: Pk,
+    cursor: i64,
+    at: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO watch_renames (account_pk, cursor, marked_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(account_pk) DO UPDATE SET
+             cursor    = excluded.cursor,
+             marked_at = excluded.marked_at",
+        params![pk_to_sql(account_pk), cursor, at],
     )?;
     Ok(())
 }
@@ -362,7 +397,7 @@ pub fn commit_report(
     account_pk: Pk,
     marks: &[(ListKind, i64)],
     at: i64,
-    history_cursor: i64,
+    rename_cursor: Option<i64>,
     delivery: Option<Queued<'_>>,
 ) -> Result<Option<i64>, StoreError> {
     let tx = store.conn_mut().transaction()?;
@@ -380,7 +415,14 @@ pub fn commit_report(
     };
 
     for &(kind, snapshot_id) in marks {
-        set_mark(&tx, account_pk, kind, snapshot_id, at, history_cursor)?;
+        set_mark(&tx, account_pk, kind, snapshot_id, at)?;
+    }
+
+    // `None` when this report read no rename window — every list was refused, or
+    // every one was laying a baseline. Advancing it then files renames as
+    // reported that nothing looked at, and they can never be reported again.
+    if let Some(cursor) = rename_cursor {
+        set_rename_cursor(&tx, account_pk, cursor, at)?;
     }
 
     tx.commit()?;
@@ -482,13 +524,12 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700, 12).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
         assert_eq!(
             mark(db.conn(), 7, ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(id),
                 compared_at: 1_700,
-                history_cursor: 12,
             })
         );
     }
@@ -501,7 +542,7 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700, 0).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
         assert_eq!(mark(db.conn(), 7, ListKind::Following).unwrap(), None);
     }
 
@@ -511,14 +552,13 @@ mod tests {
         let first = account_with_capture(&mut db, 7, &[user(1, "one")]);
         let second = account_with_capture(&mut db, 7, &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, first, 1_700, 3).unwrap();
-        set_mark(db.conn(), 7, ListKind::Followers, second, 1_800, 9).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, first, 1_700).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, second, 1_800).unwrap();
         assert_eq!(
             mark(db.conn(), 7, ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
-                history_cursor: 9,
             })
         );
     }
@@ -535,7 +575,7 @@ mod tests {
     fn pruning_the_marked_capture_leaves_the_receipt_behind() {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700, 5).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
 
         db.conn()
             .execute("DELETE FROM snapshots WHERE id = ?1", params![id])
@@ -546,7 +586,6 @@ mod tests {
             Some(Mark {
                 snapshot_id: None,
                 compared_at: 1_700,
-                history_cursor: 5,
             }),
             "the baseline is gone but what has already been reported is not"
         );
@@ -641,7 +680,7 @@ mod tests {
         // A newer one, so the marked capture is not kept merely for being last.
         account_with_capture(&mut db, 7, &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, marked, 1_000, 0).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, marked, 1_000).unwrap();
         age(&db, marked, KEEP_FOR_SECS * 10);
 
         prune(db.conn(), crate::store::now()).unwrap();

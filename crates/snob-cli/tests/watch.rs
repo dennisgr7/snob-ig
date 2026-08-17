@@ -397,6 +397,90 @@ async fn a_rename_is_not_repeated_when_one_list_was_refused() {
     );
 }
 
+/// A rename filed while both lists sit unchanged is reported, not stepped over.
+///
+/// Two unmoved counters is the documented common case -- "a run with nothing to
+/// report costs one request" -- and such a run used to read no rename window at
+/// all, because the window was only read for lists that had been *compared*. It
+/// advanced the cursor to the global head of `username_history` regardless, so
+/// anything another walk had filed in between was marked as reported without
+/// having been, and could never be reported by anything afterwards, `snob watch
+/// diff` included.
+///
+/// A rename moves nobody in or out of a list, so an unchanged capture is exactly
+/// as good a set of members to look among as one that was walked.
+#[tokio::test]
+async fn a_rename_filed_while_the_lists_sat_still_is_still_reported() {
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
+    walked(&mut db, ListKind::Following, &users(&[(1, "before")]));
+
+    let app = app(&server, db);
+    watch::from_store(&app, None, true).unwrap();
+
+    // Filed by something else -- another account's walk that happens to include
+    // them, or a `snob pfp` -- so neither list has a newer capture and both read
+    // as unchanged.
+    users::upsert(app.db().conn(), &user(1, "after")).unwrap();
+
+    let changes = watch::from_store(&app, None, true).unwrap().changes();
+    assert_eq!(changes.renamed.len(), 1, "the rename was stepped over");
+    assert_eq!(changes.renamed[0].from, "before");
+
+    assert!(
+        watch::from_store(&app, None, true)
+            .unwrap()
+            .changes()
+            .renamed
+            .is_empty(),
+        "and it is not announced a second time"
+    );
+}
+
+/// A list that has never been reported does not drag the rename window back.
+///
+/// The cursor was a column on `watch_marks`, so an account had one per list, and
+/// the window started at the older of the two -- necessarily, or the gap between
+/// them would be skipped for anybody in only one list. So the first run in which
+/// a second list appeared read from that list's zero and re-announced every
+/// rename already sent, under a new `run_id`, which is the value receivers are
+/// told to deduplicate on. There is one cursor per account now, and no pair to
+/// pick between.
+#[tokio::test]
+async fn a_list_reported_for_the_first_time_does_not_replay_old_renames() {
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
+
+    let mut app = app(&server, db);
+    watch::from_store(&app, None, true).unwrap();
+
+    walked_in(&mut app, ListKind::Followers, &users(&[(1, "after")]));
+    assert_eq!(
+        watch::from_store(&app, None, true)
+            .unwrap()
+            .changes()
+            .renamed
+            .len(),
+        1,
+        "reported once, from the only list there is"
+    );
+
+    // Now the following list exists for the first time, with the same person in
+    // it. It has never been reported, so it lays a baseline -- and it must not
+    // reopen a window that has already been sent.
+    walked_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
+    assert!(
+        watch::from_store(&app, None, true)
+            .unwrap()
+            .changes()
+            .renamed
+            .is_empty(),
+        "the rename was announced twice"
+    );
+}
+
 /// Somebody in both lists is one person. Asking each list separately would file
 /// their rename twice.
 #[tokio::test]
