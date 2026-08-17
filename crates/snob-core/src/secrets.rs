@@ -817,19 +817,42 @@ mod tests {
         format!("snob-ig-test-{}-{n}", std::process::id())
     }
 
-    fn file_store() -> (tempfile::TempDir, SecretStore) {
+    /// Serializes the tests that reach the keyring.
+    ///
+    /// The credential store belongs to the operating system, and touching it
+    /// from several threads at once is not reliable here: an entry written by
+    /// one test came back missing to another, roughly one run in ten, in
+    /// whichever test happened to be running at the time. Not a collision
+    /// between the tests — each already has a service name of its own — so the
+    /// race is below this code and cannot be fixed from here. Running them one
+    /// at a time is the whole fix, and it costs milliseconds.
+    ///
+    /// The guard is handed back by `file_store` so a test cannot forget to take
+    /// it: there is no way to get a store without one.
+    fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn file_store() -> (
+        tempfile::TempDir,
+        SecretStore,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let held = keyring_lock();
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path());
         (
             tmp,
             SecretStore::new(paths, true).with_service(&test_service()),
+            held,
         )
     }
 
     /// The real service name must not appear in any test.
     #[test]
     fn tests_never_point_at_the_real_keyring() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         assert_ne!(store.service, KEYRING_SERVICE);
         assert!(store.service.starts_with("snob-ig-test-"));
     }
@@ -860,7 +883,7 @@ mod tests {
     /// shape as the test that walks every `StopReason`.
     #[test]
     fn purging_takes_every_kind_of_secret_with_it() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store
             .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
             .unwrap();
@@ -909,7 +932,7 @@ mod tests {
     /// is lost with no retry.
     #[test]
     fn logging_out_leaves_the_monitors_secrets_alone() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store
             .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
             .unwrap();
@@ -937,7 +960,7 @@ mod tests {
 
     #[test]
     fn a_stored_secret_reads_back_and_can_be_forgotten() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         if store
             .save_secret(Kind::WatchToken, &Secret::new("Bearer abc"))
             .is_err()
@@ -962,7 +985,7 @@ mod tests {
 
     #[test]
     fn file_round_trip() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let original = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
 
         assert_eq!(store.probe_writable().unwrap(), Backend::File);
@@ -1042,13 +1065,13 @@ mod tests {
 
     #[test]
     fn with_no_session_stored_it_returns_none() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         assert!(store.load().unwrap().is_none());
     }
 
     #[test]
     fn delete_removes_the_session() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         store.delete().unwrap();
@@ -1063,13 +1086,13 @@ mod tests {
     /// it as one would make every `logout` on a clean machine exit non-zero.
     #[test]
     fn nothing_stored_is_not_a_refusal() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store.delete().unwrap();
     }
 
     #[test]
     fn a_session_in_the_legacy_location_is_rescued() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
 
         // Simulate an earlier install: the session only exists in the legacy
@@ -1090,7 +1113,7 @@ mod tests {
 
     #[test]
     fn delete_also_clears_the_legacy_location() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let previous = store.paths.legacy_session_file().unwrap();
         std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
         std::fs::write(&previous, b"{}").unwrap();
@@ -1116,7 +1139,7 @@ mod tests {
     /// reporting, not the reason the operating system said no.
     #[test]
     fn a_copy_that_will_not_go_is_reported_and_does_not_stop_the_others() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
 
@@ -1148,7 +1171,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_file_gives_a_clear_error() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store.paths.ensure_dirs().unwrap();
         std::fs::write(store.paths.session_file(), b"this is not json").unwrap();
         assert!(matches!(store.load(), Err(SecretsError::Corrupt(_))));
@@ -1163,7 +1186,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn on_windows_the_file_does_not_hold_the_credential_in_the_clear() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         let raw = std::fs::read_to_string(store.paths.session_file()).unwrap();
@@ -1177,7 +1200,7 @@ mod tests {
     #[cfg(unix)]
     fn on_unix_the_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         let mode = std::fs::metadata(store.paths.session_file())
