@@ -212,6 +212,27 @@ pub fn last_run(conn: &Connection, account_pk: Pk) -> Result<Option<Run>, StoreE
     Ok(run)
 }
 
+/// When the monitor last started a run, for any account.
+///
+/// Not per account, unlike [`last_run`], and that is the question being asked:
+/// one loop covers every watched account, so "when did this last run" is one
+/// moment. The scheduled loop seeds its `--every` clock from it.
+///
+/// It has to, and it did not. The clock started again at every process start, so
+/// `--every 24h` on a machine powered on from eight to six, or under a
+/// supervisor restarting more often than the interval, never reached its first
+/// run — while `status` read this same table and said "it has not run yet".
+pub fn last_started(conn: &Connection) -> Result<Option<i64>, StoreError> {
+    let started = conn
+        .query_row(
+            "SELECT started_at FROM watch_runs ORDER BY started_at DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(started)
+}
+
 /// One receipt, with what it is a receipt for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountMark {
