@@ -97,9 +97,29 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
         params![cutoff],
     )?;
 
-    // Settled deliveries are a record, not work. Pending ones are never touched
+    // A report too old to be news stops being owed.
+    //
+    // `MAX_AGE_SECS` used to be applied only inside `deliveries::failed`, which
+    // is only reached by a run that tries the report — so a report nothing ever
+    // retried aged without limit. Three ways that showed: a year-old row was
+    // still `due` and went out as news on the next run; removing `[webhook]`
+    // from the configuration left rows owed forever with `status` promising the
+    // next run would try them; and a walk that failed before the delivery step
+    // stopped the queue draining even when the webhook was fine.
+    //
+    // Marked rather than deleted, so `status` can still say what became of it.
+    conn.execute(
+        "UPDATE watch_deliveries
+         SET state = 'expired', settled_at = ?1,
+             next_try_at = NULL,
+             last_error = coalesce(last_error, 'it grew too old to be news')
+         WHERE state = 'pending' AND created_at < ?2",
+        params![now, now - super::deliveries::MAX_AGE_SECS],
+    )?;
+
+    // Settled deliveries are a record, not work. Pending ones are never deleted
     // here: `deliveries::failed` is what decides when one stops being owed, and
-    // deleting one from under it would lose a report that was still going to be
+    // removing one from under it would lose a report that was still going to be
     // tried.
     conn.execute(
         "DELETE FROM watch_deliveries
@@ -107,8 +127,21 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
         params![now - KEEP_DELIVERIES_FOR_SECS],
     )?;
 
+    // Runs are a log, and nothing else read them back. `--every 30m` over three
+    // accounts writes some fifty thousand rows a year; the table postdates the
+    // rest of retention, which is how it came to have none.
+    conn.execute(
+        "DELETE FROM watch_runs WHERE started_at < ?1",
+        params![now - KEEP_RUNS_FOR_SECS],
+    )?;
+
     Ok(removed)
 }
+
+/// How long the run log is kept. Long enough for `status` to describe a bad
+/// week, short enough that a monitor on a half-hourly schedule does not
+/// accumulate rows forever.
+pub const KEEP_RUNS_FOR_SECS: i64 = 30 * 24 * 3_600;
 
 /// What one run of the monitor did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,13 +182,21 @@ pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
     Ok(conn.last_insert_rowid())
 }
 
-/// The most recent run, for `status`.
-pub fn last_run(conn: &Connection) -> Result<Option<Run>, StoreError> {
+/// The most recent run of one account.
+///
+/// Per account, because a run covers every configured one and each writes its
+/// own row. Without the predicate the answer was always whichever account came
+/// last in the file, so `status` said "found nothing" on a tick where an earlier
+/// account had found five, and reported `ok` for a tick where another was rate
+/// limited. It also made `watch_runs_lookup` — the index 002 added for exactly
+/// this query — unusable, so the query scanned and sorted in a temp b-tree.
+pub fn last_run(conn: &Connection, account_pk: Pk) -> Result<Option<Run>, StoreError> {
     let run = conn
         .query_row(
             "SELECT account_pk, started_at, finished_at, requests, outcome, changes
-             FROM watch_runs ORDER BY started_at DESC, id DESC LIMIT 1",
-            [],
+             FROM watch_runs WHERE account_pk = ?1
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+            params![pk_to_sql(account_pk)],
             |row| {
                 Ok(Run {
                     account_pk: pk_from_sql(row.get(0)?),
@@ -637,12 +678,15 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         account_with_capture(&mut db, 7, &[user(1, "one")]);
 
-        let long_ago = crate::store::now() - KEEP_DELIVERIES_FOR_SECS * 10;
-        let owed = crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", long_ago).unwrap();
+        let now = crate::store::now();
+        let long_ago = now - KEEP_DELIVERIES_FOR_SECS * 10;
+        // Owed, and young enough to still be news — the other half of the rule
+        // is the test below.
+        let owed = crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", now - 60).unwrap();
         let done = crate::store::deliveries::enqueue(db.conn(), "done", 7, "{}", long_ago).unwrap();
         crate::store::deliveries::delivered(db.conn(), done, 200, long_ago).unwrap();
 
-        prune(db.conn(), crate::store::now()).unwrap();
+        prune(db.conn(), now).unwrap();
 
         assert_eq!(
             crate::store::deliveries::state(db.conn(), owed)
@@ -657,6 +701,107 @@ mod tests {
                 .is_none(),
             "a settled one from a week ago is only a record"
         );
+    }
+
+    /// The other half: a report nothing ever retried does not stay owed forever.
+    ///
+    /// `MAX_AGE_SECS` used to be applied only by `deliveries::failed`, which is
+    /// reached only by a run that *tries* the report — so removing `[webhook]`
+    /// from the configuration, or a walk that failed before the delivery step,
+    /// left rows owed indefinitely while `status` promised the next run would
+    /// try them. Marked rather than deleted, so `status` can still say why.
+    #[test]
+    fn a_report_too_old_to_be_news_stops_being_owed() {
+        let mut db = Store::in_memory().unwrap();
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        let now = crate::store::now();
+        let stale = now - crate::store::deliveries::MAX_AGE_SECS - 1;
+        let id = crate::store::deliveries::enqueue(db.conn(), "stale", 7, "{}", stale).unwrap();
+        assert_eq!(crate::store::deliveries::pending(db.conn()).unwrap(), 1);
+
+        prune(db.conn(), now).unwrap();
+
+        assert_eq!(
+            crate::store::deliveries::state(db.conn(), id)
+                .unwrap()
+                .as_deref(),
+            Some("expired")
+        );
+        assert!(
+            crate::store::deliveries::due(db.conn(), now, 10)
+                .unwrap()
+                .is_empty(),
+            "and it does not go out as news"
+        );
+    }
+
+    /// Runs are a log. `--every 30m` over three accounts writes some fifty
+    /// thousand rows a year, and nothing was removing any of them: the table
+    /// arrived after the rest of retention had been written.
+    #[test]
+    fn the_run_log_does_not_grow_without_end() {
+        let mut db = Store::in_memory().unwrap();
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        let now = crate::store::now();
+        for age in [KEEP_RUNS_FOR_SECS + 1, 60] {
+            record_run(
+                db.conn(),
+                &Run {
+                    account_pk: 7,
+                    started_at: now - age,
+                    finished_at: Some(now - age),
+                    requests: 1,
+                    outcome: Some("ok".to_string()),
+                    changes: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        prune(db.conn(), now).unwrap();
+
+        let left: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM watch_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the old one goes and the recent one stays");
+        assert_eq!(
+            last_run(db.conn(), 7).unwrap().unwrap().started_at,
+            now - 60
+        );
+    }
+
+    /// A run belongs to an account, and `status` speaks per account.
+    ///
+    /// One query with no predicate always answered with whichever account came
+    /// last in the configuration, so `status` said "found nothing" on a tick
+    /// where an earlier account had found five.
+    #[test]
+    fn the_last_run_is_the_last_run_of_that_account() {
+        let mut db = Store::in_memory().unwrap();
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, 8, &[user(2, "two")]);
+
+        let now = crate::store::now();
+        for (pk, changes) in [(7u64, 5u32), (8, 0)] {
+            record_run(
+                db.conn(),
+                &Run {
+                    account_pk: pk,
+                    started_at: now,
+                    finished_at: Some(now),
+                    requests: 1,
+                    outcome: Some("ok".to_string()),
+                    changes,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(last_run(db.conn(), 7).unwrap().unwrap().changes, 5);
+        assert_eq!(last_run(db.conn(), 8).unwrap().unwrap().changes, 0);
     }
 
     /// `username_history` holds everybody this tool has ever seen. A diff about

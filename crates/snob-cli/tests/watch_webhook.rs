@@ -314,7 +314,11 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
 
     snob_core::store::users::ensure(app.db().conn(), 42).unwrap();
     snob_core::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
-    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, 1_000).unwrap();
+    // A moment the report is still young at. The queue refuses to hand back a
+    // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
+    // so a synthetic timestamp from 1970 would simply never be due.
+    let queued_at = 1_000_000;
+    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, queued_at).unwrap();
 
     // First attempt: the receiver is down.
     let down = MockServer::start().await;
@@ -323,10 +327,10 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
         .post(BODY, "watch.changes", &id.to_string(), 1)
         .await;
     assert!(matches!(outcome, Attempt::Failed { .. }));
-    deliveries::failed(app.db().conn(), id, Some(503), "busy", false, 1_000).unwrap();
+    deliveries::failed(app.db().conn(), id, Some(503), "busy", false, queued_at).unwrap();
 
     // Still owed, and the bytes are the ones that were signed.
-    let owed = deliveries::due(app.db().conn(), 999_999, 10).unwrap();
+    let owed = deliveries::due(app.db().conn(), queued_at + 3_600, 10).unwrap();
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].body, BODY);
 
@@ -342,7 +346,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
         )
         .await;
     assert_eq!(outcome, Attempt::Delivered { status: 200 });
-    deliveries::delivered(app.db().conn(), id, 200, 2_000).unwrap();
+    deliveries::delivered(app.db().conn(), id, 200, queued_at + 3_600).unwrap();
 
     assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
     let requests = up.received_requests().await.unwrap();

@@ -286,7 +286,19 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 
     let owed = deliveries::pending(db.conn())?;
     let marks = watch_store::all_marks(db.conn())?;
-    let last = watch_store::last_run(db.conn())?;
+    // Per account, and reported per account: a run covers every configured one,
+    // so one unqualified "last ran" line is whichever account happened to be
+    // last in the file.
+    let mut last_runs = Vec::new();
+    for account in marks
+        .iter()
+        .map(|m| m.account_pk)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if let Some(run) = watch_store::last_run(db.conn(), account)? {
+            last_runs.push((account, run));
+        }
+    }
 
     if args.json {
         println!(
@@ -298,12 +310,13 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 // Told apart from the marks below on purpose. A run that could
                 // not look moves no mark, so without this a monitor sitting in
                 // a cooldown is indistinguishable from one that was killed.
-                "last_run": last.as_ref().map(|run| serde_json::json!({
+                "last_runs": last_runs.iter().map(|(pk, run)| serde_json::json!({
+                    "pk": pk,
                     "at": run.started_at,
                     "outcome": run.outcome,
                     "requests": run.requests,
                     "changes": run.changes,
-                })),
+                })).collect::<Vec<_>>(),
                 "accounts": marks.iter().map(|m| serde_json::json!({
                     "pk": m.account_pk,
                     "kind": m.kind.as_str(),
@@ -333,9 +346,15 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // `status` actually has. A run that could not look moves no mark, so a
     // monitor that has been in a cooldown since Monday looks, from the marks
     // alone, exactly like one that was killed on Monday.
-    match &last {
-        Some(run) => {
-            let mut line = format!("Last ran on {}", report::stored_on(run.started_at));
+    if last_runs.is_empty() {
+        println!("It has not run yet.");
+    } else {
+        for (pk, run) in &last_runs {
+            let who = snob_core::store::users::name(db.conn(), *pk)?
+                .map(|n| format!("@{}", printable(&n)))
+                .unwrap_or_else(|| format!("account {pk}"));
+
+            let mut line = format!("{who} last ran on {}", report::stored_on(run.started_at));
             if let Some(outcome) = &run.outcome
                 && outcome != "ok"
             {
@@ -351,7 +370,17 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
             }
             println!("{line}.");
         }
-        None => println!("It has not run yet."),
+    }
+
+    // A queue with nothing configured to send it is not going to move, and
+    // saying "the next run tries it" would be false.
+    if owed > 0 && config.as_ref().and_then(|c| c.webhook.as_ref()).is_none() {
+        println!();
+        println!(
+            "{owed} report{} queued, but no webhook is configured, so nothing will send              {}. They expire on their own.",
+            if owed == 1 { " is" } else { "s are" },
+            if owed == 1 { "it" } else { "them" }
+        );
     }
 
     println!();
@@ -392,13 +421,13 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
         when.push(format!("every {}", duration::format(every)));
     }
     if !config.on.is_empty() {
-        when.push(format!("on {}", config.on.join(", ")));
+        when.push(format!("on {}", printable(&config.on.join(", "))));
     }
     if !config.at.is_empty() {
-        when.push(format!("at {}", config.at.join(", ")));
+        when.push(format!("at {}", printable(&config.at.join(", "))));
     }
     if let Some(cron) = &config.cron {
-        when.push(format!("cron \"{cron}\""));
+        when.push(format!("cron \"{}\"", printable(cron)));
     }
     lines.push(if when.is_empty() {
         "no schedule: it will not run until one is set".to_string()
@@ -408,7 +437,7 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
 
     match &config.webhook {
         Some(webhook) => {
-            lines.push(format!("Reports to {}", webhook.url));
+            lines.push(format!("Reports to {}", printable(&webhook.url)));
             if webhook.heartbeat {
                 lines.push("Sends a report even when nothing changed".to_string());
             }

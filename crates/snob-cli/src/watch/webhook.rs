@@ -204,6 +204,19 @@ fn describe(status: reqwest::StatusCode, body: &str) -> String {
 /// that would have been shouting a token into the open fails at the moment
 /// somebody can still read the message.
 pub fn check(webhook: &Webhook) -> Result<()> {
+    // A password in the address is a credential in a plain-text file, which is
+    // the one thing `watch.toml` promises not to hold — and `reqwest` turns it
+    // into a second `Authorization` header, so it also collides with the one
+    // the user configured. It would be echoed by `status` and written into the
+    // log of an unattended service by the refusal below.
+    if !webhook.url.username().is_empty() || webhook.url.password().is_some() {
+        bail!(
+            "the address carries a username or password. Put the credential in a header \
+             instead -- \"snob watch setup\" stores one in the keyring -- so it is not sitting \
+             in a configuration file and in every log line that names the address."
+        );
+    }
+
     match webhook.url.scheme() {
         "https" => {}
         "http" if is_private(&webhook.url) => {}
@@ -266,15 +279,23 @@ fn is_private(url: &Url) -> bool {
     // parse as an address, so loopback over IPv6 was refused. The typed host
     // has already done that work and tells the three cases apart.
     match url.host() {
-        Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        // `is_unique_local` and `is_unicast_link_local` are still unstable, so
-        // the prefixes are matched directly: fc00::/7 and fe80::/10.
+        Some(url::Host::Ipv4(v4)) => is_private_v4(v4),
         Some(url::Host::Ipv6(v6)) => {
+            // An IPv4-mapped address is an IPv4 address written the long way,
+            // so `[::ffff:127.0.0.1]` is loopback and was being refused.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_v4(v4);
+            }
+            // `is_unique_local` and `is_unicast_link_local` are still unstable,
+            // so the prefixes are matched directly: fc00::/7 and fe80::/10.
             let first = v6.segments()[0];
             v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
         }
         Some(url::Host::Domain(host)) => {
+            // One trailing dot is the fully-qualified form of the same name,
+            // and `n8n.local.` resolves exactly where `n8n.local` does.
             let host = host.to_ascii_lowercase();
+            let host = host.strip_suffix('.').unwrap_or(&host);
             host == "localhost"
                 || host.ends_with(".localhost")
                 || host.ends_with(".local")
@@ -283,6 +304,24 @@ fn is_private(url: &Url) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether an IPv4 address is somewhere plain HTTP is reasonable.
+///
+/// **169.254.169.254 is excluded**, though it is link-local and the rest of
+/// that range is allowed. It is the cloud instance metadata endpoint on every
+/// major provider, and it answers credentials to anything that asks. A mistyped
+/// address is one thing; a mistyped address that POSTs the body and the stored
+/// token at the hypervisor is another.
+///
+/// `0.0.0.0` is treated as loopback: it means "this host" and nothing routes to
+/// it, so refusing it only made the local case harder to write.
+fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    const METADATA: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+    if v4 == METADATA {
+        return false;
+    }
+    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
 }
 
 #[cfg(test)]
@@ -310,8 +349,59 @@ mod tests {
             "http://n8n.local/webhook/snob",
             "http://box.home.arpa/hook",
             "http://[::1]:5678/hook",
+            // The same three written the other ways people write them.
+            "http://n8n.local./webhook/snob",
+            "http://[::ffff:127.0.0.1]:5678/hook",
+            "http://0.0.0.0:5678/hook",
         ] {
             assert!(check(&webhook(url)).is_ok(), "{url} should be allowed");
+        }
+    }
+
+    /// Link-local, and allowed by that rule — but it is the cloud metadata
+    /// endpoint, which answers credentials to whatever asks. A typo that sends
+    /// the body and the stored token to the hypervisor is not a typo worth
+    /// being permissive about.
+    #[test]
+    fn the_cloud_metadata_endpoint_is_refused_though_it_is_link_local() {
+        assert!(check(&webhook("http://169.254.169.254/hook")).is_err());
+        // The rest of the range is still fine.
+        assert!(check(&webhook("http://169.254.4.4/hook")).is_ok());
+    }
+
+    /// A password in the address is a credential in a plain-text file, which is
+    /// what the configuration promises not to hold — and it would be echoed
+    /// into an unattended service's log by the refusal path.
+    #[test]
+    fn a_credential_in_the_address_is_refused() {
+        for url in [
+            "https://alice:s3cret@example.com/hook",
+            "https://token@example.com/hook",
+        ] {
+            let error = check(&webhook(url)).unwrap_err();
+            assert!(
+                error.to_string().contains("username or password"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A header that reqwest cannot build is refused where the address is, not
+    /// discovered when every POST dies in the builder and the report is retried
+    /// for two hours against an error no waiting can fix.
+    #[test]
+    fn a_header_that_could_never_be_sent_is_refused_up_front() {
+        for (name, value) in [
+            ("X Token", "abc"),
+            ("", "abc"),
+            ("X-Token", "line\r\nInjected: yes"),
+        ] {
+            let mut hook = webhook("https://example.com/hook");
+            hook.headers.push((name.into(), value.into()));
+            assert!(
+                check(&hook).is_err(),
+                "\"{name}: {value}\" should be refused"
+            );
         }
     }
 
