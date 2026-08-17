@@ -93,9 +93,14 @@ pub async fn fetch(
     snapshots::close(app.db().conn(), id, summary.reason)?;
 
     // Asked of the store rather than inferred from the stop reason, and asked
-    // with the same function the next run will use — so "it can be continued"
+    // with the same predicate the next run will use — so "it can be continued"
     // means the next run really would, cursor and resume window included.
-    let resumable = snapshots::resumable(app.db().conn(), target.pk, kind)?.is_some();
+    //
+    // `is_resumable` and not `resumable`: the latter takes the claim in the
+    // statement that finds the row, so asking it here handed this process the
+    // claim `close` had just released, moments before it exited. See its
+    // doc-comment for what that cost.
+    let resumable = snapshots::is_resumable(app.db().conn(), target.pk, kind)?;
 
     // What Instagram said, said out loud. The walker keeps the error next to
     // the stop reason and nothing used to read it, so a checkpoint arrived as
