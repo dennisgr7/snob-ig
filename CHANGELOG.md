@@ -50,6 +50,19 @@ after a few hours rather than retried forever.
 report carries account names and any token you configured travels with it. That
 is checked when you give the address, not six hours later.
 
+**`snob watch setup` writes it all down once**, so a systemd unit or a Task
+Scheduler entry needs nothing but `snob watch`. It asks the questions, writes a
+`watch.toml` you can edit afterwards, and puts any token or signing key in the
+system keyring rather than in that file — which is what lets the unit file hold
+nothing sensitive. `snob watch status` reads back what is configured, when each
+list was last reported on, and what is still owed. `snob purge` takes the new
+keyring entries with it, like everything else.
+
+The monitor expires captures older than a month, so a database does not grow
+without end on a six-hour schedule. What it never takes: the capture the next
+comparison measures against, the newest of each list, and any interrupted walk
+that could still be resumed.
+
 Four things it will not do. The first run on an account has nothing to compare
 against, so it reports nothing and says so rather than announcing your whole
 follower list as new arrivals. A list served from storage during a cooldown, or

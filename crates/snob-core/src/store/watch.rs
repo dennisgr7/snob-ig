@@ -47,6 +47,69 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
     Ok(mark)
 }
 
+/// How long a capture is kept once nothing needs it.
+///
+/// A monitor on a six-hour schedule leaves four captures a day per list, each
+/// holding a row per account. On a thousand-follower account that is millions
+/// of rows a year, for a history nobody reads: the diff only ever compares
+/// against the last reported capture, and everything older is there in case
+/// somebody wants to look back. Thirty days is enough to look back over.
+pub const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
+
+/// How many settled deliveries to keep, for `status` and for anybody wondering
+/// where a report went. Older ones are only a record that something arrived.
+pub const KEEP_DELIVERIES_FOR_SECS: i64 = 7 * 24 * 3_600;
+
+/// Removes captures nothing needs any more.
+///
+/// Three things are kept whatever their age, and each is load-bearing:
+///
+/// - **The capture every mark points at.** It is the baseline of the next diff.
+///   Deleting it sets `watch_marks.snapshot_id` to NULL, and the next run then
+///   lays a new baseline and reports nothing — one silently missed report per
+///   pruned mark.
+/// - **The newest complete capture of each account and list**, which is what
+///   the cache serves and what a crossing reads.
+/// - **Anything an interrupted walk could still be resumed from**, which is any
+///   incomplete capture: `delete_partials` already clears those when a walk
+///   starts, and taking one here would end a resume somebody is mid-way through.
+///
+/// `secure_delete` is on for the whole connection — `store::configure` says it
+/// is there for "whatever the monitor ends up expiring", which is this — so the
+/// rows go rather than being unlinked with their contents still readable.
+pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+    let cutoff = now - KEEP_FOR_SECS;
+
+    let removed = conn.execute(
+        "DELETE FROM snapshots
+         WHERE complete = 1
+           AND taken_at IS NOT NULL
+           AND taken_at < ?1
+           AND id NOT IN (SELECT snapshot_id FROM watch_marks WHERE snapshot_id IS NOT NULL)
+           AND id NOT IN (
+             SELECT id FROM (
+               SELECT id, row_number() OVER (
+                 PARTITION BY account_pk, kind ORDER BY taken_at DESC, id DESC
+               ) AS rank
+               FROM usable_snapshots
+             ) WHERE rank = 1
+           )",
+        params![cutoff],
+    )?;
+
+    // Settled deliveries are a record, not work. Pending ones are never touched
+    // here: `deliveries::failed` is what decides when one stops being owed, and
+    // deleting one from under it would lose a report that was still going to be
+    // tried.
+    conn.execute(
+        "DELETE FROM watch_deliveries
+         WHERE state != 'pending' AND settled_at IS NOT NULL AND settled_at < ?1",
+        params![now - KEEP_DELIVERIES_FOR_SECS],
+    )?;
+
+    Ok(removed)
+}
+
 /// One receipt, with what it is a receipt for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountMark {
@@ -395,6 +458,144 @@ mod tests {
     fn an_empty_history_starts_where_an_unreported_mark_does() {
         let db = Store::in_memory().unwrap();
         assert_eq!(history_head(db.conn()).unwrap(), 0);
+    }
+
+    /// Back-dates a capture, so retention can be tested without waiting a
+    /// month. Raw SQL for the same reason `tests/cache.rs` uses it: there is no
+    /// legitimate way to write a `taken_at` in the past.
+    fn age(db: &Store, id: i64, seconds: i64) {
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET taken_at = taken_at - ?2, started_at = started_at - ?2
+                 WHERE id = ?1",
+                params![id, seconds],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_old_capture_nothing_needs_is_removed_with_its_members() {
+        let mut db = Store::in_memory().unwrap();
+        let old = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let newer = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        age(&db, old, KEEP_FOR_SECS + 1);
+
+        assert_eq!(prune(db.conn(), crate::store::now()).unwrap(), 1);
+        assert!(snapshots::find_usable(db.conn(), old).unwrap().is_none());
+        assert!(snapshots::find_usable(db.conn(), newer).unwrap().is_some());
+
+        let members: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM snapshot_members WHERE snapshot_id = ?1",
+                params![old],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "the members go with the capture");
+    }
+
+    /// The rule the whole of retention has to respect. Taking the marked
+    /// capture leaves the next run with no baseline, so it reports nothing —
+    /// one silently missed report, and no error anywhere.
+    #[test]
+    fn the_capture_a_mark_points_at_is_kept_however_old_it_is() {
+        let mut db = Store::in_memory().unwrap();
+        let marked = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        // A newer one, so the marked capture is not kept merely for being last.
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        set_mark(db.conn(), 7, ListKind::Followers, marked, 1_000, 0).unwrap();
+        age(&db, marked, KEEP_FOR_SECS * 10);
+
+        prune(db.conn(), crate::store::now()).unwrap();
+        assert!(
+            snapshots::find_usable(db.conn(), marked).unwrap().is_some(),
+            "the baseline of the next diff was pruned"
+        );
+    }
+
+    /// However old everything is, the newest of each list stays: it is what the
+    /// cache serves and what a crossing reads.
+    #[test]
+    fn the_newest_capture_of_each_list_is_always_kept() {
+        let mut db = Store::in_memory().unwrap();
+        let followers = account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        users::ensure(db.conn(), 7).unwrap();
+        let opened = snapshots::begin(db.conn(), 7, ListKind::Following, None).unwrap();
+        snapshots::save_page(&mut db, opened.id, &[user(2, "two")], None).unwrap();
+        snapshots::close(db.conn(), opened.id, crate::model::StopReason::Completed).unwrap();
+
+        age(&db, followers, KEEP_FOR_SECS * 5);
+        age(&db, opened.id, KEEP_FOR_SECS * 5);
+
+        assert_eq!(prune(db.conn(), crate::store::now()).unwrap(), 0);
+        assert!(
+            snapshots::find_usable(db.conn(), followers)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            snapshots::find_usable(db.conn(), opened.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// An interrupted walk is resumed from its rows. Taking them would end a
+    /// resume somebody is in the middle of, and the resume window is what
+    /// decides when a partial stops being useful — not this.
+    #[test]
+    fn an_unfinished_walk_is_left_alone() {
+        let mut db = Store::in_memory().unwrap();
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        let partial = snapshots::begin(db.conn(), 7, ListKind::Followers, None)
+            .unwrap()
+            .id;
+        snapshots::save_page(&mut db, partial, &[user(3, "three")], Some("cursor")).unwrap();
+        age(&db, partial, KEEP_FOR_SECS * 5);
+
+        prune(db.conn(), crate::store::now()).unwrap();
+        let still_there: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM snapshots WHERE id = ?1",
+                params![partial],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 1);
+    }
+
+    /// A report still owed is work, not history. Deleting one would lose a
+    /// change that was still going to be delivered.
+    #[test]
+    fn a_report_still_waiting_is_never_pruned() {
+        let mut db = Store::in_memory().unwrap();
+        account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        let long_ago = crate::store::now() - KEEP_DELIVERIES_FOR_SECS * 10;
+        let owed = crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", long_ago).unwrap();
+        let done = crate::store::deliveries::enqueue(db.conn(), "done", 7, "{}", long_ago).unwrap();
+        crate::store::deliveries::delivered(db.conn(), done, 200, long_ago).unwrap();
+
+        prune(db.conn(), crate::store::now()).unwrap();
+
+        assert_eq!(
+            crate::store::deliveries::state(db.conn(), owed)
+                .unwrap()
+                .as_deref(),
+            Some("pending"),
+            "a report that has not been delivered is still owed"
+        );
+        assert!(
+            crate::store::deliveries::state(db.conn(), done)
+                .unwrap()
+                .is_none(),
+            "a settled one from a week ago is only a record"
+        );
     }
 
     /// `username_history` holds everybody this tool has ever seen. A diff about
