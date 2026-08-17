@@ -142,6 +142,8 @@ pub enum ConfigError {
          It was probably written by a newer snob; update, or move that file aside."
     )]
     Unknown { path: PathBuf, found: u32 },
+    #[error(transparent)]
+    Paths(#[from] crate::paths::PathError),
 }
 
 /// Where the file lives.
@@ -187,16 +189,61 @@ pub fn parse(text: &str, path: &Path) -> Result<WatchConfig, ConfigError> {
 pub fn write(paths: &AppPaths, contents: &str) -> Result<PathBuf, ConfigError> {
     let path = path(paths);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        // `create_private_dir` rather than `create_dir_all`, which is what the
+        // data directory already uses. This holds the webhook address — which
+        // for an n8n, Slack or Discord hook *is* the credential — the accounts
+        // being watched and when consent was given. 0755 was letting every
+        // other account on the machine read all three.
+        crate::paths::create_private_dir(parent)?;
     }
-    std::fs::write(&path, contents).map_err(|source| ConfigError::Write {
+
+    // Written whole and then moved into place, and readable only by its owner.
+    //
+    // The temporary file is not tidiness: `fs::write` truncates first, so a
+    // process that dies mid-write leaves a half-written schedule that the next
+    // start refuses to parse. Renaming is atomic on both platforms, so the file
+    // is either the old one or the new one.
+    let temporary = path.with_extension("toml.new");
+    write_private(&temporary, contents)?;
+    std::fs::rename(&temporary, &path).map_err(|source| ConfigError::Write {
         path: path.clone(),
         source,
     })?;
     Ok(path)
+}
+
+/// Writes a file only its owner can read.
+fn write_private(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    let failed = |source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The mode goes on at creation rather than afterwards, so there is no
+        // window in which the file exists and is world-readable.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(failed)?;
+        file.write_all(contents.as_bytes()).map_err(failed)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows inherits the directory's ACL, and the directory is under the
+        // user's own profile.
+        std::fs::write(path, contents).map_err(failed)?;
+    }
+
+    Ok(())
 }
 
 /// Renders a configuration file a person can read and edit.

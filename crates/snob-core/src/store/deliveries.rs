@@ -76,15 +76,22 @@ pub fn enqueue(
 /// Oldest first because they are a sequence of events about one account, and a
 /// receiver that gets Tuesday's arrivals after Wednesday's has to sort them out
 /// itself.
+/// The age bound is applied here as well as in [`failed`], and that is not
+/// belt-and-braces: `failed` is only reached by a run that *tries* the report,
+/// so a report nothing retried — because the process was stopped, or the
+/// webhook was removed from the configuration — aged without limit and then
+/// went out as news. A row past the bound is simply not due; `store::watch::prune`
+/// is what settles it.
 pub fn due(conn: &Connection, now: i64, limit: usize) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, body, attempts, created_at
          FROM watch_deliveries
          WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
+           AND created_at >= ?3
          ORDER BY created_at, id
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![now, limit as i64], |row| {
+    let rows = stmt.query_map(params![now, limit as i64, now - MAX_AGE_SECS], |row| {
         Ok(Delivery {
             id: row.get(0)?,
             run_id: row.get(1)?,
