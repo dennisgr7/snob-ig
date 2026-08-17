@@ -12,7 +12,7 @@
 //! Wording, dates and exit codes live here. What actually changed is
 //! [`crate::engine::watch`]'s answer, and this never recomputes any of it.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
@@ -211,6 +211,13 @@ async fn run_one(
             report::print_error(&e);
             failed = Some(e);
         }
+    }
+
+    // Once, after every account. Whatever is owed from earlier runs goes out
+    // here — including when no account had news of its own, which is the common
+    // case and the one that used to leave the queue untouched.
+    if let Some(delivery) = delivery {
+        drain(&app, delivery).await;
     }
 
     match failed {
@@ -462,6 +469,9 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     }
 
     deliver(&mut app, &tick, delivery.as_ref()).await?;
+    if let Some(delivery) = delivery.as_ref() {
+        drain(&app, delivery).await;
+    }
 
     ui::info(&format!(
         "{} - {}",
@@ -523,16 +533,30 @@ fn delivery_from(
     // `setup` having put them in the keyring: a systemd unit runs `snob watch`
     // with no arguments and the token is not in the unit file, the process
     // table, or anybody's shell history.
-    if !args
-        .header
+    //
+    // The guard looks at the **merged** list, not only at the flags. Inspecting
+    // `args.header` alone meant a configured `Authorization` and a stored token
+    // both went out — and the second one was the secret `setup` had put away.
+    let authorization_given = headers
         .iter()
-        .any(|h| h.to_ascii_lowercase().starts_with("authorization"))
-        && let Some(token) = secrets.load_secret(Kind::WatchToken)?
-    {
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    if !authorization_given && let Some(token) = secrets.load_secret(Kind::WatchToken)? {
         headers.push(("Authorization".to_string(), token.expose().to_string()));
     }
 
     let key = match args.sign_with.clone() {
+        // An empty `--sign-with` is not a request to sign with nothing: it is
+        // `--sign-with ${SNOB_KEY}` in a unit file where the variable is unset.
+        // Taken literally it signs with a zero-length key — a well-formed
+        // signature anybody can forge — and, because this arm wins over the
+        // keyring, it would silently replace a key that was configured
+        // correctly. `ask_webhook` already refuses an empty one; the flag has
+        // to agree with it.
+        Some(given) if given.trim().is_empty() => bail!(
+            "--sign-with was given an empty value. If that came from an environment variable \
+             that is not set, leave the flag out: the key stored by \"snob watch setup\" is \
+             used when it is absent."
+        ),
         Some(given) => Some(Secret::from(given)),
         None => secrets.load_secret(Kind::WatchSigningKey)?,
     };
@@ -598,32 +622,41 @@ async fn deliver(
     };
 
     // This run's report, when it made one.
-    if let (Some(id), Some((_, body))) = (queued, body.as_ref()) {
-        send_one(app, delivery, id, body, 1).await;
+    if let (Some(id), Some((run_id, body))) = (queued, body.as_ref()) {
+        send_one(app, delivery, id, run_id, body, 1).await;
     }
 
-    // And then whatever is still owed, **whether or not this run had anything
-    // to say**. This used to sit behind the same `let else` as the line above,
-    // so a run that found nothing returned before reaching it — and a run that
-    // finds nothing is the common case. A report queued on Monday because the
-    // receiver was restarting was then never retried, never aged out (only
-    // `deliveries::failed` applies the age limit, and nothing was calling it),
-    // and sat `pending` until some later run happened to find a change. That is
-    // exactly the promise "a report is never lost because its delivery failed"
-    // was written to make.
-    //
-    // After this run's own report, so the newest is not held up behind a
-    // backlog.
-    drain(app, delivery).await;
+    // Whatever is still owed from earlier runs is NOT drained here. It is
+    // drained once per run, after every watched account, by the caller. Doing
+    // it here meant once per account: the backoff is a stored wall-clock
+    // moment while a tick takes minutes, so an owed report burned most of its
+    // eight attempts inside a single run, and one run could make
+    // `accounts * DRAIN_LIMIT` requests at somebody's server at once.
     Ok(())
 }
 
 /// Sends one queued report and records what came of it.
-async fn send_one(app: &crate::app::App, delivery: &Delivery, id: i64, body: &str, attempt: i64) {
+/// `run_id` is what the receiver is told to deduplicate on, and it is **not**
+/// the row id.
+///
+/// The row id is a SQLite rowid with no AUTOINCREMENT, so it is reused after
+/// `prune` empties the table — which happens on any account quiet for longer
+/// than `KEEP_DELIVERIES_FOR_SECS`, the default case. A receiver doing exactly
+/// what AGENTS.md, the CHANGELOG and the tests tell it to do would then drop a
+/// real report as a repeat. `run_id` is `UNIQUE` in the schema and already
+/// inside the body, so it is the one value that means what the header claims.
+async fn send_one(
+    app: &crate::app::App,
+    delivery: &Delivery,
+    id: i64,
+    run_id: &str,
+    body: &str,
+    attempt: i64,
+) {
     let now = snob_core::store::now();
     let outcome = delivery
         .client
-        .post(body, event_of(body), &id.to_string(), attempt)
+        .post(body, event_of(body), run_id, attempt)
         .await;
 
     // Failing to write down what happened is not worth failing the run over:
@@ -681,6 +714,14 @@ fn event_of(body: &str) -> &str {
 }
 
 /// Tries whatever is owed from earlier runs.
+///
+/// **Once per run, after every account**, not once per account. The backoff is
+/// a stored wall-clock moment while a tick takes minutes, so draining inside
+/// the per-account loop burned an owed report's whole retry ladder inside a
+/// single run: six accounts was five of the eight attempts spent, nine was
+/// `expired` before the run finished. It also made up to `accounts ×
+/// DRAIN_LIMIT` POSTs at somebody's server in one go, which is the thing
+/// `DRAIN_LIMIT` exists to bound.
 async fn drain(app: &crate::app::App, delivery: &Delivery) {
     let now = snob_core::store::now();
     let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT) {
@@ -692,7 +733,15 @@ async fn drain(app: &crate::app::App, delivery: &Delivery) {
     };
 
     for report in owed {
-        send_one(app, delivery, report.id, &report.body, report.attempts + 1).await;
+        send_one(
+            app,
+            delivery,
+            report.id,
+            &report.run_id,
+            &report.body,
+            report.attempts + 1,
+        )
+        .await;
     }
 }
 

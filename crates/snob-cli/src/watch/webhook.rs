@@ -110,7 +110,35 @@ impl WebhookClient {
         // The user's headers go on last so they can set what they need — but
         // the signature is not among them: `check` refuses a configuration that
         // names it, rather than letting one silently replace the other here.
+        //
+        // Built as a map and merged, rather than added one at a time.
+        // `RequestBuilder::header` is `HeaderMap::append`, so two entries of one
+        // name both went out — a configured `Authorization` and a `--header` one
+        // meant to replace it, or a configured one and the keyring token. A
+        // receiver reading the ordinary single-value accessor sees the first,
+        // so the override silently failed and the second value, which was the
+        // stored secret, travelled anyway. `insert` is what "the last one wins"
+        // needs to be true.
+        let mut extra = reqwest::header::HeaderMap::new();
         for (name, value) in &self.webhook.headers {
+            // Both were validated by `check` before this client was built, so a
+            // failure here is a configuration that never went through it.
+            match (
+                reqwest::header::HeaderName::try_from(name.as_str()),
+                reqwest::header::HeaderValue::try_from(value.as_str()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    extra.insert(name, value);
+                }
+                _ => {
+                    return Attempt::Refused {
+                        status: 0,
+                        error: format!("\"{name}\" is not a header this can send"),
+                    };
+                }
+            }
+        }
+        for (name, value) in extra.iter() {
             request = request.header(name, value);
         }
 
@@ -198,6 +226,30 @@ pub fn check(webhook: &Webhook) -> Result<()> {
         .find(|(name, _)| name.eq_ignore_ascii_case(sign::HEADER))
     {
         bail!("{name} is set by snob itself and cannot be configured");
+    }
+
+    // Every header actually has to be one. This used to check the scheme, the
+    // host and the collision above, and never tried to build the headers — so
+    // `--header "X Token: abc"`, an empty name, or a value with a newline in it
+    // all passed, and then every POST died inside reqwest's builder before a
+    // socket opened. The report was queued, retried eight times over two hours
+    // against an error no waiting could fix, and expired. Every change the
+    // monitor ever found was lost, and the only sign was a warning saying it
+    // would be tried again.
+    for (name, value) in &webhook.headers {
+        if reqwest::header::HeaderName::try_from(name.as_str()).is_err() {
+            bail!(
+                "\"{}\" is not a header name (they may not contain spaces or punctuation \
+                 beyond \"-\")",
+                snob_core::model::printable(name)
+            );
+        }
+        if reqwest::header::HeaderValue::try_from(value.as_str()).is_err() {
+            bail!(
+                "the value of \"{}\" is not one a header can carry (a line break, most likely)",
+                snob_core::model::printable(name)
+            );
+        }
     }
     Ok(())
 }

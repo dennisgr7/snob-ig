@@ -294,8 +294,25 @@ impl Schedule {
         self.validated()
     }
 
+    /// Sets how far a run may be pushed past its due moment.
+    ///
+    /// Bounded to what the schedule can absorb. This is the one builder that
+    /// did not go through [`Schedule::validated`], so `--jitter 30d` on a
+    /// six-hourly schedule was accepted and displaced runs by up to 27 days —
+    /// the safe direction, but unbounded, and the same value can arrive from
+    /// the configuration file rather than a typo. A jitter cannot sensibly
+    /// exceed the gap it is jittering within.
     pub fn with_jitter(mut self, jitter: Duration) -> Self {
-        self.jitter = jitter;
+        let ceiling = self
+            .every
+            .or_else(|| {
+                self.calendar
+                    .as_ref()
+                    .and_then(|c| c.tightest_gap())
+                    .map(|gap| Duration::from_secs(gap as u64))
+            })
+            .unwrap_or(Duration::from_secs(24 * 3_600));
+        self.jitter = jitter.min(ceiling);
         self
     }
 
@@ -424,6 +441,27 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
 
     if next > now {
         return Due::At(next);
+    }
+
+    // The floor, enforced where it is actually spent rather than only where the
+    // schedule was built.
+    //
+    // `validated()` refuses a schedule whose own grid is tighter than this, but
+    // that is a statement about the grid and the runs happen off it. Jitter
+    // moves a run later, the next due moment is then computed from when the run
+    // really happened, and a calendar's grid does not move with it — so
+    // `--cron "*/15 * * * *"`, the tightest schedule this tool advertises as
+    // legal, put 44% of its consecutive runs under the floor and its worst pair
+    // one second apart. Two full walks of both lists, seconds apart, is exactly
+    // what MIN_GAP_SECS's own doc calls requests spent to be told what the last
+    // run was told.
+    //
+    // Checking it here catches every route into a run that is too soon, this
+    // one and the daylight-saving hour that repeats, rather than one at a time.
+    if let Some(last) = last_run
+        && now - last < MIN_GAP_SECS
+    {
+        return Due::At(last + MIN_GAP_SECS);
     }
 
     Due::Now {
@@ -699,6 +737,60 @@ mod tests {
     fn an_interval_with_nothing_behind_it_is_due_at_once() {
         let schedule = Schedule::every(Duration::from_secs(hours(6) as u64)).unwrap();
         assert_eq!(due(&schedule, None, at(0), &Utc), Due::Now { missed: 0 });
+    }
+
+    /// The floor holds against the runs, not only against the grid.
+    ///
+    /// `validated()` refuses a schedule whose grid is tighter than the floor,
+    /// but jitter moves each run off that grid and the next due moment is
+    /// computed from where the run actually landed. `*/15` — the tightest
+    /// schedule the tool advertises as legal — put 44% of consecutive pairs
+    /// under the floor and its worst two one second apart.
+    #[test]
+    fn jitter_cannot_push_two_runs_inside_the_minimum_gap() {
+        let schedule = Schedule::cron("*/15 * * * *").unwrap();
+        let start = at(0);
+
+        // The worst case the old code allowed: a run jittered to the very end
+        // of its window, then the next one due immediately.
+        let last = start + MIN_GAP_SECS - 1;
+        match due(&schedule, Some(last), start + MIN_GAP_SECS, &Utc) {
+            Due::At(next) => assert_eq!(
+                next,
+                last + MIN_GAP_SECS,
+                "a run within the floor of the last one waits it out"
+            ),
+            other => panic!("must not be due yet: {other:?}"),
+        }
+
+        // Swept over the whole window: whatever the last run and the current
+        // moment are, `due` never says "now" while the floor has not passed.
+        // That is the property, and it holds however the jitter falls.
+        let last = start + 7;
+        for ahead in 0..MIN_GAP_SECS {
+            assert!(
+                !matches!(
+                    due(&schedule, Some(last), last + ahead, &Utc),
+                    Due::Now { .. }
+                ),
+                "declared due {ahead}s after the last run"
+            );
+        }
+    }
+
+    /// A jitter larger than the gap it is jittering within is not a jitter.
+    #[test]
+    fn jitter_is_bounded_by_what_the_schedule_can_absorb() {
+        let every = Duration::from_secs(hours(6) as u64);
+        let schedule = Schedule::every(every)
+            .unwrap()
+            .with_jitter(Duration::from_secs(30 * 24 * 3_600));
+        assert_eq!(schedule.jitter(), every);
+
+        let calendar = Schedule::calendar(&[], &[(9, 0), (21, 0)])
+            .unwrap()
+            .with_jitter(Duration::from_secs(30 * 24 * 3_600));
+        assert_eq!(calendar.jitter(), Duration::from_secs(hours(12) as u64));
     }
 
     /// The count is against what actually decides the schedule, not against the
