@@ -144,6 +144,17 @@ cause of corruption. Every table is `STRICT`. The rule that an incomplete
 snapshot is never a basis for comparison is structural rather than disciplinary:
 comparison code reads the `usable_snapshots` view, which cannot return one.
 
+**The database is shared between processes, and a walk in progress says whose
+it is.** `snapshots.claimed_by` and `claimed_at` are a soft lease: `resumable`
+takes the claim in the same `UPDATE` that finds the row, so two processes racing
+for one partial cannot both win, and `save_page` refreshes it so a long walk
+keeps its claim while a dead process loses it after `CLAIM_TTL_SECS`. Before
+that existed, one `snob watch` running while somebody typed `snob followers` was
+enough for both to continue the same partial — and then either a capture was
+closed complete while the other was still paging into it, or the slower one
+threw the finished capture back to incomplete, or one process's
+`delete_partials` deleted a walk the other was writing to.
+
 Configuration is the other half, and it goes in the **roaming** directory where
 it belongs — one file, `watch.toml`, written by `snob watch setup`. Nothing else
 writes there and `ensure_dirs` still does not create it, so somebody who never
@@ -187,6 +198,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Two runs never happen inside the minimum gap, whatever moved them | `schedule::due`, which refuses before it declares one due |
 | What a receiver deduplicates on is unique | `run_id`, which is `UNIQUE` — not the rowid, which SQLite reuses |
 | A configured header cannot be one the request could not carry | `webhook::check`, which builds every name and value before accepting the address |
+| Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
+| A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
 
 ## Running headless
 
