@@ -405,3 +405,58 @@ async fn only_a_recorded_answer_lets_an_unattended_run_read_a_stranger() {
             .may_run_unattended()
     );
 }
+
+/// A report too old to be news settles even when no tick got as far as
+/// reporting.
+///
+/// The expiry ran inside the step that commits a comparison, which is reached
+/// only through the delivery step — so a run that ended earlier, because the
+/// session had gone or a watched stranger went private, settled nothing. The row
+/// stayed `pending` for ever: `deliveries::due` will not hand back an over-age
+/// report, and the only thing that expires one is a failed attempt, which could
+/// therefore never happen. `snob watch status` went on counting it as owed and
+/// promising the next run would try it.
+#[tokio::test]
+async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&server, open_db(tmp.path()));
+
+    let now = snob_core::store::now();
+    let long_ago = now - snob_core::store::deliveries::MAX_AGE_SECS - 1;
+    snob_core::store::users::upsert(
+        app.db().conn(),
+        &snob_core::model::User {
+            pk: 42,
+            username: "me".into(),
+            full_name: None,
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        },
+    )
+    .unwrap();
+    snob_core::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
+    let id =
+        snob_core::store::deliveries::enqueue(app.db().conn(), "run-1", 42, "{}", long_ago, None)
+            .unwrap();
+
+    assert!(
+        snob_core::store::deliveries::due(app.db().conn(), now, 10, "https://receiver.example")
+            .unwrap()
+            .is_empty(),
+        "an over-age report is not due, so nothing can expire it by failing"
+    );
+
+    watch::settle(&app, now);
+
+    assert_eq!(
+        snob_core::store::deliveries::state(app.db().conn(), id).unwrap(),
+        Some("expired".to_string())
+    );
+    assert_eq!(
+        snob_core::store::deliveries::pending(app.db().conn()).unwrap(),
+        0,
+        "status must not go on saying a report is owed"
+    );
+}

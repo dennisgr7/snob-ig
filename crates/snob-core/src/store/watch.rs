@@ -349,19 +349,32 @@ pub fn set_mark(
 ///
 /// `marks` names only the lists this report actually spoke about. A list that
 /// was refused is left out by the caller and its mark stays where it was.
+pub struct Queued<'a> {
+    pub run_id: &'a str,
+    pub body: &'a str,
+    /// Where it is addressed. `None` when this run has no webhook, so the report
+    /// is only printed.
+    pub destination: Option<&'a str>,
+}
+
 pub fn commit_report(
     store: &mut super::Store,
     account_pk: Pk,
     marks: &[(ListKind, i64)],
     at: i64,
     history_cursor: i64,
-    delivery: Option<(&str, &str)>,
+    delivery: Option<Queued<'_>>,
 ) -> Result<Option<i64>, StoreError> {
     let tx = store.conn_mut().transaction()?;
 
     let queued = match delivery {
-        Some((run_id, body)) => Some(super::deliveries::enqueue(
-            &tx, run_id, account_pk, body, at,
+        Some(queued) => Some(super::deliveries::enqueue(
+            &tx,
+            queued.run_id,
+            account_pk,
+            queued.body,
+            at,
+            queued.destination,
         )?),
         None => None,
     };
@@ -703,8 +716,10 @@ mod tests {
         let long_ago = now - KEEP_DELIVERIES_FOR_SECS * 10;
         // Owed, and young enough to still be news — the other half of the rule
         // is the test below.
-        let owed = crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", now - 60).unwrap();
-        let done = crate::store::deliveries::enqueue(db.conn(), "done", 7, "{}", long_ago).unwrap();
+        let owed =
+            crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", now - 60, None).unwrap();
+        let done =
+            crate::store::deliveries::enqueue(db.conn(), "done", 7, "{}", long_ago, None).unwrap();
         crate::store::deliveries::delivered(db.conn(), done, 200, long_ago).unwrap();
 
         prune(db.conn(), now).unwrap();
@@ -738,7 +753,8 @@ mod tests {
 
         let now = crate::store::now();
         let stale = now - crate::store::deliveries::MAX_AGE_SECS - 1;
-        let id = crate::store::deliveries::enqueue(db.conn(), "stale", 7, "{}", stale).unwrap();
+        let id =
+            crate::store::deliveries::enqueue(db.conn(), "stale", 7, "{}", stale, None).unwrap();
         assert_eq!(crate::store::deliveries::pending(db.conn()).unwrap(), 1);
 
         prune(db.conn(), now).unwrap();
@@ -750,7 +766,7 @@ mod tests {
             Some("expired")
         );
         assert!(
-            crate::store::deliveries::due(db.conn(), now, 10)
+            crate::store::deliveries::due(db.conn(), now, 10, "https://receiver.example")
                 .unwrap()
                 .is_empty(),
             "and it does not go out as news"
