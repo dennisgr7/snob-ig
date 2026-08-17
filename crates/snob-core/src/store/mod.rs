@@ -6,6 +6,7 @@
 //! version of `rusqlite` we use.
 
 pub mod accounts;
+pub mod deliveries;
 pub mod migrations;
 pub mod rate_budget;
 pub mod snapshots;

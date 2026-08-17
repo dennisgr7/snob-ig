@@ -20,7 +20,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use snob_cli::app::{App, Viewer};
 use snob_cli::engine::Provenance;
-use snob_cli::engine::watch::{self, Skipped, Watched};
+use snob_cli::engine::watch::{self, Skipped, TickReport, Watched};
 
 mod common;
 use common::{SID, UA};
@@ -80,6 +80,18 @@ async fn requests(server: &MockServer) -> usize {
     server.received_requests().await.unwrap().len()
 }
 
+/// A whole run: look, then record having reported it.
+///
+/// The command does these as two steps so the body can be built in between --
+/// what a report looks like on the wire is presentation, and `engine` does not
+/// decide how anything looks. A test that only called `tick` would leave the
+/// marks where they were and prove nothing about the second run.
+async fn run(app: &mut App, watched: &Watched) -> TickReport {
+    let tick = watch::tick(app, watched).await.unwrap();
+    watch::commit(app, &tick, None).unwrap();
+    tick
+}
+
 /// The number the whole design rests on, and it is **one**.
 ///
 /// One request, not one per list: `web_profile_info` answers with both counters
@@ -103,13 +115,13 @@ async fn a_run_with_nothing_to_report_costs_one_request() {
 
     // The first run walks both lists and lays down the baseline.
     let mut first = app(&server, open_db(tmp.path()));
-    watch::tick(&mut first, &Watched::own()).await.unwrap();
+    run(&mut first, &Watched::own()).await;
     drop(first);
     let after_first = requests(&server).await;
 
     // The second: both counters unchanged, so neither list is walked.
     let mut second = app(&server, open_db(tmp.path()));
-    let tick = watch::tick(&mut second, &Watched::own()).await.unwrap();
+    let tick = run(&mut second, &Watched::own()).await;
 
     assert_eq!(
         requests(&server).await - after_first,
@@ -137,7 +149,7 @@ async fn the_first_run_lays_a_baseline_and_reports_nothing() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&server, open_db(tmp.path()));
-    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+    let tick = run(&mut app, &Watched::own()).await;
 
     assert!(tick.report.changes().is_empty());
     assert_eq!(tick.report.followers.as_ref().unwrap().total, 3);
@@ -156,7 +168,7 @@ async fn a_counter_that_moved_is_walked_and_the_arrival_is_reported() {
         mount_list(&server, "following", &[8, 9]).await;
 
         let mut app = app(&server, open_db(tmp.path()));
-        watch::tick(&mut app, &Watched::own()).await.unwrap();
+        run(&mut app, &Watched::own()).await;
     }
 
     // A fresh server, because the counter and the list both have to change.
@@ -166,7 +178,7 @@ async fn a_counter_that_moved_is_walked_and_the_arrival_is_reported() {
     mount_list(&server, "following", &[8, 9]).await;
 
     let mut app = app(&server, open_db(tmp.path()));
-    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+    let tick = run(&mut app, &Watched::own()).await;
     let changes = tick.report.changes();
 
     assert_eq!(changes.followers.gained.len(), 1);
@@ -194,7 +206,7 @@ async fn a_cooldown_stops_the_run_concluding_anything_and_leaves_the_mark() {
 
     // A first run, so there is something stored to serve.
     let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-    watch::tick(&mut app, &Watched::own()).await.unwrap();
+    run(&mut app, &Watched::own()).await;
     drop(app);
 
     budget
@@ -203,7 +215,7 @@ async fn a_cooldown_stops_the_run_concluding_anything_and_leaves_the_mark() {
     let before = requests(&server).await;
 
     let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+    let tick = run(&mut app, &Watched::own()).await;
 
     assert_eq!(
         requests(&server).await,
@@ -238,7 +250,7 @@ async fn a_refused_run_does_not_move_the_monitor_on() {
         mount_list(&server, "followers", &[1, 2]).await;
         mount_list(&server, "following", &[8, 9]).await;
         let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-        watch::tick(&mut app, &Watched::own()).await.unwrap();
+        run(&mut app, &Watched::own()).await;
     }
 
     // Somebody arrives, and a run happens during a cooldown.
@@ -249,13 +261,13 @@ async fn a_refused_run_does_not_move_the_monitor_on() {
         mount_list(&server, "following", &[8, 9]).await;
 
         let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-        watch::tick(&mut app, &Watched::own()).await.unwrap();
+        run(&mut app, &Watched::own()).await;
 
         budget
             .start_cooldown("rate_limit", std::time::Duration::from_secs(3600))
             .unwrap();
         let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-        let refused = watch::tick(&mut app, &Watched::own()).await.unwrap();
+        let refused = run(&mut app, &Watched::own()).await;
         assert!(!refused.looked());
     }
 

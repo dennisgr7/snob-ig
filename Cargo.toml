@@ -78,6 +78,15 @@ url = "2"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 base64 = "0.23"
+# Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
+# backends are optional features and stay off, which is what makes these build
+# on Windows ARM64 -- the target that has no LLVM and is the reason the TLS
+# backend is chosen per platform. `ring` and `aws-lc-rs` are the obvious
+# alternatives and are exactly the two crates that do not build there.
+# On Linux both are already in the tree, through the keyring's Secret Service
+# backend; on Windows and macOS they are a few hundred lines of new code.
+hmac = "0.12"
+sha2 = { version = "0.10", default-features = false }
 # Already in the tree under `url`, so this costs no extra compilation. Used to
 # put a username into the profile address. Encoding rather than filtering,
 # because filtering removes characters and a name with one removed is the

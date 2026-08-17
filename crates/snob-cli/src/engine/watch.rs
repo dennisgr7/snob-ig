@@ -220,9 +220,68 @@ pub struct TickReport {
     pub report: WatchReport,
     pub requests: u32,
     pub lists: Vec<TickList>,
+    /// The captures this report spoke about, and the moment it covers.
+    ///
+    /// Held rather than recomputed because [`commit`] has to move exactly these
+    /// marks and no others: a list that was refused is absent, and asking the
+    /// store again afterwards would find it and mark it anyway.
+    committable: Vec<(ListKind, i64)>,
+    at: i64,
+    history_cursor: i64,
+}
+
+/// A report on its way to somewhere, ready to be made durable.
+///
+/// The bytes rather than the events, because the signature covers bytes and a
+/// retry has to send the same string.
+pub struct Queued<'a> {
+    pub run_id: &'a str,
+    pub body: &'a str,
+}
+
+/// Records that this report has been reported.
+///
+/// Split from [`tick`] so the body can be built in between, which is where it
+/// belongs: what a report looks like on the wire is presentation, and `engine`
+/// does not decide how anything looks. What is not split is the writing —
+/// queueing the report and retiring the marks happen in one transaction, for
+/// the reason `store::watch::commit_report` sets out.
+pub fn commit(
+    app: &mut App,
+    tick: &TickReport,
+    delivery: Option<Queued<'_>>,
+) -> Result<Option<i64>> {
+    let pk = tick.report.account_pk;
+    let (_, db, _) = app.parts();
+    Ok(store::commit_report(
+        db,
+        pk,
+        &tick.committable,
+        tick.at,
+        tick.history_cursor,
+        delivery.map(|d| (d.run_id, d.body)),
+    )?)
 }
 
 impl TickReport {
+    /// A report that never ran, for a test that only cares what it looks like.
+    ///
+    /// **Tests only.** The three fields it leaves empty are the ones that say
+    /// what to commit, and they are private precisely so nothing outside this
+    /// module can decide that — a caller that could set `committable` could
+    /// retire the mark of a list the run refused.
+    #[doc(hidden)]
+    pub fn for_test(report: WatchReport, requests: u32) -> Self {
+        Self {
+            report,
+            requests,
+            lists: Vec::new(),
+            committable: Vec::new(),
+            at: 0,
+            history_cursor: 0,
+        }
+    }
+
     /// Whether this run established anything at all.
     ///
     /// A caller that sends the result somewhere has to be able to say "nothing
@@ -270,12 +329,24 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         });
     }
 
-    let report = compare(app, pk, &usable, true)?;
+    // Read before the comparison, and both handed back, so that whatever
+    // commits this report writes the same two numbers the renames were read
+    // against. Read again at commit time, a rename filed in between would be
+    // marked as reported without having been.
+    let at = snob_core::store::now();
+    let history_cursor = store::history_head(app.db().conn())?;
+
+    // `advance: false`. The marks move in `commit`, together with the report
+    // being queued — reporting and recording having reported are one event.
+    let report = compare(app, pk, &usable, None)?;
 
     Ok(TickReport {
         report,
         requests: app.client().pacer().spent().saturating_sub(before),
         lists,
+        committable: usable,
+        at,
+        history_cursor,
     })
 }
 
@@ -299,9 +370,8 @@ fn refusal(outcome: &ListOutcome) -> Option<Skipped> {
 /// Reads the report without touching the network.
 ///
 /// `advance` decides whether the marks move. `snob watch diff` looks and leaves
-/// them alone — a question that changes the answer to the next question is not
-/// a question anybody can ask twice — while a tick commits what it has
-/// reported.
+/// them alone — a question whose answer changes when it is asked is one nobody
+/// can check.
 pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<WatchReport> {
     let (pk, username) = resolve(app, typed)?;
 
@@ -316,30 +386,41 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
         }
     }
 
+    // Both read before the comparison, so a rename filed while it runs lands on
+    // the next report's side rather than being marked as said without having
+    // been said.
+    let advance = advance
+        .then(|| -> Result<_> {
+            Ok((
+                snob_core::store::now(),
+                store::history_head(app.db().conn())?,
+            ))
+        })
+        .transpose()?;
+
     let mut report = compare(app, pk, &usable, advance)?;
     report.username = username;
     Ok(report)
 }
 
-/// Compares each named capture against its receipt, and optionally moves it.
+/// Compares each named capture against its receipt.
 ///
 /// The one place a comparison is made, so that a tick and a plain look cannot
 /// disagree about what "since the last report" means. The captures are named by
 /// the caller because the two callers know them differently: a tick has the id
 /// the walk it just ran produced, which is the only id that is certainly the
 /// one those users came from, while a look asks the store for the newest.
-fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], advance: bool) -> Result<WatchReport> {
-    // One reading of each, taken once for the whole report, so every list
-    // marked by it carries the same two numbers. Read per list, two marks
-    // written a moment apart would leave a sliver between them in which a
-    // rename is filed and then belongs to neither this report nor the next.
-    //
-    // The head is read **before** anything is compared, so a rename filed while
-    // this runs stays on the next report's side rather than being marked as
-    // said without having been said.
-    let at = snob_core::store::now();
-    let head = store::history_head(app.db().conn())?;
-
+///
+/// `advance` is `Some` only for the caller that does not queue a report — a
+/// tick hands `None` and commits later, together with the report itself. The
+/// two numbers come in rather than being read here, so that both callers write
+/// the same pair the renames were read against.
+fn compare(
+    app: &App,
+    pk: Pk,
+    usable: &[(ListKind, i64)],
+    advance: Option<(i64, i64)>,
+) -> Result<WatchReport> {
     let mut followers = None;
     let mut following = None;
     for &(kind, snapshot_id) in usable {
@@ -362,7 +443,7 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], advance: bool) -> Resu
         _ => Vec::new(),
     };
 
-    if advance {
+    if let Some((at, head)) = advance {
         // Only the lists that made it this far. A list the caller left out was
         // refused — nobody looked, or the walk came back short — and moving its
         // mark would file it as reported when nothing was said about it, which

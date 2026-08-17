@@ -12,21 +12,26 @@
 //! Wording, dates and exit codes live here. What actually changed is
 //! [`crate::engine::watch`]'s answer, and this never recomputes any of it.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
+use snob_core::secret::Secret;
 use snob_core::secrets::SecretStore;
-use snob_core::watch::{Basis, ListDiff, Rename};
-
+use snob_core::store::deliveries;
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
+use snob_core::watch::{Basis, ListDiff, Rename};
+use url::Url;
 
-use crate::cli::{WatchArgs, WatchCommand, WatchDiffArgs, WatchOnceArgs, WatchRunArgs};
+use crate::cli::{
+    WatchArgs, WatchCommand, WatchDiffArgs, WatchOnceArgs, WatchRunArgs, WebhookArgs,
+};
 use crate::commands::common::{self, Session};
 use crate::engine::Provenance;
-use crate::engine::watch::{ListReport, Skipped, TickReport, WatchReport, Watched};
+use crate::engine::watch::{ListReport, Queued, Skipped, TickReport, WatchReport, Watched};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui;
+use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
 
 pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     match args.command {
@@ -46,6 +51,11 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
 async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     let schedule = schedule_from(&args)?;
     let watched = watched_from(args.target.clone());
+    // Built once and reused, so a service that runs for months holds one
+    // connection pool rather than building a TLS stack every few hours. Checked
+    // here for the same reason the schedule is: a bad address should stop this
+    // at the moment somebody is watching it start.
+    let delivery = delivery_from(&args.delivery)?;
 
     // Refused here rather than at the first tick. A service that starts, waits
     // six hours and then exits because it was never allowed to read that
@@ -140,7 +150,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             // cooldown lifts, a network comes back, and a session that is gone
             // gets reported every time until somebody fixes it — which is the
             // point of something that watches.
-            if let Err(e) = run_one(&args, &watched, &secrets, paths).await {
+            if let Err(e) = run_one(&args, &watched, delivery.as_ref(), &secrets, paths).await {
                 report::print_error(&e);
             }
             continue;
@@ -170,6 +180,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
 async fn run_one(
     args: &WatchRunArgs,
     watched: &Watched,
+    delivery: Option<&Delivery>,
     secrets: &SecretStore,
     paths: &AppPaths,
 ) -> Result<()> {
@@ -202,7 +213,8 @@ async fn run_one(
     {
         ui::warn(&refusal_line(kind, skipped));
     }
-    Ok(())
+
+    deliver(&mut app, &tick, delivery).await
 }
 
 fn watched_from(target: Option<String>) -> Watched {
@@ -279,6 +291,10 @@ fn describe_schedule(schedule: &Schedule, now: bool) -> String {
 
 /// One run of the monitor: look, report, and remember having reported.
 async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    // Before the session is opened and long before a request is spent, so a
+    // webhook address that could never work costs nothing to find out about.
+    let delivery = delivery_from(&args.delivery)?;
+
     let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
     else {
         return Ok(ExitCode::NoSession);
@@ -316,6 +332,8 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
         ui::warn(&refusal_line(skipped.0, skipped.1));
     }
 
+    deliver(&mut app, &tick, delivery.as_ref()).await?;
+
     ui::info(&format!(
         "{} - {}",
         report::stored_on(snob_core::store::now()),
@@ -323,6 +341,172 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     ));
 
     Ok(ExitCode::Ok)
+}
+
+/// Where reports go, once the arguments have been checked.
+struct Delivery {
+    client: WebhookClient,
+    heartbeat: bool,
+}
+
+/// Reads the webhook arguments, or explains what is wrong with them.
+///
+/// Called before anything is opened or spent. A run that would have shouted a
+/// token over plain HTTP fails while somebody is still there to read the
+/// message, rather than six hours later into a log.
+fn delivery_from(args: &WebhookArgs) -> Result<Option<Delivery>> {
+    let Some(url) = &args.webhook else {
+        if !args.header.is_empty() || args.sign_with.is_some() || args.heartbeat {
+            ui::warn("there is no --webhook, so nothing is sent and those options do nothing");
+        }
+        return Ok(None);
+    };
+
+    let webhook = Webhook {
+        url: Url::parse(url).with_context(|| format!("\"{url}\" is not an address"))?,
+        headers: args
+            .header
+            .iter()
+            .map(|raw| {
+                raw.split_once(':')
+                    .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("\"{raw}\" is not a header; write it as \"Name: value\"")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        key: args.sign_with.clone().map(Secret::from),
+    };
+    webhook::check(&webhook)?;
+
+    Ok(Some(Delivery {
+        client: WebhookClient::new(webhook)?,
+        heartbeat: args.heartbeat,
+    }))
+}
+
+/// Commits the report and gets it to the webhook, if there is one.
+///
+/// The order is the whole of it: the report is queued and the marks retire in
+/// **one transaction**, and only then is anything sent. A send that fails
+/// leaves a row for the next run to retry; a mark that moved without the row
+/// would lose the change for good.
+async fn deliver(
+    app: &mut crate::app::App,
+    tick: &TickReport,
+    delivery: Option<&Delivery>,
+) -> Result<()> {
+    let changes = tick.report.changes();
+
+    // Silence when nothing happened, unless somebody asked to hear it anyway.
+    // An automation where every message means something is the point of that;
+    // a heartbeat is for the opposite case, where the absence of messages is
+    // the signal and "quiet" has to be told from "stopped".
+    let body = match delivery {
+        Some(d) if !changes.is_empty() || d.heartbeat => {
+            let run_id = run_id(tick);
+            // Serialized once, here, and stored as the string that goes on the
+            // wire. `serde_json` may render one value two ways, and the
+            // signature covers bytes — so a retry that rendered it again could
+            // be rejected after the first attempt was accepted.
+            let event = if changes.is_empty() {
+                "watch.heartbeat"
+            } else {
+                "watch.changes"
+            };
+            Some((
+                run_id.clone(),
+                serde_json::to_string(&payload(tick, &run_id, event))?,
+            ))
+        }
+        _ => None,
+    };
+
+    let queued = crate::engine::watch::commit(
+        app,
+        tick,
+        body.as_ref().map(|(run_id, body)| Queued { run_id, body }),
+    )?;
+
+    let (Some(delivery), Some(id), Some((_, body))) = (delivery, queued, body.as_ref()) else {
+        return Ok(());
+    };
+
+    send_one(app, delivery, id, body, 1).await;
+    // Whatever is left owed from earlier runs. After this one, so the newest
+    // report is not held up behind a backlog.
+    drain(app, delivery).await;
+    Ok(())
+}
+
+/// Sends one queued report and records what came of it.
+async fn send_one(app: &crate::app::App, delivery: &Delivery, id: i64, body: &str, attempt: i64) {
+    let now = snob_core::store::now();
+    let outcome = delivery.client.post(body, &id.to_string(), attempt).await;
+
+    // Failing to write down what happened is not worth failing the run over:
+    // the report either arrived or it did not, and the row is still there.
+    let recorded = match &outcome {
+        Attempt::Delivered { status } => deliveries::delivered(app.db().conn(), id, *status, now),
+        Attempt::Failed { status, error } => {
+            deliveries::failed(app.db().conn(), id, *status, error, false, now).map(|_| ())
+        }
+        Attempt::Refused { status, error } => {
+            deliveries::failed(app.db().conn(), id, Some(*status), error, true, now).map(|_| ())
+        }
+    };
+    if let Err(e) = recorded {
+        ui::warn(&format!(
+            "could not record what happened to the report: {e}"
+        ));
+    }
+
+    match outcome {
+        Attempt::Delivered { .. } => {}
+        Attempt::Failed { error, .. } => ui::warn(&format!(
+            "the report could not be delivered ({error}); it is queued and will be tried again"
+        )),
+        Attempt::Refused { error, .. } => ui::warn(&format!(
+            "the webhook refused the report ({error}). Waiting will not change that, so it was \
+             not queued for another try -- check the address and any token it needs"
+        )),
+    }
+}
+
+/// Tries whatever is owed from earlier runs.
+async fn drain(app: &crate::app::App, delivery: &Delivery) {
+    let now = snob_core::store::now();
+    let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT) {
+        Ok(owed) => owed,
+        Err(e) => {
+            ui::warn(&format!("could not read the queue of owed reports: {e}"));
+            return;
+        }
+    };
+
+    for report in owed {
+        send_one(app, delivery, report.id, &report.body, report.attempts + 1).await;
+    }
+}
+
+/// How many owed reports one run will try before leaving the rest.
+///
+/// Bounded so a queue that built up over a weekend does not turn one run into a
+/// hundred requests at somebody's server all at once. The rest go on the next
+/// run, and `deliveries::MAX_AGE_SECS` is what stops them lingering forever.
+const DRAIN_LIMIT: usize = 10;
+
+/// An id for this report, unique enough for a receiver to deduplicate on.
+///
+/// The moment and a random suffix rather than a UUID: the column is `UNIQUE`,
+/// so a collision is an error rather than a silent overwrite, and this avoids a
+/// dependency for a value nothing derives meaning from.
+fn run_id(tick: &TickReport) -> String {
+    format!(
+        "{}-{:08x}",
+        snob_core::store::now(),
+        fastrand::u32(..) ^ (tick.report.account_pk as u32)
+    )
 }
 
 /// Why a list was not compared, said in a sentence.
@@ -430,6 +614,84 @@ fn tick_json(tick: &TickReport) -> serde_json::Value {
         })).collect::<Vec<_>>(),
     });
     out
+}
+
+/// What goes on the wire.
+///
+/// A contract with whatever is on the other end, so it is built here by hand
+/// and asserted in a test: this is the one output of the tool that a stranger's
+/// automation branches on, and a field renamed by accident breaks a workflow
+/// somebody built months ago.
+///
+/// Three decisions worth knowing about, all of them about what an n8n node
+/// actually needs:
+///
+/// - **`counts` is separate from `changes`**, and redundant with the array
+///   lengths on purpose. `{{ $json.counts.followers_lost > 0 }}` is the
+///   condition people write, and it is far less fragile than an expression over
+///   `.length` on a field that may be absent.
+/// - **`schema` and `event` are at the top**, so fields can be added later
+///   without breaking anybody and a Switch node can tell a heartbeat from a
+///   report without looking inside.
+/// - **`looked` is not derivable from the arrays.** Empty changes mean "nothing
+///   happened" when the run could see and "I could not look" when it could not,
+///   and something watching for silence reads those as the same thing.
+fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
+    let report = &tick.report;
+    let changes = report.changes();
+
+    serde_json::json!({
+        "schema": 1,
+        "event": event,
+        "run": {
+            "id": run_id,
+            "at": snob_core::store::now(),
+            "looked": tick.looked(),
+            "requests": tick.requests,
+            "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
+        },
+        "account": {
+            "pk": report.account_pk,
+            "username": report.username,
+            "is_self": report.is_self,
+        },
+        "lists": {
+            "followers": list_json(report.followers.as_ref()),
+            "following": list_json(report.following.as_ref()),
+        },
+        "counts": {
+            "followers_gained": changes.followers.gained.len(),
+            "followers_lost":   changes.followers.lost.len(),
+            "following_gained": changes.following.gained.len(),
+            "following_lost":   changes.following.lost.len(),
+            "renamed": changes.renamed.len(),
+            "total": changes.len(),
+        },
+        "events": {
+            // The accounts are the same `User` that `snob followers --format
+            // json` already emits, plus the address: whoever receives this is
+            // usually about to put it in a message, and rebuilding the URL at
+            // the other end is exactly where somebody pastes a name without
+            // encoding it.
+            "followers_gained": changes.followers.gained.iter().map(account_json).collect::<Vec<_>>(),
+            "followers_lost":   changes.followers.lost.iter().map(account_json).collect::<Vec<_>>(),
+            "following_gained": changes.following.gained.iter().map(account_json).collect::<Vec<_>>(),
+            "following_lost":   changes.following.lost.iter().map(account_json).collect::<Vec<_>>(),
+            "renamed": changes.renamed.iter().map(rename_json).collect::<Vec<_>>(),
+        },
+    })
+}
+
+/// One account, as an automation wants it.
+fn account_json(user: &User) -> serde_json::Value {
+    let mut value = serde_json::to_value(user).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "profile_url".to_string(),
+            serde_json::Value::String(user.profile_url()),
+        );
+    }
+    value
 }
 
 /// The stable name of why a list was left out.
@@ -751,6 +1013,97 @@ mod tests {
         ] {
             assert_eq!(basis_token(basis), token);
         }
+    }
+
+    /// The shape a stranger's automation branches on, pinned to a literal.
+    ///
+    /// This is the one output of the tool that somebody else's workflow reads,
+    /// and a key renamed by accident breaks something built months ago with no
+    /// error anywhere. Comparing against a literal means a change to the
+    /// contract has to be a change somebody made on purpose.
+    ///
+    /// The two moving fields are left out of the comparison: `run.at` is the
+    /// clock and `run.id` is random, which is what they are for.
+    #[test]
+    fn the_payload_has_the_shape_a_receiver_was_promised() {
+        let tick = TickReport::for_test(
+            report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    ListDiff {
+                        gained: vec![user(1, "arrived")],
+                        lost: vec![user(2, "left")],
+                    },
+                    Some(1_000),
+                )),
+                vec![Rename {
+                    pk: 7,
+                    from: "before".into(),
+                    to: "after".into(),
+                    at: 1_500,
+                }],
+            ),
+            14,
+        );
+
+        let mut payload = payload(&tick, "run-1", "watch.changes");
+        payload["run"]["at"] = serde_json::Value::Null;
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "schema": 1,
+                "event": "watch.changes",
+                "run": {
+                    "id": "run-1",
+                    "at": null,
+                    "looked": false,
+                    "requests": 14,
+                    "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
+                },
+                "account": { "pk": 42, "username": "me", "is_self": true },
+                "lists": {
+                    "followers": {
+                        "basis": "compared",
+                        "since": 1_000,
+                        "until": 2_000,
+                        "count": 10,
+                    },
+                    "following": null,
+                },
+                "counts": {
+                    "followers_gained": 1,
+                    "followers_lost": 1,
+                    "following_gained": 0,
+                    "following_lost": 0,
+                    "renamed": 1,
+                    "total": 3,
+                },
+                "events": {
+                    "followers_gained": [{
+                        "pk": 1,
+                        "username": "arrived",
+                        "profile_url": "https://www.instagram.com/arrived/",
+                    }],
+                    "followers_lost": [{
+                        "pk": 2,
+                        "username": "left",
+                        "profile_url": "https://www.instagram.com/left/",
+                    }],
+                    "following_gained": [],
+                    "following_lost": [],
+                    "renamed": [{
+                        "pk": 7,
+                        "from": "before",
+                        "to": "after",
+                        "changed_at": 1_500,
+                    }],
+                },
+            })
+        );
     }
 
     /// A control character in a name reaches a terminal through this command
