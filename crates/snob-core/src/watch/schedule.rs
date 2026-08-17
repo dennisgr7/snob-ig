@@ -50,7 +50,7 @@ pub const MAX_INTERVAL_SECS: i64 = 366 * 24 * 3_600;
 /// pattern, and lowering the chance of a checkpoint is what the whole pacing
 /// design is for. Fifteen minutes, or a tenth of the interval when that is
 /// smaller, with a floor of one minute.
-pub fn default_jitter(every: Option<Duration>) -> Duration {
+fn default_jitter(every: Option<Duration>) -> Duration {
     let ceiling = Duration::from_secs(15 * 60);
     match every {
         Some(every) => (every / 10).clamp(Duration::from_secs(60), ceiling),
@@ -63,7 +63,7 @@ pub fn default_jitter(every: Option<Duration>) -> Duration {
 /// Every cron field fits in 64 bits — the widest is day-of-month at 31 — so a
 /// field is one integer and testing membership is one shift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldSet(u64);
+struct FieldSet(u64);
 
 impl FieldSet {
     /// Everything in `range`, which is what `*` means.
@@ -97,19 +97,59 @@ impl FieldSet {
 /// the hour; `--at 09:00,21:30` is two specific moments, and reading it as
 /// cron's product gives four — 09:00, 09:30, 21:00 and 21:30, doubling what
 /// anybody asked for. So a calendar built from times of day carries them as
-/// pairs and matches on those instead. [`Calendar::allows`] is where the two
-/// come back together.
+/// pairs and matches on those instead — which of the two readings applies is
+/// [`Times`], and [`Calendar::allows`] is where they come back together.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Calendar {
-    minutes: FieldSet,
-    hours: FieldSet,
-    /// The exact `(hour, minute)` pairs, when this came from `--at`. Empty for
-    /// a cron expression, where the product is the right reading.
-    times: Vec<(u32, u32)>,
+struct Calendar {
+    times: Times,
     days_of_month: FieldSet,
     months: FieldSet,
     /// Sunday is 0, the way cron numbers them.
     days_of_week: FieldSet,
+}
+
+/// Which times of day a calendar allows, in whichever of the two readings the
+/// syntax it came from means.
+///
+/// An enum rather than the three fields it replaced. `--at` filled the minute
+/// and hour sets *as well as* the pairs, with a comment about a caller that
+/// might only want to ask whether an hour was allowed — and no such caller can
+/// exist, because both readers branch on whether the pairs are empty. So the two
+/// sets were written and never read on that path, and a reader had to work out
+/// from the branch which of the two shapes was live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Times {
+    /// The `(hour, minute)` pairs somebody named, as they named them.
+    Exact(Vec<(u32, u32)>),
+    /// The two fields, to be crossed. What a cron expression means.
+    Crossed { minutes: FieldSet, hours: FieldSet },
+}
+
+impl Times {
+    fn allows(&self, hour: u32, minute: u32) -> bool {
+        match self {
+            Self::Exact(times) => times.contains(&(hour, minute)),
+            Self::Crossed { minutes, hours } => hours.contains(hour) && minutes.contains(minute),
+        }
+    }
+
+    /// Every allowed moment of the day, as seconds since midnight.
+    fn moments(&self) -> Vec<i64> {
+        match self {
+            Self::Exact(times) => times
+                .iter()
+                .map(|&(h, m)| i64::from(h) * 3_600 + i64::from(m) * 60)
+                .collect(),
+            Self::Crossed { minutes, hours } => (0..24u32)
+                .filter(|&hour| hours.contains(hour))
+                .flat_map(|hour| {
+                    (0..60u32)
+                        .filter(|&minute| minutes.contains(minute))
+                        .map(move |minute| i64::from(hour) * 3_600 + i64::from(minute) * 60)
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Calendar {
@@ -121,14 +161,7 @@ impl Calendar {
     /// When one of them is `*`, only the other one decides. Every
     /// implementation that gets this wrong gets it wrong quietly.
     fn allows<Tz: TimeZone>(&self, at: &DateTime<Tz>) -> bool {
-        // Exact moments when there are any, the two fields crossed when there
-        // are not. See the note on the struct for why the two readings differ.
-        let time_matches = if self.times.is_empty() {
-            self.minutes.contains(at.minute()) && self.hours.contains(at.hour())
-        } else {
-            self.times.contains(&(at.hour(), at.minute()))
-        };
-        if !time_matches {
+        if !self.times.allows(at.hour(), at.minute()) {
             return false;
         }
         if !self.months.contains(at.month()) {
@@ -160,25 +193,7 @@ impl Calendar {
     /// `None` when there is only one allowed minute in the whole day, where the
     /// gap is a day and there is nothing to refuse.
     fn tightest_gap(&self) -> Option<i64> {
-        let mut allowed: Vec<i64> = if self.times.is_empty() {
-            let mut all = Vec::new();
-            for hour in 0..24u32 {
-                if !self.hours.contains(hour) {
-                    continue;
-                }
-                for minute in 0..60u32 {
-                    if self.minutes.contains(minute) {
-                        all.push(i64::from(hour) * 3_600 + i64::from(minute) * 60);
-                    }
-                }
-            }
-            all
-        } else {
-            self.times
-                .iter()
-                .map(|&(h, m)| i64::from(h) * 3_600 + i64::from(m) * 60)
-                .collect()
-        };
+        let mut allowed = self.times.moments();
         allowed.sort_unstable();
         allowed.dedup();
 
@@ -283,16 +298,12 @@ impl Schedule {
             ));
         }
 
-        let mut minutes = 0u64;
-        let mut hours = 0u64;
         for &(hour, minute) in times {
             if hour > 23 || minute > 59 {
                 return Err(ScheduleError::Unreadable(format!(
                     "{hour:02}:{minute:02} is not a time of day"
                 )));
             }
-            hours |= 1 << hour;
-            minutes |= 1 << minute;
         }
 
         let days_of_week = if days.is_empty() {
@@ -307,11 +318,7 @@ impl Schedule {
 
         Self {
             calendar: Some(Calendar {
-                // Kept as well as the pairs, so a caller that only asks whether
-                // an hour is allowed still gets a true answer.
-                minutes: FieldSet(minutes),
-                hours: FieldSet(hours),
-                times: exact,
+                times: Times::Exact(exact),
                 days_of_month: FieldSet::all(1..=31),
                 months: FieldSet::all(1..=12),
                 days_of_week,
@@ -456,7 +463,7 @@ const HORIZON_MINUTES: i64 = 4 * 366 * 24 * 60;
 /// `None` only when the calendar can never match. Both arguments and the answer
 /// are epoch seconds; the zone is what turns them into wall-clock time, and it
 /// is passed in so a test can pick one rather than inherit the machine's.
-pub fn next_after<Tz: TimeZone>(
+fn next_after<Tz: TimeZone>(
     schedule: &Schedule,
     last_run: Option<i64>,
     now: i64,
@@ -698,11 +705,12 @@ fn parse_cron(expression: &str) -> Result<Calendar, ScheduleError> {
     }
 
     Ok(Calendar {
-        minutes: cron_field(fields[0], 0..=59, "minute")?,
-        hours: cron_field(fields[1], 0..=23, "hour")?,
-        // Empty: for cron, crossing the two fields is the correct reading and
-        // the one anybody writing an expression expects.
-        times: Vec::new(),
+        // Crossed, not paired: for cron that is the correct reading and the one
+        // anybody writing an expression expects.
+        times: Times::Crossed {
+            minutes: cron_field(fields[0], 0..=59, "minute")?,
+            hours: cron_field(fields[1], 0..=23, "hour")?,
+        },
         days_of_month: cron_field(fields[2], 1..=31, "day of month")?,
         months: cron_field(fields[3], 1..=12, "month")?,
         // Seven and zero are both Sunday, which is what every cron accepts.

@@ -51,11 +51,11 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
 /// of rows a year, for a history nobody reads: the diff only ever compares
 /// against the last reported capture, and everything older is there in case
 /// somebody wants to look back. Thirty days is enough to look back over.
-pub const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
+const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
 
 /// How many settled deliveries to keep, for `status` and for anybody wondering
 /// where a report went. Older ones are only a record that something arrived.
-pub const KEEP_DELIVERIES_FOR_SECS: i64 = 7 * 24 * 3_600;
+const KEEP_DELIVERIES_FOR_SECS: i64 = 7 * 24 * 3_600;
 
 /// Removes captures nothing needs any more.
 ///
@@ -138,7 +138,7 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
 /// How long the run log is kept. Long enough for `status` to describe a bad
 /// week, short enough that a monitor on a half-hourly schedule does not
 /// accumulate rows forever.
-pub const KEEP_RUNS_FOR_SECS: i64 = 30 * 24 * 3_600;
+const KEEP_RUNS_FOR_SECS: i64 = 30 * 24 * 3_600;
 
 /// What one run of the monitor did.
 #[derive(Debug, Clone, PartialEq, Eq)]

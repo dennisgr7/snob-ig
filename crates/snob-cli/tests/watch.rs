@@ -97,8 +97,8 @@ async fn a_first_look_reports_nothing_at_all() {
     let mut db = Store::in_memory().unwrap();
     walked(&mut db, ListKind::Followers, &users(&[(1, "a"), (2, "b")]));
 
-    let app = app(&server, db);
-    let report = watch::from_store(&app, None, true).unwrap();
+    let mut app = app(&server, db);
+    let report = watch::from_store(&mut app, None, true).unwrap();
 
     assert!(
         report.changes().is_empty(),
@@ -119,12 +119,12 @@ async fn a_first_look_leaves_a_mark_so_the_next_one_can_speak() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "a"), (2, "b")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     // Somebody new turns up and somebody else leaves.
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "a"), (3, "c")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     let changes = report.changes();
 
     assert_eq!(changes.followers.gained.len(), 1, "one arrived");
@@ -141,11 +141,11 @@ async fn asking_without_advancing_gives_the_same_answer_twice() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "a")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "a"), (2, "b")]));
 
-    let first = watch::from_store(&app, None, false).unwrap();
-    let second = watch::from_store(&app, None, false).unwrap();
+    let first = watch::from_store(&mut app, None, false).unwrap();
+    let second = watch::from_store(&mut app, None, false).unwrap();
 
     assert_eq!(first.changes().len(), 1);
     assert_eq!(
@@ -165,15 +165,18 @@ async fn a_change_is_reported_once_and_not_again() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "a")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "a"), (2, "b")]));
 
     assert_eq!(
-        watch::from_store(&app, None, true).unwrap().changes().len(),
+        watch::from_store(&mut app, None, true)
+            .unwrap()
+            .changes()
+            .len(),
         1
     );
     assert!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .is_empty(),
@@ -189,10 +192,10 @@ async fn a_list_nothing_has_touched_reads_as_unchanged() {
     let mut db = Store::in_memory().unwrap();
     walked(&mut db, ListKind::Followers, &users(&[(1, "a")]));
 
-    let app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    let mut app = app(&server, db);
+    watch::from_store(&mut app, None, true).unwrap();
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert!(matches!(
         report.followers.unwrap().basis,
         snob_core::watch::Basis::Unchanged { .. }
@@ -213,12 +216,12 @@ async fn a_walk_that_stopped_short_is_never_compared_against() {
     );
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     // A later walk that only got one page before Instagram stopped serving.
     cut_short_in(&mut app, ListKind::Followers, &users(&[(1, "a")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert!(
         report.changes().is_empty(),
         "two accounts would have been reported as departures because a walk was cut short"
@@ -234,11 +237,11 @@ async fn reporting_the_followers_does_not_silence_the_following() {
     walked(&mut db, ListKind::Following, &users(&[(5, "e")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     walked_in(&mut app, ListKind::Following, &users(&[(5, "e"), (6, "f")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert_eq!(report.changes().following.gained.len(), 1);
     assert_eq!(report.changes().following.gained[0].username, "f");
 }
@@ -254,7 +257,7 @@ async fn a_manual_run_between_reports_does_not_swallow_the_changes() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "a")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     // Somebody arrives, and the user happens to run `snob followers` themselves.
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "a"), (2, "b")]));
@@ -265,7 +268,7 @@ async fn a_manual_run_between_reports_does_not_swallow_the_changes() {
         &users(&[(1, "a"), (2, "b"), (3, "c")]),
     );
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     let changes = report.changes();
     let gained: Vec<&str> = changes
         .followers
@@ -290,11 +293,11 @@ async fn a_rename_is_reported_as_a_rename_and_nothing_else() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "after")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     let changes = report.changes();
 
     assert!(
@@ -322,12 +325,12 @@ async fn a_rename_of_somebody_only_in_the_following_list_is_reported() {
     walked(&mut db, ListKind::Following, &users(&[(2, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "a_follower")]));
     walked_in(&mut app, ListKind::Following, &users(&[(2, "after")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     let changes = report.changes();
 
     assert_eq!(changes.renamed.len(), 1, "they are in a list this watches");
@@ -345,13 +348,13 @@ async fn a_rename_is_reported_when_only_the_following_list_moved() {
     walked(&mut db, ListKind::Following, &users(&[(2, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     // Only the following list is walked again — what happens when the followers
     // counter has not moved.
     walked_in(&mut app, ListKind::Following, &users(&[(2, "after")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert_eq!(
         report.changes().renamed.len(),
         1,
@@ -369,7 +372,7 @@ async fn a_rename_is_not_repeated_when_one_list_was_refused() {
     walked(&mut db, ListKind::Following, &users(&[(1, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     // A rename, seen by a followers walk that finished and a following walk
     // that did not — so only the followers mark moves.
@@ -377,7 +380,7 @@ async fn a_rename_is_not_repeated_when_one_list_was_refused() {
     cut_short_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
 
     assert_eq!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .renamed
@@ -388,7 +391,7 @@ async fn a_rename_is_not_repeated_when_one_list_was_refused() {
 
     walked_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
     assert!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .renamed
@@ -416,20 +419,20 @@ async fn a_rename_filed_while_the_lists_sat_still_is_still_reported() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
     walked(&mut db, ListKind::Following, &users(&[(1, "before")]));
 
-    let app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    let mut app = app(&server, db);
+    watch::from_store(&mut app, None, true).unwrap();
 
     // Filed by something else -- another account's walk that happens to include
     // them, or a `snob pfp` -- so neither list has a newer capture and both read
     // as unchanged.
     users::upsert(app.db().conn(), &user(1, "after")).unwrap();
 
-    let changes = watch::from_store(&app, None, true).unwrap().changes();
+    let changes = watch::from_store(&mut app, None, true).unwrap().changes();
     assert_eq!(changes.renamed.len(), 1, "the rename was stepped over");
     assert_eq!(changes.renamed[0].from, "before");
 
     assert!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .renamed
@@ -454,11 +457,11 @@ async fn a_list_reported_for_the_first_time_does_not_replay_old_renames() {
     walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "after")]));
     assert_eq!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .renamed
@@ -472,7 +475,7 @@ async fn a_list_reported_for_the_first_time_does_not_replay_old_renames() {
     // reopen a window that has already been sent.
     walked_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
     assert!(
-        watch::from_store(&app, None, true)
+        watch::from_store(&mut app, None, true)
             .unwrap()
             .changes()
             .renamed
@@ -491,12 +494,12 @@ async fn a_friend_who_renamed_themselves_is_reported_once() {
     walked(&mut db, ListKind::Following, &users(&[(1, "before")]));
 
     let mut app = app(&server, db);
-    watch::from_store(&app, None, true).unwrap();
+    watch::from_store(&mut app, None, true).unwrap();
 
     walked_in(&mut app, ListKind::Followers, &users(&[(1, "after")]));
     walked_in(&mut app, ListKind::Following, &users(&[(1, "after")]));
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert_eq!(
         report.changes().renamed.len(),
         1,
@@ -510,9 +513,9 @@ async fn a_friend_who_renamed_themselves_is_reported_once() {
 async fn an_account_with_nothing_walked_reports_nothing_stored() {
     let server = MockServer::start().await;
     let db = Store::in_memory().unwrap();
-    let app = app(&server, db);
+    let mut app = app(&server, db);
 
-    let report = watch::from_store(&app, None, true).unwrap();
+    let report = watch::from_store(&mut app, None, true).unwrap();
     assert!(!report.has_anything_stored());
     assert!(report.changes().is_empty());
 }
@@ -524,10 +527,10 @@ async fn an_account_with_nothing_walked_reports_nothing_stored() {
 async fn an_unknown_account_is_refused_with_something_to_do_about_it() {
     let server = MockServer::start().await;
     let db = Store::in_memory().unwrap();
-    let app = app(&server, db);
+    let mut app = app(&server, db);
 
-    let error =
-        watch::from_store(&app, Some("stranger"), false).expect_err("nothing is stored about them");
+    let error = watch::from_store(&mut app, Some("stranger"), false)
+        .expect_err("nothing is stored about them");
     let text = error.to_string();
 
     assert!(text.contains("stranger"), "{text}");

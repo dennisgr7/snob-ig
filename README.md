@@ -222,8 +222,11 @@ Nothing is sent when nothing changed, so every message that arrives means
 something; `--heartbeat` sends one anyway, for when silence is the signal you
 are watching. A report that cannot be delivered is queued and retried, and it is
 queued *before* the monitor moves on — a receiver that was restarting does not
-cost you the change. Plain `http://` is refused unless the address is on your own
-network, because the report carries account names and any token travels with it.
+cost you the change. It remembers the address it was made for, so pointing a run
+somewhere else with `--webhook` does not flush your backlog, or your stored
+token, to that address. Plain `http://` is refused unless the address is on your
+own network, because the report carries account names and any token travels with
+it.
 
 No webhook at all is a complete way to use this:
 

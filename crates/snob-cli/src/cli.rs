@@ -327,10 +327,10 @@ pub struct WebhookArgs {
 
 /// The monitor.
 ///
-/// A subcommand is required for now. The scheduled run — `snob watch` on its
-/// own, with the interval either on the command line or in its configuration
-/// file — makes this optional when it lands, which is an addition rather than a
-/// change: nothing written against these stops working.
+/// Optional: `snob watch` with no subcommand is the scheduled run, taking its
+/// interval from the command line or from `watch.toml`. The subcommands are the
+/// things a person does by hand — look once, read the last diff, configure it,
+/// ask what it has been doing.
 #[derive(Subcommand, Debug)]
 pub enum WatchCommand {
     /// What has changed since the last time the monitor reported
@@ -346,7 +346,8 @@ pub enum WatchCommand {
     /// Look now, report what changed, and remember having reported it
     #[command(
         after_help = "One run of the monitor. Meant for cron, a systemd timer or Windows Task \
-                      Scheduler until the scheduled mode lands.\n\n\
+                      Scheduler; \"snob watch\" with no subcommand schedules \
+                      itself instead.\n\n\
                       It reads the account's counters and only walks a list if its counter moved, \
                       so a run with nothing to report costs a single request. Unlike \"diff\", \
                       this moves the monitor on: whatever it reports is not reported again.\n\n\
@@ -402,8 +403,9 @@ pub struct WatchOnceArgs {
     // No -y here, and deliberately. Consent to enumerate somebody else's lists
     // is a thing a person gives, and an unattended run that could be handed one
     // on the command line is one whose consent came from whoever wrote the cron
-    // entry. Reading another account needs a terminal to ask at until the
-    // configuration file lands, which is where a recorded answer will live.
+    // entry. Reading another account needs a terminal to ask at, or an
+    // `[[account]]` in `watch.toml` carrying the answer somebody gave once,
+    // which is the only thing an unattended run accepts.
     pub target: Option<String>,
 
     /// Return the data as JSON
@@ -464,22 +466,19 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// What this wrapper actually adds: the error carries the text somebody
+    /// typed, so clap can say which value it was complaining about.
+    ///
+    /// The parsing itself moved to `snob_core::duration` and its tests went with
+    /// it; a verbatim copy of them stayed here for a while, testing the same
+    /// function twice and quietly implying there were two.
     #[test]
-    fn it_parses_the_usual_durations() {
-        use std::time::Duration;
-        assert_eq!(duration("30m").unwrap(), Duration::from_secs(1_800));
-        assert_eq!(duration("6h").unwrap(), Duration::from_secs(21_600));
-        assert_eq!(duration("2d").unwrap(), Duration::from_secs(172_800));
-        assert_eq!(duration("45s").unwrap(), Duration::from_secs(45));
-        assert_eq!(duration("90").unwrap(), Duration::from_secs(90));
-        assert_eq!(duration(" 6h ").unwrap(), Duration::from_secs(21_600));
-    }
-
-    #[test]
-    fn it_rejects_what_is_not_a_duration() {
-        for bad in ["", "h", "six hours", "6x", "-3h", "6.5h"] {
-            assert!(duration(bad).is_err(), "\"{bad}\" should be rejected");
-        }
+    fn a_duration_that_will_not_parse_is_refused_by_name() {
+        assert_eq!(
+            duration("6h").unwrap(),
+            std::time::Duration::from_secs(21_600)
+        );
+        assert!(duration("six hours").is_err());
     }
 
     #[test]

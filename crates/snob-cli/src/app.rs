@@ -48,10 +48,21 @@ impl Viewer {
     /// How to name this account to a person: `@someone`, or the id when the
     /// name has not been learned yet.
     pub fn label(&self) -> String {
-        match self.safe_username() {
-            Some(name) => format!("@{name}"),
-            None => format!("account {}", self.pk),
-        }
+        label(self.pk, self.username.as_deref())
+    }
+}
+
+/// How to name any account to a person: `@someone`, or the id when the name has
+/// not been learned yet.
+///
+/// A free function because the rule was written out four times — here and three
+/// more in the monitor, which names accounts it never has a `Viewer` for. All
+/// four did call `printable`, so nothing went out unfiltered; four spellings of
+/// one rule is four places to forget it.
+pub fn label(pk: Pk, username: Option<&str>) -> String {
+    match username {
+        Some(name) => format!("@{}", snob_core::model::printable(name)),
+        None => format!("account {pk}"),
     }
 }
 

@@ -41,10 +41,17 @@ message that arrives means something. A report that cannot be delivered is
 queued and tried again with a growing wait, and it is queued **before** the
 monitor moves on, so a receiver that was restarting does not cost you the
 change. It carries `X-Snob-Delivery` for exactly that reason: delivery is
-at-least-once, so a repeat is possible and the receiver can drop it. A webhook
-that refuses — a wrong token, an address that is not there — is not retried,
-because waiting does not fix a 401, and one that keeps failing is given up on
-after a few hours rather than retried forever.
+at-least-once, so a repeat is possible and the receiver can drop it. Every
+answer your endpoint gives is worth another try — a 404 from an n8n workflow
+that was not registered, a 403 from a proxy reloading, a 401 from a token that
+expired — because the alternative is losing the only copy of that change. One
+that keeps failing is given up on after a few hours rather than retried forever,
+and the line you get then says the change was not reported rather than implying
+it is still queued.
+
+A queued report remembers the address it was made for, so pointing a run
+somewhere else with `--webhook` to see what the payload looks like does not
+flush your backlog, or your stored token, to that address.
 
 `http://` is refused unless the address is on your own network, because the
 report carries account names and any token you configured travels with it. That
@@ -74,9 +81,9 @@ scheduled run that was down for a day does not fire the runs it missed when it
 comes back: it runs once and says how many it is standing in for, because there
 is only one present state and nothing to catch up on.
 
-`--every` will not go below fifteen minutes, and says why.
-
-The webhook is not built yet.
+`--every` will not go below fifteen minutes, and says why — and neither will a
+calendar or a cron expression that amounts to the same thing, nor two runs that
+jitter happened to push together.
 
 Four things here change what a script sees, so they come first:
 

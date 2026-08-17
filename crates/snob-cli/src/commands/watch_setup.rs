@@ -190,19 +190,42 @@ fn ask_webhook() -> Result<WebhookAnswers> {
     let parsed =
         url::Url::parse(url.trim()).with_context(|| format!("\"{url}\" is not an address"))?;
 
-    // Checked while the person is still here. The alternative is a service that
-    // starts, waits six hours, and then fails on an address they typed wrong.
-    crate::watch::webhook::check(&crate::watch::webhook::Webhook {
-        url: parsed,
-        headers: vec![],
-        key: None,
-    })?;
-
     // Headers whose values are not secret go in the file; the Authorization
     // value goes to the keyring and nothing about it is written here. An empty
     // placeholder in the file would be worse than nothing: it reads as a header
     // that is configured and sends nothing.
-    let headers = Vec::new();
+    //
+    // The question is asked rather than assumed away. This was an empty vector
+    // with the comment above it, so `[webhook.headers]` could only ever be
+    // written by hand while the wizard implied otherwise — and `X-Api-Key` on an
+    // n8n instance is the ordinary case.
+    let mut headers = Vec::new();
+    if ui::confirm("Does it need any other headers?", false)? {
+        loop {
+            let line = ui::prompt_line("Name: value (blank when there are no more)")?;
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                bail!(
+                    "\"{}\" is not a header; write it as \"Name: value\"",
+                    printable(line)
+                );
+            };
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    // Checked while the person is still here, address and headers together. The
+    // alternative is a service that starts, waits six hours, and then fails on
+    // something they typed wrong.
+    crate::watch::webhook::check(&crate::watch::webhook::Webhook {
+        url: parsed,
+        headers: headers.clone(),
+        key: None,
+    })?;
+
     let mut token = None;
     if ui::confirm("Does it need an Authorization header?", false)? {
         let value = ui::prompt_secret("The header value (for example \"Bearer abc123\")")?;
@@ -348,9 +371,8 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     } else {
         for run in &last_runs {
             let pk = run.account_pk;
-            let who = snob_core::store::users::name(db.conn(), pk)?
-                .map(|n| format!("@{}", printable(&n)))
-                .unwrap_or_else(|| format!("account {pk}"));
+            let name = snob_core::store::users::name(db.conn(), pk)?;
+            let who = crate::app::label(pk, name.as_deref());
 
             let mut line = format!("{who} last ran on {}", report::stored_on(run.started_at));
             if let Some(outcome) = &run.outcome
@@ -375,9 +397,8 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         println!("The monitor has not reported on anything yet.");
     } else {
         for mark in &marks {
-            let who = snob_core::store::users::name(db.conn(), mark.account_pk)?
-                .map(|n| format!("@{}", printable(&n)))
-                .unwrap_or_else(|| format!("account {}", mark.account_pk));
+            let name = snob_core::store::users::name(db.conn(), mark.account_pk)?;
+            let who = crate::app::label(mark.account_pk, name.as_deref());
             println!(
                 "{who}: {} last reported on {}",
                 mark.kind,

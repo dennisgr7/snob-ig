@@ -29,7 +29,7 @@ const MAX_BACKOFF_SECS: i64 = 3_600;
 /// With the backoff above, eight attempts span a little over five hours. Past
 /// that the far end is not restarting, it is gone or it is refusing, and the
 /// row is more use as a line in the log than as work that never finishes.
-pub const MAX_ATTEMPTS: i64 = 8;
+const MAX_ATTEMPTS: i64 = 8;
 
 /// How old a report may get before it is given up on whatever its attempt
 /// count says.

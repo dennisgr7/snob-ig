@@ -305,6 +305,18 @@ async fn tick_one(
         }
     }
 
+    warn_about_refusals(&tick);
+
+    deliver(app, &tick, delivery).await
+}
+
+/// Says out loud which lists this run could not look at, and why.
+///
+/// To standard error, so it does not land in the middle of a report something
+/// else is parsing — and said even in JSON, where a caller reading `looked`
+/// would otherwise have to guess why. Both callers had a verbatim copy of the
+/// loop, one destructured and one indexing the pair.
+fn warn_about_refusals(tick: &TickReport) {
     for (kind, skipped) in tick
         .lists
         .iter()
@@ -312,8 +324,6 @@ async fn tick_one(
     {
         ui::warn(&refusal_line(kind, skipped));
     }
-
-    deliver(app, &tick, delivery).await
 }
 
 /// Which account a scheduled run watches, and whether it may.
@@ -566,16 +576,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
         }
     }
 
-    // What was refused goes to standard error, so it does not land in the
-    // middle of a report something else is parsing — and it is said even in
-    // JSON, where a caller reading `looked` would otherwise have to guess why.
-    for skipped in tick
-        .lists
-        .iter()
-        .filter_map(|l| l.skipped.map(|s| (l.kind, s)))
-    {
-        ui::warn(&refusal_line(skipped.0, skipped.1));
-    }
+    warn_about_refusals(&tick);
 
     deliver(&mut app, &tick, delivery.as_ref()).await?;
     if let Some(delivery) = delivery.as_ref() {
@@ -1033,11 +1034,11 @@ fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
 /// thing `snob watch` does when it has actually reported them somewhere.
 fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Nothing is fetched here, so there is no bar to draw.
-    let Session::Open(app) = common::open_with_progress(false, &secrets, paths)? else {
+    let Session::Open(mut app) = common::open_with_progress(false, &secrets, paths)? else {
         return Ok(ExitCode::NoSession);
     };
 
-    let report = crate::engine::watch::from_store(&app, args.target.as_deref(), false)?;
+    let report = crate::engine::watch::from_store(&mut app, args.target.as_deref(), false)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&as_json(&report))?);
@@ -1243,10 +1244,7 @@ fn basis_token(basis: Basis) -> &'static str {
 /// Returned as lines rather than printed, so a test can read them without
 /// capturing standard output.
 fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
-    let who = match report.username.as_deref() {
-        Some(name) => format!("@{}", printable(name)),
-        None => format!("account {}", report.account_pk),
-    };
+    let who = crate::app::label(report.account_pk, report.username.as_deref());
 
     if !report.has_anything_stored() {
         // A run in which every list was refused concluded nothing, and that is
