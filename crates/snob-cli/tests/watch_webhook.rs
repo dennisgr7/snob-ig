@@ -77,7 +77,7 @@ async fn a_report_that_is_accepted_is_delivered() {
 
     let client = client_for(&server, None, vec![]);
     assert_eq!(
-        client.post(BODY, "7", 1).await,
+        client.post(BODY, "watch.changes", "7", 1).await,
         Attempt::Delivered { status: 200 }
     );
 }
@@ -90,7 +90,9 @@ async fn the_body_arrives_byte_for_byte() {
     let server = MockServer::start().await;
     mount_hook(&server, 200).await;
 
-    client_for(&server, None, vec![]).post(BODY, "7", 1).await;
+    client_for(&server, None, vec![])
+        .post(BODY, "watch.changes", "7", 1)
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(std::str::from_utf8(&last(&requests).body).unwrap(), BODY);
@@ -108,7 +110,7 @@ async fn the_signature_checks_out_against_the_bytes_that_arrived() {
     mount_hook(&server, 200).await;
 
     client_for(&server, Some("a shared secret"), vec![])
-        .post(BODY, "7", 1)
+        .post(BODY, "watch.changes", "7", 1)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -126,7 +128,9 @@ async fn without_a_secret_nothing_is_signed() {
     let server = MockServer::start().await;
     mount_hook(&server, 200).await;
 
-    client_for(&server, None, vec![]).post(BODY, "7", 1).await;
+    client_for(&server, None, vec![])
+        .post(BODY, "watch.changes", "7", 1)
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     assert!(last(&requests).headers.get("x-snob-signature").is_none());
@@ -139,13 +143,40 @@ async fn the_receiver_is_told_what_this_is_and_which_attempt() {
     let server = MockServer::start().await;
     mount_hook(&server, 200).await;
 
-    client_for(&server, None, vec![]).post(BODY, "41", 3).await;
+    client_for(&server, None, vec![])
+        .post(BODY, "watch.changes", "41", 3)
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     let sent = last(&requests);
     assert_eq!(sent.headers.get("x-snob-delivery").unwrap(), "41");
     assert_eq!(sent.headers.get("x-snob-attempt").unwrap(), "3");
     assert_eq!(sent.headers.get("x-snob-event").unwrap(), "watch.changes");
+}
+
+/// The header exists so a receiver can route without parsing the body, which
+/// means it has to agree with the body. It said `watch.changes` over every
+/// heartbeat, so exactly the receiver the header is for would have treated
+/// every one of them as a report of changes.
+#[tokio::test]
+async fn a_heartbeat_says_so_in_the_header_too() {
+    let server = MockServer::start().await;
+    mount_hook(&server, 200).await;
+
+    client_for(&server, None, vec![])
+        .post(
+            r#"{"schema":1,"event":"watch.heartbeat"}"#,
+            "watch.heartbeat",
+            "7",
+            1,
+        )
+        .await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        last(&requests).headers.get("x-snob-event").unwrap(),
+        "watch.heartbeat"
+    );
 }
 
 #[tokio::test]
@@ -158,7 +189,7 @@ async fn a_configured_header_is_sent() {
         None,
         vec![("Authorization".into(), "Bearer secret".into())],
     )
-    .post(BODY, "7", 1)
+    .post(BODY, "watch.changes", "7", 1)
     .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -175,7 +206,9 @@ async fn the_session_never_reaches_the_webhook() {
     let server = MockServer::start().await;
     mount_hook(&server, 200).await;
 
-    client_for(&server, None, vec![]).post(BODY, "7", 1).await;
+    client_for(&server, None, vec![])
+        .post(BODY, "watch.changes", "7", 1)
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     let sent = last(&requests);
@@ -209,7 +242,9 @@ async fn a_server_error_is_worth_retrying_and_a_refusal_is_not() {
         let server = MockServer::start().await;
         mount_hook(&server, status).await;
 
-        let outcome = client_for(&server, None, vec![]).post(BODY, "7", 1).await;
+        let outcome = client_for(&server, None, vec![])
+            .post(BODY, "watch.changes", "7", 1)
+            .await;
         match (&outcome, retryable) {
             (Attempt::Failed { .. }, true) | (Attempt::Refused { .. }, false) => {}
             _ => panic!(
@@ -236,7 +271,9 @@ async fn a_redirect_is_not_followed() {
         .mount(&server)
         .await;
 
-    client_for(&server, None, vec![]).post(BODY, "7", 1).await;
+    client_for(&server, None, vec![])
+        .post(BODY, "watch.changes", "7", 1)
+        .await;
 
     assert!(
         elsewhere.received_requests().await.unwrap().is_empty(),
@@ -261,7 +298,7 @@ async fn an_unreachable_address_is_a_temporary_failure() {
     .unwrap();
 
     assert!(matches!(
-        client.post(BODY, "7", 1).await,
+        client.post(BODY, "watch.changes", "7", 1).await,
         Attempt::Failed { status: None, .. }
     ));
 }
@@ -283,7 +320,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let down = MockServer::start().await;
     mount_hook(&down, 503).await;
     let outcome = client_for(&down, None, vec![])
-        .post(BODY, &id.to_string(), 1)
+        .post(BODY, "watch.changes", &id.to_string(), 1)
         .await;
     assert!(matches!(outcome, Attempt::Failed { .. }));
     deliveries::failed(app.db().conn(), id, Some(503), "busy", false, 1_000).unwrap();
@@ -297,7 +334,12 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let up = MockServer::start().await;
     mount_hook(&up, 200).await;
     let outcome = client_for(&up, None, vec![])
-        .post(&owed[0].body, &id.to_string(), owed[0].attempts + 1)
+        .post(
+            &owed[0].body,
+            "watch.changes",
+            &id.to_string(),
+            owed[0].attempts + 1,
+        )
         .await;
     assert_eq!(outcome, Attempt::Delivered { status: 200 });
     deliveries::delivered(app.db().conn(), id, 200, 2_000).unwrap();

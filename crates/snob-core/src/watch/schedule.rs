@@ -81,10 +81,21 @@ impl FieldSet {
 }
 
 /// Which minutes a run is allowed to happen in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The hour and minute fields are independent, which is what cron means and is
+/// **not** what `--at` means. `0 9,21 * * *` is nine and twenty-one o'clock on
+/// the hour; `--at 09:00,21:30` is two specific moments, and reading it as
+/// cron's product gives four — 09:00, 09:30, 21:00 and 21:30, doubling what
+/// anybody asked for. So a calendar built from times of day carries them as
+/// pairs and matches on those instead. [`Calendar::allows`] is where the two
+/// come back together.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Calendar {
     minutes: FieldSet,
     hours: FieldSet,
+    /// The exact `(hour, minute)` pairs, when this came from `--at`. Empty for
+    /// a cron expression, where the product is the right reading.
+    times: Vec<(u32, u32)>,
     days_of_month: FieldSet,
     months: FieldSet,
     /// Sunday is 0, the way cron numbers them.
@@ -100,7 +111,14 @@ impl Calendar {
     /// When one of them is `*`, only the other one decides. Every
     /// implementation that gets this wrong gets it wrong quietly.
     fn allows<Tz: TimeZone>(&self, at: &DateTime<Tz>) -> bool {
-        if !self.minutes.contains(at.minute()) || !self.hours.contains(at.hour()) {
+        // Exact moments when there are any, the two fields crossed when there
+        // are not. See the note on the struct for why the two readings differ.
+        let time_matches = if self.times.is_empty() {
+            self.minutes.contains(at.minute()) && self.hours.contains(at.hour())
+        } else {
+            self.times.contains(&(at.hour(), at.minute()))
+        };
+        if !time_matches {
             return false;
         }
         if !self.months.contains(at.month()) {
@@ -120,6 +138,54 @@ impl Calendar {
             (false, true) => dow,
             (false, false) => true,
         }
+    }
+
+    /// The shortest gap between two moments this calendar allows, in seconds.
+    ///
+    /// Only the minutes and hours are looked at, and that is enough: the day
+    /// fields can only ever make the gaps *longer*, so a calendar whose
+    /// within-a-day spacing is acceptable is acceptable however it is
+    /// restricted by day. What this catches is `*/5 * * * *` and `09:00,09:05`.
+    ///
+    /// `None` when there is only one allowed minute in the whole day, where the
+    /// gap is a day and there is nothing to refuse.
+    fn tightest_gap(&self) -> Option<i64> {
+        let mut allowed: Vec<i64> = if self.times.is_empty() {
+            let mut all = Vec::new();
+            for hour in 0..24u32 {
+                if !self.hours.contains(hour) {
+                    continue;
+                }
+                for minute in 0..60u32 {
+                    if self.minutes.contains(minute) {
+                        all.push(i64::from(hour) * 3_600 + i64::from(minute) * 60);
+                    }
+                }
+            }
+            all
+        } else {
+            self.times
+                .iter()
+                .map(|&(h, m)| i64::from(h) * 3_600 + i64::from(m) * 60)
+                .collect()
+        };
+        allowed.sort_unstable();
+        allowed.dedup();
+
+        if allowed.len() < 2 {
+            return None;
+        }
+        // The wrap from the last of one day to the first of the next counts:
+        // 23:59 and 00:00 are a minute apart, not twenty-four hours.
+        let wrap = 24 * 3_600 - allowed[allowed.len() - 1] + allowed[0];
+        Some(
+            allowed
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .chain(std::iter::once(wrap))
+                .min()
+                .unwrap_or(wrap),
+        )
     }
 }
 
@@ -185,10 +251,17 @@ impl Schedule {
             FieldSet(days.iter().fold(0u64, |bits, d| bits | (1 << d.number())))
         };
 
+        let mut exact: Vec<(u32, u32)> = times.to_vec();
+        exact.sort_unstable();
+        exact.dedup();
+
         Self {
             calendar: Some(Calendar {
+                // Kept as well as the pairs, so a caller that only asks whether
+                // an hour is allowed still gets a true answer.
                 minutes: FieldSet(minutes),
                 hours: FieldSet(hours),
+                times: exact,
                 days_of_month: FieldSet::all(1..=31),
                 months: FieldSet::all(1..=12),
                 days_of_week,
@@ -201,11 +274,12 @@ impl Schedule {
 
     /// A five-field cron expression.
     pub fn cron(expression: &str) -> Result<Self, ScheduleError> {
-        Ok(Self {
+        Self {
             calendar: Some(parse_cron(expression)?),
             every: None,
             jitter: default_jitter(None),
-        })
+        }
+        .validated()
     }
 
     /// Adds a floor to a calendar, or a calendar to a floor.
@@ -229,6 +303,14 @@ impl Schedule {
         self.jitter
     }
 
+    /// Refuses a schedule that would run more often than the floor allows.
+    ///
+    /// **Both halves are checked, not just the interval.** This used to look at
+    /// `every` alone, and `cron` did not call it at all — so `--every 5m` was
+    /// refused while `--cron "*/5 * * * *"` and `--at 09:00,09:05` were
+    /// accepted and ran exactly as often. The message said "the monitor does not
+    /// run twice inside fifteen minutes" while two of the three ways of asking
+    /// for it did.
     fn validated(self) -> Result<Self, ScheduleError> {
         if self.calendar.is_none() && self.every.is_none() {
             return Err(ScheduleError::Empty);
@@ -238,6 +320,20 @@ impl Schedule {
         {
             return Err(ScheduleError::TooOften {
                 interval: crate::duration::format(every),
+                minutes: MIN_GAP_SECS / 60,
+            });
+        }
+
+        // A calendar with an interval on it is bounded by the interval, which
+        // has just been checked. On its own, the calendar's own tightest gap is
+        // what decides.
+        if self.every.is_none()
+            && let Some(calendar) = &self.calendar
+            && let Some(gap) = calendar.tightest_gap()
+            && gap < MIN_GAP_SECS
+        {
+            return Err(ScheduleError::TooOften {
+                interval: crate::duration::format(Duration::from_secs(gap as u64)),
                 minutes: MIN_GAP_SECS / 60,
             });
         }
@@ -330,19 +426,62 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
         return Due::At(next);
     }
 
-    // Due, or overdue. Count how many were skipped so the run can say so — a
-    // report that arrives after an outage should be able to admit it covers
-    // more than one interval.
-    let missed = match (schedule.every, last_run) {
-        (Some(every), Some(last)) => {
-            let elapsed = now - last;
-            let interval = every.as_secs().max(1) as i64;
-            ((elapsed / interval).max(1) - 1) as u32
-        }
-        _ => 0,
-    };
-    Due::Now { missed }
+    Due::Now {
+        missed: missed_since(schedule, last_run, now, zone),
+    }
 }
+
+/// How many scheduled runs went by unrun, not counting the one due now.
+///
+/// Counted against whatever actually decides the schedule. Dividing the elapsed
+/// time by the interval is only right when the interval is the whole of it: with
+/// `--every 1h --on mon --at 09:00` a week of downtime is one missed run, and
+/// the arithmetic said 167. The number is printed at the user, so a wrong one is
+/// a sentence that is simply false.
+///
+/// Bounded by `MAX_MISSED_COUNTED`, because the answer is only ever used to say
+/// "several" out loud and walking a calendar minute by minute over a year of
+/// downtime is not worth doing to reach a larger number.
+fn missed_since<Tz: TimeZone>(
+    schedule: &Schedule,
+    last_run: Option<i64>,
+    now: i64,
+    zone: &Tz,
+) -> u32 {
+    let Some(last) = last_run else {
+        return 0; // nothing has run, so nothing was missed
+    };
+
+    // No calendar: the interval is the schedule, and division is exact.
+    if schedule.calendar.is_none() {
+        let Some(every) = schedule.every else {
+            return 0;
+        };
+        let interval = every.as_secs().max(1) as i64;
+        return (((now - last) / interval).max(1) - 1).min(MAX_MISSED_COUNTED as i64) as u32;
+    }
+
+    // With one, the moments it allows have to be walked. Each step starts from
+    // the moment found, so `every` keeps acting as the floor it is.
+    //
+    // Only moments strictly before `now` are counted, so the one due this
+    // instant is already excluded — nothing is subtracted afterwards.
+    let mut counted = 0;
+    let mut at = last;
+    while counted < MAX_MISSED_COUNTED {
+        match next_after(schedule, Some(at), at, zone) {
+            Some(next) if next < now => {
+                counted += 1;
+                at = next;
+            }
+            _ => break,
+        }
+    }
+    counted
+}
+
+/// The largest number of skipped runs worth counting exactly.
+const MAX_MISSED_COUNTED: u32 = 1_000;
 
 /// The moment to actually wake at, once jitter is applied.
 ///
@@ -425,6 +564,9 @@ fn parse_cron(expression: &str) -> Result<Calendar, ScheduleError> {
     Ok(Calendar {
         minutes: cron_field(fields[0], 0..=59, "minute")?,
         hours: cron_field(fields[1], 0..=23, "hour")?,
+        // Empty: for cron, crossing the two fields is the correct reading and
+        // the one anybody writing an expression expects.
+        times: Vec::new(),
         days_of_month: cron_field(fields[2], 1..=31, "day of month")?,
         months: cron_field(fields[3], 1..=12, "month")?,
         // Seven and zero are both Sunday, which is what every cron accepts.
@@ -559,6 +701,25 @@ mod tests {
         assert_eq!(due(&schedule, None, at(0), &Utc), Due::Now { missed: 0 });
     }
 
+    /// The count is against what actually decides the schedule, not against the
+    /// interval alone. A week down on `--every 1h --on mon --at 09:00` is one
+    /// missed Monday; dividing the elapsed time by the hour said 167, and that
+    /// number is printed at the user.
+    #[test]
+    fn a_calendar_counts_the_runs_it_allows_and_not_the_hours() {
+        let schedule = Schedule::calendar(&[Weekday::Mon], &[(9, 0)])
+            .unwrap()
+            .and_every(Duration::from_secs(hours(1) as u64))
+            .unwrap();
+
+        // Last ran one Monday at nine; it is now the Monday a fortnight later.
+        let last = at(hours(9));
+        match due(&schedule, Some(last), last + 14 * hours(24), &Utc) {
+            Due::Now { missed } => assert_eq!(missed, 1, "one Monday went by unrun"),
+            other => panic!("should be due: {other:?}"),
+        }
+    }
+
     /// The rule that keeps an outage from becoming a burst.
     #[test]
     fn a_process_that_was_down_for_days_runs_once_and_says_how_many_it_missed() {
@@ -614,11 +775,101 @@ mod tests {
 
     /// The test that holds "one evaluator, two syntaxes" together. If these
     /// ever disagree, the same schedule means two things.
+    ///
+    /// Compared by the moments they fire at rather than by their fields. The
+    /// two representations are no longer identical and should not be: a
+    /// calendar built from `--at` carries the exact times, because `09:00,21:30`
+    /// means two moments while cron's `0,30 9,21` means four. What has to match
+    /// is the answer, and that is what this asks for.
     #[test]
     fn the_dsl_and_cron_agree_about_monday_at_nine() {
         let dsl = Schedule::calendar(&[Weekday::Mon], &[(9, 0)]).unwrap();
         let cron = Schedule::cron("0 9 * * 1").unwrap();
-        assert_eq!(dsl.calendar, cron.calendar);
+
+        let mut at = at(-hours(30));
+        for _ in 0..5 {
+            let from_dsl = next_after(&dsl, None, at, &Utc);
+            assert_eq!(from_dsl, next_after(&cron, None, at, &Utc));
+            at = from_dsl.expect("Monday comes round") + 60;
+        }
+    }
+
+    /// `--at 09:00,21:30` is two moments a day, not the four that crossing the
+    /// hour and minute fields gives. It used to be four, which quietly doubled
+    /// what anybody who named two times was spending.
+    #[test]
+    fn two_times_of_day_are_two_moments_and_not_their_product() {
+        let schedule = Schedule::calendar(&[], &[(9, 0), (21, 30)]).unwrap();
+
+        let mut fired = Vec::new();
+        let mut at = at(0);
+        for _ in 0..4 {
+            let next = next_after(&schedule, None, at, &Utc).unwrap();
+            let local = Utc.timestamp_opt(next, 0).unwrap();
+            fired.push(format!("{:02}:{:02}", local.hour(), local.minute()));
+            at = next + 60;
+        }
+
+        assert_eq!(fired, vec!["09:00", "21:30", "09:00", "21:30"]);
+    }
+
+    /// And cron keeps cron's reading, which is the product. `0,30 9,21 * * *`
+    /// really is four times a day, and somebody writing that expression means
+    /// exactly that.
+    #[test]
+    fn a_cron_expression_still_crosses_its_hour_and_minute_fields() {
+        let schedule = Schedule::cron("0,30 9,21 * * *").unwrap();
+
+        let mut fired = Vec::new();
+        let mut at = at(0);
+        for _ in 0..4 {
+            let next = next_after(&schedule, None, at, &Utc).unwrap();
+            let local = Utc.timestamp_opt(next, 0).unwrap();
+            fired.push(format!("{:02}:{:02}", local.hour(), local.minute()));
+            at = next + 60;
+        }
+
+        assert_eq!(fired, vec!["09:00", "09:30", "21:00", "21:30"]);
+    }
+
+    /// The floor applies to every way of asking, not only to `--every`.
+    ///
+    /// `cron` did not call `validated()` at all and `validated()` only looked at
+    /// the interval, so the tool refused `--every 5m` while accepting
+    /// `--cron "*/5 * * * *"` and `--at 09:00,09:05` — which run just as often.
+    /// The error message claimed a rule two of the three ways round it.
+    #[test]
+    fn nothing_gets_past_the_minimum_gap() {
+        for expression in ["* * * * *", "*/5 * * * *", "0,10 * * * *"] {
+            assert!(
+                Schedule::cron(expression).is_err(),
+                "\"{expression}\" runs more often than the floor allows"
+            );
+        }
+        assert!(Schedule::calendar(&[], &[(9, 0), (9, 5)]).is_err());
+        assert!(Schedule::every(Duration::from_secs(300)).is_err());
+    }
+
+    /// And what is spaced widely enough still goes through, including the
+    /// shapes people actually write.
+    #[test]
+    fn an_ordinary_schedule_is_not_caught_by_the_floor() {
+        for expression in ["0 9 * * *", "0 */6 * * *", "0 9 * * 1,4", "0,30 * * * *"] {
+            assert!(
+                Schedule::cron(expression).is_ok(),
+                "\"{expression}\" should be allowed"
+            );
+        }
+        assert!(Schedule::calendar(&[], &[(9, 0), (21, 30)]).is_ok());
+        assert!(Schedule::every(Duration::from_secs(MIN_GAP_SECS as u64)).is_ok());
+    }
+
+    /// The gap across midnight is a gap. `23:55` and `00:00` are five minutes
+    /// apart, and measuring only the forward differences within a day would
+    /// call them nearly twenty-four hours and let them through.
+    #[test]
+    fn the_wrap_around_midnight_counts_as_a_gap() {
+        assert!(Schedule::calendar(&[], &[(23, 55), (0, 0)]).is_err());
     }
 
     #[test]

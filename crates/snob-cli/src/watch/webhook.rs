@@ -88,12 +88,19 @@ impl WebhookClient {
     /// `body` is sent verbatim and signed verbatim. It is not re-serialized
     /// here, and `.json()` is deliberately not used: that would render the
     /// value again, and the signature covers bytes.
-    pub async fn post(&self, body: &str, delivery_id: &str, attempt: i64) -> Attempt {
+    /// `event` is what the body says it is, and the header has to agree.
+    ///
+    /// It used to be the literal `"watch.changes"` on every request, including
+    /// heartbeats, whose body says `watch.heartbeat`. The whole point of the
+    /// header is that a receiver can route on it without parsing the body —
+    /// which is precisely the receiver that would have treated every heartbeat
+    /// as a report of changes.
+    pub async fn post(&self, body: &str, event: &str, delivery_id: &str, attempt: i64) -> Attempt {
         let mut request = self
             .client
             .post(self.webhook.url.clone())
             .header("Content-Type", "application/json")
-            .header(EVENT_HEADER, "watch.changes")
+            .header(EVENT_HEADER, event)
             .header(DELIVERY_HEADER, delivery_id)
             .header(ATTEMPT_HEADER, attempt.to_string());
 

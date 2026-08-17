@@ -57,7 +57,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     let configured = config::load(paths)?;
 
     let schedule = schedule_from(&args, configured.as_ref())?;
-    let watched = watched_from(args.target.clone(), configured.as_ref())?;
+    let watched = watched_from(args.target.clone(), configured.as_ref());
     // Built once and reused, so a service that runs for months holds one
     // connection pool rather than building a TLS stack every few hours. Checked
     // here for the same reason the schedule is: a bad address should stop this
@@ -67,14 +67,15 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // Refused here rather than at the first tick. A service that starts, waits
     // six hours and then exits because it was never allowed to read that
     // account is a service that looked healthy all afternoon.
-    if !watched.may_run_unattended() {
+    if let Some(unallowed) = watched.iter().find(|w| !w.may_run_unattended()) {
+        let name = unallowed.name().unwrap_or_default();
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
-                "reading {}'s lists needs confirmation, and a scheduled run has nobody to ask.\n\
-                 Use \"snob watch once {}\" while you are here to answer it.",
-                target_label(args.target.as_deref()),
-                args.target.as_deref().unwrap_or_default(),
+                "reading @{}'s lists needs confirmation, and a scheduled run has nobody to \
+                 ask.\nRun \"snob watch setup\" to answer it once, or \"snob watch once {name}\" \
+                 while you are here.",
+                printable(name),
             ),
         )
         .into());
@@ -82,7 +83,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
 
     ui::info(&format!(
         "Watching {}. {} Stop with Ctrl+C.",
-        target_label(args.target.as_deref()),
+        watching_label(&watched),
         describe_schedule(&schedule, args.now),
     ));
 
@@ -186,7 +187,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
 /// `snob purge` in another terminal is not blocked by a file this has open.
 async fn run_one(
     args: &WatchRunArgs,
-    watched: &Watched,
+    watched: &[Watched],
     delivery: Option<&Delivery>,
     secrets: &SecretStore,
     paths: &AppPaths,
@@ -199,7 +200,34 @@ async fn run_one(
         return Ok(());
     };
 
-    let tick = crate::engine::watch::tick(&mut app, watched).await;
+    // One `App` for all of them, unlike one per run: they share a session and a
+    // request budget, and opening a second would be a second connection to the
+    // same database for no reason. A failure on one account does not stop the
+    // rest — a private account somebody stopped being allowed to read must not
+    // silence the monitor's own.
+    let mut failed = None;
+    for account in watched {
+        if let Err(e) = tick_one(args, &mut app, account, delivery).await {
+            report::print_error(&e);
+            failed = Some(e);
+        }
+    }
+
+    match failed {
+        Some(e) if watched.len() == 1 => Err(e),
+        // Already printed, and the run as a whole did something.
+        _ => Ok(()),
+    }
+}
+
+/// One account, inside a run that may cover several.
+async fn tick_one(
+    args: &WatchRunArgs,
+    app: &mut crate::app::App,
+    watched: &Watched,
+    delivery: Option<&Delivery>,
+) -> Result<()> {
+    let tick = crate::engine::watch::tick(app, watched).await;
     app.progress().finish();
     let tick = tick?;
 
@@ -221,7 +249,7 @@ async fn run_one(
         ui::warn(&refusal_line(kind, skipped));
     }
 
-    deliver(&mut app, &tick, delivery).await
+    deliver(app, &tick, delivery).await
 }
 
 /// Which account a scheduled run watches, and whether it may.
@@ -230,32 +258,74 @@ async fn run_one(
 /// only place a consent can have been recorded — and an unattended run that
 /// could be pointed at a stranger by an argument would make the recording
 /// pointless.
-fn watched_from(target: Option<String>, configured: Option<&WatchConfig>) -> Result<Watched> {
-    let Some(name) = target else {
-        return Ok(Watched::own());
-    };
+fn watched_from(target: Option<String>, configured: Option<&WatchConfig>) -> Vec<Watched> {
+    if let Some(name) = target {
+        return vec![with_recorded_consent(&name, configured)];
+    }
 
+    let listed: Vec<Watched> = configured
+        .into_iter()
+        .flat_map(|c| c.accounts.iter())
+        .map(|account| {
+            if account.is_own() {
+                Watched::own()
+            } else {
+                with_recorded_consent(&account.target, configured)
+            }
+        })
+        .collect();
+
+    // A file with no `[[account]]` at all means the obvious thing rather than
+    // nothing: somebody who configured a schedule and a webhook and never
+    // mentioned an account meant their own.
+    if listed.is_empty() {
+        vec![Watched::own()]
+    } else {
+        listed
+    }
+}
+
+/// One account, with whatever answer is on record for it.
+///
+/// The file is the only place a consent can have come from, which is what makes
+/// an unattended run safe: an argument cannot grant one.
+fn with_recorded_consent(name: &str, configured: Option<&WatchConfig>) -> Watched {
     let recorded = configured
         .into_iter()
         .flat_map(|c| c.accounts.iter())
-        .find(|account| !account.is_own() && account.target.eq_ignore_ascii_case(&name))
+        .find(|account| !account.is_own() && account.target.eq_ignore_ascii_case(name))
         .and_then(|account| account.consent);
 
-    Ok(match recorded {
+    match recorded {
         Some(consent) => Watched::consented(
-            name,
+            name.to_string(),
             crate::engine::watch::Consent {
                 given_at: consent.agreed_at,
             },
         ),
-        None => Watched::asking(name),
-    })
+        None => Watched::asking(name.to_string()),
+    }
 }
 
 fn target_label(target: Option<&str>) -> String {
     match target {
         Some(name) => format!("@{}", printable(name)),
         None => "your account".to_string(),
+    }
+}
+
+/// What the opening line names, so somebody starting the service can see that
+/// it understood which accounts it is for.
+fn watching_label(watched: &[Watched]) -> String {
+    let names: Vec<String> = watched.iter().map(|w| target_label(w.name())).collect();
+
+    match names.len() {
+        0 => "nothing".to_string(),
+        1 => names[0].clone(),
+        _ => {
+            let (last, rest) = names.split_last().expect("more than one");
+            format!("{} and {last}", rest.join(", "))
+        }
     }
 }
 
@@ -523,13 +593,27 @@ async fn deliver(
         body.as_ref().map(|(run_id, body)| Queued { run_id, body }),
     )?;
 
-    let (Some(delivery), Some(id), Some((_, body))) = (delivery, queued, body.as_ref()) else {
+    let Some(delivery) = delivery else {
         return Ok(());
     };
 
-    send_one(app, delivery, id, body, 1).await;
-    // Whatever is left owed from earlier runs. After this one, so the newest
-    // report is not held up behind a backlog.
+    // This run's report, when it made one.
+    if let (Some(id), Some((_, body))) = (queued, body.as_ref()) {
+        send_one(app, delivery, id, body, 1).await;
+    }
+
+    // And then whatever is still owed, **whether or not this run had anything
+    // to say**. This used to sit behind the same `let else` as the line above,
+    // so a run that found nothing returned before reaching it — and a run that
+    // finds nothing is the common case. A report queued on Monday because the
+    // receiver was restarting was then never retried, never aged out (only
+    // `deliveries::failed` applies the age limit, and nothing was calling it),
+    // and sat `pending` until some later run happened to find a change. That is
+    // exactly the promise "a report is never lost because its delivery failed"
+    // was written to make.
+    //
+    // After this run's own report, so the newest is not held up behind a
+    // backlog.
     drain(app, delivery).await;
     Ok(())
 }
@@ -537,7 +621,10 @@ async fn deliver(
 /// Sends one queued report and records what came of it.
 async fn send_one(app: &crate::app::App, delivery: &Delivery, id: i64, body: &str, attempt: i64) {
     let now = snob_core::store::now();
-    let outcome = delivery.client.post(body, &id.to_string(), attempt).await;
+    let outcome = delivery
+        .client
+        .post(body, event_of(body), &id.to_string(), attempt)
+        .await;
 
     // Failing to write down what happened is not worth failing the run over:
     // the report either arrived or it did not, and the row is still there.
@@ -566,6 +653,31 @@ async fn send_one(app: &crate::app::App, delivery: &Delivery, id: i64, body: &st
              not queued for another try -- check the address and any token it needs"
         )),
     }
+}
+
+/// The event name a queued body carries.
+///
+/// Read back out of the body rather than remembered alongside it, so the header
+/// and the body cannot disagree — which they did, the header saying
+/// `watch.changes` over a heartbeat. A retry days later reads the same string
+/// from the same bytes, so it stays true then too.
+fn event_of(body: &str) -> &str {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("event")
+                .and_then(|e| e.as_str())
+                // The borrow has to outlive the parsed value, so the answer is
+                // matched back to one of the names this tool emits rather than
+                // returned from inside it. Anything else is a body this version
+                // did not write.
+                .map(|event| match event {
+                    "watch.heartbeat" => "watch.heartbeat",
+                    _ => "watch.changes",
+                })
+        })
+        .unwrap_or("watch.changes")
 }
 
 /// Tries whatever is owed from earlier runs.
