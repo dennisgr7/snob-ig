@@ -34,6 +34,16 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike};
 /// quietly change how often the monitor knocks.
 pub const MIN_GAP_SECS: i64 = 15 * 60;
 
+/// The longest interval `--every` accepts.
+///
+/// A year, because past that a calendar says it better and because there was no
+/// upper bound at all: the arithmetic that adds an interval to the previous run
+/// overflowed on an absurd one, which is a panic in a debug build and, in
+/// release, a wrap to a negative floor that turns "every two hundred billion
+/// years" into "every fifteen minutes". Absurd values are not only typos — this
+/// one can arrive from a hand-edited `watch.toml`.
+pub const MAX_INTERVAL_SECS: i64 = 366 * 24 * 3_600;
+
 /// How far past its due moment a run may be pushed.
 ///
 /// Not decoration. A walk that starts at exactly 09:00:00 every day is a
@@ -177,15 +187,50 @@ impl Calendar {
         }
         // The wrap from the last of one day to the first of the next counts:
         // 23:59 and 00:00 are a minute apart, not twenty-four hours.
-        let wrap = 24 * 3_600 - allowed[allowed.len() - 1] + allowed[0];
-        Some(
-            allowed
-                .windows(2)
-                .map(|pair| pair[1] - pair[0])
-                .chain(std::iter::once(wrap))
-                .min()
-                .unwrap_or(wrap),
-        )
+        //
+        // But only when there really is a next day. It was counted
+        // unconditionally, so `--on mon --at 00:00,23:55` was refused as "5m is
+        // too often" about two runs 23h55m apart: with only Monday allowed, the
+        // 23:55 run is followed by the *next* Monday's midnight.
+        let wrap = self
+            .days_can_be_consecutive()
+            .then(|| 24 * 3_600 - allowed[allowed.len() - 1] + allowed[0]);
+        allowed
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .chain(wrap)
+            .min()
+    }
+
+    /// Whether some day this calendar allows can be immediately followed by
+    /// another.
+    ///
+    /// Only [`Calendar::tightest_gap`] asks, to decide whether the wrap around
+    /// midnight is a gap between two runs or a week of waiting.
+    fn days_can_be_consecutive(&self) -> bool {
+        let dom_restricted = !self.days_of_month.is_all(1..=31);
+        let dow_restricted = !self.days_of_week.is_all(0..=6);
+
+        match (dom_restricted, dow_restricted) {
+            // Nothing restricts the day, so every day is allowed and each is
+            // followed by the next.
+            (false, false) => true,
+            // Restricted in both, where `allows` combines them with OR — so the
+            // set of allowed days is the union, which is larger and not smaller.
+            // Taken as possible rather than worked out across a whole month:
+            // this answer only ever feeds a refusal and a jitter ceiling, and
+            // both have to err towards the tighter number.
+            (true, true) => true,
+            (true, false) => {
+                (1..31).any(|d| self.days_of_month.contains(d) && self.days_of_month.contains(d + 1))
+                    // A month's last day followed by the first of the next. Which
+                    // day that is depends on the month, so any of them counts.
+                    || (self.days_of_month.contains(1)
+                        && (28..=31).any(|d| self.days_of_month.contains(d)))
+            }
+            (false, true) => (0..7)
+                .any(|d| self.days_of_week.contains(d) && self.days_of_week.contains((d + 1) % 7)),
+        }
     }
 }
 
@@ -210,6 +255,11 @@ pub enum ScheduleError {
          find that out."
     )]
     TooOften { interval: String, minutes: i64 },
+    #[error(
+        "{interval} is longer than this can schedule. The longest interval is {days} days; past \
+         that, use a calendar."
+    )]
+    TooRare { interval: String, days: i64 },
     #[error("{0}")]
     Unreadable(String),
 }
@@ -302,16 +352,29 @@ impl Schedule {
     /// the safe direction, but unbounded, and the same value can arrive from
     /// the configuration file rather than a typo. A jitter cannot sensibly
     /// exceed the gap it is jittering within.
+    ///
+    /// **Both halves bound it when both are set**, and it used to be the
+    /// interval alone: `--every 2w --on mon --at 09:00 --jitter 5d` kept all
+    /// five days, so a run due Monday at nine woke on Friday evening — a day the
+    /// calendar does not allow, on a schedule that names one.
     pub fn with_jitter(mut self, jitter: Duration) -> Self {
-        let ceiling = self
-            .every
-            .or_else(|| {
-                self.calendar
-                    .as_ref()
-                    .and_then(|c| c.tightest_gap())
-                    .map(|gap| Duration::from_secs(gap as u64))
-            })
-            .unwrap_or(Duration::from_secs(24 * 3_600));
+        let day = Duration::from_secs(24 * 3_600);
+        let from_calendar = self.calendar.as_ref().map(|c| {
+            c.tightest_gap()
+                .map(|gap| Duration::from_secs(gap as u64))
+                // One moment a day. Whatever the day fields allow, the next
+                // moment is at least a day away, so a day is the bound — and a
+                // roll is in `[0, 1)`, so the run still lands strictly before it.
+                .unwrap_or(day)
+        });
+        let ceiling = match (self.every, from_calendar) {
+            (Some(every), Some(gap)) => every.min(gap),
+            (Some(every), None) => every,
+            (None, Some(gap)) => gap,
+            // Neither half. `validated` refuses this, so it is unreachable; a
+            // day is the answer that cannot be wrong by much.
+            (None, None) => day,
+        };
         self.jitter = jitter.min(ceiling);
         self
     }
@@ -332,13 +395,27 @@ impl Schedule {
         if self.calendar.is_none() && self.every.is_none() {
             return Err(ScheduleError::Empty);
         }
-        if let Some(every) = self.every
-            && (every.as_secs() as i64) < MIN_GAP_SECS
-        {
-            return Err(ScheduleError::TooOften {
-                interval: crate::duration::format(every),
-                minutes: MIN_GAP_SECS / 60,
-            });
+        if let Some(every) = self.every {
+            // Compared as a `u64`, not cast to `i64`. The cast wrapped, so
+            // `--every 18446744073709551615` was refused with "18446744073709551615s
+            // is too often" — the opposite of what was wrong with it.
+            if every.as_secs() < MIN_GAP_SECS as u64 {
+                return Err(ScheduleError::TooOften {
+                    interval: crate::duration::format(every),
+                    minutes: MIN_GAP_SECS / 60,
+                });
+            }
+            // And an upper bound, because there was none. A `watch.toml` saying
+            // `every = "9223372036854775807"` parsed, validated, and then
+            // overflowed `last + every`: a panic in a debug build, and in
+            // release a wrap to a negative floor that ran the monitor every
+            // fifteen minutes forever.
+            if every.as_secs() > MAX_INTERVAL_SECS as u64 {
+                return Err(ScheduleError::TooRare {
+                    interval: crate::duration::format(every),
+                    days: MAX_INTERVAL_SECS / (24 * 3_600),
+                });
+            }
         }
 
         // A calendar with an interval on it is bounded by the interval, which
@@ -385,15 +462,38 @@ pub fn next_after<Tz: TimeZone>(
     now: i64,
     zone: &Tz,
 ) -> Option<i64> {
-    // The floor, if there is one. Counted from the previous run rather than
-    // from an absolute grid: `--every 6h` started at 09:13 means 15:13, which
-    // is what people mean by it.
-    let floor = match (schedule.every, last_run) {
-        (Some(every), Some(last)) => last + every.as_secs() as i64,
-        // No previous run and an interval: due immediately. There is no past
-        // to wait from.
-        (Some(_), None) => now,
-        (None, _) => now,
+    // The floor. Counted from the previous run rather than from an absolute
+    // grid: `--every 6h` started at 09:13 means 15:13, which is what people
+    // mean by it.
+    //
+    // **`MIN_GAP_SECS` is part of the floor, and that is where it has to be.**
+    // It used to be checked after the search, in `due`, and a calendar never
+    // reached the check: `Due::Now` needs the answer to equal `now` to the
+    // second, and the grid the search returns is minute-aligned while the runs
+    // happen off it — jitter moves a run later and the grid does not move with
+    // it. So `--cron "*/15 * * * *"` breached the floor on half of its
+    // consecutive pairs, worst case 36 seconds apart, and when the check *was*
+    // reached it answered `last + MIN_GAP_SECS` raw: an instant the calendar
+    // does not allow, so `--cron "0,20,40 * * * *" --jitter 0` ran six times an
+    // hour, at :20, :35, :40, :55, on an expression that names three. Folded
+    // into the search start, the answer is always both on the grid and far
+    // enough from the last run.
+    //
+    // `saturating_add` because an absurd `--every` can arrive from a
+    // hand-edited `watch.toml`: the sum overflowed, which panicked a debug
+    // build and in release wrapped to a negative floor, turning an interval of
+    // billions of years into one that ran every fifteen minutes.
+    let floor = match last_run {
+        Some(last) => {
+            let interval = schedule
+                .every
+                .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            last.saturating_add(interval.max(MIN_GAP_SECS))
+        }
+        // Nothing has run. There is no past to wait from, and no run to be too
+        // close to.
+        None => now,
     };
 
     let Some(calendar) = &schedule.calendar else {
@@ -443,26 +543,16 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
         return Due::At(next);
     }
 
-    // The floor, enforced where it is actually spent rather than only where the
-    // schedule was built.
-    //
-    // `validated()` refuses a schedule whose own grid is tighter than this, but
-    // that is a statement about the grid and the runs happen off it. Jitter
-    // moves a run later, the next due moment is then computed from when the run
-    // really happened, and a calendar's grid does not move with it — so
-    // `--cron "*/15 * * * *"`, the tightest schedule this tool advertises as
-    // legal, put 44% of its consecutive runs under the floor and its worst pair
-    // one second apart. Two full walks of both lists, seconds apart, is exactly
-    // what MIN_GAP_SECS's own doc calls requests spent to be told what the last
-    // run was told.
-    //
-    // Checking it here catches every route into a run that is too soon, this
-    // one and the daylight-saving hour that repeats, rather than one at a time.
-    if let Some(last) = last_run
-        && now - last < MIN_GAP_SECS
-    {
-        return Due::At(last + MIN_GAP_SECS);
-    }
+    // No floor check here. `next_after` puts `MIN_GAP_SECS` into the start of
+    // its search, so `next <= now` already implies `now - last >= MIN_GAP_SECS`
+    // — and unlike a check bolted on afterwards, the answer it gives is one the
+    // calendar allows. Checking it in this position was the bug: for a calendar
+    // the code below was all but unreachable, and when it was reached it
+    // answered off-grid.
+    debug_assert!(
+        last_run.is_none_or(|last| now - last >= MIN_GAP_SECS),
+        "the floor belongs to next_after and it did not hold"
+    );
 
     Due::Now {
         missed: missed_since(schedule, last_run, now, zone),
@@ -504,11 +594,19 @@ fn missed_since<Tz: TimeZone>(
     //
     // Only moments strictly before `now` are counted, so the one due this
     // instant is already excluded — nothing is subtracted afterwards.
+    //
+    // `next > at` is what makes the walk finish. Without an `every` the floor
+    // used to be `now` itself, so a moment already on the grid answered with
+    // itself, the cursor never moved and the count ran to `MAX_MISSED_COUNTED`:
+    // `cron "0,20,40 * * * *"` reported 1000 missed runs where one was missed.
+    // The floor now includes `MIN_GAP_SECS`, so the cursor always advances —
+    // this keeps the loop's termination a property of the loop rather than of a
+    // constant somewhere else.
     let mut counted = 0;
     let mut at = last;
     while counted < MAX_MISSED_COUNTED {
         match next_after(schedule, Some(at), at, zone) {
-            Some(next) if next < now => {
+            Some(next) if next < now && next > at => {
                 counted += 1;
                 at = next;
             }
@@ -739,43 +837,53 @@ mod tests {
         assert_eq!(due(&schedule, None, at(0), &Utc), Due::Now { missed: 0 });
     }
 
-    /// The floor holds against the runs, not only against the grid.
+    /// The floor holds against the runs, not only against the grid — and the
+    /// moment it names is one the calendar allows.
     ///
-    /// `validated()` refuses a schedule whose grid is tighter than the floor,
-    /// but jitter moves each run off that grid and the next due moment is
-    /// computed from where the run actually landed. `*/15` — the tightest
-    /// schedule the tool advertises as legal — put 44% of consecutive pairs
-    /// under the floor and its worst two one second apart.
+    /// Two defects, one property. `validated()` refuses a schedule whose grid is
+    /// tighter than the floor, but jitter moves each run off that grid and the
+    /// next due moment is computed from where the run actually landed: `*/15` —
+    /// the tightest schedule the tool advertises as legal — put half of its
+    /// consecutive pairs under the floor, worst case 36 seconds apart. And the
+    /// check that was supposed to stop that answered `last + MIN_GAP_SECS`, an
+    /// instant no `*/15` expression names, so `--jitter 0` ran on minutes the
+    /// expression forbids. Both are gone by folding the floor into the start of
+    /// the search instead of testing it afterwards.
     #[test]
-    fn jitter_cannot_push_two_runs_inside_the_minimum_gap() {
+    fn a_run_is_never_due_inside_the_floor_nor_off_the_calendar() {
         let schedule = Schedule::cron("*/15 * * * *").unwrap();
         let start = at(0);
-
-        // The worst case the old code allowed: a run jittered to the very end
-        // of its window, then the next one due immediately.
-        let last = start + MIN_GAP_SECS - 1;
-        match due(&schedule, Some(last), start + MIN_GAP_SECS, &Utc) {
-            Due::At(next) => assert_eq!(
-                next,
-                last + MIN_GAP_SECS,
-                "a run within the floor of the last one waits it out"
-            ),
-            other => panic!("must not be due yet: {other:?}"),
-        }
+        let grid = 15 * 60;
 
         // Swept over the whole window: whatever the last run and the current
-        // moment are, `due` never says "now" while the floor has not passed.
-        // That is the property, and it holds however the jitter falls.
+        // moment are, `due` never says "now" while the floor has not passed, and
+        // whatever it does name is on the quarter hour.
         let last = start + 7;
         for ahead in 0..MIN_GAP_SECS {
-            assert!(
-                !matches!(
-                    due(&schedule, Some(last), last + ahead, &Utc),
-                    Due::Now { .. }
-                ),
-                "declared due {ahead}s after the last run"
-            );
+            match due(&schedule, Some(last), last + ahead, &Utc) {
+                Due::At(next) => {
+                    assert!(
+                        next - last >= MIN_GAP_SECS,
+                        "next run {}s after the last one",
+                        next - last
+                    );
+                    assert_eq!(
+                        (next - start) % grid,
+                        0,
+                        "{next} is not a moment \"*/15\" names"
+                    );
+                }
+                other => panic!("declared due {ahead}s after the last run: {other:?}"),
+            }
         }
+
+        // And the pair the old floor produced: a run at :14:59 must wait for
+        // :30:00, not for :29:59.
+        let last = start + MIN_GAP_SECS - 1;
+        assert_eq!(
+            due(&schedule, Some(last), start + MIN_GAP_SECS, &Utc),
+            Due::At(start + 2 * grid)
+        );
     }
 
     /// A jitter larger than the gap it is jittering within is not a jitter.
@@ -791,6 +899,44 @@ mod tests {
             .unwrap()
             .with_jitter(Duration::from_secs(30 * 24 * 3_600));
         assert_eq!(calendar.jitter(), Duration::from_secs(hours(12) as u64));
+
+        // With both halves set, the tighter of the two bounds it. The interval
+        // alone used to, so `--every 2w --on mon --at 09:00 --jitter 5d` kept
+        // all five days and woke on a Friday, which the calendar forbids.
+        let both = Schedule::calendar(&[Weekday::Mon], &[(9, 0)])
+            .unwrap()
+            .and_every(Duration::from_secs(14 * 24 * 3_600))
+            .unwrap()
+            .with_jitter(Duration::from_secs(5 * 24 * 3_600));
+        assert_eq!(both.jitter(), Duration::from_secs(24 * 3_600));
+    }
+
+    /// The midnight wrap is only a gap when there is a next day.
+    ///
+    /// It was counted unconditionally, so `--on mon --at 00:00,23:55` was
+    /// refused as "5m is too often" about two runs 23h55m apart: with only
+    /// Monday allowed, 23:55 is followed by the next Monday's midnight.
+    #[test]
+    fn the_wrap_is_not_a_gap_when_the_days_are_not_consecutive() {
+        assert!(
+            Schedule::calendar(&[Weekday::Mon], &[(0, 0), (23, 55)]).is_ok(),
+            "a whole week apart is not too often"
+        );
+        assert!(
+            Schedule::cron("0,55 0,23 * * 1").is_ok(),
+            "the same schedule written as cron"
+        );
+
+        // Consecutive days, and it is a gap again: Monday 23:55 to Tuesday
+        // 00:00 is five minutes.
+        assert!(matches!(
+            Schedule::calendar(&[Weekday::Mon, Weekday::Tue], &[(0, 0), (23, 55)]),
+            Err(ScheduleError::TooOften { .. })
+        ));
+        assert!(matches!(
+            Schedule::calendar(&[], &[(0, 0), (23, 55)]),
+            Err(ScheduleError::TooOften { .. })
+        ));
     }
 
     /// The count is against what actually decides the schedule, not against the
@@ -810,6 +956,50 @@ mod tests {
             Due::Now { missed } => assert_eq!(missed, 1, "one Monday went by unrun"),
             other => panic!("should be due: {other:?}"),
         }
+    }
+
+    /// A calendar with no interval on it counts, rather than answering "1000".
+    ///
+    /// Without an `every` the floor used to be `now` itself, so asking for the
+    /// next moment after a moment already on the grid answered with that same
+    /// moment: the cursor never advanced and the count ran to
+    /// `MAX_MISSED_COUNTED`. The number is printed at the user, so a wrong one
+    /// is a sentence that is simply false.
+    #[test]
+    fn a_calendar_with_no_interval_counts_the_runs_it_missed() {
+        let schedule = Schedule::cron("0 * * * *").unwrap();
+        let last = at(hours(10));
+
+        match due(&schedule, Some(last), at(hours(13)), &Utc) {
+            Due::Now { missed } => assert_eq!(missed, 2, "eleven and twelve o'clock went by"),
+            other => panic!("should be due: {other:?}"),
+        }
+    }
+
+    /// An interval nothing could serve is refused, and says which way it is
+    /// wrong.
+    ///
+    /// There was no upper bound. `every = "9223372036854775807"` in a
+    /// hand-edited `watch.toml` parsed and validated, and then adding it to the
+    /// previous run overflowed: a panic in a debug build, and in release a wrap
+    /// to a negative floor, so an interval of billions of years ran every
+    /// fifteen minutes. `u64::MAX` was refused, but as "too often".
+    #[test]
+    fn an_interval_too_long_to_add_up_is_refused_as_too_long() {
+        for seconds in [u64::MAX, i64::MAX as u64, MAX_INTERVAL_SECS as u64 + 1] {
+            let refused = Schedule::every(Duration::from_secs(seconds));
+            assert!(
+                matches!(refused, Err(ScheduleError::TooRare { .. })),
+                "{seconds}s: {refused:?}"
+            );
+        }
+
+        // And the largest one that is allowed still answers without overflowing.
+        let schedule = Schedule::every(Duration::from_secs(MAX_INTERVAL_SECS as u64)).unwrap();
+        assert_eq!(
+            due(&schedule, Some(at(0)), at(1), &Utc),
+            Due::At(at(MAX_INTERVAL_SECS))
+        );
     }
 
     /// The rule that keeps an outage from becoming a burst.
