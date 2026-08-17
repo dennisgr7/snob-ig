@@ -15,7 +15,7 @@
 
 use anyhow::{Result, bail};
 use snob_core::Pk;
-use snob_core::model::{ListKind, StopReason, User};
+use snob_core::model::{ListKind, StopReason};
 use snob_core::store::{accounts, snapshots, users, watch as store};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 
@@ -202,9 +202,11 @@ impl Watched {
 #[derive(Debug)]
 pub struct TickList {
     pub kind: ListKind,
-    pub provenance: Provenance,
-    pub reason: StopReason,
     /// Why this list could not be compared, when it could not.
+    ///
+    /// The provenance and the stop reason used to sit beside this and nothing
+    /// read either: both facts are already inside `Skipped`, which is what
+    /// every caller matches on.
     pub skipped: Option<Skipped>,
 }
 
@@ -394,12 +396,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         if skipped.is_none() {
             usable.push((kind, outcome.snapshot_id));
         }
-        lists.push(TickList {
-            kind,
-            provenance: outcome.provenance,
-            reason: outcome.reason,
-            skipped,
-        });
+        lists.push(TickList { kind, skipped });
     }
 
     // Read before the comparison, and both handed back, so that whatever
@@ -629,13 +626,4 @@ fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
     };
 
     Ok((pk, users::name(app.db().conn(), pk)?))
-}
-
-/// Users in a capture, for a caller that has an id and wants the people.
-///
-/// Re-exported rather than reached for through `snapshots` so that the monitor
-/// has one door to the members and the guard about which captures are readable
-/// stays on this side of it.
-pub fn members(app: &App, snapshot_id: i64) -> Result<Vec<User>> {
-    Ok(snapshots::members(app.db().conn(), snapshot_id)?)
 }

@@ -15,8 +15,6 @@ pub mod sign;
 pub use diff::{Basis, ListDiff, Rename};
 pub use schedule::{Due, Schedule, ScheduleError, Weekday};
 
-use crate::model::ListKind;
-
 /// Everything one run found about one account.
 ///
 /// The two lists and the renames travel together because they are one answer to
@@ -42,13 +40,6 @@ impl Changes {
     /// them.
     pub fn len(&self) -> usize {
         self.followers.len() + self.following.len() + self.renamed.len()
-    }
-
-    pub fn of(&self, kind: ListKind) -> &ListDiff {
-        match kind {
-            ListKind::Followers => &self.followers,
-            ListKind::Following => &self.following,
-        }
     }
 }
 
@@ -107,8 +98,8 @@ mod tests {
             renamed: vec![],
         };
 
-        assert_eq!(changes.of(ListKind::Followers).gained.len(), 1);
-        assert_eq!(changes.of(ListKind::Following).lost.len(), 1);
+        assert_eq!(changes.followers.gained.len(), 1);
+        assert_eq!(changes.following.lost.len(), 1);
         assert_eq!(changes.len(), 2);
     }
 }
