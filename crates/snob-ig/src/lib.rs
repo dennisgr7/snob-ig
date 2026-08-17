@@ -9,6 +9,7 @@
 pub mod client;
 pub mod client_hints;
 pub mod error;
+pub mod http;
 pub mod login;
 pub mod model;
 pub mod pace;

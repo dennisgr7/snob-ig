@@ -288,6 +288,9 @@ pub struct WatchRunArgs {
     #[arg(long)]
     pub now: bool,
 
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
     /// Emit one JSON object per run, on standard output
     #[arg(long)]
     pub json: bool,
@@ -295,6 +298,31 @@ pub struct WatchRunArgs {
     /// Do not draw the progress bar
     #[arg(long)]
     pub no_progress: bool,
+}
+
+/// Where a report goes, shared by the scheduled run and `once`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct WebhookArgs {
+    /// POST each report to this address, as JSON
+    #[arg(long, value_name = "URL")]
+    pub webhook: Option<String>,
+
+    /// Header to send with it, repeatable: --header "Authorization: Bearer x"
+    // A literal token here ends up in the shell history and in `ps`. The help
+    // says so rather than the code refusing it: this is the shape that works in
+    // a systemd unit, where the value comes from an environment file.
+    #[arg(long, value_name = "NAME: VALUE")]
+    pub header: Vec<String>,
+
+    /// Sign the body with this secret, so the receiver can check it came from
+    /// here. Sent as an X-Snob-Signature header.
+    #[arg(long, value_name = "SECRET")]
+    pub sign_with: Option<String>,
+
+    /// Send a report even when nothing changed, so something watching for
+    /// silence can tell "nothing happened" from "it stopped running"
+    #[arg(long)]
+    pub heartbeat: bool,
 }
 
 /// The monitor.
@@ -340,6 +368,9 @@ pub struct WatchDiffArgs {
 
 #[derive(Args, Debug)]
 pub struct WatchOnceArgs {
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
     /// Account to watch. Defaults to your own.
     // No -y here, and deliberately. Consent to enumerate somebody else's lists
     // is a thing a person gives, and an unattended run that could be handed one

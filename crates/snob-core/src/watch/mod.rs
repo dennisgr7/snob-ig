@@ -9,6 +9,7 @@
 
 pub mod diff;
 pub mod schedule;
+pub mod sign;
 
 pub use diff::{Basis, ListDiff, Rename};
 pub use schedule::{Due, Schedule, ScheduleError, Weekday};

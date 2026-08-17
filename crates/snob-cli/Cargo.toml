@@ -48,11 +48,16 @@ zeroize.workspace = true
 # one — but the roll is made here and handed to `schedule::with_jitter`, which
 # reads no randomness of its own and can therefore be tested.
 fastrand.workspace = true
+# Was a dev-dependency, for pointing the client at a mock server. Now also a
+# real one: the monitor's webhook address is parsed and inspected before
+# anything is posted to it, and `Url::host()` is what tells an IPv6 loopback
+# from a domain -- the string form keeps the brackets the syntax requires, so
+# `[::1]` does not parse as an address.
+url.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
-url.workspace = true
 
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key

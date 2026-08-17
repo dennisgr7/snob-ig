@@ -170,6 +170,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A change is reported once: not twice, and not never | `store::watch::Mark` — the receipt, written where the report was made |
 | A list nothing verified is neither compared nor marked | `engine::watch::refusal`, over `Provenance::describes_now` |
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
+| The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
+| A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 
 ## Running headless
 
@@ -321,12 +323,13 @@ deliberately unfinished:
   Shipping the subcommand would answer those by accident.
 - **The monitor** (`snob watch`) works and is not finished. Bare, it stays up
   and runs on a schedule; `once` does one run and exits; `diff` answers the same
-  question out of storage without moving anything on. What is not built is the
-  webhook, the configuration file and the retention of old captures.
-  `lost`/`gained` are its words for the temporal diff — `unfollowers` is the
-  static set and must never drift to mean `lost`.
+  question out of storage without moving anything on. Any of them can POST the
+  report to an address the user chose. What is not built is the configuration
+  file, `status`, and the retention of old captures. `lost`/`gained` are its
+  words for the temporal diff — `unfollowers` is the static set and must never
+  drift to mean `lost`.
 
-  Five things about it are worth knowing before changing any of it:
+  Six things about it are worth knowing before changing any of it:
 
   - **It compares against what was last *reported*** — `watch_marks` — and not
     against the previous capture. Those come apart the moment somebody runs
@@ -357,6 +360,15 @@ deliberately unfinished:
     Missed runs are **folded into one and never replayed**: firing twelve to
     catch up is the burst the pacing exists to prevent, and they would all
     report the same present state anyway.
+  - **The webhook is queued before the mark moves, in one transaction.** A
+    change that has been reported is one the next run will not find, so if the
+    mark moved without the queue row the change would be gone. Delivery is
+    therefore at-least-once, which is what `X-Snob-Delivery` is for. Retrying
+    here does **not** contradict the hard-stop rule: that rule is about
+    Instagram, a service that did not ask to be talked to; this is the user's
+    own server. A refusal — anything but 408 and 429 — is still not retried.
+    The body is stored as the exact string that was signed, because the
+    signature covers bytes and a second rendering could differ.
 
 ## Known walls
 

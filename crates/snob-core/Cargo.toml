@@ -19,6 +19,11 @@ tracing.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
 percent-encoding.workspace = true
+# Signing the monitor's webhook body, so the receiver can tell a report from
+# this tool apart from anything else that found the address. See the workspace
+# manifest for why these two and not the obvious alternatives.
+hmac.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

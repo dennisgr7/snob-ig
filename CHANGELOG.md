@@ -27,6 +27,29 @@ the first release and had never shown anybody.
 All three take `--json`, and down a pipe `snob watch diff --json | jq` works
 without being told to.
 
+**And it can POST each report somewhere.** `--webhook https://n8n.local/webhook/snob`,
+with `--header "Authorization: Bearer ..."` for an endpoint that wants one and
+`--sign-with` to have the body signed — HMAC-SHA256, sent as
+`X-Snob-Signature: sha256=...`, the shape you already have a snippet for. The
+JSON is built for an automation to branch on: `counts.followers_lost` is there
+next to the arrays so a condition does not have to reach into one, `event` tells
+a report from a heartbeat without looking inside, and `run.looked` says whether
+this run could see at all — which empty arrays cannot.
+
+Nothing is sent when nothing changed, unless `--heartbeat` asks for it, so every
+message that arrives means something. A report that cannot be delivered is
+queued and tried again with a growing wait, and it is queued **before** the
+monitor moves on, so a receiver that was restarting does not cost you the
+change. It carries `X-Snob-Delivery` for exactly that reason: delivery is
+at-least-once, so a repeat is possible and the receiver can drop it. A webhook
+that refuses — a wrong token, an address that is not there — is not retried,
+because waiting does not fix a 401, and one that keeps failing is given up on
+after a few hours rather than retried forever.
+
+`http://` is refused unless the address is on your own network, because the
+report carries account names and any token you configured travels with it. That
+is checked when you give the address, not six hours later.
+
 Four things it will not do. The first run on an account has nothing to compare
 against, so it reports nothing and says so rather than announcing your whole
 follower list as new arrivals. A list served from storage during a cooldown, or

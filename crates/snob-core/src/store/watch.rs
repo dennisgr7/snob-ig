@@ -102,6 +102,46 @@ pub fn set_mark(
     Ok(())
 }
 
+/// Commits a report: queues it, and moves the marks it makes stale.
+///
+/// **One transaction, and the order inside it is the point.** A change that has
+/// been reported is one the next run will not find, because the next run
+/// compares against the mark this moves. So the report has to be durable before
+/// the mark that retires it — and both have to land together, or a process
+/// killed in between loses a window nobody will ever report.
+///
+/// The direction it fails in is deliberate. If the queue row commits and the
+/// send never happens, the report goes out late. If the mark moved without the
+/// row, the report is gone. At-least-once is the only defensible choice here,
+/// which is why every report carries an id the receiver can deduplicate on.
+///
+/// `marks` names only the lists this report actually spoke about. A list that
+/// was refused is left out by the caller and its mark stays where it was.
+pub fn commit_report(
+    store: &mut super::Store,
+    account_pk: Pk,
+    marks: &[(ListKind, i64)],
+    at: i64,
+    history_cursor: i64,
+    delivery: Option<(&str, &str)>,
+) -> Result<Option<i64>, StoreError> {
+    let tx = store.conn_mut().transaction()?;
+
+    let queued = match delivery {
+        Some((run_id, body)) => Some(super::deliveries::enqueue(
+            &tx, run_id, account_pk, body, at,
+        )?),
+        None => None,
+    };
+
+    for &(kind, snapshot_id) in marks {
+        set_mark(&tx, account_pk, kind, snapshot_id, at, history_cursor)?;
+    }
+
+    tx.commit()?;
+    Ok(queued)
+}
+
 /// Renames filed in an interval, for the accounts in one capture.
 ///
 /// Scoped to the capture's members on purpose. `username_history` accumulates
