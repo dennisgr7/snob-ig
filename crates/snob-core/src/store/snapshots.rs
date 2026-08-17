@@ -28,13 +28,28 @@ pub const RESUME_WINDOW_SECS: i64 = 15 * 60;
 /// what this bounds is how long a walk whose process was killed goes on looking
 /// busy.
 ///
-/// Fifteen minutes rather than something tighter because the pacer can
-/// legitimately be quiet for a long time: `Pace::third_party` waits up to thirty
-/// seconds between pages, and the request budget can ration for minutes on top
-/// of that. Being slow to release an abandoned claim costs one resume; releasing
-/// a live one costs two processes writing into one capture, which is the whole
-/// thing this prevents.
-pub const CLAIM_TTL_SECS: i64 = 15 * 60;
+/// **It has to be strictly shorter than [`RESUME_WINDOW_SECS`], and by enough
+/// to leave a gap somebody can use.** `save_page` refreshes `claimed_at`, so it
+/// is never earlier than `started_at` — which means that with the two constants
+/// equal, "the claim has gone stale" (`claimed_at + CLAIM_TTL_SECS < now`) and
+/// "the partial is still worth resuming" (`started_at + RESUME_WINDOW_SECS >=
+/// now`) cannot both hold. They were equal, and so the window in which another
+/// process could adopt a walk whose own process was killed was empty: every
+/// interrupted walk of every list started again from page one, at the full cost
+/// of the requests it had already paid for.
+///
+/// Five minutes rather than something tighter because the pacer can legitimately
+/// be quiet for a while: `Pace::third_party` waits up to thirty seconds between
+/// pages, and the request budget can ration on top of that. And rather than
+/// something looser because losing a claim is no longer a way to corrupt a
+/// capture: `save_page` refuses to write into a snapshot this process does not
+/// hold, so a walk whose claim was taken stops instead of interleaving with the
+/// walk that took it.
+pub const CLAIM_TTL_SECS: i64 = 5 * 60;
+
+/// The ordering above, enforced where it cannot be argued with: a build in which
+/// a killed walk can never be adopted does not compile.
+const _: () = assert!(CLAIM_TTL_SECS < RESUME_WINDOW_SECS);
 
 /// Who this process is, for the length of this process.
 ///
@@ -171,6 +186,43 @@ pub fn resumable(
     Ok(snapshot)
 }
 
+/// Whether an interrupted walk could be continued — asked, not taken.
+///
+/// The same predicate as [`resumable`] and deliberately not the same statement.
+/// `engine::walk` asks this after closing its own snapshot, to choose between
+/// "run it again to continue where it left off" and "run it again to start
+/// over"; asking it with [`resumable`] meant the answer claimed the row on the
+/// way past, so the process that had just released the claim took it back as it
+/// exited. The next invocation is a different process, and it found a partial
+/// with a claim that could not go stale before the resume window closed:
+/// [`resumable`] refused it and [`delete_partials`] spared it. Every interrupted
+/// walk of `followers`, `following`, `scan`, `unfollowers`, `fans` and `friends`
+/// began again at page one while the advice on screen promised the opposite.
+///
+/// Availability is judged the way the **next** process will judge it, so this
+/// does not count "claimed by me" as available: the run that continues the walk
+/// is never this one.
+pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<bool, StoreError> {
+    let now = now();
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM snapshots
+             WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
+               AND next_cursor IS NOT NULL AND started_at >= ?3
+               AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ?4)
+             LIMIT 1",
+            params![
+                pk_to_sql(account_pk),
+                kind.as_str(),
+                now - RESUME_WINDOW_SECS,
+                now - CLAIM_TTL_SECS,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 /// Records that an existing snapshot is being continued.
 pub fn mark_resumed(conn: &Connection, id: i64) -> Result<(), StoreError> {
     conn.execute(
@@ -240,17 +292,30 @@ pub fn save_page(
     // `claimed_at` moves with every page, which is what lets a claim outlive a
     // long walk without outliving a dead process: progress is the evidence that
     // somebody is still here.
-    tx.execute(
+    //
+    // `claimed_by = ?4` in the WHERE is what makes the claim a rule rather than
+    // a hint. Because `CLAIM_TTL_SECS` is now shorter than the resume window, a
+    // walk that goes quiet for long enough really can have its row adopted by
+    // another process — and the page it saves next would otherwise interleave
+    // with the adopter's, inflating `member_count`, scrambling the ordinals and
+    // clobbering the cursor, until whichever finished first closed a capture
+    // that was missing the other's pages. Refusing the write leaves exactly one
+    // writer per snapshot, which is the invariant the claim was added for.
+    let held = tx.execute(
         "UPDATE snapshots
          SET member_count = member_count + ?2,
              pages        = pages + 1,
              requests     = requests + 1,
              next_cursor  = ?3,
-             claimed_by   = ?4,
              claimed_at   = ?5
-         WHERE id = ?1",
+         WHERE id = ?1 AND claimed_by = ?4",
         params![id, result.added as i64, cursor, this_process(), now()],
     )?;
+    if held == 0 {
+        // Dropping the transaction rolls the page back, so the capture is left
+        // exactly as the process that holds it last saw it.
+        return Err(StoreError::ClaimTaken);
+    }
 
     tx.commit()?;
     Ok(result)
@@ -509,6 +574,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holder.as_deref(), Some(this_process()));
+    }
+
+    /// Asking whether a walk could be continued does not continue it.
+    ///
+    /// `engine::walk` asks right after closing its own snapshot, to pick the
+    /// sentence it prints. It asked with `resumable`, which claims the row it
+    /// finds — so the exiting process took back the claim `close` had just
+    /// released, and the next invocation found a partial it could not adopt and
+    /// could not clear. Six commands walked every interrupted list again from
+    /// page one while telling the user it would continue.
+    #[test]
+    fn asking_whether_a_walk_is_resumable_does_not_claim_it() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        close(db.conn(), id, StopReason::Canceled).unwrap();
+
+        assert!(
+            is_resumable(db.conn(), 1, ListKind::Followers).unwrap(),
+            "the walk stopped with a cursor, inside the window"
+        );
+
+        let holder: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT claimed_by FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder, None, "asking is not taking");
+    }
+
+    /// There is a window in which another process can adopt a killed walk.
+    ///
+    /// A hard kill never reaches `close`, so the claim `save_page` last wrote
+    /// stands. With the two constants equal that claim could not go stale before
+    /// the partial stopped being worth resuming — `claimed_at` is never earlier
+    /// than `started_at` — so the two conditions were mutually exclusive and
+    /// resume was dead for every list command. The ordering of the two constants
+    /// is held by the `const` assertion beside them; this is the state it makes
+    /// reachable.
+    #[test]
+    fn a_claim_goes_stale_while_the_partial_is_still_worth_resuming() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+
+        // A walk that started well inside the resume window and whose process
+        // was killed a moment after its last page: no `close`, so the claim is
+        // still there.
+        let started = now() - CLAIM_TTL_SECS - 60;
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET started_at = ?2 WHERE id = ?1",
+                params![id, started],
+            )
+            .unwrap();
+        claimed_by_somebody_else(&db, id, started + 30);
+
+        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+            .unwrap()
+            .expect("the claim is stale and the partial is young");
+        assert_eq!(adopted.id, id);
+    }
+
+    /// A page for a walk this process no longer holds is refused, not written.
+    ///
+    /// The claim only bounds how long an abandoned walk looks busy; it cannot
+    /// stop the walk that was abandoned from waking up. Without this guard that
+    /// walk's next page interleaves with the adopter's — inflating
+    /// `member_count`, scrambling the ordinals and clobbering the cursor — until
+    /// whichever finished first closed a capture missing the other's pages.
+    #[test]
+    fn a_page_for_a_walk_somebody_else_took_over_is_refused() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, id, now());
+
+        let refused = save_page(&mut db, id, &[user(11)], Some("further"));
+        assert!(matches!(refused, Err(StoreError::ClaimTaken)));
+
+        let (count, cursor): (i64, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT member_count, next_cursor FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the refused page rolled back");
+        assert_eq!(cursor.as_deref(), Some("cursor"), "the cursor is untouched");
     }
 
     /// A finished capture is never unfinished again.

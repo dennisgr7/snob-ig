@@ -36,6 +36,14 @@ pub enum StoreError {
          longer compatible.\nDelete that file and run the command again."
     )]
     OutdatedSchema { path: String },
+    /// A page arrived for a walk this process no longer holds.
+    ///
+    /// Its own variant rather than a [`StoreError::Data`] string because it is
+    /// the one store error that is not a fault: another process decided this
+    /// walk had been abandoned and adopted it, and the honest response is to
+    /// stop rather than to write a second stream of pages into one capture.
+    #[error("another process took over this walk")]
+    ClaimTaken,
     #[error("{0}")]
     Data(String),
 }

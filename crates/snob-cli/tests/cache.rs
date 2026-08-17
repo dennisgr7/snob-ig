@@ -427,6 +427,55 @@ async fn the_page_cap_leaves_the_list_marked_incomplete() {
     );
 }
 
+/// An interrupted walk is left for the next run to pick up.
+///
+/// The walk asks the store whether its partial could be continued, so it can
+/// print "run it again to continue where it left off" — and it asked with the
+/// function that *takes* the claim, so the process handed itself the claim it
+/// had just released and then exited. The next invocation is a different
+/// process: it found a claim it was not allowed to adopt and, because
+/// `delete_partials` spares a live claim, could not clear it either. Every
+/// interrupted walk of every list started again at page one, at the price of the
+/// requests it had already spent, while the advice on screen said the opposite.
+#[tokio::test]
+async fn an_interrupted_walk_is_left_unclaimed_for_the_next_run() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 500).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .and(query_param("count", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"users":[{"pk":1,"username":"u1"}],"next_max_id":"next"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut args = args();
+    args.max_pages = Some(1);
+    let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
+
+    assert!(
+        outcome.resumable,
+        "it stopped with a cursor, inside the window"
+    );
+
+    let holder: Option<String> = open_db(tmp.path())
+        .conn()
+        .query_row(
+            "SELECT claimed_by FROM snapshots WHERE complete = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        holder, None,
+        "the process that stopped must not still hold the walk it stopped"
+    );
+}
+
 /// Resolving a name and polling its counters are the same call to the same
 /// endpoint. Asking twice doubled the cheapest part of every run against
 /// somebody else's account, and quadrupled it for a crossing.
