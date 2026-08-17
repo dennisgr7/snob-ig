@@ -36,12 +36,48 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::paths::{AppPaths, PathError};
+use crate::secret::Secret;
 use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
 
 const KEYRING_SERVICE: &str = "snob-ig";
 const KEYRING_USER: &str = "session";
 /// Separate keyring entry used only to check that writing works.
 const KEYRING_PROBE_USER: &str = "write-probe";
+
+/// Everything this tool may keep in the keyring.
+///
+/// An enum with an `ALL` rather than a set of loose strings, and the reason is
+/// [`SecretStore::delete`]: it walks this list, so a secret added later is
+/// deleted by `snob purge` without anybody having to remember to add it there
+/// too. A test walks the variants for the same reason.
+///
+/// The probe entry is deliberately not here. It is written and removed by the
+/// write check itself and never holds anything, so listing it would only mean
+/// `delete` reporting a failure about a value nobody stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The Instagram session. What every command needs.
+    Session,
+    /// A token the monitor sends as a header to the user's webhook.
+    WatchToken,
+    /// The key the monitor signs the webhook body with.
+    WatchSigningKey,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Session, Kind::WatchToken, Kind::WatchSigningKey];
+
+    /// The keyring entry's user name. Stable: changing one of these strands
+    /// whatever is already stored under the old one, where `purge` will no
+    /// longer find it either.
+    pub fn entry_name(self) -> &'static str {
+        match self {
+            Self::Session => KEYRING_USER,
+            Self::WatchToken => "watch-token",
+            Self::WatchSigningKey => "watch-signing-key",
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SecretsError {
@@ -291,6 +327,53 @@ impl SecretStore {
         Ok(None)
     }
 
+    /// Stores one of the monitor's secrets.
+    ///
+    /// Keyring only, unlike the session — and that is a deliberate difference
+    /// rather than an omission. The session has a fallback because without one
+    /// the tool does not work at all on a machine with no keyring, which
+    /// `paths.rs` documents as normal for a server or a container. A webhook
+    /// token is not in that position: without it the monitor still runs, still
+    /// reports, and still writes to standard output. So rather than invent a
+    /// second protected file, this says it cannot keep the secret and the user
+    /// passes `--sign-with` or `--header` on the command line, where a systemd
+    /// unit can supply it from an environment file.
+    pub fn save_secret(&self, kind: Kind, value: &Secret) -> Result<(), SecretsError> {
+        debug_assert_ne!(kind, Kind::Session, "the session is saved by `save`");
+        self.entry_for(kind.entry_name())?
+            .set_password(value.expose())
+            .map_err(|e| SecretsError::KeyringRefused(e.to_string()))
+    }
+
+    /// Reads one back, if it is there.
+    pub fn load_secret(&self, kind: Kind) -> Result<Option<Secret>, SecretsError> {
+        match self.entry_for(kind.entry_name()) {
+            Ok(entry) => match entry.get_password() {
+                Ok(value) => Ok(Some(Secret::new(value))),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
+            },
+            // No keyring at all is not an error here: it means there is no
+            // secret stored, and the caller falls back to what it was given.
+            Err(e) => {
+                tracing::debug!(error = %e, "there is no keyring to read from");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Removes one, for a `setup` that is being run again with no token this
+    /// time. Silent about one that was not there.
+    pub fn forget_secret(&self, kind: Kind) -> Result<(), SecretsError> {
+        match self.entry_for(kind.entry_name()) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
+            },
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Whether there is a credential on this machine at all.
     ///
     /// **Anything but a clean "nothing there" counts as one.** A stored session
@@ -330,12 +413,22 @@ impl SecretStore {
     /// somebody can go and delete by hand.
     pub fn delete(&self) -> Result<(), SecretsError> {
         let mut keyring_refused = None;
-        match self.entry() {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => keyring_refused = Some(SecretsError::KeyringRefused(e.to_string())),
-            },
-            Err(e) => tracing::debug!(error = %e, "there is no keyring to delete from"),
+        // Every entry this tool writes, not only the session's. `Kind::ALL` is
+        // the one list, for the same reason `AppPaths::session_files` and
+        // `owned_dirs` are: a secret added later must not be forgotten by the
+        // one command whose entire job is to leave nothing behind, and a
+        // webhook token still in the keyring after `snob purge` is exactly the
+        // failure that command exists to prevent.
+        for kind in Kind::ALL {
+            match self.entry_for(kind.entry_name()) {
+                Ok(entry) => match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(e) => {
+                        keyring_refused.get_or_insert(SecretsError::KeyringRefused(e.to_string()));
+                    }
+                },
+                Err(e) => tracing::debug!(error = %e, "there is no keyring to delete from"),
+            }
         }
 
         // The legacy copy is not housekeeping: it is a working session in the
@@ -720,6 +813,87 @@ mod tests {
         let (_tmp, store) = file_store();
         assert_ne!(store.service, KEYRING_SERVICE);
         assert!(store.service.starts_with("snob-ig-test-"));
+    }
+
+    /// Every kind has an entry name, and no two share one.
+    ///
+    /// Two kinds pointing at one entry would have the second silently overwrite
+    /// the first — the signing key landing on top of the token, with nothing
+    /// failing anywhere.
+    #[test]
+    fn every_kind_has_a_name_of_its_own() {
+        let names: Vec<&str> = Kind::ALL.iter().map(|k| k.entry_name()).collect();
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "two kinds share an entry: {names:?}"
+        );
+        assert!(!names.contains(&KEYRING_PROBE_USER));
+    }
+
+    /// The guard `snob purge` rests on. Its whole promise is that afterwards
+    /// there is nothing of this tool left on the machine, and a webhook token
+    /// forgotten in the keyring is precisely the failure it exists to prevent.
+    ///
+    /// Walking `Kind::ALL` rather than naming the three, so a secret added
+    /// later is covered by this test the moment it joins the list — the same
+    /// shape as the test that walks every `StopReason`.
+    #[test]
+    fn deleting_takes_every_kind_of_secret_with_it() {
+        let (_tmp, store) = file_store();
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        for kind in Kind::ALL {
+            if kind == Kind::Session {
+                continue;
+            }
+            // A machine with no keyring cannot store these at all, which is
+            // documented on `save_secret` and is not what this is testing.
+            if store.save_secret(kind, &Secret::new("a secret")).is_err() {
+                return;
+            }
+        }
+
+        store.delete().unwrap();
+
+        assert!(
+            store.load().unwrap().is_none(),
+            "the session is still there"
+        );
+        for kind in Kind::ALL {
+            assert!(
+                store.load_secret(kind).unwrap().is_none(),
+                "{kind:?} survived a delete"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_secret_reads_back_and_can_be_forgotten() {
+        let (_tmp, store) = file_store();
+        if store
+            .save_secret(Kind::WatchToken, &Secret::new("Bearer abc"))
+            .is_err()
+        {
+            return; // no keyring on this machine; see `save_secret`
+        }
+
+        assert_eq!(
+            store
+                .load_secret(Kind::WatchToken)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "Bearer abc"
+        );
+        store.forget_secret(Kind::WatchToken).unwrap();
+        assert!(store.load_secret(Kind::WatchToken).unwrap().is_none());
+        // Forgetting one that is not there is not an error: `setup` run again
+        // with no token has to be able to clear whatever was there before.
+        store.forget_secret(Kind::WatchToken).unwrap();
     }
 
     #[test]

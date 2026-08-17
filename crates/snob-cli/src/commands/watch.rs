@@ -16,8 +16,9 @@ use anyhow::{Context, Result};
 use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
-use snob_core::secrets::SecretStore;
+use snob_core::secrets::{Kind, SecretStore};
 use snob_core::store::deliveries;
+use snob_core::watch::config::{self, WatchConfig};
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
 use snob_core::watch::{Basis, ListDiff, Rename};
 use url::Url;
@@ -37,6 +38,8 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
     match args.command {
         Some(WatchCommand::Diff(args)) => diff(args, secrets, paths),
         Some(WatchCommand::Once(args)) => once(args, secrets, paths).await,
+        Some(WatchCommand::Setup(args)) => super::watch_setup::setup(args, secrets, paths),
+        Some(WatchCommand::Status(args)) => super::watch_setup::status(args, paths),
         None => scheduled(args.run, secrets, paths).await,
     }
 }
@@ -49,13 +52,17 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
 /// literal timestamps. What is left here is sleeping and asking again, which
 /// is the part no test can usefully drive.
 async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    let schedule = schedule_from(&args)?;
-    let watched = watched_from(args.target.clone());
+    // Read first, so the flags can override it. A flag beats the file because
+    // somebody typing one is saying something about this run in particular.
+    let configured = config::load(paths)?;
+
+    let schedule = schedule_from(&args, configured.as_ref())?;
+    let watched = watched_from(args.target.clone(), configured.as_ref())?;
     // Built once and reused, so a service that runs for months holds one
     // connection pool rather than building a TLS stack every few hours. Checked
     // here for the same reason the schedule is: a bad address should stop this
     // at the moment somebody is watching it start.
-    let delivery = delivery_from(&args.delivery)?;
+    let delivery = delivery_from(&args.delivery, configured.as_ref(), &secrets)?;
 
     // Refused here rather than at the first tick. A service that starts, waits
     // six hours and then exits because it was never allowed to read that
@@ -217,11 +224,32 @@ async fn run_one(
     deliver(&mut app, &tick, delivery).await
 }
 
-fn watched_from(target: Option<String>) -> Watched {
-    match target {
-        None => Watched::own(),
-        Some(name) => Watched::asking(name),
-    }
+/// Which account a scheduled run watches, and whether it may.
+///
+/// A name on the command line is checked against the file, because that is the
+/// only place a consent can have been recorded — and an unattended run that
+/// could be pointed at a stranger by an argument would make the recording
+/// pointless.
+fn watched_from(target: Option<String>, configured: Option<&WatchConfig>) -> Result<Watched> {
+    let Some(name) = target else {
+        return Ok(Watched::own());
+    };
+
+    let recorded = configured
+        .into_iter()
+        .flat_map(|c| c.accounts.iter())
+        .find(|account| !account.is_own() && account.target.eq_ignore_ascii_case(&name))
+        .and_then(|account| account.consent);
+
+    Ok(match recorded {
+        Some(consent) => Watched::consented(
+            name,
+            crate::engine::watch::Consent {
+                given_at: consent.agreed_at,
+            },
+        ),
+        None => Watched::asking(name),
+    })
 }
 
 fn target_label(target: Option<&str>) -> String {
@@ -231,42 +259,71 @@ fn target_label(target: Option<&str>) -> String {
     }
 }
 
-/// Builds the schedule from the flags, or explains what is missing.
-fn schedule_from(args: &WatchRunArgs) -> Result<Schedule> {
-    let mut schedule = if let Some(expression) = &args.cron {
+/// Builds the schedule from the flags, or the file, or explains what is
+/// missing.
+///
+/// **A flag replaces the schedule rather than merging with it.** Half from the
+/// file and half from the command line is a schedule nobody can read back: the
+/// only honest reading of `--every 6h` against a configured `--on mon` is the
+/// one the person typing meant, and there is no way to know which.
+fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Result<Schedule> {
+    let given =
+        args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty() || args.every.is_some();
+
+    let (cron, at, on, every, jitter) = if given {
+        (
+            args.cron.clone(),
+            args.at.clone(),
+            args.on.clone(),
+            args.every,
+            args.jitter,
+        )
+    } else {
+        match configured {
+            Some(c) => (
+                c.cron.clone(),
+                c.at.clone(),
+                c.on.clone(),
+                c.every,
+                c.jitter,
+            ),
+            None => (None, vec![], vec![], None, None),
+        }
+    };
+
+    let mut schedule = if let Some(expression) = &cron {
         Schedule::cron(expression)?
-    } else if !args.at.is_empty() || !args.on.is_empty() {
-        let days = args
-            .on
+    } else if !at.is_empty() || !on.is_empty() {
+        let days = on
             .iter()
             .map(|d| {
                 Weekday::parse(d)
                     .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let times = args
-            .at
+        let times = at
             .iter()
             .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
             .collect::<Result<Vec<_>>>()?;
         Schedule::calendar(&days, &times)?
-    } else if let Some(every) = args.every {
+    } else if let Some(every) = every {
         Schedule::every(every)?
     } else {
         return Err(anyhow::anyhow!(
             "how often should this run?\n\
-             Try \"--every 6h\", or \"--on mon,thu --at 09:00\", or \"--cron '0 9 * * 1,4'\"."
+             Run \"snob watch setup\" once, or say it here: \"--every 6h\", \
+             \"--on mon,thu --at 09:00\", or \"--cron '0 9 * * 1,4'\"."
         ));
     };
 
-    // An interval given alongside a calendar is a floor on it, not a second
-    // schedule. `--every 2w --on mon` is "one Monday in every two weeks".
-    if let Some(every) = args.every
-        && (args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty())
+    // An interval alongside a calendar is a floor on it, not a second schedule.
+    // `--every 2w --on mon` is "one Monday in every two weeks".
+    if let Some(every) = every
+        && (cron.is_some() || !at.is_empty() || !on.is_empty())
     {
         schedule = schedule.and_every(every)?;
     }
-    if let Some(jitter) = args.jitter {
+    if let Some(jitter) = jitter {
         schedule = schedule.with_jitter(jitter);
     }
     Ok(schedule)
@@ -293,7 +350,9 @@ fn describe_schedule(schedule: &Schedule, now: bool) -> String {
 async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Before the session is opened and long before a request is spent, so a
     // webhook address that could never work costs nothing to find out about.
-    let delivery = delivery_from(&args.delivery)?;
+    // The file is read here too: `once` on a timer should need no more
+    // arguments than the scheduled mode does.
+    let delivery = delivery_from(&args.delivery, config::load(paths)?.as_ref(), &secrets)?;
 
     let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
     else {
@@ -354,34 +413,70 @@ struct Delivery {
 /// Called before anything is opened or spent. A run that would have shouted a
 /// token over plain HTTP fails while somebody is still there to read the
 /// message, rather than six hours later into a log.
-fn delivery_from(args: &WebhookArgs) -> Result<Option<Delivery>> {
-    let Some(url) = &args.webhook else {
+fn delivery_from(
+    args: &WebhookArgs,
+    configured: Option<&WatchConfig>,
+    secrets: &SecretStore,
+) -> Result<Option<Delivery>> {
+    let from_file = configured.and_then(|c| c.webhook.as_ref());
+
+    let Some(url) = args
+        .webhook
+        .clone()
+        .or_else(|| from_file.map(|w| w.url.clone()))
+    else {
         if !args.header.is_empty() || args.sign_with.is_some() || args.heartbeat {
-            ui::warn("there is no --webhook, so nothing is sent and those options do nothing");
+            ui::warn("there is no webhook, so nothing is sent and those options do nothing");
         }
         return Ok(None);
     };
 
+    // Headers from the file first, then the ones typed, so a flag can override
+    // a configured one of the same name — the last one wins at the request.
+    let mut headers: Vec<(String, String)> = from_file
+        .map(|w| {
+            w.headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for raw in &args.header {
+        let (name, value) = raw.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("\"{raw}\" is not a header; write it as \"Name: value\"")
+        })?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+
+    // Stored secrets fill in what was not passed. This is the whole point of
+    // `setup` having put them in the keyring: a systemd unit runs `snob watch`
+    // with no arguments and the token is not in the unit file, the process
+    // table, or anybody's shell history.
+    if !args
+        .header
+        .iter()
+        .any(|h| h.to_ascii_lowercase().starts_with("authorization"))
+        && let Some(token) = secrets.load_secret(Kind::WatchToken)?
+    {
+        headers.push(("Authorization".to_string(), token.expose().to_string()));
+    }
+
+    let key = match args.sign_with.clone() {
+        Some(given) => Some(Secret::from(given)),
+        None => secrets.load_secret(Kind::WatchSigningKey)?,
+    };
+
     let webhook = Webhook {
-        url: Url::parse(url).with_context(|| format!("\"{url}\" is not an address"))?,
-        headers: args
-            .header
-            .iter()
-            .map(|raw| {
-                raw.split_once(':')
-                    .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("\"{raw}\" is not a header; write it as \"Name: value\"")
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?,
-        key: args.sign_with.clone().map(Secret::from),
+        url: Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?,
+        headers,
+        key,
     };
     webhook::check(&webhook)?;
 
     Ok(Some(Delivery {
         client: WebhookClient::new(webhook)?,
-        heartbeat: args.heartbeat,
+        heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
     }))
 }
 
@@ -783,9 +878,16 @@ fn describe(report: &WatchReport) -> Vec<String> {
             .map(|k| k.to_string())
             .collect::<Vec<_>>()
             .join(" and ");
+        // Both lists are the common case — a first look almost always finds
+        // two — so the sentence has to read for two as well as for one.
+        let (noun, verb) = if baselines.len() > 1 {
+            ("lists have", "them")
+        } else {
+            ("list has", "it")
+        };
         lines.push(format!(
-            "The {which} list has never been reported on, so there is no earlier capture to \
-             compare it against. The next run is the first that can say anything."
+            "The {which} {noun} never been reported on, so there is no earlier capture to \
+             compare {verb} against. The next run is the first that can say anything."
         ));
     }
 
@@ -943,6 +1045,34 @@ mod tests {
             !text.contains("Nothing has changed"),
             "a baseline is not a quiet account: {text}"
         );
+    }
+
+    /// A first look almost always finds both lists, so the common case is the
+    /// plural one — and it read "the followers and following list has" until
+    /// somebody ran it.
+    #[test]
+    fn a_first_look_at_both_lists_says_so_in_the_plural() {
+        let baseline = |kind| ListReport {
+            kind,
+            basis: Basis::Baseline { snapshot_id: 1 },
+            since: None,
+            history_cursor: 0,
+            until: 2_000,
+            diff: ListDiff::default(),
+            total: 309,
+        };
+        let report = WatchReport {
+            account_pk: 42,
+            username: Some("me".into()),
+            is_self: true,
+            followers: Some(baseline(ListKind::Followers)),
+            following: Some(baseline(ListKind::Following)),
+            renamed: vec![],
+        };
+
+        let text = describe(&report).join("\n");
+        assert!(text.contains("lists have never been reported"), "{text}");
+        assert!(!text.contains("list has never"), "{text}");
     }
 
     #[test]

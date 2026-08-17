@@ -150,6 +150,28 @@ impl ListKind {
     }
 }
 
+/// The other direction, for reading a stored row back.
+///
+/// The standard trait rather than an inherent `from_str`, which clippy warns
+/// about for a good reason: a caller reaching for `"followers".parse()` would
+/// otherwise get a different function than the one they expected, or none.
+///
+/// It fails rather than defaulting. A `kind` column holding something else
+/// means the database was written by something that is not this program, and
+/// quietly calling that "followers" would answer a question about a list nobody
+/// asked about.
+impl std::str::FromStr for ListKind {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "followers" => Ok(Self::Followers),
+            "following" => Ok(Self::Following),
+            _ => Err(()),
+        }
+    }
+}
+
 impl std::fmt::Display for ListKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
