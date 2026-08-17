@@ -36,9 +36,6 @@ pub struct ListReport {
     /// apart the moment somebody types `snob followers` between two runs, and
     /// this is the one that says what has actually been said out loud.
     pub since: Option<i64>,
-    /// The rename history row the last report stopped at. Zero when there has
-    /// never been one, which is also what an empty history reads as.
-    pub history_cursor: i64,
     /// When the newest capture was taken.
     pub until: i64,
     pub diff: ListDiff,
@@ -52,6 +49,18 @@ impl ListReport {
     /// baseline being laid down or a list nothing has touched.
     pub fn compared(&self) -> bool {
         matches!(self.basis, Basis::Compare { .. })
+    }
+
+    /// Whether this run established that the list is still true, which is what
+    /// makes a rename among its members worth reporting.
+    ///
+    /// `Unchanged` counts, and it did not: a rename moves nobody in or out of a
+    /// list, so a capture whose counter was checked and had not moved is exactly
+    /// as good a set of members to look for renames among as one that was walked.
+    /// Only a baseline does not count -- announcing renames against one would
+    /// report moves from before anything was ever reported.
+    pub fn verified(&self) -> bool {
+        matches!(self.basis, Basis::Compare { .. } | Basis::Unchanged { .. })
     }
 }
 
@@ -231,11 +240,14 @@ pub struct TickReport {
     /// The captures this report spoke about, and the moment it covers.
     ///
     /// Held rather than recomputed because [`commit`] has to move exactly these
-    /// marks and no others: a list that was refused is absent, and asking the
-    /// store again afterwards would find it and mark it anyway.
+    /// marks and no others: a list that was refused is absent, and so is one the
+    /// comparison could not build a report for, and asking the store again
+    /// afterwards would find both and mark them anyway.
     committable: Vec<(ListKind, i64)>,
     at: i64,
-    history_cursor: i64,
+    /// How far along the rename history this report has covered, when it read a
+    /// window at all. `None` means the cursor must not move.
+    rename_cursor: Option<i64>,
 }
 
 /// A report on its way to somewhere, ready to be made durable.
@@ -271,7 +283,7 @@ pub fn commit(
         pk,
         &tick.committable,
         at,
-        tick.history_cursor,
+        tick.rename_cursor,
         delivery.map(|d| store::Queued {
             run_id: d.run_id,
             body: d.body,
@@ -346,7 +358,7 @@ impl TickReport {
             lists: Vec::new(),
             committable: Vec::new(),
             at: 0,
-            history_cursor: 0,
+            rename_cursor: None,
         }
     }
 
@@ -420,19 +432,20 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
     // against. Read again at commit time, a rename filed in between would be
     // marked as reported without having been.
     let at = snob_core::store::now();
-    let history_cursor = store::history_head(app.db().conn())?;
+    let head = store::history_head(app.db().conn())?;
 
-    // `advance: false`. The marks move in `commit`, together with the report
-    // being queued — reporting and recording having reported are one event.
-    let report = compare(app, pk, &usable, None)?;
+    // Nothing is written here. The marks and the cursor move in `commit`,
+    // together with the report being queued — reporting and recording having
+    // reported are one event.
+    let compared = compare(app, pk, &usable, head)?;
 
     Ok(TickReport {
-        report,
+        report: compared.report,
         requests: app.client().pacer().spent().saturating_sub(before),
         lists,
-        committable: usable,
+        committable: compared.marks,
         at,
-        history_cursor,
+        rename_cursor: compared.rename_cursor,
     })
 }
 
@@ -472,19 +485,23 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
         }
     }
 
-    // Both read before the comparison, so a rename filed while it runs lands on
-    // the next report's side rather than being marked as said without having
-    // been said.
-    let advance = advance
-        .then(|| -> Result<_> {
-            Ok((
-                snob_core::store::now(),
-                store::history_head(app.db().conn())?,
-            ))
-        })
-        .transpose()?;
+    // Read before the comparison, so a rename filed while it runs lands on the
+    // next report's side rather than being marked as said without having been
+    // said.
+    let head = store::history_head(app.db().conn())?;
+    let compared = compare(app, pk, &usable, head)?;
 
-    let mut report = compare(app, pk, &usable, advance)?;
+    if advance {
+        let at = snob_core::store::now();
+        for &(kind, snapshot_id) in &compared.marks {
+            store::set_mark(app.db().conn(), pk, kind, snapshot_id, at)?;
+        }
+        if let Some(cursor) = compared.rename_cursor {
+            store::set_rename_cursor(app.db().conn(), pk, cursor, at)?;
+        }
+    }
+
+    let mut report = compared.report;
     report.username = username;
     Ok(report)
 }
@@ -497,16 +514,14 @@ pub fn from_store(app: &App, typed: Option<&str>, advance: bool) -> Result<Watch
 /// the walk it just ran produced, which is the only id that is certainly the
 /// one those users came from, while a look asks the store for the newest.
 ///
-/// `advance` is `Some` only for the caller that does not queue a report — a
-/// tick hands `None` and commits later, together with the report itself. The
-/// two numbers come in rather than being read here, so that both callers write
-/// the same pair the renames were read against.
-fn compare(
-    app: &App,
-    pk: Pk,
-    usable: &[(ListKind, i64)],
-    advance: Option<(i64, i64)>,
-) -> Result<WatchReport> {
+/// This writes nothing. It hands back what a commit would have to write, and
+/// the two callers commit it differently — a tick together with the report it
+/// queues, a plain look not at all.
+///
+/// `head` is the rename history's newest row, read by the caller **before** this
+/// runs: a rename filed while the comparison is in progress then lands on the
+/// next report's side rather than being filed as said without having been said.
+fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<Compared> {
     let mut followers = None;
     let mut following = None;
     for &(kind, snapshot_id) in usable {
@@ -517,68 +532,90 @@ fn compare(
         }
     }
 
-    // Renames are looked for across **every** list that was compared, and
-    // deduplicated afterwards.
+    // Renames are looked for among the members of **every list this run
+    // verified**, and deduplicated afterwards.
     //
     // This used to ask about one capture — followers when there was one — and
     // that was wrong three ways, all of them silent. Somebody only in the
     // following list, which is exactly the `unfollowers` set, had their rename
-    // dropped and the cursor advanced past it, so it was never reported by
-    // anybody. A run where followers was `Unchanged` and following was compared
-    // reported none at all, for the same reason. And when one list was refused
-    // its cursor stayed behind, so the next run read from the older of the two
-    // and announced renames it had already sent.
+    // dropped and the cursor advanced past it. A run where followers was
+    // `Unchanged` and following was compared reported none at all. And when one
+    // list was refused its cursor stayed behind, so the next run read from the
+    // older of the two and announced renames it had already sent.
     //
-    // The window starts at the **oldest** cursor among the lists being marked,
-    // so nothing between the two is skipped; anything that produces is
-    // deduplicated by `pk` below, which is what the old single-capture reading
-    // was really trying to achieve. A friend is in both lists and is one person.
-    let compared: Vec<&ListReport> = [followers.as_ref(), following.as_ref()]
+    // `verified` rather than `compared`, so an `Unchanged` list counts: a rename
+    // moves nobody in or out of a list, and a capture whose counter was checked
+    // this run is as good a set of members to look among as one that was walked.
+    // Requiring a walk meant the documented common case — two unmoved counters,
+    // one request — read no window at all while still advancing the cursor past
+    // whatever was in it.
+    //
+    // One cursor for the account, not one per list, so there are no two numbers
+    // to pick between. Anything that turns up is deduplicated by `pk`: a friend
+    // is in both lists and is one person.
+    let verified: Vec<&ListReport> = [followers.as_ref(), following.as_ref()]
         .into_iter()
         .flatten()
-        .filter(|report| report.compared())
+        .filter(|report| report.verified())
         .collect();
 
     let mut renamed: Vec<Rename> = Vec::new();
-    if let Some(since) = compared.iter().map(|r| r.history_cursor).min() {
+    let mut covered = None;
+    if !verified.is_empty() {
+        let since = store::rename_cursor(app.db().conn(), pk)?;
         let mut seen = std::collections::HashSet::new();
-        for report in &compared {
+        for report in &verified {
             for rename in store::renames_since(app.db().conn(), report.basis.mark_to(), since)? {
                 if seen.insert(rename.pk) {
                     renamed.push(rename);
                 }
             }
         }
+        // A window was read, so it may be filed as reported. Nothing filed after
+        // `head` is inside it, which is the point of reading the head before the
+        // comparison rather than after.
+        covered = Some(head);
     }
 
-    if let Some((at, head)) = advance {
-        // Only the lists that made it this far. A list the caller left out was
-        // refused — nobody looked, or the walk came back short — and moving its
-        // mark would file it as reported when nothing was said about it, which
-        // loses whatever changed in it for good.
-        for report in [followers.as_ref(), following.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            store::set_mark(
-                app.db().conn(),
-                pk,
-                report.kind,
-                report.basis.mark_to(),
-                at,
-                head,
-            )?;
-        }
-    }
+    // The lists this report actually spoke about, for whoever commits it.
+    //
+    // Built here rather than by the caller, and that is the fix: the caller
+    // handed everything that had not been refused, and `list_report` can still
+    // answer with nothing — for a capture that turns out not to be usable, or a
+    // baseline another process pruned between the mark being read and the capture
+    // being looked up. The mark then advanced over a list nothing was said about,
+    // which loses that window for good. The two callers also disagreed about it,
+    // one marking a list the other left alone on identical state.
+    let marks = [followers.as_ref(), following.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|report| (report.kind, report.basis.mark_to()))
+        .collect();
 
-    Ok(WatchReport {
-        account_pk: pk,
-        username: users::name(app.db().conn(), pk)?,
-        is_self: app.viewer().pk == pk,
-        followers,
-        following,
-        renamed,
+    Ok(Compared {
+        report: WatchReport {
+            account_pk: pk,
+            username: users::name(app.db().conn(), pk)?,
+            is_self: app.viewer().pk == pk,
+            followers,
+            following,
+            renamed,
+        },
+        marks,
+        rename_cursor: covered,
     })
+}
+
+/// A comparison, and what committing it would have to write.
+///
+/// The three come out together because they have to agree: the marks name the
+/// lists the report spoke about, and the cursor is only set when the report read
+/// a rename window. Working either out again at the point of writing is how they
+/// came apart.
+struct Compared {
+    report: WatchReport,
+    marks: Vec<(ListKind, i64)>,
+    rename_cursor: Option<i64>,
 }
 
 fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Option<ListReport>> {
@@ -630,7 +667,6 @@ fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Op
         kind,
         basis,
         since: mark.map(|m| m.compared_at),
-        history_cursor: mark.map(|m| m.history_cursor).unwrap_or_default(),
         until: latest.taken_at.unwrap_or_default(),
         diff,
         total: latest.member_count as usize,
