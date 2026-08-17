@@ -110,6 +110,67 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
     Ok(removed)
 }
 
+/// What one run of the monitor did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub account_pk: Pk,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub requests: u32,
+    /// `ExitCode::as_str()`: the same vocabulary as the README's table and as
+    /// `$?`, so a caller is told the same thing by the same name wherever it
+    /// reads it.
+    pub outcome: Option<String>,
+    pub changes: u32,
+}
+
+/// Records a run, whatever came of it.
+///
+/// **Including the ones that reported nothing**, which is the whole reason this
+/// table is not just `watch_marks` again. A mark only moves when a list was
+/// actually compared, so a monitor sitting in a cooldown for two days moves
+/// nothing — and from outside that is identical to a monitor that was killed on
+/// Monday. `snob watch status` needs to tell those apart, and this is what lets
+/// it: the marks say when something was last *reported*, this says when the
+/// thing last *ran*.
+pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
+    conn.execute(
+        "INSERT INTO watch_runs (account_pk, started_at, finished_at, requests, outcome, changes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            pk_to_sql(run.account_pk),
+            run.started_at,
+            run.finished_at,
+            run.requests,
+            run.outcome,
+            run.changes,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// The most recent run, for `status`.
+pub fn last_run(conn: &Connection) -> Result<Option<Run>, StoreError> {
+    let run = conn
+        .query_row(
+            "SELECT account_pk, started_at, finished_at, requests, outcome, changes
+             FROM watch_runs ORDER BY started_at DESC, id DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(Run {
+                    account_pk: pk_from_sql(row.get(0)?),
+                    started_at: row.get(1)?,
+                    finished_at: row.get(2)?,
+                    requests: row.get(3)?,
+                    outcome: row.get(4)?,
+                    changes: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(run)
+}
+
 /// One receipt, with what it is a receipt for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountMark {

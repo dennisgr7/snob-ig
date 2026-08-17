@@ -286,6 +286,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 
     let owed = deliveries::pending(db.conn())?;
     let marks = watch_store::all_marks(db.conn())?;
+    let last = watch_store::last_run(db.conn())?;
 
     if args.json {
         println!(
@@ -294,6 +295,15 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 "configured": config.is_some(),
                 "config_path": config::path(paths).display().to_string(),
                 "pending_deliveries": owed,
+                // Told apart from the marks below on purpose. A run that could
+                // not look moves no mark, so without this a monitor sitting in
+                // a cooldown is indistinguishable from one that was killed.
+                "last_run": last.as_ref().map(|run| serde_json::json!({
+                    "at": run.started_at,
+                    "outcome": run.outcome,
+                    "requests": run.requests,
+                    "changes": run.changes,
+                })),
                 "accounts": marks.iter().map(|m| serde_json::json!({
                     "pk": m.account_pk,
                     "kind": m.kind.as_str(),
@@ -316,6 +326,32 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
             "Nothing is configured. Run \"snob watch setup\", or pass the schedule on the \
              command line."
         ),
+    }
+
+    println!();
+    // Said before the marks, because it answers the question somebody opening
+    // `status` actually has. A run that could not look moves no mark, so a
+    // monitor that has been in a cooldown since Monday looks, from the marks
+    // alone, exactly like one that was killed on Monday.
+    match &last {
+        Some(run) => {
+            let mut line = format!("Last ran on {}", report::stored_on(run.started_at));
+            if let Some(outcome) = &run.outcome
+                && outcome != "ok"
+            {
+                line.push_str(&format!(" and could not look ({outcome})"));
+            } else if run.changes == 0 {
+                line.push_str(" and found nothing");
+            } else {
+                line.push_str(&format!(
+                    " and found {} change{}",
+                    run.changes,
+                    if run.changes == 1 { "" } else { "s" }
+                ));
+            }
+            println!("{line}.");
+        }
+        None => println!("It has not run yet."),
     }
 
     println!();

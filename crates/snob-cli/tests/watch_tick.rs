@@ -280,6 +280,51 @@ async fn a_refused_run_does_not_move_the_monitor_on() {
     assert!(mark.snapshot_id.is_some());
 }
 
+/// The distinction `watch_runs` exists for, and the reason `status` reads it.
+///
+/// A run that could not look moves no mark, so from the marks alone a monitor
+/// sitting in a cooldown since Monday is indistinguishable from one that was
+/// killed on Monday. The run has to be recorded either way, and it has to say
+/// which of the two it was.
+#[tokio::test]
+async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 2, 2).await;
+    mount_list(&server, "followers", &[1, 2]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+
+    {
+        let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+        run(&mut app, &Watched::own()).await;
+    }
+
+    budget
+        .start_cooldown("rate_limit", std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+    let blocked = run(&mut app, &Watched::own()).await;
+    assert!(!blocked.looked());
+    drop(app);
+
+    let db = Store::open(&paths).unwrap();
+    let last = snob_core::store::watch::last_run(db.conn())
+        .unwrap()
+        .expect("a run that concluded nothing still ran");
+
+    assert_eq!(
+        last.outcome.as_deref(),
+        Some("rate_limited"),
+        "it has to say why it could not look, not merely that it was quiet"
+    );
+    assert_eq!(last.changes, 0);
+}
+
 /// Your own account needs nobody's permission; somebody else's does, and a
 /// scheduled run has nobody to ask.
 #[tokio::test]

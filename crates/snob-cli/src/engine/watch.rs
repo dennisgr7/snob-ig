@@ -22,6 +22,7 @@ use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::{self, ListOutcome, Provenance, target};
+use crate::exit::ExitCode;
 
 /// What one list has to report.
 #[derive(Debug, Clone)]
@@ -264,6 +265,30 @@ pub fn commit(
         delivery.map(|d| (d.run_id, d.body)),
     )?;
 
+    // Recorded whatever came of it, including a run that concluded nothing.
+    // The marks only move when a list was compared, so a monitor sitting in a
+    // cooldown for two days moves none of them — and from outside that looks
+    // exactly like a monitor that was killed on Monday. This is what lets
+    // `status` tell them apart.
+    //
+    // Not part of the transaction above: that one exists so a report cannot be
+    // retired without being queued, and a bookkeeping row has no business being
+    // able to fail it.
+    let record = store::record_run(
+        db.conn(),
+        &store::Run {
+            account_pk: pk,
+            started_at: at,
+            finished_at: Some(snob_core::store::now()),
+            requests: tick.requests,
+            outcome: Some(tick.outcome().as_str().to_string()),
+            changes: tick.report.changes().len() as u32,
+        },
+    );
+    if let Err(e) = record {
+        tracing::warn!(error = %e, "the run could not be recorded");
+    }
+
     // After the marks have moved, and outside their transaction. A monitor on a
     // six-hour schedule leaves four captures a day per list and nothing reads
     // the old ones — the diff only ever compares against the last reported one.
@@ -309,6 +334,29 @@ impl TickReport {
     /// for silence reads them as the same thing and they are opposites.
     pub fn looked(&self) -> bool {
         self.lists.iter().any(|l| l.skipped.is_none())
+    }
+
+    /// What this run amounts to, in the vocabulary `$?` and the README's table
+    /// already use.
+    ///
+    /// Recorded rather than reconstructed later, because the reasons a list was
+    /// refused are held on the run and nothing else keeps them. A run that
+    /// could not look at either list is reported as what stopped it, so
+    /// `status` can say "in cooldown" rather than only "quiet since Monday".
+    pub fn outcome(&self) -> ExitCode {
+        if self.looked() {
+            return ExitCode::Ok;
+        }
+        // Every list was refused. The most specific reason wins: a cooldown is
+        // something that lifts, and saying so is more use than "error".
+        self.lists
+            .iter()
+            .find_map(|list| match list.skipped {
+                Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
+                Some(Skipped::Incomplete(reason)) => Some(ExitCode::from_stop_reason(reason)),
+                _ => None,
+            })
+            .unwrap_or(ExitCode::Error)
     }
 }
 
