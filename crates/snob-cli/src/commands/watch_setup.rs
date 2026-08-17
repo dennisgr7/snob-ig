@@ -55,7 +55,7 @@ pub fn setup(args: WatchSetupArgs, secrets: SecretStore, paths: &AppPaths) -> Re
 
     let schedule_line = ask_schedule()?;
     let (webhook, heartbeat, headers, signing_key, token) = ask_webhook()?;
-    let accounts = ask_accounts(&secrets)?;
+    let accounts = ask_accounts()?;
 
     let text = config::template(
         &schedule_line,
@@ -239,7 +239,7 @@ fn ask_webhook() -> Result<WebhookAnswers> {
     ))
 }
 
-fn ask_accounts(_secrets: &SecretStore) -> Result<Vec<(String, Option<i64>)>> {
+fn ask_accounts() -> Result<Vec<(String, Option<i64>)>> {
     let mut accounts = vec![("self".to_string(), None)];
 
     if ui::confirm("Also watch somebody else's account?", false)? {

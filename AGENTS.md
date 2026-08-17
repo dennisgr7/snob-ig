@@ -183,6 +183,10 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
 | Owed reports are retried by any run, not only by one that had news | `deliver` drains the queue outside the branch that needs a report of its own |
 | A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every compared list from the oldest cursor and deduplicates by `pk` |
+| A resolved account is reused only for the account it was resolved for | `App::resolved_target` keys on the question, not only the answer |
+| Two runs never happen inside the minimum gap, whatever moved them | `schedule::due`, which refuses before it declares one due |
+| What a receiver deduplicates on is unique | `run_id`, which is `UNIQUE` — not the rowid, which SQLite reuses |
+| A configured header cannot be one the request could not carry | `webhook::check`, which builds every name and value before accepting the address |
 
 ## Running headless
 
