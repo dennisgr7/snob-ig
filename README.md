@@ -12,9 +12,8 @@ x86_64 and ARM64, macOS on Apple Silicon.
 
 **snob only ever reads.** It never follows, unfollows, blocks or removes anyone.
 
-> **Early version.** Every command works and has been used against the real API,
-> but this is the essentials and no more. Watching an account over time and
-> reading Instagram's own data export are planned and not built yet.
+> **Early version.** Every command works and has been used against the real API.
+> Reading Instagram's own data export is planned and not built yet.
 
 ## Install
 
@@ -158,6 +157,80 @@ A username can be written with or without a leading `@`. If you write it on
 PowerShell, quote it — `"@someone"` — because an unquoted `@` is swallowed by
 the shell before snob ever sees it.
 
+## Watching over time
+
+```bash
+snob watch diff
+```
+
+What has changed since the last time the monitor looked: who started following
+you and who stopped, who you followed and unfollowed, and who now goes by a
+different name. It reads what is already stored, so it costs no requests and
+running it twice gives the same answer.
+
+The first time there is nothing to compare against, so it says so rather than
+announcing your whole follower list as new arrivals. Walk a list once and it has
+something to say from then on.
+
+```bash
+snob watch setup
+```
+
+Asks how often to look and where to send the reports, then writes a file you can
+edit. After that:
+
+```bash
+snob watch          # stays up and runs on the schedule
+snob watch once     # one run, for cron or a systemd timer
+snob watch status   # what is configured, and when it last ran
+```
+
+Or say it directly: `--every 6h`, `--on mon,thu --at 09:00`, or
+`--cron "0 9 * * 1,4"` if you already have one written. The two combine, so
+`--every 2w --on mon` is one Monday in every two. Times are your local ones.
+
+**A run with nothing to report costs one request.** It reads your counters and
+only walks a list if its counter moved, which is what makes running it every few
+hours reasonable. Each run is nudged a little past its due moment so the walks
+do not start on the same second every day.
+
+### Sending it somewhere
+
+```bash
+snob watch --every 6h --webhook https://n8n.local/webhook/snob
+```
+
+Each report goes out as one JSON object — built so an automation can branch on
+it without digging through arrays:
+
+```json
+{
+  "schema": 1,
+  "event": "watch.changes",
+  "run": { "looked": true, "requests": 14 },
+  "counts": { "followers_gained": 1, "followers_lost": 2, "renamed": 1 },
+  "events": { "followers_lost": [{ "username": "someone", "profile_url": "…" }] }
+}
+```
+
+`--header "Authorization: Bearer …"` for an endpoint that wants one, and
+`--sign-with` to have the body signed with HMAC-SHA256 in an `X-Snob-Signature`
+header, so the receiver can check it came from you. `snob watch setup` puts both
+in the keyring instead, which is what lets a systemd unit hold neither.
+
+Nothing is sent when nothing changed, so every message that arrives means
+something; `--heartbeat` sends one anyway, for when silence is the signal you
+are watching. A report that cannot be delivered is queued and retried, and it is
+queued *before* the monitor moves on — a receiver that was restarting does not
+cost you the change. Plain `http://` is refused unless the address is on your own
+network, because the report carries account names and any token travels with it.
+
+No webhook at all is a complete way to use this:
+
+```bash
+snob watch --every 6h --json >> events.ndjson
+```
+
 ## Where your data goes
 
 Nowhere. There is no server, no account and no telemetry: snob talks to
@@ -173,7 +246,12 @@ it from:
   with no keyring at all, like a server or a container, `snob login` notices and
   uses the file, telling you it did.
 - **A local SQLite database** of the lists it has walked, so that asking the
-  same question twice does not cost twice the requests.
+  same question twice does not cost twice the requests. The monitor expires
+  captures older than a month; the newest of each list, and whatever it last
+  reported against, are always kept.
+- **The monitor's settings**, if you ran `snob watch setup` — a `watch.toml` you
+  can read and edit. Any token or signing key it needs goes to the keyring
+  rather than into that file.
 
 **Your browser's own cookie store is never read, copied or decrypted.** The
 browser `snob login` opens is a separate one with a profile of its own. That

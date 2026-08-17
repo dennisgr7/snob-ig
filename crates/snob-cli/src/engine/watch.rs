@@ -252,15 +252,35 @@ pub fn commit(
     delivery: Option<Queued<'_>>,
 ) -> Result<Option<i64>> {
     let pk = tick.report.account_pk;
+    let at = tick.at;
     let (_, db, _) = app.parts();
-    Ok(store::commit_report(
+
+    let queued = store::commit_report(
         db,
         pk,
         &tick.committable,
-        tick.at,
+        at,
         tick.history_cursor,
         delivery.map(|d| (d.run_id, d.body)),
-    )?)
+    )?;
+
+    // After the marks have moved, and outside their transaction. A monitor on a
+    // six-hour schedule leaves four captures a day per list and nothing reads
+    // the old ones — the diff only ever compares against the last reported one.
+    // What `prune` keeps, and why each of them, is on `prune` itself.
+    //
+    // A failure here does not fail the run. The report has been made and
+    // recorded; a database that could not be tidied is worth a line in the log
+    // and nothing more.
+    match store::prune(db.conn(), at) {
+        Ok(removed) if removed > 0 => {
+            tracing::debug!(removed, "expired captures nothing needs any more");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "old captures could not be expired"),
+    }
+
+    Ok(queued)
 }
 
 impl TickReport {

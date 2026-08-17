@@ -144,6 +144,13 @@ cause of corruption. Every table is `STRICT`. The rule that an incomplete
 snapshot is never a basis for comparison is structural rather than disciplinary:
 comparison code reads the `usable_snapshots` view, which cannot return one.
 
+Configuration is the other half, and it goes in the **roaming** directory where
+it belongs — one file, `watch.toml`, written by `snob watch setup`. Nothing else
+writes there and `ensure_dirs` still does not create it, so somebody who never
+runs the monitor gets no empty folder. **No secret is in it**: the webhook's
+token and signing key go to the keyring, because the file is plain text at a
+guessable path and would be in every backup of the home directory.
+
 ## Rules the code enforces, and where
 
 Each of these was once something a caller had to remember, and each was
@@ -172,6 +179,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
+| Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete` |
+| Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
 
 ## Running headless
 
@@ -321,15 +330,14 @@ deliberately unfinished:
   what an import should be allowed to do once it is in — whether it can be
   crossed against a live list, and whether it belongs in the store at all.
   Shipping the subcommand would answer those by accident.
-- **The monitor** (`snob watch`) works and is not finished. Bare, it stays up
-  and runs on a schedule; `once` does one run and exits; `diff` answers the same
-  question out of storage without moving anything on. Any of them can POST the
-  report to an address the user chose. What is not built is the configuration
-  file, `status`, and the retention of old captures. `lost`/`gained` are its
-  words for the temporal diff — `unfollowers` is the static set and must never
-  drift to mean `lost`.
+- **The monitor** (`snob watch`) is built. Bare, it stays up and runs on a
+  schedule; `once` does one run and exits; `diff` answers the same question out
+  of storage without moving anything on; `setup` writes the configuration and
+  `status` reads back what has happened. Any run can POST the report to an
+  address the user chose. `lost`/`gained` are its words for the temporal diff —
+  `unfollowers` is the static set and must never drift to mean `lost`.
 
-  Six things about it are worth knowing before changing any of it:
+  Seven things about it are worth knowing before changing any of it:
 
   - **It compares against what was last *reported*** — `watch_marks` — and not
     against the previous capture. Those come apart the moment somebody runs
@@ -369,6 +377,12 @@ deliberately unfinished:
     own server. A refusal — anything but 408 and 429 — is still not retried.
     The body is stored as the exact string that was signed, because the
     signature covers bytes and a second rendering could differ.
+  - **Retention keeps three things whatever their age**, and each is
+    load-bearing: the capture every mark points at (it is the next diff's
+    baseline, and taking it costs one silently missed report), the newest
+    complete capture of each list (what the cache serves), and any incomplete
+    one (a resume somebody may be mid-way through). `store::watch::prune` says
+    so; `secure_delete` is on for exactly this.
 
 ## Known walls
 
