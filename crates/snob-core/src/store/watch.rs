@@ -124,11 +124,31 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
         params![now - KEEP_DELIVERIES_FOR_SECS],
     )?;
 
-    // Runs are a log, and nothing else read them back. `--every 30m` over three
-    // accounts writes some fifty thousand rows a year; the table postdates the
-    // rest of retention, which is how it came to have none.
+    // Runs are a log, and `--every 30m` over three accounts writes some fifty
+    // thousand rows a year; the table postdates the rest of retention, which is
+    // how it came to have none.
+    //
+    // **The newest of each account is kept whatever its age**, like the newest
+    // capture of each list above it. The comment here used to say nothing else
+    // read them back, and that was false about this very module:
+    // `watch_setup::health` reads `last_runs` and decides from it whether the
+    // monitor is working. So a monitor whose session expired went, after thirty
+    // days, from "the last run ended in no_session" and exit 1 to "it has not
+    // run yet" and exit 0 — a probe polling that exit code watches it turn
+    // green while nothing has been fixed. `settle` reaches `prune` on the
+    // no-session branch of `once`, which records no run of its own, so the
+    // table can go a month without gaining a row.
     conn.execute(
-        "DELETE FROM watch_runs WHERE started_at < ?1",
+        "DELETE FROM watch_runs
+         WHERE started_at < ?1
+           AND id NOT IN (
+             SELECT id FROM (
+               SELECT id, row_number() OVER (
+                 PARTITION BY account_pk ORDER BY started_at DESC, id DESC
+               ) AS rank
+               FROM watch_runs
+             ) WHERE rank = 1
+           )",
         params![now - KEEP_RUNS_FOR_SECS],
     )?;
 
@@ -717,6 +737,51 @@ mod tests {
         let next = renames_since(db.conn(), id, head, head_now(db.conn())).unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].pk, 2);
+    }
+
+    /// The newest run of each account outlives the retention window.
+    ///
+    /// The delete was unqualified where every other rule in `prune` protects the
+    /// newest row of its kind, and its comment said nothing else read the table
+    /// back — false about this very module, since `watch_setup::health` reads
+    /// `last_runs` and decides from it whether the monitor is working. So a
+    /// monitor whose session expired went, after thirty days, from "the last run
+    /// ended in no_session" and exit 1 to "it has not run yet" and exit 0, and a
+    /// probe polling that code watched it turn green with nothing fixed.
+    ///
+    /// Reachable without anything else running: `settle` calls `prune` on the
+    /// no-session branch of `once`, which records no run of its own.
+    #[test]
+    fn the_last_run_of_an_account_is_never_pruned() {
+        let mut db = Store::in_memory().unwrap();
+        let _ = account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        let long_ago = 1_000;
+        for started_at in [long_ago, long_ago + 1] {
+            record_run(
+                db.conn(),
+                &Run {
+                    account_pk: 7,
+                    started_at,
+                    finished_at: Some(started_at),
+                    requests: 0,
+                    outcome: Some("no_session".to_string()),
+                    changes: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        prune(db.conn(), long_ago + KEEP_RUNS_FOR_SECS + 10).unwrap();
+
+        let runs = last_runs(db.conn()).unwrap();
+        assert_eq!(runs.len(), 1, "the newest one stays: {runs:?}");
+        assert_eq!(runs[0].started_at, long_ago + 1);
+        assert_eq!(
+            runs[0].outcome.as_deref(),
+            Some("no_session"),
+            "and it still says what stopped it, which is the whole point"
+        );
     }
 
     /// Zero is what a mark that has never reported carries, and an empty

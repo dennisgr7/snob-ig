@@ -26,18 +26,32 @@ const MAX_BACKOFF_SECS: i64 = 3_600;
 
 /// How many attempts before a report is given up on.
 ///
-/// With the backoff above, eight attempts span a little over five hours. Past
-/// that the far end is not restarting, it is gone or it is refusing, and the
-/// row is more use as a line in the log than as work that never finishes.
-const MAX_ATTEMPTS: i64 = 8;
+/// **The age below is the bound that decides; this one is the backstop.** It was
+/// the other way round by arithmetic rather than by intent: this said eight
+/// attempts span a little over five hours, and 60 + 120 + 240 + 480 + 960 +
+/// 1920 + 3600 is 7 380 seconds — two hours and three minutes. So a receiver
+/// that was down for an afternoon lost every report queued in it, and
+/// `MAX_AGE_SECS`, whose whole doc is about catching what the attempt count
+/// cannot, was unreachable: nothing survived long enough to be judged by it.
+///
+/// That matters more here than the number suggests. `commit_report` moves the
+/// mark in the same transaction that queues the report, so a report given up on
+/// is a set of arrivals and departures that no later run will find — the
+/// standing rule is that a report is never lost because its delivery failed.
+///
+/// Thirty-two is what it takes for the age to win: seven doubling waits and
+/// then hourly, which passes a day before this is reached. Every attempt waits,
+/// so this cannot be burned through quickly by an endpoint that answers fast.
+const MAX_ATTEMPTS: i64 = 32;
 
 /// How old a report may get before it is given up on whatever its attempt
 /// count says.
 ///
-/// Both bounds exist because they catch different failures. The attempt count
-/// catches an endpoint that answers quickly and wrongly; the age catches a
+/// Both bounds exist because they catch different failures. The age catches a
 /// process that was stopped for a week, where nothing has been attempted at all
-/// and a report about who unfollowed you last Tuesday is no longer news.
+/// and a report about who unfollowed you last Tuesday is no longer news; the
+/// attempt count catches a queue that somehow keeps being tried without the
+/// clock moving. In ordinary running it is the age that decides.
 pub const MAX_AGE_SECS: i64 = 24 * 3_600;
 
 /// A report waiting to be sent.
@@ -368,28 +382,68 @@ mod tests {
         assert!(backoff(i64::MAX) > 0, "a shift that big must not wrap");
     }
 
-    /// A queue that never drains is a queue that grows forever. This is the
-    /// half of "retry" that the reasoning in the module header pays for.
+    /// A receiver that is down for an afternoon does not cost the reports queued
+    /// in it.
+    ///
+    /// This counted iterations, so it passed at any ladder length — and the
+    /// ladder was 60 + 120 + 240 + 480 + 960 + 1920 + 3600 = 7 380 seconds, two
+    /// hours and three minutes, under a doc claiming five and under an age bound
+    /// of a day that nothing could ever live long enough to reach.
+    ///
+    /// It matters more than the number suggests: `commit_report` moves the mark
+    /// in the transaction that queues the report, so one given up on is a set of
+    /// arrivals and departures no later run will find.
     #[test]
-    fn a_report_runs_out_of_attempts_rather_than_being_retried_forever() {
+    fn a_receiver_down_for_hours_still_has_its_report_retried() {
+        let db = store();
+        let queued_at = 1_000;
+        let id = queued(&db, "run-1", queued_at);
+
+        let mut now = queued_at;
+        loop {
+            match failed(db.conn(), id, Some(503), "restarting", false, now).unwrap() {
+                Outcome::Retrying(next) => now = next,
+                Outcome::GaveUp(reason) => {
+                    assert_eq!(
+                        reason,
+                        GaveUp::TooOld,
+                        "the age is what decides in ordinary running"
+                    );
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            now - queued_at >= MAX_AGE_SECS,
+            "it gave up after {}s, and a day is what the age bound names",
+            now - queued_at
+        );
+        assert!(due(db.conn(), now + 999_999, 10, HERE).unwrap().is_empty());
+    }
+
+    /// And the attempt count is still there, for a queue that is somehow tried
+    /// without the clock moving. A queue that never drains is a queue that grows
+    /// forever.
+    #[test]
+    fn the_attempt_count_is_the_backstop_when_the_clock_does_not_move() {
         let db = store();
         let id = queued(&db, "run-1", 1_000);
 
-        let mut now = 1_000;
         for _ in 1..MAX_ATTEMPTS {
-            let Outcome::Retrying(next) =
-                failed(db.conn(), id, Some(500), "boom", false, now).unwrap()
-            else {
-                panic!("not out of attempts yet");
-            };
-            now = next;
+            assert!(
+                matches!(
+                    failed(db.conn(), id, Some(500), "boom", false, 1_000).unwrap(),
+                    Outcome::Retrying(_)
+                ),
+                "not out of attempts yet"
+            );
         }
 
         assert_eq!(
-            failed(db.conn(), id, Some(500), "boom", false, now).unwrap(),
+            failed(db.conn(), id, Some(500), "boom", false, 1_000).unwrap(),
             Outcome::GaveUp(GaveUp::OutOfAttempts)
         );
-        assert!(due(db.conn(), now + 999_999, 10, HERE).unwrap().is_empty());
     }
 
     /// The other bound, and it catches a different failure: a process stopped
