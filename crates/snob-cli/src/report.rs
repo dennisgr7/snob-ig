@@ -4,7 +4,7 @@
 //! between commands, and two copies of "run it again" that drifted apart would
 //! read as two different pieces of advice about the same situation.
 
-use snob_core::model::{ListKind, StopReason};
+use snob_core::model::{ListKind, StopReason, printable};
 
 use crate::engine::Provenance;
 
@@ -58,8 +58,23 @@ pub fn print_error(error: &anyhow::Error) {
 /// these strings are the ones somebody put between sentences, and re-wrapping
 /// would eventually split a URL or `snob login --paste` across a line. The
 /// terminal already soft-wraps at the width it really has.
+///
+/// It is also where every string this function prints is filtered, which makes
+/// it the boundary the rule asks for: a name is filtered before anything draws
+/// it, whoever it came from. Each of these messages is built by interpolating
+/// something into a sentence, and each interpolation was one more place to
+/// remember — `checked_url` and `Blocked::AccountUnknown` were both forgotten.
+///
+/// **Line by line, not over the whole string.** `printable` turns any
+/// whitespace into a space, newlines included, so filtering the text whole
+/// would collapse the deliberate paragraph breaks this function exists to lay
+/// out. Split first and the real breaks survive while an escape sequence
+/// injected into a name does not.
 fn indented(text: &str) -> String {
-    text.replace('\n', "\n       ")
+    text.split('\n')
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join("\n       ")
 }
 
 /// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
@@ -203,9 +218,16 @@ pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error 
         Blocked::RefreshWanted => {
             format!("the account is in cooldown until {when}; --refresh cannot walk until it lifts")
         }
+        // Filtered here rather than at the call site, so every caller of the
+        // variant gets it. `engine::cooldown` passes `target::clean`'s answer,
+        // which only strips a leading `@` — and that name reaches this without
+        // anybody typing it, because `Watched::list_args` puts the one from
+        // `watch.toml` straight into `ListArgs.target` and nothing validates a
+        // username there.
         Blocked::AccountUnknown(name) => format!(
-            "the account is in cooldown until {when}, and no list of @{name} is stored \
-             to serve in the meantime"
+            "the account is in cooldown until {when}, and no list of @{} is stored \
+             to serve in the meantime",
+            printable(name)
         ),
         Blocked::NothingStored(kind) => format!(
             "the account is in cooldown until {when}, and no complete snapshot of the \
@@ -332,6 +354,49 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::engine::ListOutcome;
+
+    /// Every string this module draws goes through the name filter, and the
+    /// paragraph breaks it lays out survive it.
+    ///
+    /// `printable` turns any whitespace into a space, newlines included, so
+    /// filtering a refusal whole would collapse the very structure `indented`
+    /// exists to produce. Line by line, both hold.
+    #[test]
+    fn the_layout_survives_the_filter_and_an_escape_sequence_does_not() {
+        let hostile = "first line\u{1b}[2K\u{1b}[A\nsecond line";
+        let out = indented(hostile);
+
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "{out:?} reaches a terminal"
+        );
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "the deliberate break between sentences is not the filter's business: {out:?}"
+        );
+        assert!(out.starts_with("first line"));
+        assert!(out.trim_end().ends_with("second line"));
+    }
+
+    /// An account name reaches the cooldown refusal without anybody typing it:
+    /// `Watched::list_args` puts the one from `watch.toml` straight into
+    /// `ListArgs.target`, and nothing validates a username there.
+    #[test]
+    fn a_cooldown_refusal_cannot_be_made_to_erase_the_line_above_it() {
+        let name = "gh\u{1b}[2K\u{1b}[A";
+        let error = refuse_in_cooldown(1_000, Blocked::AccountUnknown(name));
+        let message = error.to_string();
+
+        assert!(
+            !message.chars().any(|c| c.is_control()),
+            "{message:?} is printed to a terminal"
+        );
+        assert!(
+            message.contains("@gh"),
+            "the name is still shown: {message}"
+        );
+    }
 
     /// A walk that stopped for `reason`, and what Instagram said about it when
     /// that is more specific than the reason.
