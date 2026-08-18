@@ -204,7 +204,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 | Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all` — `logout` calls `delete`, which takes the session and nothing else |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
-| Owed reports are retried by any run, not only by one that had news | `run_one` and `once` drain the queue once per run, after every account, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not |
+| Owed reports are retried by any run, not only by one that had news | `run_one` and `once` drain the queue once per run, after every account, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not. `run_one` takes an `App` rather than opening one, so a test can watch it happen |
 | A queued report can only go to the address it was addressed to | `watch_deliveries.destination`, which `deliveries::due` filters on |
 | A credential set up for one host is not sent to another | `delivery_from` compares origins before attaching the keyring token or the file's headers |
 | A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every list this run verified, from the account's one cursor, and deduplicates by `pk` |

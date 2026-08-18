@@ -13,6 +13,7 @@
 //! [`crate::engine::watch`]'s answer, and this never recomputes any of it.
 
 use anyhow::{Context, Result, bail};
+use snob_core::Pk;
 use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
@@ -20,7 +21,7 @@ use snob_core::secrets::{Kind, SecretStore};
 use snob_core::store::deliveries;
 use snob_core::watch::config::{self, WatchConfig, WebhookConfig};
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
-use snob_core::watch::{Basis, ListDiff, Rename};
+use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 use url::Url;
 
 use crate::cli::{
@@ -115,7 +116,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
         // so a *schedule* does not land on the same second every day, and
         // delaying a run somebody just asked for would only look broken.
         last_run = Some(snob_core::store::now());
-        if let Err(e) = run_one(&args, &watched, delivery.as_ref(), &secrets, paths).await {
+        if let Err(e) = open_and_run(&args, &watched, delivery.as_ref(), &secrets, paths).await {
             report::print_error(&e);
         }
     }
@@ -195,7 +196,8 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             // cooldown lifts, a network comes back, and a session that is gone
             // gets reported every time until somebody fixes it — which is the
             // point of something that watches.
-            if let Err(e) = run_one(&args, &watched, delivery.as_ref(), &secrets, paths).await {
+            if let Err(e) = open_and_run(&args, &watched, delivery.as_ref(), &secrets, paths).await
+            {
                 report::print_error(&e);
             }
             continue;
@@ -240,7 +242,7 @@ fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
 /// session that was replaced and a refreshed User-Agent, and — the reason that
 /// matters on Windows — it holds no SQLite connection while the loop sleeps, so
 /// `snob purge` in another terminal is not blocked by a file this has open.
-async fn run_one(
+async fn open_and_run(
     args: &WatchRunArgs,
     watched: &[Watched],
     delivery: Option<&Delivery>,
@@ -255,6 +257,22 @@ async fn run_one(
         return Ok(());
     };
 
+    run_one(args, &mut app, watched, delivery).await
+}
+
+/// One run, over an `App` somebody else opened.
+///
+/// Split from the opening so a test can hand it one: opening a session wants a
+/// keyring, and this is where "the queue is drained once per run, after every
+/// account" lives -- AGENTS.md's rule, which regressed once and which nothing
+/// could reach to check. Deleting the drain from here left the whole suite
+/// green.
+async fn run_one(
+    args: &WatchRunArgs,
+    app: &mut crate::app::App,
+    watched: &[Watched],
+    delivery: Option<&Delivery>,
+) -> Result<()> {
     // One `App` for all of them, unlike one per run: they share a session and a
     // request budget, and opening a second would be a second connection to the
     // same database for no reason. A failure on one account does not stop the
@@ -262,7 +280,7 @@ async fn run_one(
     // silence the monitor's own.
     let mut failed = None;
     for account in watched {
-        if let Err(e) = tick_one(args, &mut app, account, delivery).await {
+        if let Err(e) = tick_one(args, app, account, delivery).await {
             report::print_error(&e);
             failed = Some(e);
         }
@@ -272,10 +290,10 @@ async fn run_one(
     // here — including when no account had news of its own, which is the common
     // case and the one that used to leave the queue untouched.
     if let Some(delivery) = delivery {
-        drain(&app, delivery).await;
+        drain(app, delivery).await;
     }
     // And once whatever the accounts did, for the reason on `settle`.
-    crate::engine::watch::settle(&app, snob_core::store::now());
+    crate::engine::watch::settle(app, snob_core::store::now());
 
     match failed {
         Some(e) if watched.len() == 1 => Err(e),
@@ -820,24 +838,19 @@ async fn deliver(
     // An automation where every message means something is the point of that;
     // a heartbeat is for the opposite case, where the absence of messages is
     // the signal and "quiet" has to be told from "stopped".
-    let body = match delivery {
-        Some(d) if !changes.is_empty() || d.heartbeat => {
-            let run_id = run_id(tick);
+    let body = match delivery.and_then(|d| event_for(&changes, d.heartbeat)) {
+        Some(event) => {
+            let run_id = run_id(snob_core::store::now(), tick.report.account_pk);
             // Serialized once, here, and stored as the string that goes on the
             // wire. `serde_json` may render one value two ways, and the
             // signature covers bytes — so a retry that rendered it again could
             // be rejected after the first attempt was accepted.
-            let event = if changes.is_empty() {
-                "watch.heartbeat"
-            } else {
-                "watch.changes"
-            };
             Some((
                 run_id.clone(),
                 serde_json::to_string(&payload(tick, &run_id, event))?,
             ))
         }
-        _ => None,
+        None => None,
     };
 
     let queued = crate::engine::watch::commit(
@@ -975,6 +988,24 @@ fn describe_when(at: i64, now: i64) -> String {
     }
 }
 
+/// Whether this run has anything to say, and what it would be called.
+///
+/// One function rather than a guard and a name computed from the same fact ten
+/// lines apart: `None` means the run is quiet and nothing is queued at all.
+/// Collapsing the guard so every run speaks turns a `--every 30m` monitor from
+/// a handful of messages a week into forty-eight a day, which is the opposite
+/// of what "nothing is sent when nothing changed" promises -- and it is the
+/// point of `--heartbeat` that the *absence* of a message means something.
+fn event_for(changes: &Changes, heartbeat: bool) -> Option<&'static str> {
+    if !changes.is_empty() {
+        Some("watch.changes")
+    } else if heartbeat {
+        Some("watch.heartbeat")
+    } else {
+        None
+    }
+}
+
 /// The event name a queued body carries.
 ///
 /// Read back out of the body rather than remembered alongside it, so the header
@@ -1044,12 +1075,11 @@ const DRAIN_LIMIT: usize = 10;
 /// The moment and a random suffix rather than a UUID: the column is `UNIQUE`,
 /// so a collision is an error rather than a silent overwrite, and this avoids a
 /// dependency for a value nothing derives meaning from.
-fn run_id(tick: &TickReport) -> String {
-    format!(
-        "{}-{:08x}",
-        snob_core::store::now(),
-        fastrand::u32(..) ^ (tick.report.account_pk as u32)
-    )
+/// `now` is an argument rather than read inside, which is this project's shape
+/// for anything with arithmetic in it -- and here it is also what lets the
+/// uniqueness be tested without building a whole tick.
+fn run_id(now: i64, account_pk: Pk) -> String {
+    format!("{}-{:08x}", now, fastrand::u32(..) ^ (account_pk as u32))
 }
 
 /// Why a list was not compared, said in a sentence.
@@ -1438,7 +1468,217 @@ fn earliest_since(report: &WatchReport) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snob_core::Pk;
+
+    const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                      (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+    const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// Nothing is sent when nothing changed, and `--heartbeat` is what asks
+    /// for the opposite.
+    ///
+    /// The guard and the name used to be computed from the same fact ten lines
+    /// apart, and collapsing the guard so every run speaks was invisible: a
+    /// `--every 30m` monitor would go from a handful of messages a week to
+    /// forty-eight a day, and the automation reading silence as the signal
+    /// would never hear it again.
+    #[test]
+    fn a_quiet_run_says_nothing_unless_a_heartbeat_was_asked_for() {
+        let quiet = report_with(None, vec![]).changes();
+        let moved = report_with(
+            Some(list(
+                Basis::Compare {
+                    before: 1,
+                    after: 2,
+                },
+                ListDiff {
+                    gained: vec![user(7, "newcomer")],
+                    lost: vec![],
+                },
+                Some(1_000),
+            )),
+            vec![],
+        )
+        .changes();
+
+        assert_eq!(event_for(&quiet, false), None, "silence means something");
+        assert_eq!(event_for(&quiet, true), Some("watch.heartbeat"));
+        assert_eq!(event_for(&moved, false), Some("watch.changes"));
+        assert_eq!(
+            event_for(&moved, true),
+            Some("watch.changes"),
+            "a run with news is news, not a heartbeat"
+        );
+    }
+
+    /// The id a receiver deduplicates on is unique, and the column is `UNIQUE`
+    /// so a repeat is an error rather than a silent overwrite.
+    ///
+    /// Reducing it to the second alone survived every test: two accounts
+    /// reported in the same second, or one account twice, then collide -- and
+    /// the insert fails inside the transaction that queues the report, so the
+    /// report **and** the marks roll back together.
+    #[test]
+    fn two_reports_never_share_an_id() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(
+                seen.insert(run_id(1_700, 42)),
+                "the same second and the same account produced one id twice"
+            );
+        }
+        // And two accounts in one second, which is one run of a monitor
+        // watching more than one.
+        assert_ne!(run_id(1_700, 42), run_id(1_700, 43));
+    }
+
+    /// An app and a webhook pointed at the same mock server.
+    fn app_posting_to(server: &wiremock::MockServer) -> (crate::app::App, Delivery) {
+        let session = snob_core::session::Session::from_sessionid(
+            SID,
+            UA,
+            snob_core::session::SessionOrigin::Paste,
+        )
+        .unwrap();
+        let client = snob_ig::client::IgClient::new(session, snob_ig::pace::Pacer::unlimited())
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        let db = snob_core::store::Store::in_memory().unwrap();
+        snob_core::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
+        snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+
+        let app = crate::app::App::for_test(
+            client,
+            db,
+            crate::app::Viewer {
+                pk: 42,
+                username: Some("me".into()),
+            },
+        );
+
+        let url = Url::parse(&format!("{}/hook", server.uri())).unwrap();
+        let delivery = Delivery {
+            destination: destination_of(&url),
+            client: WebhookClient::new(Webhook {
+                url,
+                headers: vec![],
+                key: None,
+            })
+            .unwrap(),
+            heartbeat: false,
+        };
+        (app, delivery)
+    }
+
+    async fn accepting(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/hook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    fn owe(app: &crate::app::App, delivery: &Delivery, how_many: usize, at: i64) {
+        for n in 0..how_many {
+            deliveries::enqueue(
+                app.db().conn(),
+                &format!("run-{n}"),
+                42,
+                r#"{"schema":1,"event":"watch.changes"}"#,
+                at,
+                Some(&delivery.destination),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A report owed from an earlier run goes out on a later one.
+    ///
+    /// The whole reason the outbox exists, and deleting the drain entirely --
+    /// at both call sites -- left the suite green. The integration test that
+    /// looks like it covers this reimplements the loop by hand, so it proves
+    /// the store functions work and nothing about the loop production runs.
+    #[tokio::test]
+    async fn a_report_owed_from_an_earlier_run_goes_out_on_a_later_one() {
+        let server = wiremock::MockServer::start().await;
+        accepting(&server).await;
+        let (app, delivery) = app_posting_to(&server);
+        let now = snob_core::store::now();
+        owe(&app, &delivery, 2, now);
+
+        drain(&app, &delivery).await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
+    }
+
+    /// And one run does not empty a weekend's worth of queue at somebody's
+    /// server all at once.
+    ///
+    /// `DRAIN_LIMIT` is the only thing bounding that, and raising it from ten to
+    /// a thousand was invisible.
+    #[tokio::test]
+    async fn one_run_sends_at_most_the_drain_limit() {
+        let server = wiremock::MockServer::start().await;
+        accepting(&server).await;
+        let (app, delivery) = app_posting_to(&server);
+        let now = snob_core::store::now();
+        // A literal count and a literal ceiling, not `DRAIN_LIMIT + 5` and
+        // `DRAIN_LIMIT`: a test written in terms of the constant it is checking
+        // passes whatever that constant becomes, which is exactly how this
+        // bound came to be unguarded in the first place.
+        let owed = 25;
+        owe(&app, &delivery, owed, now);
+
+        drain(&app, &delivery).await;
+
+        let sent = server.received_requests().await.unwrap().len();
+        assert!(
+            sent <= 15,
+            "one run made {sent} requests at somebody's server in a row"
+        );
+        assert_eq!(
+            deliveries::pending(app.db().conn()).unwrap() as usize,
+            owed - sent,
+            "the rest are still owed, for the next run"
+        );
+    }
+
+    /// A run drains the queue even when it had no news of its own.
+    ///
+    /// AGENTS.md's rule is that owed reports are retried by **any** run, and the
+    /// account loop is not what decides it: a monitor whose counters have not
+    /// moved is the common case, and it is exactly the run that used to leave a
+    /// backlog untouched. Deleting the drain from `run_one` left the whole
+    /// suite green, because the only tests that reached it called `drain`
+    /// directly -- they proved the function works and nothing about anybody
+    /// calling it.
+    ///
+    /// No account is watched here on purpose. That removes the network from the
+    /// test entirely and asks the one question that is open: does a run that
+    /// looked at nothing still send what it owes?
+    #[tokio::test]
+    async fn a_run_with_nothing_to_look_at_still_sends_what_it_owes() {
+        let server = wiremock::MockServer::start().await;
+        accepting(&server).await;
+        let (mut app, delivery) = app_posting_to(&server);
+        owe(&app, &delivery, 1, snob_core::store::now());
+
+        let args = WatchRunArgs {
+            no_progress: true,
+            ..WatchRunArgs::default()
+        };
+        run_one(&args, &mut app, &[], Some(&delivery))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "a run that had nothing to report still owes what it owed"
+        );
+        assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
+    }
 
     /// A `watch.toml` as the tool would read one.
     fn watch_toml(body: &str) -> WatchConfig {

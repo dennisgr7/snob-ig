@@ -252,7 +252,7 @@ pub struct WatchArgs {
 }
 
 /// `snob watch` with no subcommand: stay up and run on a schedule.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct WatchRunArgs {
     /// Account to watch. Defaults to your own.
     pub target: Option<String>,
