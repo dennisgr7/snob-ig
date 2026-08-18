@@ -417,6 +417,24 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
     let mut pk = app.viewer().pk;
 
     for kind in [ListKind::Followers, ListKind::Following] {
+        // A canceled walk comes back `Ok`, so without this the loop went
+        // straight on to the second list — and `App::resolved_target` drops the
+        // remembered counters as soon as the pacer has moved, so it asked
+        // Instagram again. The user had already been told "Stopping and saving
+        // what has been fetched…".
+        //
+        // Recorded as a refusal rather than dropped: a list this run never
+        // looked at must not be compared or marked, which is exactly what
+        // `Skipped` means, and saying so keeps the report honest about why it
+        // is short.
+        if app.cancel().is_canceled() {
+            lists.push(TickList {
+                kind,
+                skipped: Some(Skipped::Incomplete(StopReason::Canceled)),
+            });
+            continue;
+        }
+
         let (_, outcome) = engine::list(app, &args, kind).await?;
         pk = outcome.account_pk;
 
