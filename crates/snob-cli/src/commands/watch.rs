@@ -41,7 +41,7 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
         Some(WatchCommand::Diff(args)) => diff(args, secrets, paths),
         Some(WatchCommand::Once(args)) => once(args, secrets, paths).await,
         Some(WatchCommand::Check(args)) => check(args, secrets, paths).await,
-        Some(WatchCommand::Setup(args)) => super::watch_setup::setup(args, secrets, paths),
+        Some(WatchCommand::Setup(args)) => super::watch_setup::setup(args, secrets, paths).await,
         Some(WatchCommand::Status(args)) => super::watch_setup::status(args, paths),
         None => scheduled(args.run, secrets, paths).await,
     }
@@ -736,6 +736,33 @@ async fn once_one(
 /// schedule, and a broken schedule does not hide a webhook that has stopped
 /// answering: every line is reported, and the exit code is the worst of them.
 async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    use crate::engine::check::Verdict;
+
+    let report = preflight(&args, &secrets, paths).await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&check_json(&report))?);
+    } else {
+        for line in describe_check(&report) {
+            println!("{line}");
+        }
+    }
+
+    // Warnings are not failures: a monitor with no baseline yet will work, it
+    // just has nothing to say on its first run. Only what would stop a run
+    // reaches the exit code.
+    Ok(match report.verdict() {
+        Verdict::Failed => ExitCode::Error,
+        _ => ExitCode::Ok,
+    })
+}
+
+/// The checks themselves, without the printing, so `setup` can run them too.
+pub(super) async fn preflight(
+    args: &WatchCheckArgs,
+    secrets: &SecretStore,
+    paths: &AppPaths,
+) -> Result<crate::engine::check::CheckReport> {
     use crate::engine::check::{self, Verdict};
 
     let configured = config::load(paths)?;
@@ -749,7 +776,7 @@ async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> 
 
     // Before the session, like `once` does, so an address that could never work
     // is reported even on a machine that cannot log in.
-    let delivery = match delivery_from(&WebhookArgs::default(), configured.as_ref(), &secrets) {
+    let delivery = match delivery_from(&WebhookArgs::default(), configured.as_ref(), secrets) {
         Ok(delivery) => delivery,
         Err(e) => {
             report.checked.push(check::Checked {
@@ -765,10 +792,10 @@ async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> 
         }
     };
 
-    match common::open_with_progress(false, &secrets, paths)? {
+    match common::open_with_progress(false, secrets, paths)? {
         Session::Open(app) => {
             let watched = watched_from(None, configured.as_ref());
-            check::with_a_session(&app, &secrets, &watched, &mut report).await;
+            check::with_a_session(&app, secrets, &watched, &mut report).await;
         }
         Session::Missing => report.checked.push(check::Checked {
             what: check::What::Session {
@@ -802,25 +829,26 @@ async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> 
         );
     }
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&check_json(&report))?);
-    } else {
-        for line in describe_check(&report) {
-            println!("{line}");
-        }
-    }
+    Ok(report)
+}
 
-    // Warnings are not failures: a monitor with no baseline yet will work, it
-    // just has nothing to say on its first run. Only what would stop a run
-    // reaches the exit code.
-    Ok(match report.verdict() {
-        Verdict::Failed => ExitCode::Error,
-        _ => ExitCode::Ok,
-    })
+/// Walks the configured accounts once, so there is something to compare
+/// against.
+///
+/// One ordinary run with no webhook: a baseline has nothing to report, so there
+/// is nothing to send, and going through the same path as every other run is
+/// what stops this being a second way of laying one down.
+pub(super) async fn baseline_now(
+    configured: Option<&WatchConfig>,
+    secrets: &SecretStore,
+    paths: &AppPaths,
+) -> Result<()> {
+    let watched = watched_from(None, configured);
+    open_and_run(&WatchRunArgs::default(), &watched, None, secrets, paths).await
 }
 
 /// One line per check, in the order they were made.
-fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<String> {
+pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<String> {
     use crate::engine::check::{Verdict, What};
 
     let mut lines = Vec::new();
