@@ -285,6 +285,12 @@ impl IgClient {
     /// Rebuilds rather than assigns: both redirect policies are decided from
     /// the base URL when the client is made, so moving the field alone would
     /// leave them judging every hop against the wrong server.
+    ///
+    /// **This is also what turns the pace off**, through [`IgClient::is_live`],
+    /// so a consumer of this crate that pointed a client at a proxy would walk
+    /// Instagram with no waits between pages. `snob-cli` is the only consumer,
+    /// and it only does this in tests.
+    #[doc(hidden)]
     pub fn with_base_url(self, base: Url) -> Self {
         Self::pointed_at(self.session, self.pacer, base)
             .expect("rebuilding a client that already exists cannot fail")
@@ -296,6 +302,23 @@ impl IgClient {
 
     pub fn pacer(&self) -> &Pacer {
         &self.pacer
+    }
+
+    /// Whether this client is pointed at Instagram itself.
+    ///
+    /// What decides whether the pace is real: a walk against the live host pays
+    /// every wait between pages, and a walk against a mock server pays none.
+    ///
+    /// Asked of the base URL rather than set by a caller, and that is the whole
+    /// point. It used to be `ListWalker::without_sleeping()`, a `#[doc(hidden)]`
+    /// method — so "walk Instagram with no waits" was a thing anybody could ask
+    /// for, and the rule that a real account is never walked without the
+    /// limiter rested on nobody asking. A test server cannot be Instagram, and
+    /// Instagram cannot be a test server, so the question answers itself.
+    pub(crate) fn is_live(&self) -> bool {
+        static LIVE: std::sync::LazyLock<Url> =
+            std::sync::LazyLock::new(|| Url::parse(BASE_URL).expect("BASE_URL parses"));
+        same_origin(&self.base, &LIVE)
     }
 
     /// Checks the session works, with the cheapest request that exercises the

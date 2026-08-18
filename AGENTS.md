@@ -188,7 +188,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target`. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too |
 | A name inside a URL is encoded, never filtered | `User::profile_url` — filtering removes characters, and a name with one removed is the address of a different account |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
-| Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
+| Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` — and takes its waits from `IgClient::is_live`, so "walk Instagram with no pauses" is not a thing a caller can ask for |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
 | A session is never reported gone unless it went | `SecretStore::delete`, which carries the keyring's own answer back |
 | Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers |

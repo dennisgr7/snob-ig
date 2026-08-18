@@ -106,19 +106,6 @@ impl Pace {
         }
     }
 
-    /// No waits at all. **Tests only**: skipping the pace against Instagram
-    /// goes against the project's rules.
-    #[doc(hidden)]
-    pub fn instant() -> Self {
-        Self {
-            micro_pause_ms: (0, 0),
-            cycle_wait_ms: (0, 0),
-            long_pause_ms: (0, 0),
-            backoff_base_ms: 0,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn micro_pause(&self) -> Duration {
         jitter(self.micro_pause_ms)
     }
