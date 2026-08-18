@@ -35,6 +35,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     }
 
     let profile = paths.browser_profile();
+    let mut profile_failure = None;
     match (args.purge_profile, profile.exists()) {
         // The flag was typed on purpose, so it is not second-guessed: asking
         // for confirmation would also make it a no-op in a script, where
@@ -50,10 +51,17 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
                 profile.display()
             ));
         }
-        (true, true) => {
-            std::fs::remove_dir_all(&profile)?;
-            println!("Browser profile deleted.");
-        }
+        // Collected rather than `?`-ed, for the same reason `removal` above is:
+        // one refusal must not decide the other. A browser still open on the
+        // profile makes this fail, and with `?` here the early return jumped
+        // over `removal?` at the end — so a user whose keyring had *also*
+        // refused was told about the locked directory and nothing at all about
+        // the session, which was still in the keyring. `purge::execute`
+        // already collects its failures for exactly this.
+        (true, true) => match std::fs::remove_dir_all(&profile) {
+            Ok(()) => println!("Browser profile deleted."),
+            Err(e) => profile_failure = Some(e),
+        },
         (true, false) => println!("There is no browser profile to delete."),
         // Deleting the stored session leaves the browser one behind, and
         // someone who just ran logout reasonably believes the credential is
@@ -69,6 +77,24 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     // After the profile, so that one refusal does not decide the other. There
     // is no documented exit code for "a local delete was refused", and neither
     // 3 nor 5 would be true, so this becomes the generic failure.
+    //
+    // The credential goes first when both refused: a browser profile left
+    // behind is a housekeeping failure, and a session left in the keyring is a
+    // failure at the only thing this command exists for. The other is still
+    // said out loud rather than swallowed.
+    if removal.is_err()
+        && let Some(io) = &profile_failure
+    {
+        ui::warn(&format!(
+            "{} could not be removed either: {io}",
+            profile.display()
+        ));
+    }
     removal?;
+    if let Some(e) = profile_failure {
+        return Err(
+            anyhow::Error::new(e).context(format!("{} could not be removed", profile.display()))
+        );
+    }
     Ok(ExitCode::Ok)
 }

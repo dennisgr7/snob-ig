@@ -66,6 +66,38 @@ pub fn label(pk: Pk, username: Option<&str>) -> String {
     }
 }
 
+/// The one place a [`Pacer`] is assembled.
+///
+/// Three things have to be true of every one of them and only this had them all:
+/// the store is opened first, because it creates the schema the budget then
+/// opens its own connection to; the process's cancellation token is attached, so
+/// Ctrl+C reaches a request waiting on the budget; and somebody is told when a
+/// wait is imposed, because a command that stops dead for twenty minutes with no
+/// explanation reads as a hang.
+///
+/// `login` and `whoami` each built their own instead — `Pacer::new(budget)` and
+/// nothing else — which is the rule about `commands` never assembling their own
+/// dependencies, and it cost exactly what that rule exists to prevent. `snob
+/// whoami` on a rationed bucket sat silent for as long as the debt lasted, and
+/// `login --browser` had already installed the interrupt handler by the time it
+/// reached the validating request, so the first Ctrl+C printed "Stopping and
+/// saving what has been fetched…" and changed nothing at all.
+///
+/// `announce` stays with the caller: what a wait looks like is presentation, and
+/// a progress bar is right for a walk while a line on standard error is right
+/// for a single request. The wiring is what is shared.
+pub fn pacer(
+    paths: &AppPaths,
+    announce: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+) -> Result<Pacer> {
+    // The store goes first: it is what creates the schema, and the budget opens
+    // its own connection to a file that has to have tables already.
+    Store::open(paths)?;
+    Ok(Pacer::new(Arc::new(SqliteRateBudget::open(paths)?))
+        .with_cancel(interrupt::install())
+        .announcing(announce))
+}
+
 pub struct App {
     client: IgClient,
     db: Store,
@@ -138,15 +170,11 @@ impl App {
             username: session.username.clone(),
         };
 
-        // The store goes first: it is what creates the schema, and the budget
-        // opens its own connection to a file that has to have tables already.
         let db = Store::open(paths)?;
-        let budget = Arc::new(SqliteRateBudget::open(paths)?);
-
         let progress = Progress::new(with_progress);
         let cancel = interrupt::install();
 
-        let announce = {
+        let pacer = pacer(paths, {
             let progress = progress.clone();
             // `waiting` rather than `note`: the number counts down on the bar
             // instead of being frozen into the message at the moment the wait
@@ -154,11 +182,7 @@ impl App {
             Arc::new(move |waited: std::time::Duration| {
                 progress.waiting("the request budget is rationing", waited);
             })
-        };
-
-        let pacer = Pacer::new(budget)
-            .with_cancel(cancel.clone())
-            .announcing(announce);
+        })?;
 
         Ok(Some(Self {
             client: IgClient::new(session, pacer)?,
