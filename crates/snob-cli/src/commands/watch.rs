@@ -488,20 +488,27 @@ fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
             jitter: args.jitter,
         };
     }
+    // The schedule halves come as a set, so a flag does not merge into a
+    // configured calendar — but the jitter is not one of those halves, and it
+    // was being dropped with them. `given` looks only at `cron`/`at`/`on`/
+    // `every`, so with the schedule in the file `snob watch --jitter 0` threw
+    // the flag away and the banner printed "Each run is pushed up to fifteen
+    // minutes later" over the value just typed. The help and the CHANGELOG both
+    // say "0 turns it off", with no qualification about what else was typed.
     match configured {
         Some(c) => When {
             cron: c.cron.clone(),
             at: c.at.clone(),
             on: c.on.clone(),
             every: c.every,
-            jitter: c.jitter,
+            jitter: args.jitter.or(c.jitter),
         },
         None => When {
             cron: None,
             at: vec![],
             on: vec![],
             every: None,
-            jitter: None,
+            jitter: args.jitter,
         },
     }
 }
@@ -1935,6 +1942,49 @@ consent = { agreed_at = 1700 }
         );
         assert!(warnings[0].contains("not sent with it"), "{warnings:?}");
         assert!(warnings[1].contains("stored token"), "{warnings:?}");
+    }
+
+    /// `--jitter` is not one of the schedule halves, and is not dropped with
+    /// them.
+    ///
+    /// The halves come as a set so a flag cannot merge into a configured
+    /// calendar and produce a schedule neither source names. The jitter is not
+    /// part of that: with the schedule in the file, `snob watch --jitter 0`
+    /// threw the flag away and the banner printed "Each run is pushed up to
+    /// fifteen minutes later" over the value that had just been typed. The help
+    /// and the CHANGELOG both say "0 turns it off", unqualified.
+    #[test]
+    fn a_typed_jitter_survives_a_schedule_that_came_from_the_file() {
+        let file = WatchConfig {
+            schema: 1,
+            every: None,
+            at: vec!["09:00".to_string()],
+            on: vec![],
+            cron: None,
+            jitter: Some(std::time::Duration::from_secs(600)),
+            webhook: None,
+            accounts: vec![],
+        };
+
+        let args = WatchRunArgs {
+            jitter: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        let when = when_from(&args, Some(&file));
+        assert_eq!(
+            when.jitter,
+            Some(std::time::Duration::ZERO),
+            "the flag is what the user just typed"
+        );
+        assert_eq!(
+            when.at,
+            vec!["09:00".to_string()],
+            "and the schedule still comes from the file"
+        );
+
+        // Without the flag, the file's own value stands.
+        let bare = when_from(&WatchRunArgs::default(), Some(&file));
+        assert_eq!(bare.jitter, Some(std::time::Duration::from_secs(600)));
     }
 
     /// A fresh install does not step over the first moment its calendar names.

@@ -177,6 +177,30 @@ pub fn parse(text: &str, path: &Path) -> Result<WatchConfig, ConfigError> {
             found: config.schema,
         });
     }
+
+    // `cron` and the `at`/`on` pair are two syntaxes for the same thing, and
+    // only one of them can win. `schedule_from` takes `cron` first while the
+    // sentence the monitor prints is built from every field that is populated,
+    // so a file with both said "Running at 21:00, on the schedule \"0 9 * * 1\"."
+    // and then ran only on Mondays — the banner describing a schedule nobody was
+    // on. The flags cannot reach this state, `cli.rs` already declares them as
+    // conflicting; the file could, and `deny_unknown_fields` is on this struct
+    // for exactly the reason that applies here, that a schedule nobody is
+    // running must not be accepted in silence.
+    //
+    // `every` alongside a calendar stays legal: those two combine rather than
+    // compete, which is what `--every 2w --on mon` means.
+    if config.cron.is_some() && !(config.at.is_empty() && config.on.is_empty()) {
+        let other = if config.at.is_empty() { "on" } else { "at" };
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: format!(
+                "\"cron\" and \"{other}\" are two ways of saying the same thing, and only \
+                 \"cron\" would be used. Keep whichever one you meant."
+            ),
+        });
+    }
+
     Ok(config)
 }
 
@@ -374,6 +398,47 @@ heartbeat = true
         assert_eq!(webhook.url, "https://n8n.local/webhook/snob");
         assert!(webhook.heartbeat);
         assert_eq!(webhook.headers["X-Source"], "homelab");
+    }
+
+    /// Two syntaxes for the same thing, and only one of them would be used.
+    ///
+    /// `schedule_from` takes `cron` first while the sentence the monitor prints
+    /// is built from every populated field, so a file with both announced
+    /// "Running at 21:00, on the schedule "0 9 * * 1"." and then ran on Mondays
+    /// alone. `deny_unknown_fields` is on this struct because a schedule nobody
+    /// is running must not be accepted in silence, and this was one.
+    #[test]
+    fn a_file_cannot_name_a_schedule_twice() {
+        let both = at(r#"
+schema = 1
+cron = "0 9 * * 1"
+at = ["21:00"]
+"#)
+        .unwrap_err();
+        let message = both.to_string();
+        assert!(message.contains("cron"), "{message}");
+        assert!(message.contains("at"), "{message}");
+
+        assert!(
+            at(r#"
+schema = 1
+cron = "0 9 * * 1"
+on = ["thu"]
+"#)
+            .is_err(),
+            "the day half names it twice just as much as the time half"
+        );
+
+        // An interval alongside a calendar is not the same thing: those combine,
+        // which is what `--every 2w --on mon` means.
+        assert!(
+            at(r#"
+schema = 1
+cron = "0 9 * * 1"
+every = "2w"
+"#)
+            .is_ok()
+        );
     }
 
     #[test]
