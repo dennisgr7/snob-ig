@@ -1088,11 +1088,11 @@ fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
 /// thing `snob watch` does when it has actually reported them somewhere.
 fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Nothing is fetched here, so there is no bar to draw.
-    let Session::Open(mut app) = common::open_with_progress(false, &secrets, paths)? else {
+    let Session::Open(app) = common::open_with_progress(false, &secrets, paths)? else {
         return Ok(ExitCode::NoSession);
     };
 
-    let report = crate::engine::watch::from_store(&mut app, args.target.as_deref(), false)?;
+    let report = crate::engine::watch::from_store(&app, args.target.as_deref())?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&as_json(&report))?);

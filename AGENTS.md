@@ -195,6 +195,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
 | A temporal diff never compares an incomplete capture, or one against itself | `watch::Basis::decide`, over ids read from `usable_snapshots` |
+| `snob watch diff` answers without recording the answer | `engine::watch::from_store` takes `&App`, and recording needs the `&mut Store` only `record_from_store` can reach |
 | A first run reports nothing rather than announcing the whole list as arrivals | `watch::Basis::Baseline`, which has no diff to take out of it |
 | A change is reported once: not twice, and not never | `store::watch::Mark` — the receipt, written where the report was made |
 | A list nothing verified is neither compared nor marked | `engine::watch::refusal`, over `Provenance::describes_now` |
