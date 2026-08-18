@@ -52,7 +52,14 @@ const SUFFIX_EXCEPTIONS: [&str; 8] = [
 /// or `error` in this list turns the test into permanent noise. Over-pruning
 /// only causes a false negative, which is the safe direction: the other two
 /// detectors catch nearly everything that slips through.
-const SPANISH_WORDS: [&str; 46] = [
+///
+/// Two were in it anyway. `leer` is an ordinary English verb, and `todos`
+/// arrives from every `TODO` written in the plural -- `words_of` splits on
+/// non-alphabetics and `spanish_in` lowercases first, so `TODOs` in any `.rs`,
+/// `.md` or `.yml` reached this list and failed the build over correct English.
+/// Both are still caught in their accented forms by `SPANISH_CHARS`, and a real
+/// relapse into Spanish trips several of the words that remain.
+const SPANISH_WORDS: [&str; 44] = [
     "motivo",
     "aviso",
     "instantanea",
@@ -83,7 +90,6 @@ const SPANISH_WORDS: [&str; 46] = [
     "guardar",
     "borrar",
     "buscar",
-    "leer",
     "escribir",
     "porque",
     "aunque",
@@ -96,7 +102,6 @@ const SPANISH_WORDS: [&str; 46] = [
     "hasta",
     "desde",
     "entre",
-    "todos",
     "mejor",
     "puede",
 ];

@@ -507,6 +507,20 @@ mod tests {
         }
     }
 
+    /// The two windows are numbers somebody chose, and every other test in the
+    /// tree refers to them by name -- so `RESUME_WINDOW_SECS = 6 * 60` passes
+    /// the whole suite while every walk paused for longer than six minutes
+    /// silently begins again at page one, and `CLAIM_TTL_SECS = 60` makes a
+    /// walk that pauses for a minute look abandoned to any other process.
+    ///
+    /// Written out, the way `the_default_pace_is_the_documented_one` writes out
+    /// the pacing: changing one has to be deliberate and has to say so here.
+    #[test]
+    fn the_two_windows_are_the_documented_ones() {
+        assert_eq!(RESUME_WINDOW_SECS, 15 * 60);
+        assert_eq!(CLAIM_TTL_SECS, 5 * 60);
+    }
+
     fn base() -> Store {
         let db = Store::in_memory().unwrap();
         users::upsert(db.conn(), &user(1)).unwrap();
@@ -1040,18 +1054,18 @@ mod tests {
             ids.push(id);
         }
 
-        let both_at_once: i64 = db
-            .conn()
-            .query_row(
-                "SELECT count(DISTINCT taken_at) FROM snapshots WHERE complete = 1",
+        // Forced, not hoped for. `close` stamps `taken_at` from the clock and
+        // nothing here freezes it, so this used to *assert* that the two rows
+        // had landed in one second — which is true almost always and false when
+        // the runner is loaded enough to be preempted between them. The test
+        // then failed on its own precondition rather than on the tie-break, in
+        // the one shape nobody can reproduce.
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET taken_at = 1000 WHERE complete = 1",
                 [],
-                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            both_at_once, 1,
-            "the two have to share a second to be a test"
-        );
 
         assert_eq!(
             latest_complete(db.conn(), 1, ListKind::Followers)

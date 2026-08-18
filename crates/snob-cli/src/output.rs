@@ -140,7 +140,18 @@ pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<(
 ///
 /// An existing file is never overwritten here. With `-o` the user picked the
 /// name and replacing it is their call; with this one they did not.
-pub fn default_path(stem: &str, extension: &str) -> Result<PathBuf> {
+///
+/// `in_dir` is where that check looks, and it is a parameter because it used to
+/// be the **process's** working directory. That is shared state: the test for
+/// this walked into a temporary directory with `set_current_dir` while a
+/// sibling in the same binary called it expecting to be somewhere else, and
+/// `cargo test` runs those on threads of one process. An unreproducible red
+/// build, and worse if a panic left the whole binary rooted in a tempdir that
+/// `TempDir::drop` then could not remove on Windows.
+///
+/// What comes back is still the bare name, because that is what gets printed
+/// and what the caller writes to.
+pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
     #[rustfmt::skip]
     const RESERVED: [&str; 24] = [
         "con", "prn", "aux", "nul", "conin$", "conout$",
@@ -175,7 +186,7 @@ pub fn default_path(stem: &str, extension: &str) -> Result<PathBuf> {
     }
 
     let name = format!("{stem}.{extension}");
-    if Path::new(&name).exists() {
+    if in_dir.join(&name).exists() {
         return Err(anyhow!(
             "{name} already exists here. Use -o to say where the result should go"
         ));
@@ -453,6 +464,12 @@ mod tests {
     /// anything the user typed.
     #[test]
     fn a_name_that_cannot_be_a_file_is_refused_rather_than_written() {
+        // An empty directory of its own, so nothing here depends on what
+        // happens to be next to the test binary or on where the suite was
+        // started from.
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path();
+
         for bad in [
             "nul",
             "CON",
@@ -472,12 +489,15 @@ mod tests {
             &"x".repeat(200),
         ] {
             assert!(
-                default_path(bad, "jpg").is_err(),
+                default_path(here, bad, "jpg").is_err(),
                 "{bad:?} should not become a file name"
             );
         }
         for good in ["someone", "some.one", "some_one", "user123"] {
-            assert!(default_path(good, "jpg").is_ok(), "{good:?} should be fine");
+            assert!(
+                default_path(here, good, "jpg").is_ok(),
+                "{good:?} should be fine"
+            );
         }
     }
 
@@ -490,29 +510,31 @@ mod tests {
     /// sent, which is the side of the boundary nothing on this machine chose.
     #[test]
     fn the_refusal_does_not_print_the_name_it_is_refusing() {
-        let error = default_path("gh\u{1b}[2K\u{1b}[A", "jpg")
+        let error = default_path(Path::new("."), "gh\u{1b}[2K\u{1b}[A", "jpg")
             .unwrap_err()
             .to_string();
         assert!(!error.contains('\u{1b}'), "{error:?}");
         assert!(error.contains("gh[2K[A"), "{error:?}");
     }
 
+    /// Nothing here moves the process's working directory. It used to: this
+    /// walked into a tempdir with `set_current_dir` while a sibling in the same
+    /// binary resolved relative paths expecting to be elsewhere, and `cargo
+    /// test` runs those on threads of one process.
     #[test]
     fn an_existing_file_is_not_overwritten_behind_the_users_back() {
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
         assert_eq!(
-            default_path("someone", "jpg").unwrap(),
+            default_path(dir.path(), "someone", "jpg").unwrap(),
             Path::new("someone.jpg")
         );
 
-        std::fs::write("someone.jpg", b"something already here").unwrap();
-        let error = default_path("someone", "jpg").unwrap_err().to_string();
+        std::fs::write(dir.path().join("someone.jpg"), b"something already here").unwrap();
+        let error = default_path(dir.path(), "someone", "jpg")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already exists"), "{error}");
-
-        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]
