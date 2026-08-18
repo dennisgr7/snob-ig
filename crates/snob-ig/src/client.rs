@@ -579,7 +579,21 @@ impl IgClient {
         self.remember_claim(&response);
 
         let status = response.status();
-        let body = read_capped(response, MAX_BODY_BYTES).await?;
+
+        // The status is already in hand, and a body that will not read must not
+        // take it away. With `?` here, a 429 whose body died mid-stream became
+        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
+        // three more requests into an endpoint that had just said no, and
+        // `classify_and_record`, the only caller of `cooldown_for` there is,
+        // never ran: nothing was written down and the next run knocked again.
+        // What Instagram said is the status; the body only refines it.
+        let body = match read_capped(response, MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(_) if !status.is_success() => {
+                return Err(self.classify_and_record(status.as_u16(), ""));
+            }
+            Err(e) => return Err(e),
+        };
 
         // A 200 can still be an error: Instagram returns `{"status":"fail"}`
         // with a 200 in some cases.
@@ -603,7 +617,10 @@ impl IgClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use snob_core::session::{Session, SessionOrigin};
+    use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -617,6 +634,182 @@ mod tests {
         IgClient::new(session, crate::pace::Pacer::unlimited())
             .unwrap()
             .with_base_url(Url::parse(&server.uri()).unwrap())
+    }
+
+    /// A budget that remembers what it was told to write down.
+    ///
+    /// The rule that a push-back puts the account in cooldown had no observer
+    /// anywhere in the workspace: every test that drove a throttling body
+    /// through a real client hung `Pacer::unlimited()` off it, whose
+    /// `start_cooldown` answers `Ok(0)` and forgets. The whole recording half of
+    /// [`IgClient::classify_and_record`] could be deleted and the suite stayed
+    /// green — on the one rule that decides whether the next run walks back into
+    /// an account Instagram has just flagged.
+    #[derive(Default)]
+    struct Recording {
+        started: std::sync::Mutex<Vec<(String, std::time::Duration)>>,
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<(String, std::time::Duration)> {
+            self.started.lock().unwrap().clone()
+        }
+    }
+
+    impl snob_core::store::rate_budget::RateBudget for Recording {
+        fn reserve(&self) -> Result<std::time::Duration, RateBudgetError> {
+            Ok(std::time::Duration::ZERO)
+        }
+        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            Ok(None)
+        }
+        fn start_cooldown(
+            &self,
+            reason: &str,
+            minimum: std::time::Duration,
+        ) -> Result<i64, RateBudgetError> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((reason.to_string(), minimum));
+            Ok(0)
+        }
+    }
+
+    /// A client whose budget can be asked afterwards what it was told.
+    fn watching(base: &str) -> (IgClient, Arc<Recording>) {
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(
+            session,
+            crate::pace::Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>),
+        )
+        .unwrap()
+        .with_base_url(Url::parse(base).unwrap());
+        (client, budget)
+    }
+
+    async fn answering(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Every push-back is written down, with the length its own cause earns.
+    ///
+    /// `cooldown_for` is the table and it is tested on its own, but a table
+    /// nobody reads is not a rule. This drives the four causes through a real
+    /// request and asks the budget what arrived.
+    #[tokio::test]
+    async fn every_push_back_puts_the_account_in_cooldown() {
+        use crate::error::cooldown_for;
+
+        let cases = [
+            (429, "", IgError::RateLimited),
+            (
+                400,
+                r#"{"message":"","spam":true,"status":"fail"}"#,
+                IgError::RateLimited,
+            ),
+            (
+                400,
+                r#"{"message":"feedback_required","status":"fail"}"#,
+                IgError::FeedbackRequired,
+            ),
+            (
+                400,
+                r#"{"message":"challenge_required","status":"fail"}"#,
+                IgError::Challenge { url: None },
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let server = answering(status, body).await;
+            let (client, budget) = watching(&server.uri());
+            client.validate().await.unwrap_err();
+
+            let (reason, minimum) = cooldown_for(&expected).expect("this cause earns a cooldown");
+            assert_eq!(
+                budget.calls(),
+                vec![(reason.to_string(), minimum)],
+                "status {status} with body {body:?} should record one cooldown"
+            );
+        }
+    }
+
+    /// A dead session is not push-back, and must not put the account in
+    /// cooldown: logging in again is what fixes it, and a cooldown would refuse
+    /// the very command that fixes it.
+    #[tokio::test]
+    async fn a_dead_session_records_nothing() {
+        let server = answering(403, r#"{"message":"login_required","status":"fail"}"#).await;
+        let (client, budget) = watching(&server.uri());
+
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::SessionExpired));
+        assert!(budget.calls().is_empty());
+    }
+
+    /// A 429 whose body dies mid-stream is still a 429.
+    ///
+    /// The read used to be `read_capped(...).await?`, so the failure to read
+    /// replaced a status already in hand with `IgError::Network` — whose
+    /// reaction is `Retry`. The walker then fired three more requests into an
+    /// endpoint that had just said no, and `classify_and_record` never ran, so
+    /// nothing was written down either. Both halves of the rule went at once.
+    ///
+    /// Served from a raw socket rather than from `wiremock`, because what has to
+    /// happen is a body that stops arriving: the headers announce a length and
+    /// the connection closes before it is sent.
+    #[tokio::test]
+    async fn a_throttled_answer_with_a_body_that_dies_is_still_throttled() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // Drained first, or the close below races the request still being
+            // written and the failure lands on the send rather than on the read.
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while socket.read(&mut byte).unwrap_or(0) == 1 {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            // Announced as 4096 bytes, and then the connection goes away with
+            // none of them sent. The pause is what lets the head be delivered
+            // and the body read begin before that happens.
+            let _ =
+                socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4096\r\n\r\n");
+            let _ = socket.flush();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+
+        let (client, budget) = watching(&base);
+        let error = client.validate().await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            matches!(error, IgError::RateLimited),
+            "a body that would not read must not turn a 429 into a network error: {error:?}"
+        );
+        assert_eq!(error.reaction(), crate::error::Reaction::Cooldown);
+        assert_eq!(
+            budget.calls(),
+            vec![(
+                "rate_limit".to_string(),
+                snob_core::store::rate_budget::rate_limit_cooldown()
+            )]
+        );
     }
 
     /// A 200 whose body will not parse gets the same excerpt as every other
