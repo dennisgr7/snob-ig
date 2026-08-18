@@ -13,7 +13,7 @@ use snob_core::sets;
 
 use crate::cli::ListArgs;
 use crate::commands::common::{self, Session};
-use crate::engine::{self, ListOutcome};
+use crate::engine::{self, ListOutcome, ResultSource};
 use crate::exit::ExitCode;
 use crate::report;
 use crate::ui;
@@ -173,18 +173,15 @@ fn print_summary(
     base_outcome: &ListOutcome,
     against_outcome: &ListOutcome,
 ) {
-    let total_requests = base_outcome.requests + against_outcome.requests;
-
-    let (one, many) = op.description();
-    let mut line = report::counted(result.len(), kept, total, one, many);
-    line.push_str(&format!(
-        " - {} - {}",
-        // The proportion describes the crossing, so it is the count before any
-        // filter or cap: "3 of 412 accounts you follow".
-        proportion(total, base.len()),
-        report::requests(total_requests)
+    ui::info(&summary_line(
+        op,
+        result.len(),
+        kept,
+        total,
+        base.len(),
+        base_outcome,
+        against_outcome,
     ));
-    ui::info(&line);
 
     if !base_outcome.is_complete() {
         ui::warn(
@@ -192,6 +189,58 @@ fn print_summary(
              The ones shown are correct.",
         );
     }
+}
+
+/// The one line a crossing prints about itself.
+///
+/// Built rather than printed, so a test can read it. It could not: everything
+/// here went straight to `ui::info`, which is why the omission below survived —
+/// nothing in the suite could see what this said.
+fn summary_line(
+    op: SetOp,
+    found: usize,
+    kept: usize,
+    total: usize,
+    base_len: usize,
+    base_outcome: &ListOutcome,
+    against_outcome: &ListOutcome,
+) -> String {
+    let total_requests = base_outcome.requests + against_outcome.requests;
+
+    let (one, many) = op.description();
+    let mut line = report::counted(found, kept, total, one, many);
+    line.push_str(&format!(
+        " - {}",
+        // The proportion describes the crossing, so it is the count before any
+        // filter or cap: "3 of 412 accounts you follow".
+        proportion(total, base_len)
+    ));
+
+    // When it is stored, say so and say from when. This read only the counts,
+    // so `snob unfollowers --cache` a month later printed a line that could not
+    // be told apart from a crossing walked five minutes ago — while `snob
+    // followers --cache` says "list stored on 07/07 at 14:12" for the very same
+    // capture. `Provenance`'s own doc names an answer that does not say where it
+    // came from as half of the defect it was written for.
+    //
+    // The older of the two dates, because a crossing is only as recent as its
+    // staler half. `check_same_moment` is what stops the two being far apart at
+    // all, so this is completeness rather than a correction.
+    if base_outcome.source() == ResultSource::Cached
+        || against_outcome.source() == ResultSource::Cached
+    {
+        line.push_str(&format!(
+            " - lists stored on {}",
+            report::stored_on(base_outcome.taken_at.min(against_outcome.taken_at))
+        ));
+    }
+
+    if total_requests > 0 {
+        line.push_str(&format!(" - {}", report::requests(total_requests)));
+    } else {
+        line.push_str(" - without touching the network");
+    }
+    line
 }
 
 fn proportion(part: usize, total: usize) -> String {
@@ -218,6 +267,66 @@ mod tests {
             stopped_by: None,
             resumable: false,
         }
+    }
+
+    fn stored(taken_at: i64) -> ListOutcome {
+        ListOutcome {
+            provenance: engine::Provenance::CacheFlag,
+            requests: 0,
+            taken_at,
+            ..outcome(StopReason::Completed)
+        }
+    }
+
+    /// A crossing served from storage says so, and says from when.
+    ///
+    /// The line read only the counts, so `snob unfollowers --cache` a month
+    /// later was indistinguishable from a crossing walked five minutes ago —
+    /// while `snob followers --cache` says "list stored on 07/07 at 14:12" for
+    /// the very same capture. The counts are right and `check_same_moment`
+    /// blocks the dangerous case, so this is completeness rather than a
+    /// correction; but an answer that does not say where it came from is half
+    /// of what `Provenance` was written for.
+    #[test]
+    fn a_crossing_served_from_storage_says_when_it_is_from() {
+        // Two captures a day apart. The line has to name the older.
+        let older = 1_700_000_000;
+        let line = summary_line(
+            SetOp::Unfollowers,
+            3,
+            3,
+            3,
+            412,
+            &stored(older),
+            &stored(older + 24 * 3_600),
+        );
+
+        assert!(
+            line.contains(&report::stored_on(older)),
+            "a crossing is only as recent as its staler half: {line}"
+        );
+        assert!(
+            line.contains("without touching the network"),
+            "nothing was spent, and that is worth saying: {line}"
+        );
+    }
+
+    /// And a freshly walked one does not claim to be stored.
+    #[test]
+    fn a_crossing_that_was_walked_says_what_it_spent() {
+        let line = summary_line(
+            SetOp::Unfollowers,
+            3,
+            3,
+            3,
+            412,
+            &outcome(StopReason::Completed),
+            &outcome(StopReason::Completed),
+        );
+
+        assert!(!line.contains("stored on"), "{line}");
+        assert!(!line.contains("without touching the network"), "{line}");
+        assert!(line.contains(&report::requests(2)), "{line}");
     }
 
     #[test]

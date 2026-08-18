@@ -337,6 +337,25 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         rows.push(row);
     }
 
+    // When the two lists came out of storage, say so and say from when. The
+    // table carried provenance into csv, xlsx and json and left the human
+    // format — the one somebody actually reads — unable to tell a scan of five
+    // minutes ago from one of last month. `lists::print_summary` says it for a
+    // single list; this is the same sentence for a crossing.
+    //
+    // The older of the two dates, because a scan is only as recent as its
+    // staler half.
+    if summary.followers.source() == ResultSource::Cached
+        || summary.following.source() == ResultSource::Cached
+    {
+        rows.push(String::new());
+        rows.push(format!(
+            "{:<14}{}",
+            "Stored on:",
+            report::stored_on(summary.followers.taken_at.min(summary.following.taken_at))
+        ));
+    }
+
     let mut s = String::new();
     for row in rows {
         s.push_str(row.trim_end());
