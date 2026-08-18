@@ -448,7 +448,7 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
         "an over-age report is not due, so nothing can expire it by failing"
     );
 
-    watch::settle(&app, now);
+    watch::settle(app.db(), now);
 
     assert_eq!(
         snob_core::store::deliveries::state(app.db().conn(), id).unwrap(),
