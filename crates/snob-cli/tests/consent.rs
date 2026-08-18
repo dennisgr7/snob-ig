@@ -142,3 +142,85 @@ async fn a_yes_given_in_advance_needs_no_terminal() {
     result.expect("-y is consent");
     assert_eq!(spent, 0);
 }
+
+/// `--cache` is not asked about, because there is nothing to agree to.
+///
+/// Consent governs enumerating somebody else's lists. `--cache` reads a list
+/// that was already walked — with permission — off this machine's own disk, and
+/// resolves the name from the store rather than over the network, so the rule
+/// that consent comes before resolution is not in play either.
+///
+/// Asking anyway cost more than a redundant prompt: with no terminal the
+/// question cannot be put, so `snob unfollowers someone --cache` from cron or
+/// down a pipe exited 130 over an answer that spends nothing and touches
+/// nobody. It also disagreed with `cooldown::serve`, which hands back the
+/// identical stored list with no question at all and says so in as many words.
+#[tokio::test]
+async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
+    use snob_core::model::{ListKind, StopReason, User};
+    use snob_core::store::{accounts, snapshots, users};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Store::open_at(&tmp.path().join("test.db")).unwrap();
+
+    // A list of theirs that was walked at some point, which is what `--cache`
+    // is for reading back.
+    let ghost = User {
+        pk: 7,
+        username: "ghost".into(),
+        full_name: None,
+        is_private: None,
+        is_verified: None,
+        pfp_url: None,
+    };
+    users::upsert(db.conn(), &ghost).unwrap();
+    accounts::upsert(db.conn(), 7, false).unwrap();
+    let opened = snapshots::begin(db.conn(), 7, ListKind::Followers, Some(1)).unwrap();
+    snapshots::save_page(
+        &mut db,
+        opened.id,
+        &[User {
+            pk: 8,
+            username: "someone".into(),
+            full_name: None,
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        }],
+        None,
+    )
+    .unwrap();
+    snapshots::close(db.conn(), opened.id, StopReason::Completed).unwrap();
+
+    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+    let client = IgClient::new(session, Pacer::unlimited())
+        .unwrap()
+        .with_base_url(Url::parse(&server.uri()).unwrap());
+    let mut app = App::for_test(
+        client,
+        db,
+        Viewer {
+            pk: 42,
+            username: Some("me".into()),
+        },
+    );
+
+    // No `-y`, no terminal — `cargo test` is not one — and somebody else's
+    // account. Every ingredient of the refusal, and it must not come.
+    let args = ListArgs {
+        cache: true,
+        ..args("@ghost")
+    };
+    let (users, outcome) = engine::list(&mut app, &args, ListKind::Followers)
+        .await
+        .expect("a local answer needs nobody's permission and nobody's terminal");
+
+    assert_eq!(users.len(), 1);
+    assert_eq!(outcome.requests, 0, "nothing may be spent to answer this");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        0,
+        "and nothing may be asked of Instagram either"
+    );
+}
