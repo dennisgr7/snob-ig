@@ -206,8 +206,11 @@ impl ListOutcome {
 /// request being spent that did not have to be:
 ///
 /// 1. In cooldown nothing may be spent, so only storage can answer.
-/// 2. With `--cache` the network is off, resolution included.
-/// 3. Someone else's account needs consent before it is enumerated.
+/// 2. With `--cache` the network is off, resolution included — and with it the
+///    consent question, which is about enumerating somebody rather than about
+///    reading what was already enumerated.
+/// 3. Otherwise, someone else's account needs consent before it is enumerated,
+///    and before it is resolved.
 /// 4. The cooldown is checked again, because it can land while step 3 waits.
 /// 5. One counter poll says whether the list moved at all.
 /// 6. If it did not, and what is stored is fresh enough, storage answers.
@@ -236,7 +239,26 @@ async fn decide(
         return cooldown::serve(app, args, kind, until_ms);
     }
 
-    ask_consent(app, args).await?;
+    // **`--cache` is not asked about**, because there is nothing to agree to:
+    // consent governs enumerating somebody else's lists, and this reads a list
+    // that was already walked — with permission — off this machine's own disk.
+    // Nothing is resolved over the network either, so the rule that consent
+    // comes before resolution is not in play.
+    //
+    // Asking anyway cost more than a redundant prompt. `ui::can_be_asked` is
+    // false without a terminal, so `snob unfollowers someone --cache` from cron
+    // or down a pipe exited 130 with "there is no terminal to ask at" over an
+    // answer that costs nothing and touches nobody. Interactively it warned
+    // about "a heavier request" that was never going to be made.
+    //
+    // And it disagreed with the tool's other storage path: `cooldown::serve`
+    // hands back the identical stored lists with no question at all, and says
+    // in as many words that none is asked because nothing is enumerated. The
+    // same data was gated or not depending on whether Instagram happened to be
+    // throttling.
+    if !args.cache {
+        ask_consent(app, args).await?;
+    }
 
     // A crossing asks for two lists, and resolving is a request. Reusing what
     // the first call worked out is what stops the second asking Instagram the
