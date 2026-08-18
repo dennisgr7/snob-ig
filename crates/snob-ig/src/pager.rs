@@ -324,8 +324,15 @@ impl<'a> ListWalker<'a> {
                 after,
                 error: error.to_string(),
             });
+            // `Canceled`, not the server's error. Both outcomes of the wait
+            // used to return what Instagram had said, so a 503 on page nine
+            // plus Ctrl+C during the backoff was reported as a network failure:
+            // an `error:` label, `stopped_by = 'network'` on the snapshot and
+            // exit 1 — while the same interrupt half a second later exits 130
+            // with nothing to explain. The user stopping is not the server
+            // failing, whichever of the two happened first.
             if self.sleeps && self.cancel.sleep_or_cancel(after).await {
-                return Err(error);
+                return Err(IgError::Canceled);
             }
             attempt += 1;
         }
@@ -907,6 +914,63 @@ mod tests {
             .count();
         assert_eq!(retries, 3, "it should retry three times");
         assert_eq!(summary.reason, StopReason::Network);
+    }
+
+    /// Ctrl+C during a retry backoff is the user stopping, not the server
+    /// failing.
+    ///
+    /// Both outcomes of the wait used to return the server's error, so a 503 on
+    /// page nine plus an interrupt during the two-second backoff was reported as
+    /// a network failure — an `error:` label, `stopped_by = 'network'` and exit
+    /// 1 — while the same interrupt half a second later exits 130 with nothing
+    /// to explain.
+    ///
+    /// The waits have to be on for this: the backoff is where the token is
+    /// read, and a walk against a test server does not wait at all. Everything
+    /// else in the pace is set to zero so the only real wait is the one under
+    /// test, and the cancellation is fired from the `Retrying` event, which is
+    /// emitted immediately before it.
+    #[tokio::test]
+    async fn canceling_during_a_backoff_is_not_a_network_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("oops"))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let cancel = CancelToken::default();
+        let pace = Pace {
+            micro_pause_ms: (0, 0),
+            cycle_wait_ms: (0, 0),
+            long_pause_ms: (0, 0),
+            backoff_base_ms: 30_000,
+            ..Pace::default()
+        };
+        let mut walker = ListWalker::new(&client)
+            .with_pace(pace)
+            .with_cancel(cancel.clone());
+        walker.sleeps = true;
+
+        let summary = walker
+            .walk(
+                request(),
+                |p, _| Ok(p.users.len()),
+                |event| {
+                    if matches!(event, Event::Retrying { .. }) {
+                        cancel.cancel();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert!(
+            matches!(summary.error, Some(IgError::Canceled)),
+            "the server's error must not survive the user's interrupt: {:?}",
+            summary.error
+        );
     }
 
     #[tokio::test]
