@@ -460,3 +460,84 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
         "status must not go on saying a report is owed"
     );
 }
+
+/// A run that is interrupted does not go on to the next list.
+///
+/// A canceled walk comes back `Ok`, so the loop over the two lists went
+/// straight on — and `App::resolved_target` drops the remembered counters as
+/// soon as the pacer has moved, so the second list polled Instagram again. The
+/// user had already been told "Stopping and saving what has been fetched…".
+///
+/// The cancellation is fired by the followers response itself, so it lands
+/// exactly between the two lists with nothing to time.
+#[tokio::test]
+async fn a_canceled_run_does_not_walk_the_second_list() {
+    struct CancelWhenAsked {
+        token: snob_ig::pace::CancelToken,
+        body: String,
+    }
+
+    impl wiremock::Respond for CancelWhenAsked {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            self.token.cancel();
+            ResponseTemplate::new(200).set_body_string(self.body.clone())
+        }
+    }
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+    let token = app.cancel().clone();
+
+    mount_profile(&server, 3, 2).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .respond_with(CancelWhenAsked {
+            token,
+            body: r#"{"users":[{"pk":1,"username":"u1"}]}"#.to_string(),
+        })
+        .mount(&server)
+        .await;
+    // Mounted so that a request for it would succeed: the assertion below has
+    // to fail loudly if the guard ever goes away, rather than pass because the
+    // mock was missing.
+    mount_list(&server, "following", &[8, 9]).await;
+
+    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+
+    let following = tick
+        .lists
+        .iter()
+        .find(|l| l.kind == ListKind::Following)
+        .expect("both lists are still reported on");
+    assert!(
+        matches!(
+            following.skipped,
+            Some(Skipped::Incomplete(snob_core::model::StopReason::Canceled))
+        ),
+        "a list nobody looked at must be refused, not concluded from: {:?}",
+        following.skipped
+    );
+
+    // The count is the assertion, not the absence of a `/following/` page: the
+    // walker's own loop already refuses to page after cancellation, so the
+    // request that used to be spent anyway was the **counter poll**.
+    // `App::resolved_target` drops the remembered counters as soon as the pacer
+    // has moved, so the second list asked `web_profile_info` all over again —
+    // one more request into an account the user had stopped asking about.
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            "/api/v1/users/web_profile_info/",
+            "/api/v1/friendships/42/followers/",
+        ],
+        "nothing may be spent after the user asked it to stop"
+    );
+}

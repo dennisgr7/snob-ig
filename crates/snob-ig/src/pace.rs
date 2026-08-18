@@ -235,7 +235,23 @@ impl Pacer {
     }
 
     /// Takes a slot and waits for it. Every request goes through here.
+    ///
+    /// Which is why the cancellation is read here rather than left to each
+    /// caller: the token was only honored *inside* the wait, so with nothing
+    /// owed a canceled run kept sending. Every loop that had to remember to
+    /// check between requests was a loop that could forget, and two of them
+    /// had — the monitor kept walking its second list and posting its queued
+    /// reports after the user had asked it to stop. "No request is sent after
+    /// cancellation" now lives in the same place as "every request is paid
+    /// for", and is as hard to get around.
+    ///
+    /// Before the reservation, not after: refusing to send and charging for it
+    /// anyway is the one combination that helps nobody.
     pub(crate) async fn clear_to_send(&self) -> Result<(), crate::error::IgError> {
+        if self.cancel.is_canceled() {
+            return Err(crate::error::IgError::Canceled);
+        }
+
         let owed = self.reserve().await?;
         // Counted at the reservation rather than at the answer: the budget has
         // been charged by now whatever the server goes on to say.
@@ -389,5 +405,33 @@ mod tests {
         let c = CancelToken::default();
         c.cancel();
         assert!(c.sleep_or_cancel(Duration::from_secs(30)).await);
+    }
+
+    /// A canceled run is never cleared to send, even with nothing owed.
+    ///
+    /// The token used to be read only inside the wait, so in the ordinary case
+    /// — a budget that owes nothing — `clear_to_send` answered `Ok` and the
+    /// request went out. That left "stop when asked" as something every loop
+    /// between requests had to remember, and two of them did not: the monitor
+    /// walked its second list and drained its webhook queue after the user had
+    /// pressed Ctrl+C.
+    #[tokio::test]
+    async fn a_canceled_run_is_not_cleared_to_send() {
+        let pacer = Pacer::unlimited();
+        pacer
+            .clear_to_send()
+            .await
+            .expect("nothing is cancelled yet");
+        assert_eq!(pacer.spent(), 1);
+
+        pacer.cancel_token().cancel();
+
+        let error = pacer.clear_to_send().await.unwrap_err();
+        assert!(matches!(error, crate::error::IgError::Canceled));
+        assert_eq!(
+            pacer.spent(),
+            1,
+            "a request that is refused is not charged for"
+        );
     }
 }

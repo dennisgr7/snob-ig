@@ -176,13 +176,20 @@ impl App {
     /// **Tests only.** It skips the signal handler and the progress bar, which
     /// are the two things a test has no use for and one of which would spawn a
     /// task per test.
+    /// The one thing it does **not** skip is how the cancellation is wired.
+    /// [`App::open`] hands one token to both the app and the client's pacer;
+    /// this used to build a second, unconnected one, so cancelling an `App` in
+    /// a test never reached a request. Every guard that stops a canceled run
+    /// spending was therefore unreachable from any test — which is how two of
+    /// them came to be missing.
     #[doc(hidden)]
     pub fn for_test(client: IgClient, db: Store, viewer: Viewer) -> Self {
+        let cancel = client.pacer().cancel_token().clone();
         Self {
             client,
             db,
             progress: Progress::new(false),
-            cancel: CancelToken::default(),
+            cancel,
             viewer,
             consented: false,
             resolved: None,

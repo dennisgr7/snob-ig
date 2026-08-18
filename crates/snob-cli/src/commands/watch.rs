@@ -280,6 +280,12 @@ async fn run_one(
     // silence the monitor's own.
     let mut failed = None;
     for account in watched {
+        // Ctrl+C stops the run rather than only the account it landed in.
+        // Without this the loop walked every remaining account after the user
+        // had asked it to stop.
+        if app.cancel().is_canceled() {
+            break;
+        }
         if let Err(e) = tick_one(args, app, account, delivery).await {
             report::print_error(&e);
             failed = Some(e);
@@ -289,7 +295,15 @@ async fn run_one(
     // Once, after every account. Whatever is owed from earlier runs goes out
     // here — including when no account had news of its own, which is the common
     // case and the one that used to leave the queue untouched.
-    if let Some(delivery) = delivery {
+    //
+    // Not after a cancellation, though: the queue is `DRAIN_LIMIT` POSTs of up
+    // to thirty seconds each, so draining it there was up to five more minutes
+    // of a run the user had already stopped. Nothing is lost by leaving it —
+    // what is owed stays owed, and the next run drains it, which is the whole
+    // point of the queue.
+    if let Some(delivery) = delivery
+        && !app.cancel().is_canceled()
+    {
         drain(app, delivery).await;
     }
     // And once whatever the accounts did, for the reason on `settle`.
