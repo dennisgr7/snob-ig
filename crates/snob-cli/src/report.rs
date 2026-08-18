@@ -307,7 +307,8 @@ pub fn requests(n: u32) -> String {
 /// Everything else is told by `resumable`, which the store answered rather than
 /// this module guessing from the reason. `Truncated` used to be treated as
 /// proof that nothing was left to continue from, and that is true of exactly
-/// one of the five ways it arrives: the reclassification `pager::verdict` makes
+/// one of the five ways it arrives: the reclassification `verify_completion`
+/// makes
 /// once pagination has already ended, where there is no cursor to save. The
 /// other four — the hard page cap, a cursor that came back unchanged, two empty
 /// pages, and several pages with nothing new — stop in the **middle** of the
@@ -688,7 +689,7 @@ third",
 
     /// The reclassified truncation is the one that really has nothing left.
     ///
-    /// `pager::verdict` reaches it **after** the pagination has ended, so the
+    /// `verify_completion` reaches it **after** the pagination has ended, so the
     /// snapshot closes with no cursor and `snapshots::resumable` will not
     /// return a row without one. The four guards that stop in the middle of the
     /// pagination do leave one, which is why the reason alone cannot answer

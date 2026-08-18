@@ -67,7 +67,12 @@ risk:
 - **No test may touch the real keyring.** It belongs to the operating system,
   not the process: a test deleting the real entry wipes the session of whoever
   is developing. Tests use their own service name via `SecretStore::with_service`,
-  and a test checks that they do.
+  and `crates/snob-core/tests/keyring.rs` reads the source of every crate to
+  check that they do. It reads the source because it has to: an integration test
+  compiles the library without `cfg(test)`, so a runtime assertion would be
+  blind in exactly the files that matter most — and the guard this replaced
+  built a store through a helper that set the service two lines above the
+  assertion, so it only ever checked itself.
 
 ## Working on it
 
@@ -202,7 +207,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
-| Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all` — `logout` calls `delete`, which takes the session and nothing else |
+| Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all`, which `purge::execute` calls unconditionally — gating it on there being a session left the monitor's secrets behind after `logout`. `logout` calls `delete`, which takes the session and nothing else |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
 | Owed reports are retried by any run, not only by one that had news | `run_one` and `once` drain the queue once per run, after every account, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not. `run_one` takes an `App` rather than opening one, so a test can watch it happen |
 | A queued report can only go to the address it was addressed to | `watch_deliveries.destination`, which `deliveries::due` filters on |
@@ -214,9 +219,19 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | What a receiver deduplicates on is unique | `run_id`, which is `UNIQUE` — not the rowid, which SQLite reuses |
 | A configured header cannot be one the request could not carry | `webhook::check`, which builds every name and value before accepting the address |
 | A configured header cannot frame the message or forge the protocol | `webhook::check` refuses `Content-Length` and the rest of the framing set, and the whole `X-Snob-` prefix |
-| A walk in progress has exactly one writer | `snapshots::save_page` refuses a snapshot this process does not hold; `is_resumable` asks without claiming |
+| A walk in progress has exactly one writer | `snapshots::save_page` **and** `snapshots::close` both refuse a snapshot this process does not hold; `is_resumable` asks without claiming. `close` had no guard and releases the claim, so a process whose lease had gone stale killed the walk that adopted it |
 | Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
 | A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
+| No request is sent after the user asks it to stop | `Pacer::clear_to_send`, which reads the token before it reserves — it was read only inside the wait, so with nothing owed a canceled run kept sending |
+| A push-back the body could not be read from is still a push-back | `IgClient::get` classifies from the status it already has when the body fails, rather than letting the read failure become a retryable network error |
+| A credential is sent only to the address it was stored for | `plan`, for the token **and** the signing key, treating an absent or unparseable configured origin as a different destination |
+| A calendar moment that went by is taken, not lost | `schedule::next_after` looks back from `now` to the floor before it looks forward |
+| Jitter cannot cost the next run | `Schedule::room_for_jitter` — the gap less the floor between two runs, applied to the default as well as to `--jitter` |
+| One wall-clock moment is one run, in a zone that repeats an hour | `schedule::already_run_at_this_wall_clock`, asked in the direction ambiguity exists in |
+| The rename cursor moves only over what this run could read | `engine::watch::compare` advances it only when every list the account has a capture of was accounted for, baselines included |
+| A rename filed mid-comparison waits for the next window | `store::watch::renames_since` bounds above by the `head` the caller read first |
+| Everything a scheduled run needs is checked while somebody is there | `snob watch check`, through `engine::check` — which takes `&App`, so it cannot record, and walks no list |
+| Whether the monitor is working is an answer, not a reading | `watch_setup::health`, in `status`'s output and in its exit code |
 
 ## Running headless
 
@@ -368,12 +383,30 @@ deliberately unfinished:
   Shipping the subcommand would answer those by accident.
 - **The monitor** (`snob watch`) is built. Bare, it stays up and runs on a
   schedule; `once` does one run and exits; `diff` answers the same question out
-  of storage without moving anything on; `setup` writes the configuration and
-  `status` reads back what has happened. Any run can POST the report to an
-  address the user chose. `lost`/`gained` are its words for the temporal diff —
+  of storage without moving anything on; `check` says whether a scheduled run
+  would work; `setup` writes the configuration and `status` reads back what has
+  happened and whether it is healthy. Any run can POST the report to an address
+  the user chose. `lost`/`gained` are its words for the temporal diff —
   `unfollowers` is the static set and must never drift to mean `lost`.
 
-  Nine things about it are worth knowing before changing any of it:
+  **`once` is the scheduled run without the loop**, and reads the same
+  `watch.toml` for the same accounts. It read the file for the webhook address
+  and built the watched set from the command line alone, so an `[[account]]`
+  added by `setup` was never walked by the mode the README puts on a timer.
+
+  **`check` is the preflight**, and it is what makes an unattended run not the
+  first thing tried: the schedule through the evaluator that decides it, the
+  session and which backend the secret store landed on, that each account
+  resolves and may be read unattended, its counters — so the truncation wall is
+  found before six hours of walking rather than after — and the webhook, by
+  posting one `watch.preflight` message with the configured headers and
+  signature. It takes `&App`, so it cannot record, and it walks no list: it is
+  meant to be safe to point a monitoring system at, and a probe that walks two
+  lists every time it is polled is worse than no probe. The baseline offer is
+  therefore in `setup`, not here. Warnings are not failures; only what would
+  stop a run reaches the exit code.
+
+  Eleven things about it are worth knowing before changing any of it:
 
   - **It compares against what was last *reported*** — `watch_marks` — and not
     against the previous capture. Those come apart the moment somebody runs
@@ -430,6 +463,35 @@ deliberately unfinished:
     `next_after`'s **search start**, not in a check after the answer: put after
     it, a calendar never reached it, and when it was reached it answered
     `last + MIN_GAP_SECS` — an instant the calendar forbids.
+  - **A moment that went by is taken, and jitter has to fit in the room the
+    floor leaves.** The search only ever looked forward and works in whole
+    minutes, so its answer was always the *ceiling* minute of `now`: `Due::Now`
+    for a calendar needed the clock to read `:00` to the second, which
+    `store::now()` does about once in nine hundred times. A machine powered on
+    at 09:05 with `--at 09:00` waited a day, a laptop that suspended across the
+    moment lost the run, and the calendar branch of `missed_since` was
+    unreachable code. `next_after` looks back from `now` to the floor first, and
+    `missed_since` takes one off the end because the moment being served is
+    itself in the past.
+
+    The floor is also why the jitter has a ceiling of its own. It is measured
+    from where a run really landed, so every second of jitter comes out of the
+    next gap: a run at `m` pushed to `m + s` reaches `m + gap` only when
+    `s <= gap - step`. Nothing subtracted the step and the calendar default was
+    a flat fifteen minutes — exactly `MIN_GAP_SECS` — so `--cron "*/15 * * * *"`
+    ran every half hour while the banner printed what was typed.
+    `Schedule::room_for_jitter` is the whole of it, and it takes the interval as
+    the step when there is one: `--every 2w --on mon` has a weekly grid and a
+    fortnightly floor, so its room is zero.
+  - **An hour a fall-back repeats is one run, not two.** `--at 01:30` in a zone
+    that puts its clocks back names two instants an hour apart, and the floor is
+    fifteen minutes. Two comments claimed this was handled and neither was:
+    `timestamp_opt(..).single()` goes from an instant to a local time, a
+    direction that is never ambiguous, and the test that credited `MIN_GAP_SECS`
+    used a `FixedOffset`, which has no transitions. The question is asked in the
+    other direction now, and the second showing is refused only when the first
+    was at or before the last run — a machine switched off through the first
+    still runs at the second.
   - **The webhook is queued before the mark moves, in one transaction.** A
     change that has been reported is one the next run will not find, so if the
     mark moved without the queue row the change would be gone. Delivery is
@@ -456,7 +518,7 @@ deliberately unfinished:
 
 - **A list of tens of thousands does not come back.** On an account declaring
   21631 followers, Instagram served 39 on the first page and offered no cursor.
-  `pager::verdict` catches that — the shortfall is far past what deleted
+  `pager::verify_completion` catches that — the shortfall is far past what deleted
   accounts explain — and `scan` and the set commands refuse rather than cross a
   list that is 0.2% of the account. This walk cannot be resumed either: the
   pagination ended, so there is no cursor to store. That is a property of
@@ -469,4 +531,8 @@ deliberately unfinished:
 - **Real behavior on a 429 has never been provoked on purpose.** The handling is
   verified against a recorded body. Everything downstream of it — the cooldown,
   the hard stop, the exit code — is tested; the classification of a live one is
-  not.
+  not. The cooldown half only became true in August 2026: every test that drove
+  a throttling body through a real client hung `Pacer::unlimited()` off it,
+  whose `start_cooldown` answers `Ok(0)` and forgets, so the recording could be
+  deleted whole with the suite still green. There is a budget double that
+  remembers now.
