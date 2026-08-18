@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, MappedLocalTime, TimeZone, Timelike};
 
 /// The shortest gap between two runs.
 ///
@@ -569,13 +569,20 @@ fn next_after<Tz: TimeZone>(
     };
 
     // A local time that does not exist — the hour a spring-forward skips —
-    // maps to no instant, and one that happens twice maps to two. `single()`
-    // accepts neither, so a time the wall clock never showed is stepped over
-    // rather than invented.
+    // maps to no instant, so it is stepped over rather than invented.
+    //
+    // **`single()` here is not what refuses an ambiguous one.** It reads as if
+    // it were, and the comment that used to sit here said so, but
+    // `timestamp_opt` goes from an instant to a local time and that direction is
+    // never ambiguous: chrono answers `Single` unconditionally and only fails
+    // outside the representable range. Ambiguity is a property of the other
+    // direction, and it is asked about below.
     let allowed = |minute: &i64| {
-        zone.timestamp_opt(minute * 60, 0)
-            .single()
-            .is_some_and(|at| calendar.allows(&at))
+        let seconds = minute * 60;
+        let Some(at) = zone.timestamp_opt(seconds, 0).single() else {
+            return false;
+        };
+        calendar.allows(&at) && !already_run_at_this_wall_clock(zone, seconds, &at, last_run)
     };
 
     // **A moment that has already gone by is still owed.** The search only ever
@@ -623,6 +630,40 @@ fn next_after<Tz: TimeZone>(
         .take(HORIZON_MINUTES as usize)
         .find(allowed)
         .map(|minute| minute * 60)
+}
+
+/// Whether this instant is the **second** showing of a wall-clock time the last
+/// run already used.
+///
+/// The hour a fall-back repeats happens twice, so `--at 01:30` in a zone that
+/// puts its clocks back names two instants an hour apart on that date. Both
+/// satisfy the calendar, and the floor does not separate them: `MIN_GAP_SECS` is
+/// fifteen minutes and they are sixty apart. So the monitor walked both lists
+/// again and posted a second webhook for a schedule that names one run a day.
+///
+/// The comment where `single()` is called claimed to prevent this and the test
+/// beside it credited `MIN_GAP_SECS`; neither was true, and the test could not
+/// have caught it because it used a `FixedOffset`, which has no transitions.
+///
+/// Asked in the direction ambiguity actually exists in: from a local wall-clock
+/// time to an instant. `Ambiguous` gives both, and the later one is only refused
+/// when the earlier one is at or before the last run — so a fall-back date on a
+/// machine that was switched off through the first showing still runs.
+fn already_run_at_this_wall_clock<Tz: TimeZone>(
+    zone: &Tz,
+    at_secs: i64,
+    local: &DateTime<Tz>,
+    last_run: Option<i64>,
+) -> bool {
+    let Some(last) = last_run else {
+        return false;
+    };
+    match zone.from_local_datetime(&local.naive_local()) {
+        MappedLocalTime::Ambiguous(first, second) => {
+            second.timestamp() == at_secs && first.timestamp() <= last
+        }
+        _ => false,
+    }
 }
 
 /// Whether a run is owed right now.
@@ -915,7 +956,82 @@ fn unreadable_field(text: &str, name: &str) -> ScheduleError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, Utc};
+    use chrono::{FixedOffset, NaiveDate, NaiveDateTime, Utc};
+
+    /// A zone whose clocks go back an hour, so one hour of the wall clock
+    /// happens twice.
+    ///
+    /// Written here rather than depended on. `chrono-tz` carries the whole IANA
+    /// database to provide a transition, and this project takes a dependency for
+    /// what it uses; the two rules under test are "an hour that repeats is not
+    /// two runs" and "one that never happened is not a run at all", and both
+    /// need a transition rather than a real city.
+    ///
+    /// `FixedOffset` cannot stand in for it — it has no transitions at all,
+    /// which is exactly why the test that credited `MIN_GAP_SECS` with stopping
+    /// the double run could never have caught it doing nothing.
+    ///
+    /// Four hours behind UTC until [`FALL_BACK_AT`], five hours behind from then
+    /// on: local 02:00 becomes local 01:00, and 01:00 through 01:59 come round
+    /// twice.
+    #[derive(Clone, Copy, Debug)]
+    struct FallsBack;
+
+    /// Monday 06:00 UTC, which is 02:00 before the change and 01:00 after it.
+    const FALL_BACK_AT: i64 = MONDAY_0000 + 6 * 3_600;
+
+    const BEFORE: i32 = -4 * 3_600;
+    const AFTER: i32 = -5 * 3_600;
+
+    fn east(seconds: i32) -> FixedOffset {
+        FixedOffset::east_opt(seconds).expect("a whole number of hours is a valid offset")
+    }
+
+    impl TimeZone for FallsBack {
+        type Offset = FixedOffset;
+
+        fn from_offset(_: &FixedOffset) -> Self {
+            FallsBack
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            // What instant each of the two offsets would put this wall-clock
+            // reading at, and whether that instant is on the side of the change
+            // where the offset actually applies.
+            let wall = local.and_utc().timestamp();
+            let as_before = wall - i64::from(BEFORE) < FALL_BACK_AT;
+            let as_after = wall - i64::from(AFTER) >= FALL_BACK_AT;
+
+            match (as_before, as_after) {
+                // The repeated hour: earliest first, which is chrono's order.
+                (true, true) => MappedLocalTime::Ambiguous(east(BEFORE), east(AFTER)),
+                (true, false) => MappedLocalTime::Single(east(BEFORE)),
+                (false, true) => MappedLocalTime::Single(east(AFTER)),
+                // An hour the wall clock skipped. This zone has no
+                // spring-forward, so it is unreachable here.
+                (false, false) => MappedLocalTime::None,
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if utc.and_utc().timestamp() < FALL_BACK_AT {
+                east(BEFORE)
+            } else {
+                east(AFTER)
+            }
+        }
+    }
 
     /// Midnight UTC on Monday 2026-08-17. Every timestamp below is an offset
     /// from it, so the weekday arithmetic is checkable by hand.
@@ -1074,6 +1190,60 @@ mod tests {
                 last = with_jitter(expected, schedule.jitter(), 0.999_999);
             }
         }
+    }
+
+    /// The hour a fall-back repeats does not turn one daily run into two.
+    ///
+    /// `--at 01:30` in a zone that puts its clocks back names two instants an
+    /// hour apart on that date, and both satisfy the calendar. `MIN_GAP_SECS` is
+    /// fifteen minutes and they are sixty apart, so nothing separated them: the
+    /// monitor walked both lists again and posted a second webhook for a
+    /// schedule that names one run a day.
+    ///
+    /// The comment at the search credited `single()` with refusing this and the
+    /// rationale on the neighbouring test credited `MIN_GAP_SECS`. Neither was
+    /// doing anything, and that test used a `FixedOffset`, which has no
+    /// transitions to be ambiguous about.
+    #[test]
+    fn the_repeated_hour_of_a_fall_back_does_not_run_twice() {
+        let schedule = Schedule::cron("30 1 * * *").unwrap();
+
+        // The same wall-clock 01:30, an hour apart in real time.
+        let first = at(hours(5) + 1_800);
+        let second = at(hours(6) + 1_800);
+        assert_eq!(second - first, 3_600, "an hour apart, and the floor is 15m");
+
+        // The fixture has to be the thing it claims: two instants for one
+        // reading, or the test proves nothing about the guard.
+        let reading = DateTime::from_timestamp(first, 0)
+            .unwrap()
+            .with_timezone(&FallsBack)
+            .naive_local();
+        assert!(
+            matches!(
+                FallsBack.from_local_datetime(&reading),
+                MappedLocalTime::Ambiguous(..)
+            ),
+            "the zone must actually repeat that hour"
+        );
+
+        // Having run at the first showing, the second is not another run: the
+        // next one is tomorrow.
+        assert_eq!(
+            due(&schedule, Some(first), second, &FallsBack),
+            Due::At(at(hours(30) + 1_800)),
+            "one run a day means one run a day, including the day with 25 hours"
+        );
+
+        // And the other half: a machine that was off through the first showing
+        // still runs at the second. The rule is "not twice", not "not at all".
+        assert!(
+            matches!(
+                due(&schedule, Some(first - 24 * 3_600), second, &FallsBack),
+                Due::Now { .. }
+            ),
+            "a run that has not happened is still owed"
+        );
     }
 
     /// The midnight wrap is only a gap when there is a next day.
@@ -1446,14 +1616,17 @@ mod tests {
     /// The search matches against local wall-clock time, which is what decides
     /// what happens at a daylight-saving transition.
     ///
-    /// A fixed offset has no transitions, so this cannot provoke one; what it
-    /// pins is the mechanism that governs both cases. `next_after` asks
-    /// `timestamp_opt(..).single()`, so an hour the local clock skips over maps
-    /// to no instant and is stepped past rather than invented, and an hour that
-    /// happens twice maps to two and is not fired twice — `MIN_GAP_SECS` is
-    /// what stops the second, since a run within fifteen minutes of the last is
-    /// not due. Proving that end to end would mean carrying a zone database
-    /// into the test build for one assertion.
+    /// A fixed offset has no transitions, so this pins the matching alone: a
+    /// moment is chosen by what the wall clock reads, not by UTC.
+    ///
+    /// What happens at a transition is a separate question and is asked
+    /// separately, by `the_repeated_hour_of_a_fall_back_does_not_run_twice`
+    /// against a zone written for it. The rationale that used to be here said
+    /// `single()` refused an ambiguous hour and `MIN_GAP_SECS` stopped the
+    /// second run. Neither was true: `timestamp_opt` goes from an instant to a
+    /// local time, a direction that is never ambiguous, and the two showings of
+    /// a repeated hour are sixty minutes apart while the floor is fifteen. A
+    /// fixed offset could not have shown that, which is why it went unnoticed.
     #[test]
     fn the_calendar_matches_against_local_wall_clock_time() {
         let schedule = Schedule::calendar(&[], &[(2, 30)]).unwrap();
