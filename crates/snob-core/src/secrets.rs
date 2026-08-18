@@ -261,36 +261,35 @@ impl SecretStore {
                 .map_err(|e| SecretsError::Corrupt(format!("while serializing: {e}")))?,
         );
 
-        // The Windows keyring has a size ceiling. If we go over it, store the
-        // essentials rather than failing.
-        let json = if keyring_bytes(&json) > MAX_KEYRING_SECRET_BYTES {
-            tracing::warn!(
-                bytes = keyring_bytes(&json),
-                "the session does not fit the keyring whole; storing only the essential fields"
-            );
-            Zeroizing::new(
-                serde_json::to_string(&session.minimal())
-                    .map_err(|e| SecretsError::Corrupt(format!("while serializing: {e}")))?,
-            )
-        } else {
-            json
-        };
-
         match self.backend {
             Backend::Keyring => {
+                // The Windows keyring has a size ceiling. If we go over it,
+                // store the essentials rather than failing.
+                //
+                // **Inside this arm**, because it is a property of this
+                // backend. Applied before the match, a 0600 file — which has no
+                // size limit at all — was written without `username`,
+                // `csrftoken`, `mid` and `ig_did`, and the warning named a
+                // keyring that was not the destination. `IgClient::get` then
+                // omits `X-CSRFToken`, which `session.rs` records as having
+                // already cost one debugging session.
+                let json =
+                    if keyring_bytes(&json) > MAX_KEYRING_SECRET_BYTES {
+                        tracing::warn!(
+                            bytes = keyring_bytes(&json),
+                            "the session does not fit the keyring whole; storing only the \
+                         essential fields"
+                        );
+                        Zeroizing::new(serde_json::to_string(&session.minimal()).map_err(|e| {
+                            SecretsError::Corrupt(format!("while serializing: {e}"))
+                        })?)
+                    } else {
+                        json
+                    };
+
                 self.entry()?
                     .set_password(&json)
                     .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))?;
-                // Do not leave two different sessions lying around. Every
-                // location, not just the current one: `load` checks the
-                // keyring first, so once an entry exists the rescue path that
-                // would have found and removed the legacy file is never
-                // reached again, and an older account's live cookie stays in
-                // the roaming profile — where it roams — until someone happens
-                // to run `logout` or `purge`.
-                for stale in self.paths.session_files() {
-                    let _ = std::fs::remove_file(stale);
-                }
             }
             Backend::File => {
                 self.write_file(&json)?;
@@ -310,6 +309,29 @@ impl SecretStore {
                     );
                 }
             }
+        }
+
+        // Do not leave two different sessions lying around. Every location, not
+        // just the current one, and **on both backends** — `session_files`'s own
+        // doc says `save` and `delete` both walk it, and only the keyring arm
+        // did.
+        //
+        // `load` checks the keyring first, so once an entry exists the rescue
+        // path that would have found and removed a legacy file is never reached
+        // again. On the file backend nothing reached it either: a `--no-keyring`
+        // save wrote the new file, deleted the keyring entry, and left an older
+        // install's `session.json` in the **roaming** profile — where it roams,
+        // and into every backup of the home directory — until somebody happened
+        // to run `logout` or `purge`.
+        //
+        // The file just written is skipped, which is what makes this safe to run
+        // after the `Backend::File` arm.
+        let just_written = (self.backend == Backend::File).then(|| self.paths.session_file());
+        for stale in self.paths.session_files() {
+            if Some(&stale) == just_written.as_ref() {
+                continue;
+            }
+            let _ = std::fs::remove_file(stale);
         }
         Ok(())
     }
@@ -971,6 +993,67 @@ mod tests {
             }
         }
         true
+    }
+
+    /// Saving to the file clears an earlier version's copy too.
+    ///
+    /// `AppPaths::session_files` says in its own doc that both `save` and
+    /// `delete` walk it, and only the keyring arm did. A `--no-keyring` save
+    /// wrote the new file, deleted the keyring entry, and left an older
+    /// install's `session.json` in the **roaming** profile — a live Instagram
+    /// cookie that roams, and lands in every backup of the home directory.
+    /// `load` reads the keyring first, so the rescue-and-delete path that would
+    /// have found it never ran again either.
+    #[test]
+    fn saving_to_the_file_clears_an_earlier_versions_copy() {
+        let (_tmp, store, _keyring) = file_store();
+        let store = store.using(Backend::File);
+
+        let legacy = store
+            .paths
+            .legacy_session_file()
+            .expect("the fixture has one");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"an older install's live session").unwrap();
+
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        assert!(
+            !legacy.exists(),
+            "the roaming copy is a live credential and has to go"
+        );
+        assert!(
+            store.paths.session_file().exists(),
+            "and the one just written stays"
+        );
+    }
+
+    /// The keyring's size ceiling is the keyring's, not the file's.
+    ///
+    /// The reduction to `session.minimal()` sat before the backend match, so a
+    /// 0600 file — which has no size limit — was written without `username`,
+    /// `csrftoken`, `mid` and `ig_did`, and the warning named a keyring that was
+    /// not the destination. `IgClient::get` then omits `X-CSRFToken`, the silent
+    /// state `session.rs` records as having already cost a debugging session.
+    #[test]
+    fn the_file_backend_does_not_shrink_to_fit_a_keyring() {
+        let (_tmp, store, _keyring) = file_store();
+        let store = store.using(Backend::File);
+
+        let mut session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        session.csrftoken = Some(Secret::new("a-csrf-token"));
+        // Long enough that the whole thing is past the keyring ceiling.
+        session.ig_did = Some("x".repeat(MAX_KEYRING_SECRET_BYTES));
+
+        store.save(&session).unwrap();
+
+        let back = store.load().unwrap().expect("it was just saved");
+        assert!(
+            back.csrftoken.is_some(),
+            "a file has no size ceiling, so nothing may be dropped to fit one"
+        );
     }
 
     /// `snob logout` takes the session and nothing else, which is what its help
