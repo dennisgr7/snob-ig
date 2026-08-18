@@ -602,21 +602,55 @@ fn next_after<Tz: TimeZone>(
     // hand-edited `watch.toml`: the sum overflowed, which panicked a debug
     // build and in release wrapped to a negative floor, turning an interval of
     // billions of years into one that ran every fifteen minutes.
-    let floor = match last_run {
-        Some(last) => {
-            let interval = schedule
-                .every
-                .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
-            last.saturating_add(interval.max(MIN_GAP_SECS))
-        }
-        // Nothing has run. There is no past to wait from, and no run to be too
-        // close to.
-        None => now,
-    };
+    let interval = schedule
+        .every
+        .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
 
     let Some(calendar) = &schedule.calendar else {
+        // No grid. The floor counts from the run, which is exactly what an
+        // interval means: `--every 6h` started at 09:13 means 15:13.
+        //
+        // Nothing has run: there is no past to wait from, and no run to be too
+        // close to.
+        let floor = last_run.map_or(now, |last| last.saturating_add(interval.max(MIN_GAP_SECS)));
         return Some(floor.max(now));
+    };
+
+    // **With a grid, the floor counts from the moment the last run served, not
+    // from the row it wrote.** They are not the same instant and the difference
+    // is not small: `watch_runs.started_at` is stamped by `tick` *after* both
+    // lists have been walked, so it trails the moment by the whole length of the
+    // walk.
+    //
+    // Measured from the row, the floor was pushed past the next moment on the
+    // grid and that moment was dropped — so a schedule was accepted and then run
+    // at half its rate, permanently and in silence. `*/15` broke for any walk at
+    // all, since its gap is exactly the floor; `0,20,40` broke on a walk over
+    // five minutes. Measuring from the moment served is what makes the grid the
+    // thing that decides, which is what `validated()` already assumes when it
+    // refuses a grid tighter than the floor.
+    //
+    // The price, stated plainly: two runs can now be closer together in wall
+    // clock than `MIN_GAP_SECS`, by however long the walk took. They still
+    // cannot overlap — the loop is sequential — and the reason the floor exists
+    // is that a second run cannot see a state the first did not, which is a
+    // statement about the moments, not about the instants the process happened
+    // to write a row at.
+    //
+    // `saturating_add` because an absurd `--every` can arrive from a hand-edited
+    // `watch.toml`: the sum overflowed, which panicked a debug build and in
+    // release wrapped to a negative floor, turning an interval of billions of
+    // years into one that ran every fifteen minutes.
+    let served = last_run.map(|last| moment_served(calendar, last, zone));
+    let floor = match (served, last_run) {
+        // Never earlier than the row the last run wrote, whatever the snap
+        // decided. A no-op in every ordinary case — the floor is a quarter of an
+        // hour past a moment the row already trails — and the thing that keeps
+        // this monotonic if a calendar is ever strange enough to snap somewhere
+        // unhelpful.
+        (Some(moment), Some(last)) => moment.saturating_add(interval.max(MIN_GAP_SECS)).max(last),
+        _ => now,
     };
 
     // A local time that does not exist — the hour a spring-forward skips —
@@ -678,8 +712,11 @@ fn next_after<Tz: TimeZone>(
     // command started at 09:00:20 waited a week. That is the `:00`-to-the-second
     // discontinuity taken out of the `last_run` path, left behind where a fresh
     // install passes `None`.
-    let earliest = match last_run {
-        Some(last) => last.div_euclid(60) + 1,
+    // From the moment served rather than from the row, for the reason the floor
+    // is: what must not be served twice is the moment, and everything after it
+    // is owed.
+    let earliest = match served {
+        Some(moment) => moment.div_euclid(60) + 1,
         None => now.div_euclid(60),
     };
     if floor <= now {
@@ -714,6 +751,34 @@ fn next_after<Tz: TimeZone>(
         .take(HORIZON_MINUTES as usize)
         .find(allowed)
         .map(|minute| minute * 60)
+}
+
+/// The moment on the grid that a run recorded at `last` was serving.
+///
+/// The most recent minute the calendar names at or before it. A run does not
+/// start on its moment and does not record itself on it either: the loop wakes
+/// at the moment plus whatever jitter it rolled, and `tick` stamps the row after
+/// both lists have been walked. Everything between the two is the process's own
+/// latency, and none of it is time the schedule asked for.
+///
+/// Falls back to `last` itself when the calendar names nothing in the whole
+/// horizon — an expression that matches no moment at all, where the old
+/// behaviour is as good an answer as any and nothing is owed regardless.
+///
+/// Deliberately asks `Calendar::allows` and not the fuller predicate the search
+/// uses: a repeated wall-clock hour is refused for a run that has *not* happened
+/// yet, and this is looking at one that has.
+fn moment_served<Tz: TimeZone>(calendar: &Calendar, last: i64, zone: &Tz) -> i64 {
+    let from = last.div_euclid(60);
+    (0..)
+        .take(HORIZON_MINUTES as usize)
+        .map(|back| from - back)
+        .find(|minute| {
+            zone.timestamp_opt(minute * 60, 0)
+                .single()
+                .is_some_and(|at| calendar.allows(&at))
+        })
+        .map_or(last, |minute| minute * 60)
 }
 
 /// Whether this instant is the **second** showing of a wall-clock time the last
@@ -774,15 +839,21 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
         return Due::At(next);
     }
 
-    // No floor check here. `next_after` puts `MIN_GAP_SECS` into the start of
-    // its search, so `next <= now` already implies `now - last >= MIN_GAP_SECS`
-    // — and unlike a check bolted on afterwards, the answer it gives is one the
-    // calendar allows. Checking it in this position was the bug: for a calendar
-    // the code below was all but unreachable, and when it was reached it
-    // answered off-grid.
+    // No floor check here. `next_after` puts the floor into the start of its
+    // search, and unlike a check bolted on afterwards the answer it gives is one
+    // the calendar allows. Checking it in this position was the bug: for a
+    // calendar the code below was all but unreachable, and when it was reached
+    // it answered off-grid.
+    //
+    // What is asserted is what is true. It used to be `now - last >=
+    // MIN_GAP_SECS`, and that is deliberately no longer the rule: with a grid
+    // the floor counts from the moment a run served rather than from the row it
+    // wrote, so two runs can be closer in wall clock than the gap by however
+    // long the walk took. `next_after` says why. What still holds either way is
+    // that a run is never due before the previous one recorded itself.
     debug_assert!(
-        last_run.is_none_or(|last| now - last >= MIN_GAP_SECS),
-        "the floor belongs to next_after and it did not hold"
+        last_run.is_none_or(|last| now >= last),
+        "a run is due before the one behind it"
     );
 
     Due::Now {
@@ -1156,35 +1227,48 @@ mod tests {
         assert_eq!(due(&schedule, None, at(0), &Utc), Due::Now { missed: 0 });
     }
 
-    /// The floor holds against the runs, not only against the grid — and the
-    /// moment it names is one the calendar allows.
+    /// The floor holds against the **moments**, not against the rows, and what
+    /// it names is one the calendar allows.
     ///
-    /// Two defects, one property. `validated()` refuses a schedule whose grid is
-    /// tighter than the floor, but jitter moves each run off that grid and the
-    /// next due moment is computed from where the run actually landed: `*/15` —
-    /// the tightest schedule the tool advertises as legal — put half of its
-    /// consecutive pairs under the floor, worst case 36 seconds apart. And the
-    /// check that was supposed to stop that answered `last + MIN_GAP_SECS`, an
-    /// instant no `*/15` expression names, so `--jitter 0` ran on minutes the
-    /// expression forbids. Both are gone by folding the floor into the start of
-    /// the search instead of testing it afterwards.
+    /// `validated()` refuses a schedule whose grid is tighter than the floor,
+    /// but jitter moves each run off that grid and the next moment used to be
+    /// computed from where the run landed: `*/15` — the tightest schedule the
+    /// tool advertises as legal — put half of its consecutive pairs under the
+    /// floor, worst case 36 seconds apart, and the check that should have caught
+    /// that answered `last + MIN_GAP_SECS`, an instant no `*/15` expression
+    /// names. Folding the floor into the start of the search fixed both.
+    ///
+    /// It then produced the opposite failure, which is what the sweep below is
+    /// really for. `watch_runs.started_at` is stamped after both lists are
+    /// walked, so it trails the moment by the whole length of the walk; measured
+    /// from there the floor lands past the next grid moment and that moment is
+    /// dropped. `*/15` ran every thirty minutes for any walk at all, on an
+    /// expression the tool had accepted.
+    ///
+    /// So the floor counts from the moment served. **That is a deliberate
+    /// softening**: two runs can be closer together in wall clock than
+    /// `MIN_GAP_SECS` by however long the walk took, which the second half of
+    /// this test pins at its extreme. They still cannot overlap, and what the
+    /// floor is about — that a second run cannot see a state the first did not —
+    /// is a statement about the moments.
     #[test]
     fn a_run_is_never_due_inside_the_floor_nor_off_the_calendar() {
         let schedule = Schedule::cron("*/15 * * * *").unwrap();
         let start = at(0);
         let grid = 15 * 60;
 
-        // Swept over the whole window: whatever the last run and the current
-        // moment are, `due` never says "now" while the floor has not passed, and
-        // whatever it does name is on the quarter hour.
+        // A run that served `start` and wrote its row seven seconds later.
+        // Whatever the current moment is before the next one comes round, `due`
+        // names that next moment: on the quarter hour, and a full grid step from
+        // the one that was served.
         let last = start + 7;
-        for ahead in 0..MIN_GAP_SECS {
+        for ahead in 0..(grid - 7) {
             match due(&schedule, Some(last), last + ahead, &Utc) {
                 Due::At(next) => {
-                    assert!(
-                        next - last >= MIN_GAP_SECS,
-                        "next run {}s after the last one",
-                        next - last
+                    assert_eq!(
+                        next - start,
+                        grid,
+                        "the moment served was {start}; the next one is a grid step away"
                     );
                     assert_eq!(
                         (next - start) % grid,
@@ -1196,13 +1280,63 @@ mod tests {
             }
         }
 
-        // And the pair the old floor produced: a run at :14:59 must wait for
-        // :30:00, not for :29:59.
-        let last = start + MIN_GAP_SECS - 1;
-        assert_eq!(
-            due(&schedule, Some(last), start + MIN_GAP_SECS, &Utc),
-            Due::At(start + 2 * grid)
-        );
+        // And the moment itself is taken when it arrives, rather than pushed
+        // past by the seven seconds the row trails.
+        assert!(matches!(
+            due(&schedule, Some(last), start + grid, &Utc),
+            Due::Now { .. }
+        ));
+
+        // The extreme of the softening, stated rather than left to be found: a
+        // walk that took almost the whole gap leaves the next run one second
+        // after the previous row. That is what a schedule asking for a run every
+        // fifteen minutes, on an account that takes fifteen minutes to walk,
+        // amounts to — and what bounds the requests there is the pacer's budget,
+        // not this.
+        let slow = start + grid - 1;
+        assert!(matches!(
+            due(&schedule, Some(slow), start + grid, &Utc),
+            Due::Now { .. }
+        ));
+    }
+
+    /// A tight grid keeps its cadence however long the walk takes.
+    ///
+    /// `watch_runs.started_at` is stamped by `tick` *after* both lists have been
+    /// walked, so the row trails the moment by the whole length of the walk.
+    /// With the floor measured from the row, that pushed it past the next grid
+    /// moment and the moment was dropped: `*/15` ran every thirty minutes for
+    /// any walk at all, `0,20,40` for a walk over five minutes — on expressions
+    /// the tool had accepted and printed back.
+    ///
+    /// Driven as the loop drives it: serve a moment, walk for `W`, record, ask
+    /// again. What is asserted is the moments, which is what the schedule names.
+    #[test]
+    fn a_tight_grid_keeps_its_cadence_however_long_the_walk_takes() {
+        for (expression, grid) in [("*/15 * * * *", 15 * 60), ("0,20,40 * * * *", 20 * 60)] {
+            let schedule = Schedule::cron(expression).unwrap();
+
+            // A walk that takes most of the gap, which is the worst case that
+            // still leaves the schedule meaningful.
+            for walk in [1, 60, grid / 2] {
+                let start = at(hours(9));
+                let mut served = start;
+
+                for step in 1..=4 {
+                    // The row is written when the walk finishes.
+                    let row = served + walk;
+                    let expected = start + step * grid;
+
+                    match due(&schedule, Some(row), expected, &Utc) {
+                        Due::Now { .. } => {}
+                        other => {
+                            panic!("{expression} with a {walk}s walk skipped {expected}: {other:?}")
+                        }
+                    }
+                    served = expected;
+                }
+            }
+        }
     }
 
     /// A jitter larger than the room it is jittering within is not a jitter.
