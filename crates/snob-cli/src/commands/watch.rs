@@ -302,7 +302,14 @@ async fn run_one(
             break;
         }
         if let Err(e) = tick_one(args, app, account, delivery).await {
-            report::print_error(&e);
+            // Printed here only when nobody else will print it. With one
+            // watched account — the default — this loop printed the whole
+            // `error:` / `caused by:` / `hint:` block and then returned the
+            // error for `scheduled` to print again, so every failing run wrote
+            // two copies of it into the journal.
+            if watched.len() > 1 {
+                report::print_error(&e);
+            }
             failed = Some(e);
         }
     }
@@ -322,7 +329,7 @@ async fn run_one(
         drain(app, delivery).await;
     }
     // And once whatever the accounts did, for the reason on `settle`.
-    crate::engine::watch::settle(app, snob_core::store::now());
+    crate::engine::watch::settle(app.db(), snob_core::store::now());
 
     match failed {
         Some(e) if watched.len() == 1 => Err(e),
@@ -597,28 +604,102 @@ fn describe_schedule(when: &When, schedule: &Schedule, now: bool) -> String {
 }
 
 /// One run of the monitor: look, report, and remember having reported.
+///
+/// **The scheduled run without the loop**, which is what the README's "one run,
+/// for cron or a systemd timer" describes and what `once` already was for the
+/// webhook half. It was not for the accounts: it read `watch.toml` for the
+/// address and then built the watched set from the command line alone, so
+/// somebody who ran `watch setup`, added @friend and put this on a timer never
+/// had @friend walked, marked or reported — and typing the name instead failed
+/// every unattended run, because `Watched::asking` discards the recorded
+/// consent that is the only thing such a run accepts.
 async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Before the session is opened and long before a request is spent, so a
     // webhook address that could never work costs nothing to find out about.
     // The file is read here too: `once` on a timer should need no more
     // arguments than the scheduled mode does.
-    let delivery = delivery_from(&args.delivery, config::load(paths)?.as_ref(), &secrets)?;
+    let configured = config::load(paths)?;
+    let delivery = delivery_from(&args.delivery, configured.as_ref(), &secrets)?;
 
     let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
     else {
+        // Settled even here. This is the run that most needs it: a session that
+        // has gone leaves owed reports ageing past `MAX_AGE_SECS`, where `due`
+        // no longer returns them and `failed` — the only thing that expires one
+        // — is never reached, while `status` goes on promising the next run
+        // will try them. `last_started` already opens a store without a session.
+        if let Ok(db) = snob_core::store::Store::open(paths) {
+            crate::engine::watch::settle(&db, snob_core::store::now());
+        }
         return Ok(ExitCode::NoSession);
     };
 
-    let watched = match args.target.clone() {
-        None => Watched::own(),
-        // Asked, not assumed. `engine::list` puts the question the same way it
-        // does for every other command, and with no terminal to ask at it
-        // refuses — which is the right answer for a cron entry aimed at
-        // somebody else's account and no recorded agreement.
-        Some(name) => Watched::asking(name),
-    };
+    let watched = watched_from(args.target.clone(), configured.as_ref());
 
-    let tick = crate::engine::watch::tick(&mut app, &watched).await;
+    let mut spent = 0;
+    let mut outcome = ExitCode::Ok;
+    let mut failed = None;
+    for account in &watched {
+        if app.cancel().is_canceled() {
+            break;
+        }
+        match once_one(&args, &mut app, account, delivery.as_ref()).await {
+            Ok(tick) => {
+                spent += tick.requests;
+                if outcome == ExitCode::Ok {
+                    outcome = tick.outcome();
+                }
+            }
+            Err(e) => {
+                if watched.len() > 1 {
+                    report::print_error(&e);
+                }
+                failed = Some(e);
+            }
+        }
+    }
+
+    // Unconditional, and after the accounts rather than inside the `?`.
+    //
+    // Both used to sit past a `let tick = tick?;` and a `deliver(..).await?`,
+    // so an ordinary failure — a cooldown, a name that would not resolve, a
+    // walk that stopped — took the queue drain and the expiry with it. A
+    // machine whose hourly run failed all day left rows owed past the age where
+    // anything can reach them again. `run_one` has always done the opposite,
+    // and AGENTS.md names `once` in the rule.
+    if let Some(delivery) = delivery.as_ref()
+        && !app.cancel().is_canceled()
+    {
+        drain(&app, delivery).await;
+    }
+    crate::engine::watch::settle(app.db(), snob_core::store::now());
+
+    ui::info(&format!(
+        "{} - {}",
+        report::stored_on(snob_core::store::now()),
+        report::requests(spent)
+    ));
+
+    if let Some(e) = failed {
+        return Err(e);
+    }
+
+    // The run's own verdict, which was computed, written into `watch_runs`, and
+    // then thrown away in favor of a literal zero. The exit codes exist so a
+    // caller on a timer can tell "wait" from "log in again" without parsing
+    // text, and `once` is the mode that is put on a timer.
+    Ok(outcome)
+}
+
+/// One account of a `once` run. Prints more than the scheduled mode does,
+/// because somebody is looking at this one.
+async fn once_one(
+    args: &WatchOnceArgs,
+    app: &mut crate::app::App,
+    watched: &Watched,
+    delivery: Option<&Delivery>,
+) -> Result<TickReport> {
+    let tick = crate::engine::watch::tick(app, watched).await;
     app.progress().finish();
     let tick = tick?;
 
@@ -632,23 +713,8 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
 
     warn_about_refusals(&tick);
 
-    deliver(&mut app, &tick, delivery.as_ref()).await?;
-    if let Some(delivery) = delivery.as_ref() {
-        drain(&app, delivery).await;
-    }
-    crate::engine::watch::settle(&app, snob_core::store::now());
-
-    ui::info(&format!(
-        "{} - {}",
-        report::stored_on(snob_core::store::now()),
-        report::requests(tick.requests)
-    ));
-
-    // The run's own verdict, which was computed, written into `watch_runs`, and
-    // then thrown away in favor of a literal zero. The exit codes exist so a
-    // caller on a timer can tell "wait" from "log in again" without parsing
-    // text, and `once` is the mode that is put on a timer.
-    Ok(tick.outcome())
+    deliver(app, &tick, delivery).await?;
+    Ok(tick)
 }
 
 /// Where reports go, once the arguments have been checked.
@@ -1942,6 +2008,66 @@ consent = { agreed_at = 1700 }
         );
         assert!(warnings[0].contains("not sent with it"), "{warnings:?}");
         assert!(warnings[1].contains("stored token"), "{warnings:?}");
+    }
+
+    /// `snob watch once` watches what the file says to watch.
+    ///
+    /// It read `watch.toml` for the webhook address and then built the watched
+    /// set from the command line alone, so somebody who ran `watch setup`, added
+    /// @friend and followed the README's "one run, for cron or a systemd timer"
+    /// never had @friend walked, marked or reported. Typing the name instead was
+    /// no answer either: `Watched::asking` carries no consent, and an unattended
+    /// run accepts only a recorded one.
+    ///
+    /// Both modes go through `watched_from` now, so there is one answer to
+    /// "which accounts" rather than two that disagree.
+    ///
+    /// What this pins is that answer. That `once` asks for it rather than
+    /// building its own is not reachable from here — it would take an
+    /// integration test that opens a session and a keyring to drive the command
+    /// — so it is said in the doc-comment on `once` instead, where somebody
+    /// changing it will read it.
+    #[test]
+    fn once_watches_the_accounts_the_file_lists() {
+        let file = WatchConfig {
+            schema: 1,
+            every: Some(std::time::Duration::from_secs(6 * 3600)),
+            at: vec![],
+            on: vec![],
+            cron: None,
+            jitter: None,
+            webhook: None,
+            accounts: vec![
+                snob_core::watch::config::AccountConfig {
+                    target: "self".to_string(),
+                    consent: None,
+                },
+                snob_core::watch::config::AccountConfig {
+                    target: "friend".to_string(),
+                    consent: Some(snob_core::watch::config::ConsentConfig {
+                        agreed_at: 1_700_000_000,
+                    }),
+                },
+            ],
+        };
+
+        let watched = watched_from(None, Some(&file));
+        let names: Vec<Option<&str>> = watched.iter().map(|w| w.name()).collect();
+        assert_eq!(
+            names,
+            vec![None, Some("friend")],
+            "the file's own account and the one it lists"
+        );
+        assert!(
+            watched.iter().all(|w| w.may_run_unattended()),
+            "the recorded consent is what makes the second one legal on a timer"
+        );
+
+        // And a name typed on the command line still picks up the answer on
+        // record, rather than discarding it and failing every unattended run.
+        let typed = watched_from(Some("friend".to_string()), Some(&file));
+        assert_eq!(typed.len(), 1);
+        assert!(typed[0].may_run_unattended());
     }
 
     /// `--jitter` is not one of the schedule halves, and is not dropped with

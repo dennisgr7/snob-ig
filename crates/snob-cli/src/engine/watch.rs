@@ -333,8 +333,13 @@ pub fn commit(
 /// A failure here does not fail the run. Whatever the run did is already
 /// recorded; a database that could not be tidied is worth a line in the log and
 /// nothing more.
-pub fn settle(app: &App, at: i64) {
-    match store::prune(app.db().conn(), at) {
+/// Takes the store rather than the `App`, because that is all it touches — and
+/// because the one caller that most needs it has no session to build an `App`
+/// from. `snob watch once` on a machine whose session has gone returns before
+/// anything is opened, and that is exactly the run that leaves reports ageing
+/// past `MAX_AGE_SECS` with `status` promising the next one will try them.
+pub fn settle(db: &snob_core::store::Store, at: i64) {
+    match store::prune(db.conn(), at) {
         Ok(removed) if removed > 0 => {
             tracing::debug!(removed, "expired what nothing needs any more");
         }
