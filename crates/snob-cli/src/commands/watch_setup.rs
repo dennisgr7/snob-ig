@@ -23,7 +23,11 @@ use crate::exit::{ExitCode, ExitError};
 use crate::{report, ui};
 
 /// Walks somebody through configuring the monitor.
-pub fn setup(args: WatchSetupArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+pub async fn setup(
+    args: WatchSetupArgs,
+    secrets: SecretStore,
+    paths: &AppPaths,
+) -> Result<ExitCode> {
     // Every question here needs an answer, and the failure mode of asking with
     // nobody there is a service configured by whatever the defaults happened to
     // be. Said once, up front.
@@ -95,8 +99,98 @@ pub fn setup(args: WatchSetupArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     store_secret(&secrets, Kind::WatchToken, token)?;
 
     ui::info(&format!("Written to {}.", written.display()));
+
+    // Everything above is a claim about a machine, a session and somebody
+    // else's server, and none of it had been tried. Trying it here is the whole
+    // point: a name with a typo, a token the receiver rejects or a session that
+    // has gone are all cheap to fix now and expensive to discover from an
+    // unattended run's log a week later.
+    println!();
+    let report = super::watch::preflight(&Default::default(), &secrets, paths).await?;
+    for line in super::watch::describe_check(&report) {
+        println!("{line}");
+    }
+
+    offer_the_baseline(&report, &secrets, paths).await?;
+
     ui::info("Start it with \"snob watch\", or put \"snob watch once\" on a timer.");
     Ok(ExitCode::Ok)
+}
+
+/// About how many accounts one request brings back.
+///
+/// Instagram serves roughly this many whatever `per_page` asks for, which is
+/// the settled note in AGENTS.md. It is here to turn a follower count into a
+/// number of requests for the sentence below, and nothing depends on it being
+/// exact — it is an estimate offered to a person, labelled as one.
+const ACCOUNTS_PER_REQUEST: u64 = 25;
+
+/// Offers to take the first capture, saying what it costs.
+///
+/// The first scheduled run is a `Basis::Baseline`: it reports nothing, by
+/// design, because there is nothing to compare against yet. Somebody who has
+/// just finished configuring a monitor reads that as broken, and the fix is
+/// either to explain it afterwards or to take the capture now — which also
+/// means the first scheduled report is a real one.
+///
+/// **Offered, not taken.** Walking two lists is the heaviest thing this tool
+/// does, and doing it unasked at the end of a wizard would be the one place
+/// requests are spent without the person having agreed to them. The estimate
+/// comes from counters the preflight already read, so working it out costs
+/// nothing.
+///
+/// It lives here rather than in `check`, and that is deliberate: `check` is
+/// meant to be safe to repeat and to point a monitoring system at, and a probe
+/// that walks two lists every time it is polled is worse than no probe.
+async fn offer_the_baseline(
+    report: &crate::engine::check::CheckReport,
+    secrets: &SecretStore,
+    paths: &AppPaths,
+) -> Result<()> {
+    use crate::engine::check::What;
+
+    // Nothing to offer if a run could not happen anyway, or if there is
+    // already something to compare against.
+    if report.verdict() == Verdict::Failed {
+        return Ok(());
+    }
+    let missing = report
+        .checked
+        .iter()
+        .any(|c| matches!(&c.what, What::Baseline { taken_at } if taken_at.len() < 2));
+    if !missing || !ui::can_show_a_menu() {
+        return Ok(());
+    }
+
+    let (followers, following) = report
+        .checked
+        .iter()
+        .find_map(|c| match &c.what {
+            What::Account {
+                followers: Some(a),
+                following: Some(b),
+                ..
+            } => Some((*a, *b)),
+            _ => None,
+        })
+        .unwrap_or((0, 0));
+    let requests =
+        followers.div_ceil(ACCOUNTS_PER_REQUEST) + following.div_ceil(ACCOUNTS_PER_REQUEST);
+
+    println!();
+    ui::info(&format!(
+        "There is no capture to compare against yet, so the first scheduled run \
+         will lay one down and report nothing.\n\
+         Taking it now means walking {followers} followers and {following} following: \
+         roughly {requests} requests, a few minutes."
+    ));
+    if !ui::confirm("Take the first capture now?", false)? {
+        ui::info("Left for the first scheduled run, which will report nothing and say so.");
+        return Ok(());
+    }
+
+    let configured = config::load(paths)?;
+    super::watch::baseline_now(configured.as_ref(), secrets, paths).await
 }
 
 /// Stores a secret, or clears whatever was there when this run has none.
