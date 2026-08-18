@@ -252,18 +252,28 @@ fn a_typed_yes_needs_nobody_to_confirm_at() {
 ///
 /// AGENTS.md read this rule as "every secret this tool stores is one `purge`
 /// removes". It was true of `delete_all` and false of the command.
+///
+/// The monitor's secrets are the one kind with no file fallback — `save_secret`
+/// says so and gives the reason — so this needs a keyring to have anything to
+/// say, and returns early where there is none. That is the same shape
+/// `secrets.rs` uses for the same reason, and it is why CI installs a keyring
+/// daemon on Linux rather than letting the suite pass over a backend nobody
+/// ships.
 #[test]
 fn purge_removes_the_monitors_secrets_with_no_session_stored() {
     use snob_core::secret::Secret;
     use snob_core::secrets::Kind;
 
     let (_tmp, paths, store) = setup("monitor-secrets");
-    store
-        .save_secret(Kind::WatchToken, &Secret::new("Bearer team"))
-        .unwrap();
-    store
-        .save_secret(Kind::WatchSigningKey, &Secret::new("shared-secret"))
-        .unwrap();
+    let stored = [
+        (Kind::WatchToken, "Bearer team"),
+        (Kind::WatchSigningKey, "shared-secret"),
+    ]
+    .into_iter()
+    .all(|(kind, value)| store.save_secret(kind, &Secret::new(value)).is_ok());
+    if !stored {
+        return;
+    }
 
     let plan = purge::survey(&store, &paths);
     assert!(!plan.session, "this is the case with no session at all");
