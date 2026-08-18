@@ -274,6 +274,17 @@ mod tests {
         db
     }
 
+    /// How old a report may get before it stops being news, written out.
+    ///
+    /// Every reference to it in the tree is relative — a fixture ages a row by
+    /// `MAX_AGE_SECS + 1` and asserts it is no longer due — so the constant can
+    /// be changed to anything at all and the suite still passes, while reports
+    /// are either given up on within the hour or kept for a year.
+    #[test]
+    fn the_age_a_report_stops_being_news_at_is_the_documented_one() {
+        assert_eq!(MAX_AGE_SECS, 24 * 3_600);
+    }
+
     fn queued(db: &Store, run_id: &str, at: i64) -> i64 {
         enqueue(db.conn(), run_id, ME, r#"{"a":1}"#, at, Some(HERE)).unwrap()
     }
