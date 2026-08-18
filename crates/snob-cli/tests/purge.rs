@@ -127,7 +127,7 @@ fn the_plan_names_the_session_and_every_directory_that_exists() {
     assert!(plan.directories.contains(&paths.data_dir().to_path_buf()));
     assert!(
         !plan.directories.contains(&paths.config_dir().to_path_buf()),
-        "nothing writes configuration yet, so there is no such directory to list"
+        "a directory that does not exist is not listed as something to remove"
     );
     assert_eq!(plan.lines().len(), 1 + plan.directories.len());
 }

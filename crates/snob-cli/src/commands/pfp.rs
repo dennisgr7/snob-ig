@@ -344,7 +344,7 @@ mod tests {
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
         assert!(
             matches!(picture.source, Source::Smaller { .. }),
-            "falling back has to be recorded, or the command says nothing about              having served the one size it exists to avoid"
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
         );
     }
 
@@ -363,7 +363,7 @@ mod tests {
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
         assert!(
             matches!(picture.source, Source::Smaller { .. }),
-            "falling back has to be recorded, or the command says nothing about              having served the one size it exists to avoid"
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
         );
     }
 

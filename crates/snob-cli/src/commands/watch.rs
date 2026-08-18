@@ -1440,6 +1440,126 @@ mod tests {
     use super::*;
     use snob_core::Pk;
 
+    /// A `watch.toml` as the tool would read one.
+    fn watch_toml(body: &str) -> WatchConfig {
+        config::parse(body, std::path::Path::new("watch.toml")).expect("the fixture parses")
+    }
+
+    /// A stranger is asked unless the file records that somebody answered.
+    ///
+    /// `with_recorded_consent` is the only thing standing between `--target`
+    /// and a scheduled run enumerating somebody else's lists: make its `None`
+    /// arm hand back a `Watched::consented` and an unattended run reads a
+    /// stranger on nobody's say-so. Nothing went through it. The test that
+    /// looks like it covers this asks `may_run_unattended` of three values
+    /// built by hand, so it never reaches the function that decides which of
+    /// the three you get.
+    #[test]
+    fn a_stranger_is_asked_unless_the_file_says_somebody_answered() {
+        let file = watch_toml(
+            r#"
+every = "6h"
+
+[[account]]
+target = "self"
+
+[[account]]
+target = "friend"
+consent = { agreed_at = 1700 }
+
+[[account]]
+target = "acquaintance"
+"#,
+        );
+
+        let asked = |name: &str, config: Option<&WatchConfig>| {
+            let watched = watched_from(Some(name.to_string()), config);
+            assert_eq!(watched.len(), 1);
+            !watched[0].may_run_unattended()
+        };
+
+        assert!(
+            !asked("friend", Some(&file)),
+            "the file records an answer for them"
+        );
+        assert!(
+            asked("stranger", Some(&file)),
+            "nobody ever agreed to this one being read"
+        );
+        assert!(
+            asked("acquaintance", Some(&file)),
+            "listed is not the same as consented -- the answer is the `consent` table"
+        );
+        assert!(
+            asked("friend", None),
+            "with no file there is nowhere an answer could have been recorded"
+        );
+
+        // Instagram's spelling and the typed one need not agree in case.
+        assert!(!asked("FRIEND", Some(&file)));
+
+        // `self` on the command line is not the `[[account]] target = "self"`
+        // line: that one is your own account, which needs nobody's permission,
+        // and matching it would hand a stranger named `self` a consent.
+        assert!(asked("self", Some(&file)));
+    }
+
+    /// Every account the file lists is watched, and a file that lists none
+    /// means your own.
+    #[test]
+    fn the_accounts_watched_are_the_ones_the_file_names() {
+        let file = watch_toml(
+            r#"
+every = "6h"
+
+[[account]]
+target = "self"
+
+[[account]]
+target = "friend"
+consent = { agreed_at = 1700 }
+"#,
+        );
+
+        let watched = watched_from(None, Some(&file));
+        let names: Vec<Option<&str>> = watched.iter().map(|w| w.name()).collect();
+        assert_eq!(names, [None, Some("friend")]);
+        assert!(watched.iter().all(|w| w.may_run_unattended()));
+
+        // A schedule with no `[[account]]` at all means the obvious thing.
+        let bare = watch_toml("every = \"6h\"\n");
+        let watched = watched_from(None, Some(&bare));
+        assert_eq!(watched.len(), 1);
+        assert_eq!(watched[0].name(), None);
+    }
+
+    /// The event a queued body carries is read back out of the body.
+    ///
+    /// It has to be, because a retry days later has only the bytes: remembering
+    /// the name alongside them let the two disagree, and the header said
+    /// `watch.changes` over every heartbeat -- so exactly the receiver the
+    /// header exists for treated each one as a report of changes.
+    ///
+    /// Nothing tested this. The test that looks like it does hands the name to
+    /// the client as an argument, so it pins the client and not the reading.
+    #[test]
+    fn the_event_is_read_back_out_of_the_body_it_describes() {
+        assert_eq!(
+            event_of(r#"{"schema":1,"event":"watch.heartbeat"}"#),
+            "watch.heartbeat"
+        );
+        assert_eq!(
+            event_of(r#"{"schema":1,"event":"watch.changes"}"#),
+            "watch.changes"
+        );
+
+        // Anything this version did not write reads as the ordinary case rather
+        // than as a heartbeat: a receiver that drops heartbeats must not be
+        // handed a report of changes wearing one's name.
+        assert_eq!(event_of(r#"{"event":"something.else"}"#), "watch.changes");
+        assert_eq!(event_of("not json at all"), "watch.changes");
+    }
+
     /// A `[webhook]` section as `watch.toml` would parse it.
     fn configured(url: &str, headers: &[(&str, &str)]) -> WebhookConfig {
         WebhookConfig {

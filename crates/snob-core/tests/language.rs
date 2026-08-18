@@ -1,12 +1,21 @@
-//! Guards the repository against Spanish creeping back in.
+//! Guards the prose this repository ships.
 //!
-//! The project was translated to English in July 2026. This test is what keeps
-//! it that way. It is a test rather than a script because that is the only
-//! thing that runs on every `cargo test`, on every machine and in CI, with
+//! Two things live here, and they share a walk of the source tree because that
+//! walk is the awkward part. A test rather than a script because that is the
+//! only thing that runs on every `cargo test`, on every machine and in CI, with
 //! nothing to install.
 //!
-//! Three detectors, because each covers the others' blind spot. An escape hatch
-//! exists: any line containing `i18n-allow` is skipped.
+//! **Spanish creeping back in.** The project was translated to English in July
+//! 2026. Three detectors, because each covers the others' blind spot. An escape
+//! hatch exists: any line containing `i18n-allow` is skipped.
+//!
+//! **Runs of spaces left in the middle of a sentence.** Cosmetic, and it earned
+//! its place anyway: the same defect shipped twice in `snob watch status`, and
+//! the second time it arrived *in the commit whose message said it was fixed*
+//! and four spaces longer than before. A multi-line string written with a `\`
+//! continuation collapses correctly until `cargo fmt` joins the line, and then
+//! the indentation is suddenly part of what the user reads. Two rounds of
+//! reading missed it. Its escape hatch is `layout-allow`.
 
 use std::path::{Path, PathBuf};
 
@@ -203,6 +212,98 @@ fn words_of(line: &str) -> impl Iterator<Item = &str> {
         .filter(|w| !w.is_empty())
 }
 
+/// A run of three or more spaces in the middle of a sentence.
+///
+/// Bounded on both sides on purpose, because the shape of the defect is what
+/// tells it apart from deliberate layout. **Before** it: a lowercase letter,
+/// which ends a word -- not the `:` that precedes every aligned label in this
+/// repository, and not the `,` that precedes an aligned SQL argument.
+/// **After** it: a lowercase letter or `{`, which is a word or a format
+/// placeholder beginning, and not the uppercase that follows every aligned SQL
+/// keyword (`JOIN users u            ON ...`).
+///
+/// That leaves one shape it cannot tell apart, and it is allowlisted below
+/// rather than guessed at.
+fn stray_spaces_in(line: &str) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != ' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i] == ' ' {
+            i += 1;
+        }
+        if i - start < 3 || start == 0 || i == chars.len() {
+            continue;
+        }
+        let before = chars[start - 1];
+        let after = chars[i];
+        if before.is_ascii_lowercase() && (after.is_ascii_lowercase() || after == '{') {
+            return Some(format!("{} spaces mid-sentence", i - start));
+        }
+    }
+    None
+}
+
+/// Files exempt from the space check.
+const LAYOUT_ALLOWLIST: [&str; 2] = [
+    // This very file holds the examples, so it flags itself -- the same trap
+    // the Spanish allowlist above records, for the same reason.
+    "crates/snob-core/tests/language.rs",
+    // The long help is a two-column table written inside one string literal,
+    // so `login                          store your session` has exactly the
+    // shape of the defect. The cost of not writing a cleverer detector is that
+    // this one file is not watched for it.
+    "crates/snob-cli/src/cli.rs",
+];
+
+/// No sentence this repository ships has a hole punched in it.
+#[test]
+fn no_run_of_spaces_is_left_inside_a_sentence() {
+    let Some(root) = repo_root() else {
+        return; // packaged build, nothing to walk
+    };
+
+    let mut violations = Vec::new();
+    for file in source_files(&root) {
+        if file.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if LAYOUT_ALLOWLIST.contains(&relative.as_str()) {
+            continue;
+        }
+
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for (number, line) in contents.lines().enumerate() {
+            if line.contains("layout-allow") {
+                continue;
+            }
+            if let Some(found) = stray_spaces_in(line) {
+                violations.push(format!("{relative}:{}: {found}", number + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "{} sentence(s) with a run of spaces in them:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
 /// Walks up from the manifest until a `Cargo.lock` shows up.
 fn repo_root() -> Option<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -254,7 +355,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::spanish_in;
+    use super::{spanish_in, stray_spaces_in};
 
     #[test]
     fn it_catches_the_three_kinds_of_giveaway() {
@@ -281,6 +382,33 @@ mod tests {
             "// checking whether the counter moved",
         ] {
             assert!(spanish_in(line).is_none(), "false positive on: {line}");
+        }
+    }
+
+    #[test]
+    fn a_hole_punched_in_a_sentence_is_found() {
+        // The two that shipped, in the shape they shipped in.
+        assert!(stray_spaces_in("so nothing will send      {it}. They expire").is_some());
+        assert!(stray_spaces_in("says nothing about      having served").is_some());
+    }
+
+    #[test]
+    fn deliberate_layout_is_not_a_hole() {
+        for line in [
+            // A label column: the `:` is what says so.
+            r#"format!("Origin:   {}", session.origin)"#,
+            r#"text.contains("Account:      @someone")"#,
+            // Aligned SQL: the keyword after it is uppercase.
+            r#""JOIN users u            ON u.pk = h.pk""#,
+            // Aligned SQL: neither the `=` nor the `,` before a column name
+            // ends a word.
+            r#""full_name   = coalesce(excluded.full_name,   users.full_name)""#,
+            // Ordinary code and ordinary prose.
+            "let total = sin(x) + cos(y);",
+            "// the walk is resumed from the stored cursor",
+            "        indented(code);",
+        ] {
+            assert!(stray_spaces_in(line).is_none(), "false positive on: {line}");
         }
     }
 
