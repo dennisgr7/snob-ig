@@ -126,56 +126,76 @@ fn ask_schedule() -> Result<String> {
     .ok_or_else(|| ExitError::new(ExitCode::Interrupted, "nothing was changed".to_string()))?;
 
     match choice {
-        0 => {
-            let text = ui::prompt_line("How often? (for example 6h)")?;
-            let every = duration::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
-            // Validated here rather than at the first run, so "5m" is refused
-            // while the person who typed it is still reading.
-            schedule::Schedule::every(every)?;
-            Ok(format!("every = \"{}\"", duration::format(every)))
-        }
+        0 => interval_line(&ui::prompt_line("How often? (for example 6h)")?),
         1 => {
             let days = ui::prompt_line("Which days? (mon,thu -- or blank for every day)")?;
             let times = ui::prompt_line("At what times? (09:00 or 09:00,21:00)")?;
-
-            let days: Vec<&str> = days
-                .split(',')
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-                .collect();
-            let parsed_days = days
-                .iter()
-                .map(|d| {
-                    schedule::Weekday::parse(d)
-                        .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let parsed_times = times
-                .split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
-                .collect::<Result<Vec<_>>>()?;
-            schedule::Schedule::calendar(&parsed_days, &parsed_times)?;
-
-            let mut line = String::new();
-            if !days.is_empty() {
-                line.push_str(&format!("on = [{}]\n", quoted_list(&days)));
-            }
-            let times: Vec<&str> = times
-                .split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .collect();
-            line.push_str(&format!("at = [{}]", quoted_list(&times)));
-            Ok(line)
+            calendar_line(&days, &times)
         }
-        _ => {
-            let expression = ui::prompt_line("The expression? (for example 0 9 * * 1,4)")?;
-            schedule::Schedule::cron(&expression)?;
-            Ok(format!("cron = \"{}\"", expression.trim()))
-        }
+        _ => cron_line(&ui::prompt_line(
+            "The expression? (for example 0 9 * * 1,4)",
+        )?),
     }
+}
+
+// The three below are the whole of what `ask_schedule` decides, split out from
+// the prompting so a test can reach them.
+//
+// Nothing could. The validation lives on this side of `dialoguer`, and the one
+// test that claimed to cover it — `an_interval_below_the_floor_is_refused_at_setup`
+// — asserted `Schedule::every(300).is_err()`, which is a fact about the schedule
+// module and says nothing about whether `setup` asks it. Deleting the
+// `Schedule::every(every)?` line left the suite green while `every = "5m"` was
+// written into a file the scheduler refuses at every run afterwards, with the
+// person who typed it long gone. `config::parse` cannot catch it either: it
+// checks the TOML and the schema number, not what the values mean.
+
+/// The `every = "..."` line, or what is wrong with the interval.
+fn interval_line(text: &str) -> Result<String> {
+    let every = duration::parse(text).map_err(|e| anyhow::anyhow!(e))?;
+    // Validated here rather than at the first run, so "5m" is refused while the
+    // person who typed it is still reading.
+    schedule::Schedule::every(every)?;
+    Ok(format!("every = \"{}\"", duration::format(every)))
+}
+
+/// The `on = [...]` and `at = [...]` lines, or what is wrong with the calendar.
+fn calendar_line(days: &str, times: &str) -> Result<String> {
+    fn listed(text: &str) -> Vec<&str> {
+        text.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    let days = listed(days);
+    let times = listed(times);
+
+    let parsed_days = days
+        .iter()
+        .map(|d| {
+            schedule::Weekday::parse(d)
+                .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let parsed_times = times
+        .iter()
+        .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    schedule::Schedule::calendar(&parsed_days, &parsed_times)?;
+
+    let mut line = String::new();
+    if !days.is_empty() {
+        line.push_str(&format!("on = [{}]\n", quoted_list(&days)));
+    }
+    line.push_str(&format!("at = [{}]", quoted_list(&times)));
+    Ok(line)
+}
+
+/// The `cron = "..."` line, or what is wrong with the expression.
+fn cron_line(expression: &str) -> Result<String> {
+    schedule::Schedule::cron(expression)?;
+    Ok(format!("cron = \"{}\"", expression.trim()))
 }
 
 type WebhookAnswers = (
@@ -490,7 +510,6 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
@@ -559,10 +578,61 @@ mod tests {
         assert_eq!(quoted_list(&[]), "");
     }
 
-    /// Setup refuses an interval the scheduler would refuse anyway, but it does
+    /// Setup refuses a schedule the scheduler would refuse anyway, but it does
     /// it while the person who typed it is still reading.
+    ///
+    /// This used to be one line asserting `Schedule::every(300).is_err()`, which
+    /// is a fact about the schedule module and says nothing about whether
+    /// `setup` asks it. The validation was unreachable behind `dialoguer`, so
+    /// deleting it left the suite green while `every = "5m"` went into a file
+    /// the scheduler then refuses at every run — and `config::parse` cannot
+    /// catch that, because it checks the TOML and the schema number, not what
+    /// the values mean.
+    ///
+    /// All three shapes, because the floor binds all three and only one of them
+    /// was ever mentioned here.
     #[test]
-    fn an_interval_below_the_floor_is_refused_at_setup() {
-        assert!(schedule::Schedule::every(Duration::from_secs(300)).is_err());
+    fn a_schedule_below_the_floor_is_refused_at_setup() {
+        assert!(interval_line("5m").is_err(), "five minutes is too often");
+        assert!(
+            cron_line("*/5 * * * *").is_err(),
+            "the same five minutes, written the other way"
+        );
+        assert!(
+            calendar_line("", "09:00,09:05").is_err(),
+            "and again, as two moments five minutes apart"
+        );
+
+        // And the lines a good answer produces, since the file is written from
+        // them: TOML a parser accepts, in the keys `config::parse` reads.
+        assert_eq!(interval_line("6h").unwrap(), "every = \"6h\"");
+        assert_eq!(
+            cron_line(" 0 9 * * 1,4 ").unwrap(),
+            "cron = \"0 9 * * 1,4\""
+        );
+        assert_eq!(
+            calendar_line("mon, thu", "09:00, 21:00").unwrap(),
+            "on = [\"mon\", \"thu\"]\nat = [\"09:00\", \"21:00\"]"
+        );
+        assert_eq!(
+            calendar_line("", "09:00").unwrap(),
+            "at = [\"09:00\"]",
+            "no days means every day, and no `on` key at all"
+        );
+    }
+
+    /// What comes back from those lines has to parse as the file it is going
+    /// into, or `setup` writes something the monitor cannot read.
+    #[test]
+    fn the_lines_setup_writes_are_a_configuration_it_can_read_back() {
+        for line in [
+            interval_line("6h").unwrap(),
+            cron_line("0 9 * * 1,4").unwrap(),
+            calendar_line("mon", "09:00,21:00").unwrap(),
+        ] {
+            let text = format!("schema = 1\n{line}\n");
+            config::parse(&text, std::path::Path::new("watch.toml"))
+                .unwrap_or_else(|e| panic!("{line:?} does not parse back: {e}"));
+        }
     }
 }
