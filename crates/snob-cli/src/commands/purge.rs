@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::SecretStore;
+use snob_core::secrets::{Kind, SecretStore};
 
 use crate::cli::PurgeArgs;
 use crate::exit::{ExitCode, ExitError};
@@ -33,13 +33,20 @@ use crate::ui;
 pub struct Plan {
     /// Whether there is a stored session to delete.
     pub session: bool,
+    /// The monitor's stored secrets, when there are any.
+    ///
+    /// **For the listing only.** What `execute` removes is `Kind::ALL`, always,
+    /// and it does not consult this: the deletion must not be gated on a survey
+    /// the keyring could answer wrongly, which is the shape the defect this
+    /// field was added for actually had.
+    pub secrets: Vec<Kind>,
     /// Directories to remove, whole.
     pub directories: Vec<PathBuf>,
 }
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        !self.session && self.directories.is_empty()
+        !self.session && self.secrets.is_empty() && self.directories.is_empty()
     }
 
     /// One line per thing that will go, for the user to read before answering.
@@ -51,6 +58,25 @@ impl Plan {
             // this run would have written to, so naming either would be a
             // half-truth in the one message that has to be exact.
             lines.push("the stored session, from the system keyring and from disk".to_string());
+        }
+        // Named separately from the session, because they are a different
+        // thing to lose: a webhook token and a signing key belong to the
+        // user's own server, not to Instagram, and somebody re-running `setup`
+        // afterwards has to know they will have to enter them again.
+        if !self.secrets.is_empty() {
+            let named: Vec<&str> = self
+                .secrets
+                .iter()
+                .map(|kind| match kind {
+                    Kind::WatchToken => "webhook token",
+                    Kind::WatchSigningKey => "signing key",
+                    Kind::Session => "session",
+                })
+                .collect();
+            lines.push(format!(
+                "the monitor's stored {}, from the system keyring",
+                named.join(" and ")
+            ));
         }
         lines.extend(self.directories.iter().map(|d| d.display().to_string()));
         lines
@@ -64,6 +90,7 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
         // machine, so it asks the store the question that covers a credential too
         // corrupt to parse as well as a readable one.
         session: store.something_is_stored(),
+        secrets: store.monitor_secrets_stored(),
         directories: app_paths
             .owned_dirs()
             .into_iter()
@@ -112,11 +139,23 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
     // `delete_all`, not `delete`: this is the command whose whole promise is
     // that nothing of snob's is left, so it takes the monitor's webhook token
     // and signing key too. `logout` is the caller that must not.
-    if plan.session
-        && let Err(e) = store.delete_all()
-    {
+    //
+    // **Unconditional.** It used to be gated on `plan.session`, which is
+    // `something_is_stored()`, which reads the session entry and nothing else —
+    // so the only call to `delete_all` in the workspace was reached only when
+    // there was a session. `snob watch setup` needs none, and `snob logout`
+    // removes the one there is by design, so the ordinary sequence
+    // setup → logout → purge deleted the directories, printed "snob's files are
+    // gone from this computer.", exited 0, and left the webhook token and the
+    // signing key in the keyring for good. With the directories already gone it
+    // said "There is nothing of snob's stored on this computer." over two live
+    // credentials.
+    //
+    // Nothing is lost by always asking: `delete_all` walks `Kind::ALL` and a
+    // `NoEntry` for every one of them is already `Ok(())`.
+    if let Err(e) = store.delete_all() {
         failures.push(Failure {
-            what: "the stored session".to_string(),
+            what: "the stored credentials".to_string(),
             why: e.to_string(),
             credential: true,
         });
@@ -324,6 +363,7 @@ mod tests {
     fn the_listing_covers_the_session_and_every_directory() {
         let plan = Plan {
             session: true,
+            secrets: vec![],
             directories: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
         };
         let lines = plan.lines();
@@ -331,6 +371,29 @@ mod tests {
         assert!(lines[0].contains("session"));
         assert!(lines[1].contains("one"));
         assert!(lines[2].contains("two"));
+    }
+
+    /// The monitor's secrets are named separately from the session, because
+    /// they are a different thing to lose: they belong to the user's own
+    /// server, and somebody re-running `setup` afterwards has to know they will
+    /// have to enter them again.
+    #[test]
+    fn the_listing_names_the_monitors_secrets_too() {
+        let plan = Plan {
+            session: false,
+            secrets: vec![Kind::WatchToken, Kind::WatchSigningKey],
+            directories: vec![],
+        };
+        assert!(!plan.is_empty(), "two live credentials are not nothing");
+
+        let lines = plan.lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("webhook token"), "{lines:?}");
+        assert!(lines[0].contains("signing key"), "{lines:?}");
+        assert!(
+            !lines[0].contains("session"),
+            "there is no session here to claim: {lines:?}"
+        );
     }
 
     /// Nothing to remove is not a failure: someone uninstalling a tool that
