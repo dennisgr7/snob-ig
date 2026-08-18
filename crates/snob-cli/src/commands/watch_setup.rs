@@ -18,6 +18,7 @@ use snob_core::watch::config::{self, WatchConfig};
 use snob_core::{duration, watch::schedule};
 
 use crate::cli::{WatchSetupArgs, WatchStatusArgs};
+use crate::engine::check::Verdict;
 use crate::exit::{ExitCode, ExitError};
 use crate::{report, ui};
 
@@ -349,6 +350,8 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // monitor that had been running all week.
     let last_runs = watch_store::last_runs(db.conn())?;
 
+    let health = health(config.as_ref(), &last_runs, owed);
+
     if args.json {
         println!(
             "{}",
@@ -356,6 +359,13 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 "configured": config.is_some(),
                 "config_path": config::path(paths).display().to_string(),
                 "pending_deliveries": owed,
+                // The verdict, so a caller reading this does not have to
+                // reimplement which combinations of the fields below mean the
+                // monitor has stopped doing its job.
+                "health": {
+                    "verdict": health.verdict.as_str(),
+                    "notes": health.notes,
+                },
                 // Told apart from the marks below on purpose. A run that could
                 // not look moves no mark, so without this a monitor sitting in
                 // a cooldown is indistinguishable from one that was killed.
@@ -374,7 +384,10 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 })).collect::<Vec<_>>(),
             }))?
         );
-        return Ok(ExitCode::Ok);
+        return Ok(match health.verdict {
+            Verdict::Failed => ExitCode::Error,
+            _ => ExitCode::Ok,
+        });
     }
 
     match &config {
@@ -460,7 +473,89 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         }
     }
 
-    Ok(ExitCode::Ok)
+    if !health.notes.is_empty() {
+        println!();
+        println!("Health: {}", health.verdict.as_str());
+        for note in &health.notes {
+            println!("  {note}");
+        }
+    }
+
+    // Non-zero when the monitor is not doing what it was configured to do, so
+    // this is usable as a probe rather than only as something to read. A
+    // warning is not a failure: a monitor that has not run yet, or one sitting
+    // out a cooldown, is working.
+    Ok(match health.verdict {
+        Verdict::Failed => ExitCode::Error,
+        _ => ExitCode::Ok,
+    })
+}
+
+/// Whether the monitor is doing what it was configured to do.
+///
+/// `status` was a historical report and always exited 0, so the only way to
+/// know a monitor had stopped working was to read it — which is the same
+/// problem the reports themselves have and which `--json` exists to solve. This
+/// is the verdict, made of what `status` already reads.
+///
+/// Pure, and separate from the printing, because the interesting part is which
+/// states count as broken and that is a thing worth pinning.
+struct Health {
+    verdict: Verdict,
+    notes: Vec<String>,
+}
+
+fn health(config: Option<&WatchConfig>, runs: &[watch_store::Run], owed: usize) -> Health {
+    let mut notes = Vec::new();
+    let mut verdict = Verdict::Ok;
+    let mut at_least = |level: Verdict| verdict = verdict.max(level);
+
+    if config.is_none() {
+        at_least(Verdict::Warned);
+        notes.push(
+            "nothing is configured, so a bare \"snob watch\" has no schedule to run on".to_string(),
+        );
+    }
+
+    if runs.is_empty() {
+        at_least(Verdict::Warned);
+        notes.push("it has not run yet".to_string());
+    }
+
+    // What stopped the last run of each account. A cooldown lifts on its own
+    // and is worth saying rather than alarming about; a session that has gone
+    // will not come back without somebody logging in, and every run until then
+    // does nothing.
+    for run in runs {
+        match run.outcome.as_deref() {
+            Some("ok") | None => {}
+            Some(code @ ("rate_limited" | "interrupted")) => {
+                at_least(Verdict::Warned);
+                notes.push(format!("the last run ended in {code}"));
+            }
+            Some(code) => {
+                at_least(Verdict::Failed);
+                notes.push(format!("the last run ended in {code}"));
+            }
+        }
+    }
+
+    if owed > 0 {
+        // Queued with nowhere to go is the worse half: those reports expire,
+        // and the changes in them are already marked as reported, so they are
+        // the only copy.
+        if config.and_then(|c| c.webhook.as_ref()).is_none() {
+            at_least(Verdict::Failed);
+            notes.push(format!(
+                "{owed} queued report(s) with no webhook configured to send them to"
+            ));
+        } else {
+            at_least(Verdict::Warned);
+            notes.push(format!("{owed} report(s) still waiting to be delivered"));
+        }
+    }
+
+    Health { verdict, notes }
 }
 
 /// The configuration in a few lines, for `status` and for the confirmation
@@ -576,6 +671,82 @@ mod tests {
     fn quoting_a_list_gives_toml_a_parser_accepts() {
         assert_eq!(quoted_list(&["mon", "thu"]), "\"mon\", \"thu\"");
         assert_eq!(quoted_list(&[]), "");
+    }
+
+    fn ran(outcome: &str) -> watch_store::Run {
+        watch_store::Run {
+            account_pk: 42,
+            started_at: 0,
+            finished_at: Some(0),
+            requests: 1,
+            outcome: Some(outcome.to_string()),
+            changes: 0,
+        }
+    }
+
+    /// Which states count as a monitor that has stopped doing its job.
+    ///
+    /// `status` was a historical report that always exited 0, so the only way
+    /// to find out was to read it -- which is the same problem the reports
+    /// themselves have and which `--json` exists to solve. What is pinned here
+    /// is the line between "working" and "not", because that is what an exit
+    /// code is.
+    #[test]
+    fn a_healthy_monitor_is_told_apart_from_one_that_has_stopped_working() {
+        let configured = config(
+            "schema = 1
+every = \"6h\"
+
+[webhook]
+url = \"https://n8n.internal/hook\"
+",
+        );
+
+        assert_eq!(
+            health(Some(&configured), &[ran("ok")], 0).verdict,
+            Verdict::Ok,
+            "configured, ran, nothing owed"
+        );
+
+        // A cooldown lifts on its own, and an interrupt was the user. Neither
+        // is a monitor that needs attention.
+        for lifts in ["rate_limited", "interrupted"] {
+            assert_eq!(
+                health(Some(&configured), &[ran(lifts)], 0).verdict,
+                Verdict::Warned,
+                "{lifts} passes on its own"
+            );
+        }
+
+        // A session that has gone will not come back without somebody logging
+        // in, and every run until then does nothing at all.
+        assert_eq!(
+            health(Some(&configured), &[ran("no_session")], 0).verdict,
+            Verdict::Failed
+        );
+
+        // Owed reports with somewhere to send them are a wait. With nowhere,
+        // they expire -- and the changes in them are already marked as
+        // reported, so they are the only copy.
+        assert_eq!(
+            health(Some(&configured), &[ran("ok")], 2).verdict,
+            Verdict::Warned
+        );
+        let no_webhook = config(
+            "schema = 1
+every = \"6h\"
+",
+        );
+        assert_eq!(
+            health(Some(&no_webhook), &[ran("ok")], 2).verdict,
+            Verdict::Failed
+        );
+
+        // And a machine with nothing configured is not broken, but a bare
+        // `snob watch` there has no schedule to run on.
+        let nothing = health(None, &[], 0);
+        assert_eq!(nothing.verdict, Verdict::Warned);
+        assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
     }
 
     /// Setup refuses a schedule the scheduler would refuse anyway, but it does
