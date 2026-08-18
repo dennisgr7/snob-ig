@@ -390,6 +390,29 @@ impl SecretStore {
         !matches!(self.load(), Ok(None))
     }
 
+    /// Which of the monitor's secrets are on this machine.
+    ///
+    /// The session is not among them: [`something_is_stored`] answers for that
+    /// one, and it has to, because a session too corrupt to parse still counts
+    /// and `load_secret` would call it absent.
+    ///
+    /// This exists so `purge` can **name** what it is about to remove. What it
+    /// removes is `Kind::ALL` unconditionally, so nothing depends on this
+    /// answer being complete — a keyring that refuses to be read leaves the
+    /// listing short and the deletion whole, which is the right way round.
+    ///
+    /// Walking `Kind::ALL` rather than naming the two, so a secret added later
+    /// appears here without anybody remembering to come back.
+    ///
+    /// [`something_is_stored`]: SecretStore::something_is_stored
+    pub fn monitor_secrets_stored(&self) -> Vec<Kind> {
+        Kind::ALL
+            .into_iter()
+            .filter(|kind| *kind != Kind::Session)
+            .filter(|kind| matches!(self.load_secret(*kind), Ok(Some(_))))
+            .collect()
+    }
+
     /// Removes the session from everywhere it can be, and says so only if it
     /// went.
     ///

@@ -20,11 +20,18 @@ use snob_core::store::Store;
 mod common;
 use common::{SID, UA};
 
+/// The keyring service this test uses, and the only place it is spelled.
+///
+/// Per test and per process: the real service belongs to the operating system
+/// rather than to this process, and these tests delete.
+fn service(name: &str) -> String {
+    format!("snob-ig-test-purge-{name}-{}", std::process::id())
+}
+
 fn setup(name: &str) -> (tempfile::TempDir, AppPaths, SecretStore) {
     let tmp = tempfile::tempdir().unwrap();
     let paths = AppPaths::rooted_at(tmp.path());
-    let store = SecretStore::new(paths.clone(), true)
-        .with_service(&format!("snob-ig-test-purge-{name}-{}", std::process::id()));
+    let store = SecretStore::new(paths.clone(), true).with_service(&service(name));
     (tmp, paths, store)
 }
 
@@ -232,4 +239,50 @@ fn a_typed_yes_needs_nobody_to_confirm_at() {
 
     purge::run_with(purge_now(), store, &paths, false).unwrap();
     assert!(!paths.session_file().exists());
+}
+
+/// The monitor's secrets go even when there is no session left to find.
+///
+/// `execute` gated the workspace's only `delete_all()` call on `plan.session`,
+/// which is `something_is_stored()`, which reads the session entry and nothing
+/// else. `snob watch setup` needs no session and `snob logout` removes the one
+/// there is by design, so setup → logout → purge deleted the directories,
+/// printed "snob's files are gone from this computer.", exited 0, and left a
+/// live webhook token and signing key in the keyring for good.
+///
+/// AGENTS.md read this rule as "every secret this tool stores is one `purge`
+/// removes". It was true of `delete_all` and false of the command.
+#[test]
+fn purge_removes_the_monitors_secrets_with_no_session_stored() {
+    use snob_core::secret::Secret;
+    use snob_core::secrets::Kind;
+
+    let (_tmp, paths, store) = setup("monitor-secrets");
+    store
+        .save_secret(Kind::WatchToken, &Secret::new("Bearer team"))
+        .unwrap();
+    store
+        .save_secret(Kind::WatchSigningKey, &Secret::new("shared-secret"))
+        .unwrap();
+
+    let plan = purge::survey(&store, &paths);
+    assert!(!plan.session, "this is the case with no session at all");
+    assert!(
+        !plan.is_empty(),
+        "two live credentials are not nothing to remove"
+    );
+    assert!(
+        plan.lines().iter().any(|l| l.contains("webhook token")),
+        "an answer given to an incomplete list is not consent to the rest: {:?}",
+        plan.lines()
+    );
+
+    purge::run(purge_now(), store, &paths).unwrap();
+
+    // Re-opened rather than reusing the moved store, and pointed at the same
+    // service name, which is what makes this a question about the keyring
+    // rather than about a handle.
+    let after = SecretStore::new(paths.clone(), true).with_service(&service("monitor-secrets"));
+    assert!(after.load_secret(Kind::WatchToken).unwrap().is_none());
+    assert!(after.load_secret(Kind::WatchSigningKey).unwrap().is_none());
 }
