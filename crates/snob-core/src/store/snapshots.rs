@@ -6,7 +6,7 @@
 //! simply a matter of stopping: whatever committed is durable even if the
 //! process dies outright.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, StoreError, now, now_ms, pk_from_sql, pk_to_sql};
 use crate::Pk;
@@ -145,41 +145,42 @@ pub fn resumable(
     kind: ListKind,
 ) -> Result<Option<Snapshot>, StoreError> {
     let now = now();
-    let claimed = conn.execute(
-        "UPDATE snapshots
-         SET claimed_by = ?4, claimed_at = ?5
-         WHERE id = (
-           SELECT id FROM snapshots
-           WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-             AND next_cursor IS NOT NULL AND started_at >= ?3
-             AND (claimed_by IS NULL OR claimed_by = ?4
-                  OR claimed_at IS NULL OR claimed_at < ?6)
-           ORDER BY started_at DESC LIMIT 1
-         )",
-        params![
-            pk_to_sql(account_pk),
-            kind.as_str(),
-            now - RESUME_WINDOW_SECS,
-            this_process(),
-            now,
-            now - CLAIM_TTL_SECS,
-        ],
-    )?;
 
-    if claimed == 0 {
-        return Ok(None);
-    }
-
-    // Read back the row this process now holds. Nothing else can be writing to
-    // it: the claim above is what says so.
+    // `RETURNING`, so what comes back is **the row that was claimed** rather
+    // than the answer to a second, looser question.
+    //
+    // The read-back used to be its own statement, keyed on
+    // `account_pk`/`kind`/`complete = 0`/`claimed_by` and ordered `started_at
+    // DESC` — dropping both of the predicates that make a partial resumable at
+    // all: `next_cursor IS NOT NULL` and the resume window. So a claimed
+    // cursor-less row left behind by this process — `walk::fetch` returns on a
+    // save or budget failure without calling `close` — was newer than the
+    // partial actually claimed, and came back instead of it. What followed was
+    // `mark_resumed` against the wrong id, a walk restarted from page one under
+    // the wrong `started_at`, and the real partial abandoned still holding this
+    // process's claim.
     let snapshot = conn
         .query_row(
-            "SELECT id, account_pk, kind, started_at, taken_at, complete, member_count,
-                    declared_count, pages, requests, next_cursor, resumes
-             FROM snapshots
-             WHERE account_pk = ?1 AND kind = ?2 AND complete = 0 AND claimed_by = ?3
-             ORDER BY started_at DESC LIMIT 1",
-            params![pk_to_sql(account_pk), kind.as_str(), this_process()],
+            "UPDATE snapshots
+             SET claimed_by = ?4, claimed_at = ?5
+             WHERE id = (
+               SELECT id FROM snapshots
+               WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
+                 AND next_cursor IS NOT NULL AND started_at >= ?3
+                 AND (claimed_by IS NULL OR claimed_by = ?4
+                      OR claimed_at IS NULL OR claimed_at < ?6)
+               ORDER BY started_at DESC LIMIT 1
+             )
+             RETURNING id, account_pk, kind, started_at, taken_at, complete, member_count,
+                       declared_count, pages, requests, next_cursor, resumes",
+            params![
+                pk_to_sql(account_pk),
+                kind.as_str(),
+                now - RESUME_WINDOW_SECS,
+                this_process(),
+                now,
+                now - CLAIM_TTL_SECS,
+            ],
             row_to_snapshot,
         )
         .optional()?;
@@ -243,7 +244,23 @@ pub fn save_page(
     users: &[User],
     cursor: Option<&str>,
 ) -> Result<SavedPage, StoreError> {
-    let tx = store.conn_mut().transaction()?;
+    // `BEGIN IMMEDIATE` rather than the default deferred one, for the reason
+    // `SqliteRateBudget::reserve` gives at length: this reads before it writes,
+    // and a deferred transaction pins a WAL read snapshot at the `SELECT` below
+    // that the first `INSERT` then has to upgrade. `SQLITE_BUSY_SNAPSHOT` on
+    // that upgrade does **not** invoke the busy handler, so the five-second
+    // `busy_timeout` this connection sets does not cover it and the page fails
+    // outright. What follows is a `WalkError::Save`, an early return that never
+    // calls `close`, the page that was already paid for rolled back, and the
+    // snapshot left claimed until the lease goes stale — over a page that would
+    // have succeeded a moment later.
+    //
+    // The database is shared between processes on purpose, which is the whole
+    // reason the claim exists; taking the write lock up front is what makes them
+    // queue instead of collide.
+    let tx = store
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let first_ordinal: i64 = tx.query_row(
         "SELECT member_count FROM snapshots WHERE id = ?1",
@@ -333,6 +350,17 @@ pub fn save_page(
 ///
 /// The claim is released either way. The walk is over, so anything else may
 /// have the row.
+///
+/// **And only this process's walk may end it.** `save_page` refuses a snapshot
+/// this process does not hold, and AGENTS.md rests "a walk in progress has
+/// exactly one writer" on that guard alone — but `close` was a second writer
+/// with no guard at all, so a process whose claim had gone stale and been
+/// adopted still closed the row and set `claimed_by` to NULL on the way out.
+/// The adopter's next `save_page` then answered `ClaimTaken`, rolled back and
+/// gave up: both walks died over one that should simply have stopped. The
+/// window is narrow — an exhausted retry sequence is about two minutes against
+/// a `CLAIM_TTL_SECS` of five — but a rationing budget or a suspend reaches it,
+/// and it is the exact case the claim exists for.
 pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), StoreError> {
     let complete = reason.yields_complete_list();
     conn.execute(
@@ -340,8 +368,8 @@ pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), Store
          SET complete = ?2, taken_at = ?3, stopped_by = ?4,
              next_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE next_cursor END,
              claimed_by = NULL, claimed_at = NULL
-         WHERE id = ?1 AND complete = 0",
-        params![id, complete, now(), reason.as_str()],
+         WHERE id = ?1 AND complete = 0 AND claimed_by = ?5",
+        params![id, complete, now(), reason.as_str(), this_process()],
     )?;
     Ok(())
 }
@@ -673,6 +701,92 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "the refused page rolled back");
         assert_eq!(cursor.as_deref(), Some("cursor"), "the cursor is untouched");
+    }
+
+    /// Closing a walk this process no longer holds is refused, like saving one.
+    ///
+    /// `save_page` carried the only claim guard, and AGENTS.md rests "a walk in
+    /// progress has exactly one writer" on it — but `close` was a second writer
+    /// with none, and it sets `claimed_by` to NULL. So a process whose claim had
+    /// gone stale and been adopted still ended the row on its way out, and the
+    /// adopter's next page answered `ClaimTaken`, rolled back and gave up: two
+    /// walks died where one should merely have stopped.
+    #[test]
+    fn closing_a_walk_somebody_else_took_over_is_refused() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        claimed_by_somebody_else(&db, id, now());
+
+        close(db.conn(), id, StopReason::Completed).unwrap();
+
+        let (complete, claimed): (i64, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT complete, claimed_by FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(complete, 0, "the adopter's walk is still in progress");
+        assert_eq!(
+            claimed.as_deref(),
+            Some("another-process"),
+            "and it still holds the claim it took"
+        );
+    }
+
+    /// The row that comes back is the row that was claimed.
+    ///
+    /// The read-back used to be a second statement that dropped both predicates
+    /// making a partial resumable — `next_cursor IS NOT NULL` and the resume
+    /// window — and simply took the newest row this process held. A claimed,
+    /// cursor-less row left behind by this process is newer than the partial
+    /// actually claimed, and `walk::fetch` leaves exactly that behind when a
+    /// save or the budget fails: it returns without calling `close`.
+    ///
+    /// What followed was `mark_resumed` against the wrong id, a walk restarted
+    /// from page one under the wrong `started_at`, and the real partial
+    /// abandoned still holding this process's claim.
+    #[test]
+    fn resuming_returns_the_partial_it_claimed_and_not_a_newer_dead_one() {
+        let mut db = base();
+
+        // The partial worth resuming: it has a cursor.
+        let wanted = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, wanted, &[user(10)], Some("cursor")).unwrap();
+
+        // And a newer row this process opened and walked away from without
+        // closing, so it is claimed, incomplete and has no cursor at all.
+        let abandoned = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+
+        // Forced apart in the fixture rather than left to the clock. `begin`
+        // stamps `started_at` in whole seconds, so two rows opened in one test
+        // share it and `ORDER BY started_at DESC` is a tie SQLite may break
+        // either way — which would make this pass or fail on timing rather than
+        // on the thing it is about.
+        db.conn()
+            .execute(
+                "UPDATE snapshots SET started_at = started_at - 10 WHERE id = ?1",
+                params![wanted],
+            )
+            .unwrap();
+        assert!(abandoned > wanted, "the dead one has to be the newer row");
+
+        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+            .unwrap()
+            .expect("there is a partial with a cursor to continue");
+        assert_eq!(
+            adopted.id, wanted,
+            "the row handed back must be the row the claim was taken on"
+        );
+        assert_eq!(adopted.next_cursor.as_deref(), Some("cursor"));
     }
 
     /// A capture that stopped short is not found by id either.
