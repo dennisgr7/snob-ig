@@ -707,3 +707,96 @@ fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
 
     Ok((pk, users::name(app.db().conn(), pk)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(provenance: Provenance, reason: StopReason) -> ListOutcome {
+        ListOutcome {
+            provenance,
+            reason,
+            requests: 0,
+            started_at: 1_000,
+            taken_at: 1_100,
+            account_pk: 42,
+            snapshot_id: 7,
+            stopped_by: None,
+            resumable: false,
+        }
+    }
+
+    /// A walk that came back short is refused, and refused as *incomplete*
+    /// rather than as unverified.
+    ///
+    /// The two halves of `refusal` mean different things to the caller: nobody
+    /// looked is something the next run fixes, while a truncated walk is a list
+    /// whose missing accounts would read as people who left. Only the first was
+    /// ever asserted, so deleting the `is_complete` check entirely left the
+    /// suite green -- and then a truncated walk is recorded `outcome = "ok"`,
+    /// nothing is warned about, and `$?` tells a systemd timer the run went
+    /// fine.
+    #[test]
+    fn a_walk_that_came_back_short_is_refused_as_incomplete() {
+        for reason in [
+            StopReason::RateLimit,
+            StopReason::Truncated,
+            StopReason::Canceled,
+            StopReason::PageLimit,
+            StopReason::Network,
+            StopReason::SessionInvalid,
+        ] {
+            assert!(
+                matches!(
+                    refusal(&outcome(Provenance::Walked, reason)),
+                    Some(Skipped::Incomplete(got)) if got == reason
+                ),
+                "a walk that ended {reason:?} was accepted as a basis for comparison"
+            );
+        }
+
+        // A list nothing verified is the other refusal, and it wins: the run
+        // never looked, so what the stored capture says about completeness is
+        // beside the point.
+        assert!(matches!(
+            refusal(&outcome(Provenance::Cooldown, StopReason::Completed)),
+            Some(Skipped::NobodyLooked(Provenance::Cooldown))
+        ));
+
+        assert!(
+            refusal(&outcome(Provenance::Walked, StopReason::Completed)).is_none(),
+            "a complete walk this run made is exactly what may be compared"
+        );
+    }
+
+    /// And the run says so in the one place a timer can read without parsing
+    /// English.
+    #[test]
+    fn a_run_whose_lists_all_came_back_short_does_not_exit_zero() {
+        let report = WatchReport {
+            account_pk: 42,
+            username: None,
+            is_self: true,
+            followers: None,
+            following: None,
+            renamed: Vec::new(),
+        };
+        let tick = TickReport {
+            report,
+            requests: 1,
+            lists: vec![TickList {
+                kind: ListKind::Followers,
+                skipped: Some(Skipped::Incomplete(StopReason::RateLimit)),
+            }],
+            committable: Vec::new(),
+            at: 0,
+            rename_cursor: None,
+        };
+
+        assert!(!tick.looked());
+        assert_eq!(
+            tick.outcome(),
+            ExitCode::from_stop_reason(StopReason::RateLimit)
+        );
+    }
+}

@@ -74,10 +74,10 @@ impl AppPaths {
         }
     }
 
-    /// Where configuration **would** live. Nothing writes there yet, and the
-    /// directory is deliberately not created until something does: an empty
-    /// folder in the user's roaming profile is litter, and this tool left one
-    /// on every machine it ran on.
+    /// Where configuration lives: `watch.toml`, written by `snob watch setup`.
+    /// The directory is not created until something writes to it, because an
+    /// empty folder in the user's roaming profile is litter and this tool left
+    /// one on every machine it ran on.
     pub fn config_dir(&self) -> &Path {
         &self.config
     }
@@ -125,8 +125,8 @@ impl AppPaths {
     ///
     /// Assembled here rather than by the command so that a directory added
     /// later cannot be forgotten by the one command whose whole job is to leave
-    /// nothing behind. The configuration directory is on the list even though
-    /// nothing writes there yet, for that same reason.
+    /// nothing behind -- the configuration directory included, which is where
+    /// `watch.toml` goes.
     ///
     /// Deduplicated, because on macOS the configuration and data directories
     /// are the same path: listed twice, the second removal would fail on a
@@ -150,10 +150,10 @@ impl AppPaths {
 
     /// Creates what the tool actually writes to.
     ///
-    /// Only the data directory: there is no configuration file, so creating a
-    /// folder for one leaves an empty directory in the roaming profile of every
-    /// machine this has ever run on. When configuration arrives, whatever
-    /// writes it creates its own directory.
+    /// Only the data directory. There **is** a configuration file --
+    /// `snob watch setup` writes one -- but that command creates the directory
+    /// itself, because creating it for everybody leaves an empty folder in the
+    /// roaming profile of every machine this has ever run on.
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         create_private_dir(&self.data)
     }
@@ -280,6 +280,11 @@ mod tests {
             paths.session_file(),
             paths.browser_profile(),
             paths.legacy_session_file().unwrap(),
+            // The configuration file. Written since `snob watch setup` landed,
+            // and missing from this list until it was: taking `self.config` out
+            // of `owned_dirs` left `watch.toml` in the user's roaming profile
+            // after `snob purge`, and nothing here noticed.
+            crate::watch::config::path(&paths),
         ] {
             assert!(
                 owned.iter().any(|dir| path.starts_with(dir)),

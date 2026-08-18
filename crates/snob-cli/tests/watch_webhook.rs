@@ -154,10 +154,13 @@ async fn the_receiver_is_told_what_this_is_and_which_attempt() {
     assert_eq!(sent.headers.get("x-snob-event").unwrap(), "watch.changes");
 }
 
-/// The header exists so a receiver can route without parsing the body, which
-/// means it has to agree with the body. It said `watch.changes` over every
-/// heartbeat, so exactly the receiver the header is for would have treated
-/// every one of them as a report of changes.
+/// The header carries whatever event it is given, so a receiver can route
+/// without parsing the body.
+///
+/// This pins the client's plumbing and nothing else: the name arrives as an
+/// argument. That the name *agrees with the body* -- the defect where the
+/// header said `watch.changes` over every heartbeat -- is decided by
+/// `commands::watch::event_of`, and is tested there.
 #[tokio::test]
 async fn a_heartbeat_says_so_in_the_header_too() {
     let server = MockServer::start().await;

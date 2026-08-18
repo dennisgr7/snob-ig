@@ -410,8 +410,9 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // One block, because there used to be two and they contradicted each other:
     // one said a queue with no webhook would never move, the other said the next
     // run would try it, and both printed in that order on the same run. The
-    // first also carried fourteen literal spaces before its pronoun, so the line
-    // read "nothing will send              it."
+    // first also carried a run of literal spaces before its pronoun, which came
+    // back when this was rewritten -- and came back longer. A test walks the
+    // source for that shape now, because two rounds of reading it did not.
     if owed > 0 {
         println!();
         let (subject, it) = if owed == 1 {
@@ -421,7 +422,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         };
         if config.as_ref().and_then(|c| c.webhook.as_ref()).is_none() {
             println!(
-                "{owed} {subject} queued, but no webhook is configured, so nothing will send                  {it}. {} expire on {} own.",
+                "{owed} {subject} queued, but no webhook is configured, so nothing will send {it}. {} expire on {} own.",
                 if owed == 1 { "It" } else { "They" },
                 if owed == 1 { "its" } else { "their" }
             );

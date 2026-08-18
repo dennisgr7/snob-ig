@@ -675,6 +675,46 @@ mod tests {
         assert_eq!(cursor.as_deref(), Some("cursor"), "the cursor is untouched");
     }
 
+    /// A capture that stopped short is not found by id either.
+    ///
+    /// `find_usable` reads the view rather than the table, and AGENTS.md names
+    /// that view first under "structural guards over discipline": the monitor
+    /// holds an id and asks for it back, and a half-walked list handed over
+    /// there is two hundred people reported as having left.
+    ///
+    /// Nothing asserted it. Every existing call is `is_some()` on a genuinely
+    /// complete capture or `is_none()` on a row that had been deleted, and both
+    /// of those pass with `FROM snapshots` just as well.
+    #[test]
+    fn a_capture_that_stopped_short_is_never_found_by_id() {
+        let mut db = base();
+
+        let cut_short = begin(db.conn(), 1, ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, cut_short, &[user(10)], Some("cursor")).unwrap();
+        close(db.conn(), cut_short, StopReason::RateLimit).unwrap();
+        assert!(
+            find_usable(db.conn(), cut_short).unwrap().is_none(),
+            "a walk that stopped short is not something to compare against"
+        );
+
+        // The other half of the view: begun, never closed, so no `taken_at`.
+        let still_open = begin(db.conn(), 1, ListKind::Following, Some(10))
+            .unwrap()
+            .id;
+        assert!(find_usable(db.conn(), still_open).unwrap().is_none());
+
+        // And one it does answer for, so this cannot pass by refusing
+        // everything.
+        let whole = begin(db.conn(), 1, ListKind::Following, Some(1))
+            .unwrap()
+            .id;
+        save_page(&mut db, whole, &[user(11)], None).unwrap();
+        close(db.conn(), whole, StopReason::Completed).unwrap();
+        assert!(find_usable(db.conn(), whole).unwrap().is_some());
+    }
+
     /// A finished capture is never unfinished again.
     ///
     /// Two processes on one row could have the faster close it `Completed` and

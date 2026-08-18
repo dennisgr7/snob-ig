@@ -864,6 +864,27 @@ mod tests {
     /// failing anywhere.
     #[test]
     fn every_kind_has_a_name_of_its_own() {
+        // `ALL` is the list `purge` walks, and every test of it -- including
+        // this one -- walks the same list, so shrinking `ALL` used to be
+        // invisible: drop `WatchSigningKey` from it and `snob purge` leaves the
+        // signing key in the user's keyring forever, with nothing failing.
+        //
+        // Two guards, because they catch opposite mistakes. The match is
+        // exhaustive, so a variant added later stops this compiling until
+        // somebody looks at `ALL`; the count catches a variant taken out of
+        // `ALL` while the type keeps it.
+        fn is_a_kind(kind: Kind) -> bool {
+            match kind {
+                Kind::Session | Kind::WatchToken | Kind::WatchSigningKey => true,
+            }
+        }
+        assert!(Kind::ALL.into_iter().all(is_a_kind));
+        assert_eq!(
+            Kind::ALL.len(),
+            3,
+            "a kind left `ALL`, so `purge` no longer removes it"
+        );
+
         let names: Vec<&str> = Kind::ALL.iter().map(|k| k.entry_name()).collect();
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
