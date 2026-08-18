@@ -519,6 +519,22 @@ pub enum Due {
 /// `0 0 31 2 *` — and the search has to stop rather than spin.
 const HORIZON_MINUTES: i64 = 4 * 366 * 24 * 60;
 
+/// The next moment this schedule is due, for somebody who wants to see it
+/// rather than sleep until it.
+///
+/// The same function the loop uses, deliberately: a preflight that worked the
+/// moments out its own way would be checking a schedule nobody runs. `None`
+/// means the calendar can never match, which is the one answer worth a red line
+/// before anything is scheduled at all.
+pub fn next_moment<Tz: TimeZone>(
+    schedule: &Schedule,
+    last_run: Option<i64>,
+    now: i64,
+    zone: &Tz,
+) -> Option<i64> {
+    next_after(schedule, last_run, now, zone)
+}
+
 /// The next moment this schedule is due after `now`.
 ///
 /// `None` only when the calendar can never match. Both arguments and the answer

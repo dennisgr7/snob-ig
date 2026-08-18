@@ -393,3 +393,104 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     assert_eq!(std::str::from_utf8(&last(&requests).body).unwrap(), BODY);
     assert_eq!(last(&requests).headers.get("x-snob-attempt").unwrap(), "2");
 }
+
+/// The preflight really posts, carrying everything a report would carry.
+///
+/// A parsed URL says nothing about whether the host resolves, the certificate
+/// verifies, the path is registered or the token is the one the receiver wants
+/// — and every one of those turns into a queued report and a retry schedule
+/// hours later, found from `status` if anybody looks. So `snob watch check`
+/// uses the address rather than inspecting it, with the configured headers and
+/// the configured signature: a preflight that skipped either would be checking
+/// a request nobody makes.
+///
+/// It is announced as `watch.preflight` so a receiver can branch on it the way
+/// it branches on the rest, and nothing about it is queued — there is no report
+/// here to retry or deduplicate.
+#[tokio::test]
+async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
+    use snob_cli::engine::check::{Verdict, What};
+
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&receiver)
+        .await;
+
+    let url = Url::parse(&format!("{}/hook", receiver.uri())).unwrap();
+    let key = Secret::from("shared-secret".to_string());
+    let client = WebhookClient::new(Webhook {
+        url,
+        headers: vec![("X-Api-Key".to_string(), "team".to_string())],
+        key: Some(key.clone()),
+    })
+    .unwrap();
+
+    let body = r#"{"event":"watch.preflight"}"#;
+    let checked = snob_cli::engine::check::webhook_of(
+        &client,
+        "https://receiver.example".to_string(),
+        true,
+        "preflight-1",
+        body,
+    )
+    .await;
+
+    assert_eq!(checked.verdict, Verdict::Ok, "{:?}", checked.problem);
+    assert!(matches!(
+        checked.what,
+        What::Webhook {
+            status: Some(204),
+            signed: true,
+            ..
+        }
+    ));
+
+    let sent = &receiver.received_requests().await.unwrap()[0];
+    let header = |name: &str| {
+        sent.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(header("X-Snob-Event"), "watch.preflight");
+    assert_eq!(header("X-Api-Key"), "team", "the configured headers travel");
+    assert_eq!(
+        header("X-Snob-Signature"),
+        sign::sign(std::str::from_utf8(&sent.body).unwrap(), &key),
+        "and so does the signature, over the bytes that were sent"
+    );
+}
+
+/// A receiver that is not there is a failure worth a red line, not a warning.
+#[tokio::test]
+async fn a_preflight_that_cannot_be_delivered_fails_the_check() {
+    use snob_cli::engine::check::Verdict;
+
+    // Started and then dropped, so the port is closed and nothing answers.
+    let address = {
+        let gone = MockServer::start().await;
+        gone.uri()
+    };
+
+    let client = WebhookClient::new(Webhook {
+        url: Url::parse(&format!("{address}/hook")).unwrap(),
+        headers: vec![],
+        key: None,
+    })
+    .unwrap();
+
+    let checked = snob_cli::engine::check::webhook_of(
+        &client,
+        address,
+        false,
+        "preflight-2",
+        r#"{"event":"watch.preflight"}"#,
+    )
+    .await;
+
+    assert_eq!(checked.verdict, Verdict::Failed);
+    assert!(checked.problem.is_some(), "it has to say what went wrong");
+}
