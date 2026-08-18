@@ -65,6 +65,24 @@ nothing sensitive. `snob watch status` reads back what is configured, when each
 list was last reported on, and what is still owed. `snob purge` takes the new
 keyring entries with it, like everything else.
 
+**`snob watch check` says whether a scheduled run would work**, before one runs
+unattended at three in the morning. The schedule through the evaluator that
+actually decides it, with the next three moments in your local time; the
+session, and which store the credential landed in; each watched account —
+that it resolves, that an unattended run may read it, and its counters, so an
+account past the size this tool can walk is found before six hours of walking
+rather than after; and the webhook, by posting one `watch.preflight` message to
+it with your headers and your signature. It writes nothing and walks no list, so
+it is safe to run as often as you like, and it exits non-zero when something
+would stop a run — which makes it usable as a probe rather than only as
+something to read. `snob watch status` gained the same verdict, over what it
+already knew.
+
+`snob watch setup` now finishes by running that check, and then offers to take
+the first capture, saying what it costs in requests and minutes. The first
+scheduled run otherwise lays the baseline down and reports nothing, which reads
+as broken when you have just set the thing up.
+
 The monitor expires captures older than a month, so a database does not grow
 without end on a six-hour schedule. What it never takes: the capture the next
 comparison measures against, the newest of each list, and any interrupted walk

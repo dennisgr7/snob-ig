@@ -177,13 +177,25 @@ snob watch setup
 ```
 
 Asks how often to look and where to send the reports, then writes a file you can
-edit. After that:
+edit. It finishes by trying all of it — the schedule, the session, that each
+account resolves and can be read, and the webhook, by posting one message to it
+— so a typo or an expired token turns up while you are still there rather than
+in an unattended run at three in the morning. Then it offers to take the first
+capture, telling you what that costs, because the first scheduled run otherwise
+lays one down and reports nothing.
 
 ```bash
 snob watch          # stays up and runs on the schedule
 snob watch once     # one run, for cron or a systemd timer
-snob watch status   # what is configured, and when it last ran
+snob watch check    # would a scheduled run work? exits non-zero if not
+snob watch status   # what is configured, when it last ran, and whether it is healthy
 ```
+
+`check` writes nothing and walks no list, so it is safe to run as often as you
+like — one request for the session and one per watched account. Both it and
+`status` exit non-zero when something would stop the monitor doing its job,
+which is what makes them usable from a monitoring system rather than only
+readable.
 
 Or say it directly: `--every 6h`, `--on mon,thu --at 09:00`, or
 `--cron "0 9 * * 1,4"` if you already have one written. The two combine, so
@@ -327,11 +339,16 @@ apart from "wait a while" without reading the message text.
 | 5 | Instagram is throttling, or the account is in cooldown. Wait. |
 | 130 | Stopped by you: Ctrl+C, or a confirmation that was not given — including with no terminal to ask at, where `-y` confirms in advance. |
 
-`followers` and `following` print what they got and exit 0 even when the walk
-was cut short, because a partial list is still true as far as it goes.
+`followers` and `following` print what they got even when the walk was cut
+short, because a partial list is still true as far as it goes — but they still
+exit with the code of whatever stopped them. Only a cap you asked for,
+`--limit` or `--max-pages`, is a 0; Instagram refusing to serve the rest of a
+list is a 1, and throttling is a 5. Something has to be able to tell those
+apart, and the printed names cannot.
+
 `unfollowers`, `fans`, `friends` and `scan` cross two lists, so an incomplete
-one there makes the answer wrong rather than short — those refuse, and exit
-with the code of whatever stopped them.
+one there makes the answer wrong rather than short — those refuse outright, and
+exit the same way.
 
 ## Inspiration
 
