@@ -199,6 +199,57 @@ pub async fn with_a_session(
     watched: &[super::watch::Watched],
     report: &mut CheckReport,
 ) {
+    // **Nothing is spent during a cooldown**, and this is the one request path
+    // in the tool that did not say so. `Pacer::clear_to_send` charges the
+    // budget but never reads the `cooldowns` table — every other caller gates
+    // explicitly — so a command advertised as safe to poll as often as you like
+    // was knocking on a door Instagram had just closed, once per configured
+    // account, on whatever interval a monitoring system polls at.
+    //
+    // Reported rather than skipped in silence: a cooldown is exactly the sort
+    // of thing somebody running `check` wants to be told about, and it lifts on
+    // its own, so it is a warning rather than a failure.
+    match app.client().pacer().cooldown() {
+        Ok(Some(until_ms)) => {
+            let waiting = |what: What| Checked {
+                what,
+                verdict: Verdict::Warned,
+                problem: Some(format!(
+                    "not checked: the account is in cooldown until {}",
+                    crate::report::cooldown_ends_at(until_ms)
+                )),
+            };
+            report.checked.push(waiting(What::Session {
+                viewer: app.viewer().username.clone(),
+                backend: secrets.backend().as_str(),
+            }));
+            for account in watched {
+                report.checked.push(waiting(What::Account {
+                    target: account.name().map(str::to_string),
+                    pk: None,
+                    followers: None,
+                    following: None,
+                    may_run_unattended: account.may_run_unattended(),
+                }));
+            }
+            return;
+        }
+        Ok(None) => {}
+        // The budget itself is unreadable. That is worth a line, and it is not
+        // a reason to go and spend anyway.
+        Err(e) => {
+            report.checked.push(Checked {
+                what: What::Session {
+                    viewer: app.viewer().username.clone(),
+                    backend: secrets.backend().as_str(),
+                },
+                verdict: Verdict::Failed,
+                problem: Some(e.to_string()),
+            });
+            return;
+        }
+    }
+
     let session = match app.client().validate().await {
         Ok(()) => Checked {
             what: What::Session {

@@ -397,3 +397,43 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
     assert_eq!(outcome.requests, 0);
     assert_eq!(requests(&empty).await, 0);
 }
+
+/// A cooldown that lands while the confirmation prompt is open costs nothing.
+///
+/// The second check sat past `target::resolve`, and resolving is a request —
+/// so a named target spent exactly the counter poll `engine::cooldown` says
+/// must never be spent: "nothing may be spent, not even the counter poll". The
+/// regression test beside this one missed it because its fixture leaves
+/// `target` as `None`, which is the one shape that resolves without asking
+/// Instagram anything.
+///
+/// `after(1)`: the entry check sees nothing, and the cooldown is there by the
+/// time the second one looks. That is the window the second check exists for.
+#[tokio::test]
+async fn a_cooldown_landing_before_the_resolve_spends_nothing() {
+    let server = MockServer::start().await;
+    mount_profile(
+        &server,
+        r#"{"id":"7","username":"someone","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _schema = Store::open(&AppPaths::rooted_at(tmp.path())).unwrap();
+
+    let named = ListArgs {
+        target: Some("someone".to_string()),
+        ..args()
+    };
+    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(1));
+    let error = execute_with(&server, reopen(tmp.path()), budget, &named)
+        .await
+        .unwrap_err();
+
+    assert_rate_limited(&error);
+    assert_eq!(
+        requests(&server).await,
+        0,
+        "resolving the name is a request, and a cooldown is a cooldown"
+    );
+}
