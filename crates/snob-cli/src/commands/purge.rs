@@ -339,7 +339,13 @@ mod tests {
     fn a_plan_with_no_session_and_no_directories_removes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path());
-        let store = SecretStore::new(paths, true).with_service("snob-ig-test-purge-empty");
+        // A name of its own per run, like every other test service name in the
+        // tree. A fixed one is shared with whatever else happens to be running
+        // -- and `cargo test --workspace` runs this binary alongside
+        // `snob-core`'s, in a different process, against the one credential
+        // store the operating system has.
+        let store = SecretStore::new(paths, true)
+            .with_service(&format!("snob-ig-test-purge-empty-{}", std::process::id()));
 
         let failures = execute(&Plan::default(), &store);
         assert!(failures.is_empty());

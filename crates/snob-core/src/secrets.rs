@@ -827,8 +827,16 @@ mod tests {
     /// race is below this code and cannot be fixed from here. Running them one
     /// at a time is the whole fix, and it costs milliseconds.
     ///
-    /// The guard is handed back by `file_store` so a test cannot forget to take
-    /// it: there is no way to get a store without one.
+    /// The guard is handed back by `file_store` so a test that goes through it
+    /// cannot forget to take it. One test does not go through it --
+    /// `the_session_lands_where_the_probe_said_it_would` builds a
+    /// keyring-backed store on purpose -- and it takes the lock by hand.
+    ///
+    /// **It does not reach across test binaries**, which a `static` cannot do,
+    /// and `snob-cli` runs its own in parallel. That is why this is a reduction
+    /// in a failure rate rather than a fix: what is left is one operating
+    /// system credential store being written by two processes at once, which
+    /// nothing in this repository can serialize.
     fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1029,6 +1037,11 @@ mod tests {
     /// the destination cannot disagree.
     #[test]
     fn the_session_lands_where_the_probe_said_it_would() {
+        // The lock, taken by hand because this is the one test that builds a
+        // keyring-backed store rather than going through `file_store` -- and
+        // the only one in the workspace that *writes* to the operating
+        // system's credential store.
+        let _keyring = keyring_lock();
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path());
         let store = SecretStore::new(paths, false).with_service(&test_service());
