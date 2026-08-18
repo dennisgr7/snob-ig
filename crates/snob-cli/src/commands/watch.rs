@@ -488,36 +488,44 @@ fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
     let given =
         args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty() || args.every.is_some();
 
+    // The schedule halves come as a set, so a flag does not merge into a
+    // configured calendar — but the jitter is not one of those halves, and it
+    // was dropped with them in **both** directions.
+    //
+    // `given` looks only at `cron`/`at`/`on`/`every`, so with the schedule in
+    // the file `snob watch --jitter 0` threw the flag away; and the early return
+    // below carries `args.jitter` alone, so a file's `jitter = "0"` was thrown
+    // away the moment any schedule flag was typed. Both are documented as
+    // turning jitter off, unqualified, and each direction leaves the banner
+    // announcing a value nobody chose.
+    //
+    // Worked out once, before the halves are decided, because it does not depend
+    // on which source won them.
+    let jitter = args.jitter.or_else(|| configured.and_then(|c| c.jitter));
+
     if given {
         return When {
             cron: args.cron.clone(),
             at: args.at.clone(),
             on: args.on.clone(),
             every: args.every,
-            jitter: args.jitter,
+            jitter,
         };
     }
-    // The schedule halves come as a set, so a flag does not merge into a
-    // configured calendar — but the jitter is not one of those halves, and it
-    // was being dropped with them. `given` looks only at `cron`/`at`/`on`/
-    // `every`, so with the schedule in the file `snob watch --jitter 0` threw
-    // the flag away and the banner printed "Each run is pushed up to fifteen
-    // minutes later" over the value just typed. The help and the CHANGELOG both
-    // say "0 turns it off", with no qualification about what else was typed.
     match configured {
         Some(c) => When {
             cron: c.cron.clone(),
             at: c.at.clone(),
             on: c.on.clone(),
             every: c.every,
-            jitter: args.jitter.or(c.jitter),
+            jitter,
         },
         None => When {
             cron: None,
             at: vec![],
             on: vec![],
             every: None,
-            jitter: args.jitter,
+            jitter,
         },
     }
 }
@@ -2382,6 +2390,45 @@ consent = { agreed_at = 1700 }
         // Without the flag, the file's own value stands.
         let bare = when_from(&WatchRunArgs::default(), Some(&file));
         assert_eq!(bare.jitter, Some(std::time::Duration::from_secs(600)));
+    }
+
+    /// A jitter in the file survives a schedule typed on the command line.
+    ///
+    /// The other direction of the same rule. `when_from` returns early as soon
+    /// as any schedule flag is given, carrying `args.jitter` alone — so a
+    /// file's `jitter = "0"`, documented unqualified as turning jitter off,
+    /// became the built-in default the moment somebody typed `--every`. The
+    /// halves come as a set; the jitter is not one of them.
+    #[test]
+    fn a_configured_jitter_survives_a_schedule_that_was_typed() {
+        let file = WatchConfig {
+            schema: 1,
+            every: None,
+            at: vec!["09:00".to_string()],
+            on: vec![],
+            cron: None,
+            jitter: Some(std::time::Duration::ZERO),
+            webhook: None,
+            accounts: vec![],
+        };
+
+        let typed = WatchRunArgs {
+            every: Some(std::time::Duration::from_secs(7200)),
+            ..Default::default()
+        };
+        let when = when_from(&typed, Some(&file));
+
+        assert_eq!(
+            when.jitter,
+            Some(std::time::Duration::ZERO),
+            "the file said to turn it off, and nothing here said otherwise"
+        );
+        assert_eq!(
+            when.every,
+            Some(std::time::Duration::from_secs(7200)),
+            "and the schedule halves still come as a set"
+        );
+        assert!(when.at.is_empty(), "the file's calendar does not merge in");
     }
 
     /// A fresh install does not step over the first moment its calendar names.
