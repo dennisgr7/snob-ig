@@ -18,7 +18,7 @@ use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
 use snob_core::secrets::{Kind, SecretStore};
 use snob_core::store::deliveries;
-use snob_core::watch::config::{self, WatchConfig};
+use snob_core::watch::config::{self, WatchConfig, WebhookConfig};
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
 use snob_core::watch::{Basis, ListDiff, Rename};
 use url::Url;
@@ -607,17 +607,39 @@ struct Delivery {
     destination: String,
 }
 
-/// Reads the webhook arguments, or explains what is wrong with them.
+/// What this run would send, worked out without touching the keyring or the
+/// network.
 ///
-/// Called before anything is opened or spent. A run that would have shouted a
-/// token over plain HTTP fails while somebody is still there to read the
-/// message, rather than six hours later into a log.
-fn delivery_from(
+/// Split out of [`delivery_from`] so the four rules it holds can be reached by a
+/// test at all. They could not be: that function takes a `&SecretStore` and
+/// hands back a live HTTP client, so nothing in the suite could ask it a
+/// question -- and replacing the origin comparison below with `true` left all
+/// 656 tests green, on the guard whose own comment records a team's `X-Api-Key`
+/// and the stored bearer token arriving at `webhook.site`.
+struct Planned {
+    webhook: Webhook,
+    heartbeat: bool,
+}
+
+/// Decides what to send, and what to say about it.
+///
+/// **The warnings come back rather than being printed**, because a decision that
+/// prints is a decision that cannot be checked. They are in the order they have
+/// to be said: either the no-webhook one on its own, or the withheld-headers one
+/// and then the withheld-token one.
+///
+/// The two stored secrets are read by the caller rather than in here, which is
+/// what makes this reachable without a keyring. One consequence, written down
+/// rather than left to be found: a machine whose keyring is broken now reports
+/// the keyring's error where it used to report the clearer one about an empty
+/// `--sign-with`. The session opened moments later would have reported it anyway.
+fn plan(
     args: &WebhookArgs,
-    configured: Option<&WatchConfig>,
-    secrets: &SecretStore,
-) -> Result<Option<Delivery>> {
-    let from_file = configured.and_then(|c| c.webhook.as_ref());
+    from_file: Option<&WebhookConfig>,
+    stored_token: Option<Secret>,
+    stored_key: Option<Secret>,
+) -> Result<(Option<Planned>, Vec<String>)> {
+    let mut warnings: Vec<String> = Vec::new();
 
     let Some(url) = args
         .webhook
@@ -625,9 +647,11 @@ fn delivery_from(
         .or_else(|| from_file.map(|w| w.url.clone()))
     else {
         if !args.header.is_empty() || args.sign_with.is_some() || args.heartbeat {
-            ui::warn("there is no webhook, so nothing is sent and those options do nothing");
+            warnings.push(
+                "there is no webhook, so nothing is sent and those options do nothing".to_string(),
+            );
         }
-        return Ok(None);
+        return Ok((None, warnings));
     };
 
     let url = Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?;
@@ -637,8 +661,8 @@ fn delivery_from(
     //
     // Nothing used to ask. `--webhook` replaced the URL and the file's headers
     // and the keyring token came along regardless, so
-    // `snob watch once --webhook https://webhook.site/<id>` — which is precisely
-    // what somebody does to see what the payload looks like — sent the team's
+    // `snob watch once --webhook https://webhook.site/<id>` -- which is precisely
+    // what somebody does to see what the payload looks like -- sent the team's
     // `X-Api-Key` and the bearer token `setup` had stored to a host nobody had
     // configured. Not malice, debugging. `check` was happy because the new
     // address was https.
@@ -655,7 +679,7 @@ fn delivery_from(
         .is_none_or(|origin| *origin == url.origin());
 
     // Headers from the file first, then the ones typed, so a flag can override
-    // a configured one of the same name — the last one wins at the request.
+    // a configured one of the same name -- the last one wins at the request.
     let mut headers: Vec<(String, String)> = from_file
         .filter(|_| same_destination)
         .map(|w| {
@@ -666,10 +690,9 @@ fn delivery_from(
         })
         .unwrap_or_default();
     if !same_destination && from_file.is_some_and(|w| !w.headers.is_empty()) {
-        ui::warn(&format!(
-            "{} is not the address in the configuration, so the headers configured there are not \
-             sent with it. Pass what this one needs with --header.",
-            url
+        warnings.push(format!(
+            "{url} is not the address in the configuration, so the headers configured there are \
+             not sent with it. Pass what this one needs with --header."
         ));
     }
 
@@ -687,26 +710,25 @@ fn delivery_from(
     //
     // The guard looks at the **merged** list, not only at the flags. Inspecting
     // `args.header` alone meant a configured `Authorization` and a stored token
-    // both went out — and the second one was the secret `setup` had put away.
+    // both went out -- and the second one was the secret `setup` had put away.
     //
     // And only to the address it was stored for. A token is a credential like
-    // the session cookie, and the one guard this module is arranged around — the
-    // client cannot carry the session — said nothing about this one.
+    // the session cookie, and the one guard this module is arranged around -- the
+    // client cannot carry the session -- said nothing about this one.
     let authorization_given = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
-    if !authorization_given && let Some(token) = secrets.load_secret(Kind::WatchToken)? {
+    if !authorization_given && let Some(token) = stored_token {
         if same_destination {
             headers.push(("Authorization".to_string(), token.expose().to_string()));
         } else {
-            ui::warn(&format!(
-                "the stored token was set up for {}, so it is not sent to {}. Pass one with \
+            warnings.push(format!(
+                "the stored token was set up for {}, so it is not sent to {url}. Pass one with \
                  --header \"Authorization: ...\" if this address needs it.",
                 configured_origin
                     .as_ref()
                     .map(|o| o.ascii_serialization())
                     .unwrap_or_default(),
-                url
             ));
         }
     }
@@ -714,8 +736,8 @@ fn delivery_from(
     let key = match args.sign_with.clone() {
         // An empty `--sign-with` is not a request to sign with nothing: it is
         // `--sign-with ${SNOB_KEY}` in a unit file where the variable is unset.
-        // Taken literally it signs with a zero-length key — a well-formed
-        // signature anybody can forge — and, because this arm wins over the
+        // Taken literally it signs with a zero-length key -- a well-formed
+        // signature anybody can forge -- and, because this arm wins over the
         // keyring, it would silently replace a key that was configured
         // correctly. `ask_webhook` already refuses an empty one; the flag has
         // to agree with it.
@@ -725,19 +747,51 @@ fn delivery_from(
              used when it is absent."
         ),
         Some(given) => Some(Secret::from(given)),
-        None => secrets.load_secret(Kind::WatchSigningKey)?,
+        None => stored_key,
     };
 
-    let webhook = Webhook { url, headers, key };
-    webhook::check(&webhook)?;
+    Ok((
+        Some(Planned {
+            webhook: Webhook { url, headers, key },
+            heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
+        }),
+        warnings,
+    ))
+}
+
+/// Reads the webhook arguments, or explains what is wrong with them.
+///
+/// Called before anything is opened or spent. A run that would have shouted a
+/// token over plain HTTP fails while somebody is still there to read the
+/// message, rather than six hours later into a log.
+fn delivery_from(
+    args: &WebhookArgs,
+    configured: Option<&WatchConfig>,
+    secrets: &SecretStore,
+) -> Result<Option<Delivery>> {
+    let (planned, warnings) = plan(
+        args,
+        configured.and_then(|c| c.webhook.as_ref()),
+        secrets.load_secret(Kind::WatchToken)?,
+        secrets.load_secret(Kind::WatchSigningKey)?,
+    )?;
+
+    for warning in &warnings {
+        ui::warn(warning);
+    }
+
+    let Some(planned) = planned else {
+        return Ok(None);
+    };
+    webhook::check(&planned.webhook)?;
 
     Ok(Some(Delivery {
         // The origin this run posts to, kept beside the client so the outbox can
         // be filtered by it: a queued report belongs to the address it was
         // addressed to, and `--webhook` must not flush a backlog somewhere else.
-        destination: destination_of(&webhook.url),
-        client: WebhookClient::new(webhook)?,
-        heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
+        destination: destination_of(&planned.webhook.url),
+        client: WebhookClient::new(planned.webhook)?,
+        heartbeat: planned.heartbeat,
     }))
 }
 
@@ -1385,6 +1439,185 @@ fn earliest_since(report: &WatchReport) -> Option<i64> {
 mod tests {
     use super::*;
     use snob_core::Pk;
+
+    /// A `[webhook]` section as `watch.toml` would parse it.
+    fn configured(url: &str, headers: &[(&str, &str)]) -> WebhookConfig {
+        WebhookConfig {
+            url: url.to_string(),
+            headers: headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            heartbeat: false,
+        }
+    }
+
+    /// Every value the planned request would send under this name.
+    ///
+    /// A `Vec`, not an `Option`: "the header went out twice" and "the header
+    /// went out once" are different answers, and one of the defects this file
+    /// has already had was exactly that.
+    fn sent_as<'a>(planned: &'a Planned, name: &str) -> Vec<&'a str> {
+        planned
+            .webhook
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// A credential set up for one address does not follow `--webhook` to
+    /// another.
+    ///
+    /// Pointing a run at a request bin to see what the payload looks like is the
+    /// first thing anybody does, and it used to send the team's `X-Api-Key` and
+    /// the bearer token `snob watch setup` had stored to that bin. `check` was
+    /// happy, because the new address was https.
+    ///
+    /// Replacing the origin comparison with `true` left all 656 tests green
+    /// before this existed.
+    #[test]
+    fn a_token_stored_for_one_host_is_not_sent_to_another() {
+        let file = configured(
+            "https://n8n.internal/webhook/snob",
+            &[("X-Api-Key", "team")],
+        );
+        let args = WebhookArgs {
+            webhook: Some("https://bin.example/inspect".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(
+            &args,
+            Some(&file),
+            Some(Secret::from("Bearer stored".to_string())),
+            None,
+        )
+        .unwrap();
+        let planned = planned.expect("there is an address to post to");
+
+        assert_eq!(sent_as(&planned, "Authorization"), Vec::<&str>::new());
+        assert_eq!(sent_as(&planned, "X-Api-Key"), Vec::<&str>::new());
+        assert_eq!(
+            warnings.len(),
+            2,
+            "both the headers and the token were withheld, so both are said: {warnings:?}"
+        );
+        assert!(warnings[0].contains("not sent with it"), "{warnings:?}");
+        assert!(warnings[1].contains("stored token"), "{warnings:?}");
+    }
+
+    /// The same address is the same destination, however the URL was written.
+    #[test]
+    fn the_stored_token_is_sent_to_the_address_it_was_stored_for() {
+        let file = configured("https://n8n.internal/webhook/snob", &[]);
+        // A different path on the same host: still where the token belongs.
+        let args = WebhookArgs {
+            webhook: Some("https://n8n.internal/webhook/other".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(
+            &args,
+            Some(&file),
+            Some(Secret::from("Bearer stored".to_string())),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sent_as(&planned.unwrap(), "Authorization"),
+            ["Bearer stored"]
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A configured `Authorization` stops the stored one being added, so the
+    /// two never both go out.
+    ///
+    /// The guard reads the **merged** list rather than the flags: looking only
+    /// at `--header` meant a configured one and the keyring's one both
+    /// travelled, and the second was the secret `setup` had put away.
+    #[test]
+    fn a_configured_authorization_stops_the_stored_token_being_added() {
+        let file = configured(
+            "https://n8n.internal/webhook/snob",
+            &[("Authorization", "Bearer configured")],
+        );
+
+        let (planned, _) = plan(
+            &WebhookArgs::default(),
+            Some(&file),
+            Some(Secret::from("Bearer stored".to_string())),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sent_as(&planned.unwrap(), "Authorization"),
+            ["Bearer configured"],
+            "the stored token was added on top of one that was already there"
+        );
+    }
+
+    /// An empty `--sign-with` is an unset environment variable, not a request
+    /// to sign with nothing.
+    ///
+    /// Taken literally it signs with a zero-length key -- a well-formed
+    /// signature anybody can forge -- and, because the flag wins over the
+    /// keyring, it would silently replace a key that was configured correctly.
+    #[test]
+    fn an_empty_sign_with_is_refused_rather_than_signing_with_nothing() {
+        for given in ["", "   "] {
+            let args = WebhookArgs {
+                webhook: Some("https://n8n.internal/hook".into()),
+                sign_with: Some(given.to_string()),
+                ..Default::default()
+            };
+            // Mapped away rather than unwrapped: the error carries a `Planned`,
+            // which holds the merged headers, and those hold the token in the
+            // clear.
+            let refused = plan(&args, None, None, None).map(|_| ()).unwrap_err();
+            assert!(refused.to_string().contains("empty value"), "{refused}");
+        }
+    }
+
+    /// A typed header goes out after a configured one of the same name, which
+    /// is what lets the flag override the file: the last one wins at the
+    /// request.
+    #[test]
+    fn a_typed_header_comes_after_the_one_from_the_file() {
+        let file = configured("https://n8n.internal/hook", &[("X-Source", "file")]);
+        let args = WebhookArgs {
+            header: vec!["X-Source: typed".into()],
+            ..Default::default()
+        };
+
+        let (planned, _) = plan(&args, Some(&file), None, None).unwrap();
+
+        assert_eq!(
+            sent_as(&planned.unwrap(), "X-Source"),
+            ["file", "typed"],
+            "order is the override: `post` inserts them in turn"
+        );
+    }
+
+    /// Options that need a webhook say so when there is none, rather than doing
+    /// nothing quietly.
+    #[test]
+    fn asking_for_a_signature_with_nowhere_to_send_it_is_said_out_loud() {
+        let args = WebhookArgs {
+            sign_with: Some("a secret".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(&args, None, None, None).unwrap();
+
+        assert!(planned.is_none());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("no webhook"), "{warnings:?}");
+    }
 
     fn user(pk: Pk, name: &str) -> User {
         User {
