@@ -259,6 +259,21 @@ pub struct Schedule {
     jitter: Duration,
 }
 
+impl Schedule {
+    /// Whether the moments this fires at are named rather than measured.
+    ///
+    /// The difference matters in exactly one place: what a fresh install should
+    /// pass as `last_run`. An interval with no past to measure from is due
+    /// immediately, so a caller that does not want a walk the moment the monitor
+    /// is set up has to invent one. A calendar has its own moments and needs no
+    /// invention — and inventing one there is harmful, because it puts
+    /// `MIN_GAP_SECS` between the install and the first run and steps over any
+    /// moment inside the next quarter of an hour.
+    pub fn is_on_a_calendar(&self) -> bool {
+        self.calendar.is_some()
+    }
+}
+
 /// What is wrong with a schedule, said so somebody can fix it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleError {
@@ -507,6 +522,52 @@ fn next_after<Tz: TimeZone>(
         return Some(floor.max(now));
     };
 
+    // A local time that does not exist — the hour a spring-forward skips —
+    // maps to no instant, and one that happens twice maps to two. `single()`
+    // accepts neither, so a time the wall clock never showed is stepped over
+    // rather than invented.
+    let allowed = |minute: &i64| {
+        zone.timestamp_opt(minute * 60, 0)
+            .single()
+            .is_some_and(|at| calendar.allows(&at))
+    };
+
+    // **A moment that has already gone by is still owed.** The search only ever
+    // looked forward, and it works in whole minutes, so the answer was always
+    // the *ceiling* minute of `now` — never `now` itself unless the clock
+    // happened to read exactly `:00`. `store::now()` is an arbitrary second, so
+    // `due` produced `Due::Now` for a calendar with probability of about one in
+    // nine hundred, and every calendar run was therefore scheduled forward
+    // instead of taken.
+    //
+    // What that cost is the whole point of the feature: a machine powered on at
+    // 09:05 with `--at 09:00` waited until the next day, a laptop that suspended
+    // across the moment lost the run outright, and the calendar branch of
+    // `missed_since` together with the "runs were missed" line were unreachable
+    // code — while the CHANGELOG said missed runs are folded into one and
+    // reported.
+    //
+    // So before looking forward, look back: if the floor allows it and any
+    // minute between the floor and now was one this calendar names, the run is
+    // owed **now**. Folded into one and never replayed, which is what
+    // `missed_since` counts and what the rule against bursts requires.
+    //
+    // Walking backwards from `now` rather than forwards from the floor, so the
+    // first hit is the most recent one and a machine that was off for a month
+    // stops after a day's worth of minutes rather than a month's. The horizon
+    // bounds it for the same reason it bounds the forward search.
+    if floor <= now {
+        let earliest = floor.div_euclid(60) + i64::from(floor.rem_euclid(60) != 0);
+        let latest = now.div_euclid(60);
+        if (earliest..=latest)
+            .rev()
+            .take(HORIZON_MINUTES as usize)
+            .any(|minute| allowed(&minute))
+        {
+            return Some(now);
+        }
+    }
+
     // Minute resolution, so the search starts at the next whole minute at or
     // after the floor. Seconds are not expressible in either syntax.
     let start = floor.max(now);
@@ -514,15 +575,7 @@ fn next_after<Tz: TimeZone>(
 
     (first..)
         .take(HORIZON_MINUTES as usize)
-        .find(|minute| {
-            // A local time that does not exist — the hour a spring-forward
-            // skips — maps to no instant, and one that happens twice maps to
-            // two. `single()` accepts neither, so a time the wall clock never
-            // showed is stepped over rather than invented.
-            zone.timestamp_opt(minute * 60, 0)
-                .single()
-                .is_some_and(|at| calendar.allows(&at))
-        })
+        .find(allowed)
         .map(|minute| minute * 60)
 }
 
@@ -599,8 +652,20 @@ fn missed_since<Tz: TimeZone>(
     // With one, the moments it allows have to be walked. Each step starts from
     // the moment found, so `every` keeps acting as the floor it is.
     //
-    // Only moments strictly before `now` are counted, so the one due this
-    // instant is already excluded — nothing is subtracted afterwards.
+    // Every moment up to and including `now` is walked, and **the last one is
+    // the run happening now** rather than one that was missed, so one comes off
+    // the end.
+    //
+    // It used to stop strictly before `now` and subtract nothing, which was
+    // right only while `Due::Now` meant the clock read the grid moment to the
+    // second. It does not any more: a moment that went by is taken now, so the
+    // moment being served is itself strictly before `now` and was counted as
+    // skipped. A machine woken at 09:41 on a `--at 09:00` schedule ran once and
+    // announced one missed run, which is the run it was doing.
+    //
+    // Subtracting at the end rather than special-casing covers both ways in: on
+    // a clock that does read exactly `:00`, `now` is the last moment walked and
+    // comes off just the same.
     //
     // `next > at` is what makes the walk finish. Without an `every` the floor
     // used to be `now` itself, so a moment already on the grid answered with
@@ -611,16 +676,16 @@ fn missed_since<Tz: TimeZone>(
     // constant somewhere else.
     let mut counted = 0;
     let mut at = last;
-    while counted < MAX_MISSED_COUNTED {
+    while counted <= MAX_MISSED_COUNTED {
         match next_after(schedule, Some(at), at, zone) {
-            Some(next) if next < now && next > at => {
+            Some(next) if next <= now && next > at => {
                 counted += 1;
                 at = next;
             }
             _ => break,
         }
     }
-    counted
+    counted.saturating_sub(1)
 }
 
 /// The largest number of skipped runs worth counting exactly.
@@ -963,6 +1028,54 @@ mod tests {
         match due(&schedule, Some(last), last + 14 * hours(24), &Utc) {
             Due::Now { missed } => assert_eq!(missed, 1, "one Monday went by unrun"),
             other => panic!("should be due: {other:?}"),
+        }
+    }
+
+    /// A calendar moment that went by is due now, whatever second it is.
+    ///
+    /// The search only ever looked forward and works in whole minutes, so the
+    /// answer was always the *ceiling* minute of `now` — never `now` itself
+    /// unless the clock read exactly `:00`. `store::now()` gives an arbitrary
+    /// second, so `Due::Now` for a calendar came up about once in nine hundred,
+    /// and a machine powered on at 09:05 with `--at 09:00` waited until the next
+    /// day. Every calendar test that existed happened to use an aligned
+    /// timestamp, which is the whole reason the suite was green over it.
+    #[test]
+    fn a_calendar_moment_that_went_by_is_due_at_any_second_of_the_clock() {
+        let schedule = Schedule::cron("0 9 * * *").unwrap();
+        // Ran yesterday at nine.
+        let last = at(hours(9) - hours(24));
+
+        // Powered on at 09:05:37: nine o'clock has gone by unrun.
+        let now = at(hours(9) + 5 * 60 + 37);
+        assert!(
+            matches!(due(&schedule, Some(last), now, &Utc), Due::Now { .. }),
+            "a run owed since 09:00 is still owed at 09:05:37"
+        );
+
+        // And 08:55:37 is before it, so it is not owed yet — the backward look
+        // must not reach past the floor and find yesterday's moment again.
+        let before = at(hours(8) + 55 * 60 + 37);
+        assert_eq!(
+            due(&schedule, Some(last), before, &Utc),
+            Due::At(at(hours(9))),
+            "the moment has not come yet"
+        );
+    }
+
+    /// The same, for the shape a laptop is actually in: suspended across the
+    /// moment, woken minutes later, with `--on` and `--at` rather than cron.
+    #[test]
+    fn a_moment_slept_through_is_taken_on_waking() {
+        let schedule = Schedule::calendar(&[Weekday::Mon], &[(9, 0)]).unwrap();
+        let last = at(hours(9) - 7 * hours(24));
+
+        match due(&schedule, Some(last), at(hours(9) + 41 * 60 + 3), &Utc) {
+            Due::Now { missed } => assert_eq!(
+                missed, 0,
+                "the one due now is not itself a missed run: {missed}"
+            ),
+            other => panic!("a Monday nine o'clock slept through is owed: {other:?}"),
         }
     }
 
