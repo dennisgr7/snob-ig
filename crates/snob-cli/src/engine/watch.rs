@@ -466,17 +466,49 @@ fn refusal(outcome: &ListOutcome) -> Option<Skipped> {
     None
 }
 
-/// Reads the report without touching the network.
+/// Reads the report without touching the network, and without recording it.
 ///
-/// `advance` decides whether the marks move. `snob watch diff` looks and leaves
-/// them alone — a question whose answer changes when it is asked is one nobody
-/// can check — so every production caller passes `false`, and what `true` is for
-/// is a test that wants a comparison recorded without a network to fetch it
-/// from. It writes through [`crate::engine::watch::commit`]'s function rather
-/// than its own statements, so there is one writer of marks in the program: the
-/// two paths used to disagree about which lists a report had spoken about, and
-/// the tests were then proving something about a path production never took.
-pub fn from_store(app: &mut App, typed: Option<&str>, advance: bool) -> Result<WatchReport> {
+/// **It takes `&App`, and that is the guard rather than a convention.**
+/// Recording a report means `commit_report`, which needs a `&mut Store`; there
+/// is no way to reach one from a shared borrow, so this entry point is
+/// incapable of moving a mark.
+///
+/// It used to be one function with an `advance: bool`, and `snob watch diff`
+/// passed `false`. Flipping that one literal to `true` left the whole suite
+/// green -- on the command whose entire contract is that asking twice gives the
+/// same answer, and with `commit_report` called with nothing to queue, which is
+/// the one direction its own doc says must never happen.
+pub fn from_store(app: &App, typed: Option<&str>) -> Result<WatchReport> {
+    Ok(look(app, typed)?.1.report)
+}
+
+/// Reads the report and records having made it, the way a tick does.
+///
+/// **Tests only.** Nothing in production wants this: a report that was recorded
+/// but never sent anywhere is a window nobody will ever hear about again. It
+/// exists so a test can put an account into "already reported" state without a
+/// network to fetch a walk from, and it writes through the same `commit_report`
+/// a tick writes through, so there is one writer of marks in the program rather
+/// than two that can come to disagree about which lists a report spoke about.
+#[doc(hidden)]
+pub fn record_from_store(app: &mut App, typed: Option<&str>) -> Result<WatchReport> {
+    let (pk, compared) = look(app, typed)?;
+
+    let (_, db, _) = app.parts();
+    store::commit_report(
+        db,
+        pk,
+        &compared.marks,
+        snob_core::store::now(),
+        compared.rename_cursor,
+        None,
+    )?;
+
+    Ok(compared.report)
+}
+
+/// The comparison both entry points make, and what committing it would write.
+fn look(app: &App, typed: Option<&str>) -> Result<(Pk, Compared)> {
     let (pk, username) = resolve(app, typed)?;
 
     // From the view, so an interrupted walk cannot become a basis for
@@ -494,27 +526,9 @@ pub fn from_store(app: &mut App, typed: Option<&str>, advance: bool) -> Result<W
     // next report's side rather than being marked as said without having been
     // said.
     let head = store::history_head(app.db().conn())?;
-    let compared = compare(app, pk, &usable, head)?;
-
-    if advance {
-        // Through `commit_report`, the same function a tick writes with, so
-        // there is one writer of marks in the program rather than two that can
-        // come to disagree. No report is queued: this path is for a caller that
-        // wants the answer recorded without sending anything.
-        let (_, db, _) = app.parts();
-        store::commit_report(
-            db,
-            pk,
-            &compared.marks,
-            snob_core::store::now(),
-            compared.rename_cursor,
-            None,
-        )?;
-    }
-
-    let mut report = compared.report;
-    report.username = username;
-    Ok(report)
+    let mut compared = compare(app, pk, &usable, head)?;
+    compared.report.username = username;
+    Ok((pk, compared))
 }
 
 /// Compares each named capture against its receipt.
