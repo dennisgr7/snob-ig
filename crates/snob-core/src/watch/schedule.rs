@@ -222,6 +222,24 @@ impl Calendar {
     ///
     /// Only [`Calendar::tightest_gap`] asks, to decide whether the wrap around
     /// midnight is a gap between two runs or a week of waiting.
+    /// Whether the day fields name a subset of the days rather than all of them.
+    ///
+    /// The jitter ceiling asks, because pushing a run past midnight is only
+    /// harmless when the next day is one the calendar allows too.
+    fn days_are_restricted(&self) -> bool {
+        !self.days_of_month.is_all(1..=31) || !self.days_of_week.is_all(0..=6)
+    }
+
+    /// How much of the day is left after its last moment.
+    ///
+    /// The bound on jitter when the days are restricted: past midnight is a day
+    /// this calendar does not name, and a run that lands there is the failure
+    /// [`Schedule::with_jitter`]'s doc says the bound exists to stop.
+    fn room_before_midnight(&self) -> i64 {
+        let latest = self.times.moments().into_iter().max().unwrap_or(0);
+        24 * 3_600 - latest
+    }
+
     fn days_can_be_consecutive(&self) -> bool {
         let dom_restricted = !self.days_of_month.is_all(1..=31);
         let dow_restricted = !self.days_of_week.is_all(0..=6);
@@ -435,7 +453,24 @@ impl Schedule {
         match &self.calendar {
             Some(calendar) => {
                 let gap = calendar.tightest_gap().unwrap_or(A_DAY);
-                Duration::from_secs(gap.saturating_sub(step).max(0) as u64)
+                let mut room = gap.saturating_sub(step).max(0);
+                // **And not past midnight, when the days are restricted.** With
+                // one moment a day `tightest_gap` is `None` and the fallback is
+                // a whole day, however narrow the day fields are — so
+                // `--on mon --at 09:00 --jitter 20h` kept all twenty hours and a
+                // run due Monday morning walked on Tuesday at three, which is
+                // the failure this bound exists to stop, named in as many words
+                // in `with_jitter`'s own doc. It reaches a calendar with several
+                // moments too: the last one of the day has the same midnight in
+                // front of it whatever the gap behind it was.
+                //
+                // Unrestricted days need no cap: the next day is one the
+                // calendar names, so a run that lands there has landed
+                // somewhere legal.
+                if calendar.days_are_restricted() {
+                    room = room.min(calendar.room_before_midnight());
+                }
+                Duration::from_secs(room as u64)
             }
             // No grid to miss. An interval is measured from the previous run, so
             // what the jitter moves is the whole schedule rather than one run
@@ -625,8 +660,29 @@ fn next_after<Tz: TimeZone>(
     // first hit is the most recent one and a machine that was off for a month
     // stops after a day's worth of minutes rather than a month's. The horizon
     // bounds it for the same reason it bounds the forward search.
+    // **The window is bounded by the last run, not by the floor.** The floor
+    // stays as the legality guard — `floor <= now` — but using it as the bottom
+    // of the window dropped every moment between the two, and a run is almost
+    // never recorded exactly on its grid minute: `commands::watch` stores the
+    // wall clock, so one second past is the ordinary case. `*/15` recorded at
+    // 09:00:01 has its floor at 09:15:01, so the 09:15 moment is below the
+    // window and above nothing — neither taken nor scheduled. It ran every half
+    // hour; `--every 1w --on mon --at 09:00` became fortnightly.
+    //
+    // Strictly after the last run's own minute, so the moment just served is not
+    // served twice.
+    //
+    // With nothing ever run, the window is the minute `now` is in. It was
+    // `now` itself, which is a whole minute only on the second — so a first
+    // `snob watch --on mon --at 09:00` started at 09:00:00 ran, and the same
+    // command started at 09:00:20 waited a week. That is the `:00`-to-the-second
+    // discontinuity taken out of the `last_run` path, left behind where a fresh
+    // install passes `None`.
+    let earliest = match last_run {
+        Some(last) => last.div_euclid(60) + 1,
+        None => now.div_euclid(60),
+    };
     if floor <= now {
-        let earliest = floor.div_euclid(60) + i64::from(floor.rem_euclid(60) != 0);
         let latest = now.div_euclid(60);
         if (earliest..=latest)
             .rev()
@@ -637,8 +693,20 @@ fn next_after<Tz: TimeZone>(
         }
     }
 
-    // Minute resolution, so the search starts at the next whole minute at or
-    // after the floor. Seconds are not expressible in either syntax.
+    // Forward, from the floor. **The answer is on the grid and past the floor,
+    // both**, which is the rule AGENTS.md states and the test below sweeps: an
+    // instant the expression does not name is not an answer, and neither is one
+    // inside the minimum gap.
+    //
+    // A grid moment that falls between the last run and the floor is therefore
+    // not served at its own moment. It is still served — the look back above
+    // finds it the next time the loop is awake past the floor — but on a grid as
+    // tight as `*/15`, where the floor is the whole gap, a run recorded a second
+    // past its moment pushes the next one under the floor and the cadence
+    // halves. That is a real cost, and the only way out of it is to measure the
+    // floor from the moment a run served rather than from when the row was
+    // written, which changes what `MIN_GAP_SECS` means. Not a thing to change
+    // in passing.
     let start = floor.max(now);
     let first = start.div_euclid(60) + i64::from(start.rem_euclid(60) != 0);
 
@@ -1178,6 +1246,42 @@ mod tests {
         assert_eq!(both.jitter(), Duration::ZERO);
     }
 
+    /// Jitter cannot move a run onto a day the calendar forbids.
+    ///
+    /// With one moment a day `tightest_gap` is `None` and the room fell back to
+    /// a whole day, however narrow the day fields were — so
+    /// `--on mon --at 09:00 --jitter 20h` kept all twenty hours and a run due
+    /// Monday morning walked on Tuesday at three. That is the failure
+    /// `with_jitter`'s own doc names as the reason the bound exists, arriving
+    /// through the branch the bound does not cover.
+    #[test]
+    fn jitter_cannot_move_a_run_onto_a_day_the_calendar_forbids() {
+        let schedule = Schedule::calendar(&[Weekday::Mon], &[(9, 0)])
+            .unwrap()
+            .with_jitter(Duration::from_secs(20 * 3_600));
+
+        let due_at = at(hours(9));
+        let woken = with_jitter(due_at, schedule.jitter(), 0.999_999);
+
+        let landed = DateTime::from_timestamp(woken, 0).unwrap();
+        assert_eq!(
+            landed.weekday(),
+            chrono::Weekday::Mon,
+            "due Monday at nine, woke {landed} — a day this schedule does not name"
+        );
+
+        // Every day allowed is the other case, and it needs no cap: the day a
+        // run spills into is one the calendar names.
+        let daily = Schedule::calendar(&[], &[(9, 0)])
+            .unwrap()
+            .with_jitter(Duration::from_secs(20 * 3_600));
+        assert_eq!(
+            daily.jitter(),
+            Duration::from_secs(20 * 3_600),
+            "nothing to protect when tomorrow is allowed too"
+        );
+    }
+
     /// Every moment a tight grid names is actually run, worst-case roll and all.
     ///
     /// The default for a calendar was a flat fifteen minutes, which is exactly
@@ -1339,6 +1443,60 @@ mod tests {
             Due::At(at(hours(9))),
             "the moment has not come yet"
         );
+    }
+
+    /// A first run does not depend on which second of the minute it started in.
+    ///
+    /// With nothing ever run the floor is `now`, and the window used to start
+    /// there — so it was a whole minute only when the clock read `:00` exactly.
+    /// The same `snob watch --on mon --at 09:00` started at 09:00:00 ran, and
+    /// started at 09:00:20 waited a week. That is the `:00`-to-the-second
+    /// discontinuity taken out of the `last_run` path, left behind where a fresh
+    /// install passes `None`.
+    #[test]
+    fn a_first_run_does_not_depend_on_the_second_it_started_in() {
+        let schedule = Schedule::calendar(&[Weekday::Mon], &[(9, 0)]).unwrap();
+
+        for second in [0, 20, 59] {
+            assert!(
+                matches!(
+                    due(&schedule, None, at(hours(9) + second), &Utc),
+                    Due::Now { .. }
+                ),
+                "started {second}s into the minute it names, and it is that minute"
+            );
+        }
+
+        // And the minute after it is not that minute.
+        assert_eq!(
+            due(&schedule, None, at(hours(9) + 60), &Utc),
+            Due::At(at(hours(9) + 7 * 24 * 3_600)),
+            "09:01 on a Monday is not 09:00 on a Monday"
+        );
+    }
+
+    /// A moment that went by between the last run and the floor is owed, not
+    /// dropped.
+    ///
+    /// The look back was bounded below by the floor, so a moment in that gap was
+    /// beneath the window and above nothing — the forward search starts at the
+    /// floor too. It is bounded by the last run now, and still guarded by
+    /// `floor <= now`, so what it produces is a run at `now`, past the floor:
+    /// served late rather than lost.
+    #[test]
+    fn a_moment_between_the_last_run_and_the_floor_is_served_late() {
+        // One moment a day, so nothing later can stand in for it.
+        let schedule = Schedule::cron("15 9 * * *").unwrap();
+
+        // Ran at 09:00:07 — seven seconds past a moment of its own — which puts
+        // the floor at 09:15:07, seven seconds past the next one.
+        let last = at(hours(9) + 7);
+        let now = at(hours(9) + 20 * 60);
+
+        match due(&schedule, Some(last), now, &Utc) {
+            Due::Now { .. } => {}
+            other => panic!("09:15 went by unrun and is owed: {other:?}"),
+        }
     }
 
     /// The same, for the shape a laptop is actually in: suspended across the
