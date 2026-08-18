@@ -146,12 +146,19 @@ impl<'a> ListWalker<'a> {
     /// Rate control is not a parameter any more: it is inside the client, which
     /// cannot be built without it. Walking without it stopped being something
     /// review has to catch and became something that cannot be written.
+    ///
+    /// **The client also decides whether the waits are real**, by the server it
+    /// is pointed at. This was `without_sleeping()`, a `#[doc(hidden)]` method
+    /// any caller could reach for — so a walk against Instagram with no waits
+    /// between pages was one line away, and the rule against it lived in a
+    /// doc-comment. It is now unreachable: a mock server is not Instagram and
+    /// Instagram is not a mock server.
     pub fn new(client: &'a IgClient) -> Self {
         Self {
             client,
             pace: Pace::default(),
             cancel: CancelToken::default(),
-            sleeps: true,
+            sleeps: client.is_live(),
         }
     }
 
@@ -162,17 +169,6 @@ impl<'a> ListWalker<'a> {
 
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
-        self
-    }
-
-    /// Computes and announces the waits, but does not sleep.
-    ///
-    /// **Tests only.** It lets the real cadence be checked in milliseconds
-    /// rather than having to pause the clock, which with sockets in play makes
-    /// tests flaky. Using it against Instagram skips rate control entirely.
-    #[doc(hidden)]
-    pub fn without_sleeping(mut self) -> Self {
-        self.sleeps = false;
         self
     }
 
@@ -612,6 +608,31 @@ mod tests {
         client_with(server, Pacer::unlimited())
     }
 
+    /// A walk against Instagram pays every wait; one against a test server pays
+    /// none, and neither is a choice a caller gets to make.
+    ///
+    /// This used to be `ListWalker::without_sleeping()`. It was `#[doc(hidden)]`
+    /// and its doc said not to use it against Instagram, which is the weakest
+    /// kind of guard there is: the whole of AGENTS.md's "never walk a real
+    /// account's lists without the limiter" rested on nobody writing one line.
+    /// Nothing asserted it either, so the rule could have been deleted and the
+    /// suite would have stayed green.
+    #[tokio::test]
+    async fn only_a_walk_against_a_test_server_skips_the_waits() {
+        let server = MockServer::start().await;
+        assert!(
+            !ListWalker::new(&client(&server)).sleeps,
+            "a mock server is not Instagram, so there is nothing to be polite to"
+        );
+
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let live = IgClient::new(session, Pacer::unlimited()).unwrap();
+        assert!(
+            ListWalker::new(&live).sleeps,
+            "a walk against Instagram has to pay its waits"
+        );
+    }
+
     /// A body with `n` users and, optionally, a cursor to the next page.
     fn body(from: u64, n: u64, cursor: Option<&str>) -> String {
         let users: Vec<String> = (from..from + n)
@@ -660,7 +681,7 @@ mod tests {
         request: ListRequest<'_>,
     ) -> (WalkSummary, Vec<Event>, Vec<u64>) {
         let client = client(server);
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
 
         let mut events = Vec::new();
         let mut seen: Vec<u64> = Vec::new();
@@ -759,9 +780,7 @@ mod tests {
 
         let client = client(&server);
         // PRODUCTION pace: the real policy is what is under test.
-        let walker = ListWalker::new(&client)
-            .with_pace(Pace::default())
-            .without_sleeping();
+        let walker = ListWalker::new(&client).with_pace(Pace::default());
 
         let mut waits = Vec::new();
         walker
@@ -930,9 +949,7 @@ mod tests {
 
         let client = client(&server);
         let cancel = CancelToken::default();
-        let walker = ListWalker::new(&client)
-            .with_cancel(cancel.clone())
-            .without_sleeping();
+        let walker = ListWalker::new(&client).with_cancel(cancel.clone());
 
         let summary = walker
             .walk(
@@ -1078,7 +1095,7 @@ mod tests {
 
         let server = MockServer::start().await;
         let client = client_with(&server, Pacer::new(std::sync::Arc::new(InCooldown)));
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
 
         let error = walker
             .walk(request(), |p, _| Ok(p.users.len()), |_| {})
@@ -1123,7 +1140,7 @@ mod tests {
 
         let budget = std::sync::Arc::new(Counting::default());
         let client = client_with(&server, Pacer::new(budget.clone()));
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
         let summary = walker
             .walk(request(), |p, _| Ok(p.users.len()), |_| {})
             .await
