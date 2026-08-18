@@ -703,12 +703,37 @@ fn plan(
     // host is still the same destination. The project already has the pattern:
     // `IgClient::check_downloadable` exists so the CDN cannot be handed a
     // credential meant for somewhere else.
+    // **An origin there is nothing to compare against is not a match.** With
+    // `is_none_or`, absence read as sameness, so the guard above held only in
+    // the one case it was written for and fell open in two others: a keyring
+    // token with no `[webhook]` in the file at all -- which `setup` can leave
+    // behind, since it stored the secrets before writing the file -- and a
+    // `[webhook]` whose `url` does not parse, which nothing validates because
+    // the file is documented as safe to hand-edit. Either one sent the stored
+    // token to whatever `--webhook` named.
+    //
+    // The question is really "did anything override the configured address",
+    // so that is what is asked. Without `--webhook` the address came from the
+    // file and is the configured one by construction; with it, sameness has to
+    // be demonstrated rather than assumed.
     let configured_origin = from_file
         .and_then(|w| Url::parse(&w.url).ok())
         .map(|configured| configured.origin());
-    let same_destination = configured_origin
-        .as_ref()
-        .is_none_or(|origin| *origin == url.origin());
+    let same_destination = match &configured_origin {
+        Some(origin) => *origin == url.origin(),
+        None => args.webhook.is_none(),
+    };
+
+    /// Names the origin a stored credential belongs to, for a warning about
+    /// not sending it. "the configuration" when the file has no usable address
+    /// to name — which is one of the ways the guard used to fall open, so the
+    /// warning has to be able to say it.
+    fn configured_for(origin: Option<&url::Origin>) -> String {
+        origin.map_or_else(
+            || "the configuration".to_string(),
+            |o| o.ascii_serialization(),
+        )
+    }
 
     // Headers from the file first, then the ones typed, so a flag can override
     // a configured one of the same name -- the last one wins at the request.
@@ -757,10 +782,7 @@ fn plan(
             warnings.push(format!(
                 "the stored token was set up for {}, so it is not sent to {url}. Pass one with \
                  --header \"Authorization: ...\" if this address needs it.",
-                configured_origin
-                    .as_ref()
-                    .map(|o| o.ascii_serialization())
-                    .unwrap_or_default(),
+                configured_for(configured_origin.as_ref()),
             ));
         }
     }
@@ -779,7 +801,25 @@ fn plan(
              used when it is absent."
         ),
         Some(given) => Some(Secret::from(given)),
-        None => stored_key,
+        // The same gate as the token, and it had none at all. The bearer token
+        // was correctly withheld from a foreign address *and then the body was
+        // signed with the stored key anyway*, so the warning misdescribed what
+        // had happened and the third party got a body and its MAC — everything
+        // needed to guess a human-chosen shared secret offline, at leisure.
+        //
+        // A signature is a credential in the same way a token is: it is not
+        // what the message says, it is proof of who it is from.
+        None if same_destination => stored_key,
+        None => {
+            if stored_key.is_some() {
+                warnings.push(format!(
+                    "the stored signing key was set up for {}, so the report sent to {url} is \
+                     not signed. Pass one with --sign-with if this address checks the signature.",
+                    configured_for(configured_origin.as_ref()),
+                ));
+            }
+            None
+        }
     };
 
     Ok((
@@ -1880,6 +1920,143 @@ consent = { agreed_at = 1700 }
         );
         assert!(warnings[0].contains("not sent with it"), "{warnings:?}");
         assert!(warnings[1].contains("stored token"), "{warnings:?}");
+    }
+
+    /// A stored token with no configured address is not sent to a typed one.
+    ///
+    /// The comparison used to read an absent configured origin as "the same
+    /// destination", so this — a keyring entry with no `[webhook]` beside it —
+    /// went straight through the guard. It is reachable rather than theoretical:
+    /// `setup` stored the secrets before it wrote the file, so a write that
+    /// failed left exactly this state, and the file is documented as safe to
+    /// hand-edit.
+    #[test]
+    fn a_stored_token_with_nothing_configured_is_not_sent_anywhere_typed() {
+        let args = WebhookArgs {
+            webhook: Some("https://bin.example/inspect".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(
+            &args,
+            None,
+            Some(Secret::from("Bearer stored".to_string())),
+            None,
+        )
+        .unwrap();
+        let planned = planned.expect("there is an address to post to");
+
+        assert_eq!(sent_as(&planned, "Authorization"), Vec::<&str>::new());
+        assert!(
+            warnings.iter().any(|w| w.contains("stored token")),
+            "withholding it silently would read as never having stored one: {warnings:?}"
+        );
+    }
+
+    /// A configured address that does not parse is not an address to match
+    /// against, so nothing stored for it travels.
+    #[test]
+    fn a_configured_address_that_does_not_parse_matches_nothing() {
+        let file = configured("n8n.internal/webhook/snob", &[("X-Api-Key", "team")]);
+        let args = WebhookArgs {
+            webhook: Some("https://bin.example/inspect".into()),
+            ..Default::default()
+        };
+
+        let (planned, _) = plan(
+            &args,
+            Some(&file),
+            Some(Secret::from("Bearer stored".to_string())),
+            Some(Secret::from("k".to_string())),
+        )
+        .unwrap();
+        let planned = planned.expect("there is an address to post to");
+
+        assert_eq!(sent_as(&planned, "Authorization"), Vec::<&str>::new());
+        assert_eq!(sent_as(&planned, "X-Api-Key"), Vec::<&str>::new());
+        assert!(planned.webhook.key.is_none());
+    }
+
+    /// The signing key is a credential, and goes through the same gate.
+    ///
+    /// It had no gate at all: the bearer token was correctly withheld from a
+    /// foreign address *and the body was signed with the stored key anyway*, so
+    /// the warning misdescribed what happened and the third party received a
+    /// body and its MAC — everything needed to guess a human-chosen shared
+    /// secret offline. Every other `plan` test passes `None` for the key, so
+    /// that arm had no coverage whatsoever.
+    #[test]
+    fn a_key_stored_for_one_host_does_not_sign_a_report_to_another() {
+        let file = configured("https://n8n.internal/webhook/snob", &[]);
+        let args = WebhookArgs {
+            webhook: Some("https://bin.example/inspect".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(
+            &args,
+            Some(&file),
+            None,
+            Some(Secret::from("shared-secret".to_string())),
+        )
+        .unwrap();
+        let planned = planned.expect("there is an address to post to");
+
+        assert!(
+            planned.webhook.key.is_none(),
+            "a foreign host must not be handed a body and its MAC"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("signing key")),
+            "an unsigned report has to be announced, or the receiver's check just starts \
+             failing: {warnings:?}"
+        );
+    }
+
+    /// And it does sign for the address it was stored for, whatever the path.
+    #[test]
+    fn the_stored_key_signs_a_report_to_the_address_it_was_stored_for() {
+        let file = configured("https://n8n.internal/webhook/snob", &[]);
+        let args = WebhookArgs {
+            webhook: Some("https://n8n.internal/webhook/other".into()),
+            ..Default::default()
+        };
+
+        let (planned, warnings) = plan(
+            &args,
+            Some(&file),
+            None,
+            Some(Secret::from("shared-secret".to_string())),
+        )
+        .unwrap();
+        let planned = planned.expect("there is an address to post to");
+
+        assert!(planned.webhook.key.is_some());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Nothing is withheld when nothing overrode the file: the address the
+    /// report goes to is the one the credentials were stored for.
+    #[test]
+    fn the_configured_address_gets_everything_configured_for_it() {
+        let file = configured(
+            "https://n8n.internal/webhook/snob",
+            &[("X-Api-Key", "team")],
+        );
+
+        let (planned, warnings) = plan(
+            &WebhookArgs::default(),
+            Some(&file),
+            Some(Secret::from("Bearer stored".to_string())),
+            Some(Secret::from("shared-secret".to_string())),
+        )
+        .unwrap();
+        let planned = planned.expect("the file names an address");
+
+        assert_eq!(sent_as(&planned, "Authorization"), vec!["Bearer stored"]);
+        assert_eq!(sent_as(&planned, "X-Api-Key"), vec!["team"]);
+        assert!(planned.webhook.key.is_some());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// The same address is the same destination, however the URL was written.

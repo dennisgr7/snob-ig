@@ -80,10 +80,19 @@ pub fn setup(args: WatchSetupArgs, secrets: SecretStore, paths: &AppPaths) -> Re
         return Ok(ExitCode::Ok);
     }
 
+    // The file first, then the secrets. The comment above says a keyring entry
+    // left behind for a configuration that was never saved is litter with a
+    // token in it — and doing the secrets first is exactly how that state is
+    // reached, because `config::write` can fail on a read-only or full disk
+    // after both entries are already stored. A credential belonging to no
+    // configured address is the worse half to be left holding: it is what the
+    // origin check in `plan` has to defend against, and what `purge` has to
+    // remember. This way round, a failure leaves an address with no credential,
+    // which announces itself at the first run instead of sitting there.
+    let written = config::write(paths, &text)?;
     store_secret(&secrets, Kind::WatchSigningKey, signing_key)?;
     store_secret(&secrets, Kind::WatchToken, token)?;
 
-    let written = config::write(paths, &text)?;
     ui::info(&format!("Written to {}.", written.display()));
     ui::info("Start it with \"snob watch\", or put \"snob watch once\" on a timer.");
     Ok(ExitCode::Ok)
