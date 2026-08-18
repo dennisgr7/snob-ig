@@ -49,13 +49,50 @@ fn no_test_builds_a_secret_store_pointing_at_the_real_service() {
         let Ok(contents) = std::fs::read_to_string(&file) else {
             continue;
         };
+        offenders.extend(offenders_in(&relative, &contents));
+    }
 
+    assert!(
+        offenders.is_empty(),
+        "{} test(s) build a `SecretStore` without `.with_service(...)`, so they point at \
+         the real keyring and will delete whatever is stored there:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
+/// The walk, over one file's text, so a test can hand it a fixture.
+///
+/// It was inline, and the test that claimed to check it asserted on two string
+/// literals it declared itself — a fact about `str::contains`, not about this.
+/// So the guard had no coverage at all, which is how the offset defect below
+/// came to be written and to survive.
+fn offenders_in(relative: &str, contents: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+
+    {
         // Everything under a `tests/` directory is test code. In `src/`, only
         // what comes after the first `#[cfg(test)]`.
         let in_a_test_file = relative.contains("/tests/");
         let mut reached_the_tests = in_a_test_file;
 
-        for (number, line) in contents.lines().enumerate() {
+        // The offset is carried rather than searched for. `contents.find(line)`
+        // answers with the **first** occurrence of that text, so two identical
+        // `SecretStore::new(` lines were both checked against the first one's
+        // statement — and one of them is already in the tree, because rustfmt
+        // wraps a long builder chain and leaves the call on a line of its own.
+        // A copy-paste of the offending shape would have passed the guard whose
+        // whole job is to stop a test wiping a live Instagram session.
+        // `split_inclusive` rather than `lines`, so the arithmetic is exact on
+        // both line endings: `lines()` strips a trailing `\r` as well as the
+        // `\n`, and adding a fixed one back drifts by a byte per line on a CRLF
+        // file — which every file in this repository is, in the working tree.
+        let mut offset = 0usize;
+        for (number, raw) in contents.split_inclusive('\n').enumerate() {
+            let at = offset;
+            offset += raw.len();
+            let line = raw.trim_end_matches(['\n', '\r']);
+
             if line.contains("#[cfg(test)]") {
                 reached_the_tests = true;
             }
@@ -71,36 +108,85 @@ fn no_test_builds_a_secret_store_pointing_at_the_real_service() {
             // The statement, not the line: `cargo fmt` breaks a long builder
             // chain across several of them, so the `.with_service(` that
             // belongs to this call is usually not on the line the call is on.
-            let from_here = &contents[contents.find(line).unwrap_or(0)..];
-            let statement = from_here.split(';').next().unwrap_or(from_here);
+            let statement = contents[at..].split(';').next().unwrap_or("");
             if !statement.contains(".with_service(") {
                 offenders.push(format!("{relative}:{}", number + 1));
             }
         }
     }
 
-    assert!(
-        offenders.is_empty(),
-        "{} test(s) build a `SecretStore` without `.with_service(...)`, so they point at \
-         the real keyring and will delete whatever is stored there:\n{}",
-        offenders.len(),
-        offenders.join("\n")
-    );
+    offenders
 }
 
 /// The guard has to be able to fail, or it is a comment.
 ///
-/// The one it replaces could not: it asserted a property of a store it had just
-/// built with the property.
+/// It could not. This asserted that one string literal contains
+/// `.with_service(` and another does not — a fact about `str::contains`,
+/// declared and checked in the same two lines, with the walk itself untouched.
+/// It is handed a fixture now and has to say which lines are wrong.
 #[test]
 fn the_guard_notices_a_store_built_without_a_service() {
-    let with = "let store = SecretStore::new(paths, true).with_service(&name);";
-    let without = "let store = SecretStore::new(paths, true);";
+    let fixture = "\
+fn setup() {
+    let ok = SecretStore::new(paths.clone(), true)
+        .with_service(&service(name));
+    let bad = SecretStore::new(paths.clone(), true);
+}
+";
+    assert_eq!(
+        offenders_in("crates/x/tests/y.rs", fixture),
+        vec!["crates/x/tests/y.rs:4".to_string()],
+        "line 2 is fine across the wrap, line 4 is not"
+    );
+}
 
-    assert!(with.contains(".with_service("));
-    assert!(
-        !without.contains(".with_service("),
-        "this is the shape the walk above is looking for"
+/// Two identical calls are two calls, and the second is checked against its own
+/// statement.
+///
+/// `contents.find(line)` answered with the **first** occurrence of that text,
+/// so a duplicated line was measured against the earlier statement's
+/// `.with_service(` and passed. The shape is already in the tree — rustfmt
+/// wraps a long builder chain and leaves the call alone on its line — so one
+/// copy-paste would have walked past the guard whose whole job is to stop a
+/// test wiping a live Instagram session.
+#[test]
+fn a_repeated_call_is_not_excused_by_an_earlier_one() {
+    // The two calls are byte-identical, which is the whole point: that is what
+    // a copy-paste produces, and what `find` cannot tell apart.
+    let fixture = "\
+fn setup() {
+    let store = SecretStore::new(paths.clone(), true)
+        .with_service(&service(name));
+    let store = SecretStore::new(paths.clone(), true)
+        .using(Backend::File);
+}
+";
+    assert_eq!(
+        offenders_in("crates/x/tests/y.rs", fixture),
+        vec!["crates/x/tests/y.rs:4".to_string()],
+        "only the second is an offender, and it must not inherit the first's service"
+    );
+}
+
+/// In `src/`, only what comes after the first `#[cfg(test)]` is test code —
+/// production building its own store is the ordinary case.
+#[test]
+fn production_code_is_not_asked_to_name_a_test_service() {
+    let fixture = "\
+fn main() {
+    let store = SecretStore::new(paths, true);
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let store = SecretStore::new(paths, true);
+    }
+}
+";
+    assert_eq!(
+        offenders_in("crates/x/src/main.rs", fixture),
+        vec!["crates/x/src/main.rs:8".to_string()]
     );
 }
 
