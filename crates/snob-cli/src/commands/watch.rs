@@ -92,18 +92,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
 
-    // Seeded from the run log, not from this process's start.
-    //
-    // The clock used to begin again on every start, so `--every 24h` on a
-    // machine that is powered on from eight to six, or under a supervisor with
-    // `Restart=always` restarting more often than the interval, never reached
-    // its first run at all — while `snob watch status`, reading the very same
-    // table, said "It has not run yet."
-    //
-    // `Some(now)` when nothing has ever run: a fresh install waits for its first
-    // scheduled moment rather than walking the moment it is set up. `--now` is
-    // what asks for a run at start, and it is spent below.
-    let mut last_run = last_started(paths)?.or_else(|| Some(snob_core::store::now()));
+    let mut last_run = seed_last_run(last_started(paths)?, &schedule, snob_core::store::now());
 
     if args.now {
         // Run one, here, rather than by pretending nothing has ever run.
@@ -234,6 +223,32 @@ const CLOCK_JUMP_SECS: i64 = 120;
 fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
     let store = snob_core::store::Store::open(paths)?;
     Ok(snob_core::store::watch::last_started(store.conn())?)
+}
+
+/// What the loop starts its clock from.
+///
+/// Seeded from the run log rather than from this process's start. The clock used
+/// to begin again on every start, so `--every 24h` on a machine that is powered
+/// on from eight to six, or under a supervisor with `Restart=always` restarting
+/// more often than the interval, never reached its first run at all — while
+/// `snob watch status`, reading the very same table, said "It has not run yet."
+///
+/// With nothing in the log the answer depends on what kind of schedule it is,
+/// and that is the whole reason this is a function rather than an `or_else`:
+///
+/// - **An interval** has no moments of its own, so `None` means "due now" and a
+///   fresh install would walk the second it was set up. `Some(now)` is what
+///   makes it wait one interval, and `--now` is how somebody asks for the walk
+///   at start.
+/// - **A calendar** has its own moments, and inventing a run for it is harmful.
+///   The invented value is a claim that a run happened this second, and
+///   `next_after` believes it: the floor becomes `now + MIN_GAP_SECS`, stepping
+///   over every moment in the next quarter of an hour. `snob watch --at 09:00`
+///   started at 08:50 printed "Running at 09:00." and then slept for a day and
+///   ten minutes. `None` is what the schedule module's own contract asks for
+///   here — there is no past to wait from, and no run to be too close to.
+fn seed_last_run(recorded: Option<i64>, schedule: &Schedule, now: i64) -> Option<i64> {
+    recorded.or_else(|| (!schedule.is_on_a_calendar()).then_some(now))
 }
 
 /// One run inside the loop: open, tick, print, close.
@@ -1920,6 +1935,53 @@ consent = { agreed_at = 1700 }
         );
         assert!(warnings[0].contains("not sent with it"), "{warnings:?}");
         assert!(warnings[1].contains("stored token"), "{warnings:?}");
+    }
+
+    /// A fresh install does not step over the first moment its calendar names.
+    ///
+    /// The seed used to be `Some(now)` whatever the schedule, which is a claim
+    /// that a run happened this second — so the floor became `now +
+    /// MIN_GAP_SECS` and every moment in the next quarter of an hour was skipped.
+    /// `snob watch --at 09:00` started at 08:50 said "Running at 09:00." and
+    /// then slept for a day and ten minutes.
+    #[test]
+    fn a_fresh_install_keeps_the_first_moment_its_calendar_names() {
+        // Midnight UTC on a Monday, so the wall clock is checkable by hand.
+        const MONDAY_0000: i64 = 1_786_924_800;
+        let at = |secs: i64| MONDAY_0000 + secs;
+
+        let calendar = Schedule::cron("0 9 * * *").unwrap();
+        let ten_to_nine = at(8 * 3600 + 50 * 60);
+
+        assert_eq!(
+            seed_last_run(None, &calendar, ten_to_nine),
+            None,
+            "a calendar has its own moments and needs no invented run"
+        );
+        assert_eq!(
+            schedule::due(&calendar, None, ten_to_nine, &chrono::Utc),
+            schedule::Due::At(at(9 * 3600)),
+            "nine o'clock is ten minutes away, which is inside the minimum gap"
+        );
+
+        // An interval is the other way round: with no past to measure from it
+        // would be due immediately, and a fresh install must not walk the second
+        // it is set up.
+        let interval = Schedule::every(std::time::Duration::from_secs(6 * 3600)).unwrap();
+        assert_eq!(
+            seed_last_run(None, &interval, ten_to_nine),
+            Some(ten_to_nine)
+        );
+
+        // And a recorded run always wins over both.
+        assert_eq!(
+            seed_last_run(Some(at(0)), &calendar, ten_to_nine),
+            Some(at(0))
+        );
+        assert_eq!(
+            seed_last_run(Some(at(0)), &interval, ten_to_nine),
+            Some(at(0))
+        );
     }
 
     /// A stored token with no configured address is not sent to a typed one.
