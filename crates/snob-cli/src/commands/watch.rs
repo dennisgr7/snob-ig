@@ -25,7 +25,8 @@ use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 use url::Url;
 
 use crate::cli::{
-    WatchArgs, WatchCommand, WatchDiffArgs, WatchOnceArgs, WatchRunArgs, WebhookArgs,
+    WatchArgs, WatchCheckArgs, WatchCommand, WatchDiffArgs, WatchOnceArgs, WatchRunArgs,
+    WebhookArgs,
 };
 use crate::commands::common::{self, Session};
 use crate::engine::Provenance;
@@ -39,6 +40,7 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
     match args.command {
         Some(WatchCommand::Diff(args)) => diff(args, secrets, paths),
         Some(WatchCommand::Once(args)) => once(args, secrets, paths).await,
+        Some(WatchCommand::Check(args)) => check(args, secrets, paths).await,
         Some(WatchCommand::Setup(args)) => super::watch_setup::setup(args, secrets, paths),
         Some(WatchCommand::Status(args)) => super::watch_setup::status(args, paths),
         None => scheduled(args.run, secrets, paths).await,
@@ -717,10 +719,249 @@ async fn once_one(
     Ok(tick)
 }
 
+/// Checks the configuration would work, before it runs unattended.
+///
+/// Everything `setup` writes down is a claim about a machine, a session and
+/// somebody else's server, and every one of them used to be tested for the
+/// first time by an unattended run at three in the morning. This puts the same
+/// questions while there is still somebody to answer them.
+///
+/// **It writes nothing and walks no list.** `engine::check` takes `&App`, so it
+/// cannot reach the `&mut Store` that recording needs — the guard `watch diff`
+/// already rests on — and the cost is one request for the session plus one per
+/// configured account. That is what makes it safe to point a monitoring system
+/// at.
+///
+/// It degrades rather than stopping. A missing session does not hide a broken
+/// schedule, and a broken schedule does not hide a webhook that has stopped
+/// answering: every line is reported, and the exit code is the worst of them.
+async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    use crate::engine::check::{self, Verdict};
+
+    let configured = config::load(paths)?;
+    let now = snob_core::store::now();
+
+    // Built the same way a run builds it, or this would be checking a schedule
+    // nobody is on. A configuration with none at all is not an error here — it
+    // is one of the things worth reporting.
+    let schedule = schedule_from(&WatchRunArgs::default(), configured.as_ref()).ok();
+    let mut report = check::without_a_session(configured.as_ref(), schedule.as_ref(), now);
+
+    // Before the session, like `once` does, so an address that could never work
+    // is reported even on a machine that cannot log in.
+    let delivery = match delivery_from(&WebhookArgs::default(), configured.as_ref(), &secrets) {
+        Ok(delivery) => delivery,
+        Err(e) => {
+            report.checked.push(check::Checked {
+                what: check::What::Webhook {
+                    destination: String::new(),
+                    status: None,
+                    signed: false,
+                },
+                verdict: Verdict::Failed,
+                problem: Some(e.to_string()),
+            });
+            None
+        }
+    };
+
+    match common::open_with_progress(false, &secrets, paths)? {
+        Session::Open(app) => {
+            let watched = watched_from(None, configured.as_ref());
+            check::with_a_session(&app, &secrets, &watched, &mut report).await;
+        }
+        Session::Missing => report.checked.push(check::Checked {
+            what: check::What::Session {
+                viewer: None,
+                backend: secrets.backend().as_str(),
+            },
+            verdict: Verdict::Failed,
+            problem: Some("no session is stored; run \"snob login\"".to_string()),
+        }),
+    }
+
+    if let Some(delivery) = delivery.as_ref()
+        && !args.no_webhook
+    {
+        let id = run_id(now, 0);
+        let body = serde_json::to_string(&serde_json::json!({
+            "event": "watch.preflight",
+            "run_id": id,
+            "at": now,
+            "note": "snob watch check: this is not a report, and nothing is queued",
+        }))?;
+        report.checked.push(
+            check::webhook_of(
+                &delivery.client,
+                delivery.destination.clone(),
+                delivery.signed,
+                &id,
+                &body,
+            )
+            .await,
+        );
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&check_json(&report))?);
+    } else {
+        for line in describe_check(&report) {
+            println!("{line}");
+        }
+    }
+
+    // Warnings are not failures: a monitor with no baseline yet will work, it
+    // just has nothing to say on its first run. Only what would stop a run
+    // reaches the exit code.
+    Ok(match report.verdict() {
+        Verdict::Failed => ExitCode::Error,
+        _ => ExitCode::Ok,
+    })
+}
+
+/// One line per check, in the order they were made.
+fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<String> {
+    use crate::engine::check::{Verdict, What};
+
+    let mut lines = Vec::new();
+    for checked in &report.checked {
+        let (label, detail) = match &checked.what {
+            What::NotConfigured => ("config".to_string(), String::new()),
+            What::Schedule { next } => (
+                "schedule".to_string(),
+                next.iter()
+                    .map(|at| report::stored_on(*at))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            What::Session { viewer, backend } => (
+                "session".to_string(),
+                match viewer {
+                    Some(name) => format!("@{} ({backend})", printable(name)),
+                    None => format!("({backend})"),
+                },
+            ),
+            What::Account {
+                target,
+                followers,
+                following,
+                ..
+            } => (
+                match target {
+                    Some(name) => format!("@{}", printable(name)),
+                    None => "your account".to_string(),
+                },
+                match (followers, following) {
+                    (Some(a), Some(b)) => format!("{a} followers, {b} following"),
+                    _ => String::new(),
+                },
+            ),
+            What::Webhook {
+                destination,
+                status,
+                signed,
+            } => (
+                "webhook".to_string(),
+                match status {
+                    Some(code) => format!(
+                        "{destination} answered {code}{}",
+                        if *signed { ", signed" } else { "" }
+                    ),
+                    None => destination.clone(),
+                },
+            ),
+            What::Baseline { taken_at } => (
+                "baseline".to_string(),
+                match taken_at.first() {
+                    Some((_, at)) => format!("stored on {}", report::stored_on(*at)),
+                    None => "nothing stored yet".to_string(),
+                },
+            ),
+        };
+
+        let mark = match checked.verdict {
+            Verdict::Ok => "ok  ",
+            Verdict::Warned => "note",
+            Verdict::Failed => "FAIL",
+        };
+        // Trimmed, because a check with nothing to say in the detail column
+        // would otherwise pad to it and leave the line ending in spaces.
+        let mut line = format!("{mark}  {label:<16}{detail}")
+            .trim_end()
+            .to_string();
+        if let Some(problem) = &checked.problem {
+            // Under the detail column rather than at column zero, so a reason
+            // reads as belonging to the line above it. Named rather than
+            // written inline: a run of spaces inside a string literal is what
+            // the layout guard in `tests/language.rs` looks for, and it is
+            // right to — this is the one shape it cannot tell from a typo.
+            const UNDER_THE_LABEL: &str = "            ";
+            line.push('\n');
+            line.push_str(UNDER_THE_LABEL);
+            line.push_str(&printable(problem));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn check_json(report: &crate::engine::check::CheckReport) -> serde_json::Value {
+    use crate::engine::check::What;
+
+    serde_json::json!({
+        "verdict": report.verdict().as_str(),
+        "checks": report.checked.iter().map(|checked| {
+            let (what, detail) = match &checked.what {
+                What::NotConfigured => ("config", serde_json::json!(null)),
+                What::Schedule { next } => ("schedule", serde_json::json!({ "next": next })),
+                What::Session { viewer, backend } => (
+                    "session",
+                    serde_json::json!({ "viewer": viewer, "storage": backend }),
+                ),
+                What::Account { target, pk, followers, following, may_run_unattended } => (
+                    "account",
+                    serde_json::json!({
+                        "target": target,
+                        "pk": pk,
+                        "followers": followers,
+                        "following": following,
+                        "may_run_unattended": may_run_unattended,
+                    }),
+                ),
+                What::Webhook { destination, status, signed } => (
+                    "webhook",
+                    serde_json::json!({
+                        "destination": destination,
+                        "status": status,
+                        "signed": signed,
+                    }),
+                ),
+                What::Baseline { taken_at } => (
+                    "baseline",
+                    serde_json::json!({
+                        "lists": taken_at.iter()
+                            .map(|(kind, at)| serde_json::json!({ "kind": kind.as_str(), "taken_at": at }))
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+            };
+            serde_json::json!({
+                "what": what,
+                "verdict": checked.verdict.as_str(),
+                "detail": detail,
+                "problem": checked.problem,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 /// Where reports go, once the arguments have been checked.
 struct Delivery {
     client: WebhookClient,
     heartbeat: bool,
+    /// Whether the body will carry `X-Snob-Signature`. Held so `check` can say
+    /// what it just sent rather than guessing at what the client did.
+    signed: bool,
     /// The origin this run posts to. Written onto every report it queues and used
     /// to filter the outbox, so a queued report can only ever be sent to the
     /// address it was addressed to.
@@ -950,6 +1191,7 @@ fn delivery_from(
         // be filtered by it: a queued report belongs to the address it was
         // addressed to, and `--webhook` must not flush a backlog somewhere else.
         destination: destination_of(&planned.webhook.url),
+        signed: planned.webhook.key.is_some(),
         client: WebhookClient::new(planned.webhook)?,
         heartbeat: planned.heartbeat,
     }))
@@ -1701,6 +1943,7 @@ mod tests {
         let url = Url::parse(&format!("{}/hook", server.uri())).unwrap();
         let delivery = Delivery {
             destination: destination_of(&url),
+            signed: false,
             client: WebhookClient::new(Webhook {
                 url,
                 headers: vec![],

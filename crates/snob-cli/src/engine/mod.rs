@@ -8,6 +8,7 @@
 //!
 //! Every list, crossing and summary the tool prints comes out of [`list`].
 
+pub mod check;
 pub mod cooldown;
 pub mod freshness;
 pub mod people;

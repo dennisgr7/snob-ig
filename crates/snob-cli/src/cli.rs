@@ -366,8 +366,32 @@ pub enum WatchCommand {
     )]
     Setup(WatchSetupArgs),
 
+    /// Check the configuration would work, before it runs unattended
+    #[command(
+        after_help = "Everything a scheduled run needs, checked while somebody is still here to \
+                      fix it: the schedule through the evaluator that actually decides it, the \
+                      session, that each configured account resolves and may be read, and the \
+                      webhook — by posting one \"watch.preflight\" message to it.\n\n\
+                      It writes nothing and walks no list, so it is safe to run as often as you \
+                      like, and it exits non-zero when something would stop a run. That makes it \
+                      usable as a monitoring probe.\n\n\
+                      Cost: one request to check the session, and one per configured account."
+    )]
+    Check(WatchCheckArgs),
+
     /// What is configured, when it last ran, and what is still owed
     Status(WatchStatusArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchCheckArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not post anything to the webhook
+    #[arg(long)]
+    pub no_webhook: bool,
 }
 
 #[derive(Args, Debug)]
