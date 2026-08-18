@@ -261,6 +261,20 @@ async fn decide(
         ask_consent(app, args).await?;
     }
 
+    // **Moved, not added.** The check at the top cannot see a cooldown that
+    // landed while the confirmation prompt was open — one written by the
+    // service sharing this database, for instance — and resolving is itself a
+    // request, so it belongs here rather than after. It used to sit past
+    // `target::resolve`, which meant a named target spent exactly the counter
+    // poll `cooldown.rs` says must never be spent: "nothing may be spent — not
+    // even the counter poll".
+    //
+    // Only the existing regression test's fixture hid it, by leaving `target`
+    // as `None` — the one shape that resolves without a request.
+    if let Some(until_ms) = app.client().pacer().cooldown()? {
+        return cooldown::serve(app, args, kind, until_ms);
+    }
+
     // A crossing asks for two lists, and resolving is a request. Reusing what
     // the first call worked out is what stops the second asking Instagram the
     // identical question about the identical account seconds later.
@@ -316,14 +330,6 @@ async fn decide(
             // what makes it unsafe to cross against another one.
             ListOutcome::cached(&snapshot, Provenance::CacheFlag),
         ));
-    }
-
-    // The check at the top cannot see a cooldown that lands while the
-    // resolution or the confirmation prompt were underway — one set by the
-    // service sharing this database, for instance. Nothing may be spent once
-    // it exists, so look again before the poll.
-    if let Some(until_ms) = app.client().pacer().cooldown()? {
-        return cooldown::serve(app, args, kind, until_ms);
     }
 
     freshness::decide_and_fetch(app, args, kind, &target, stored).await

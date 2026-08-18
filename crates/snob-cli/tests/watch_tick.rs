@@ -723,3 +723,58 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
         second.report.changes().renamed
     );
 }
+
+/// `snob watch check` spends nothing while the account is in cooldown.
+///
+/// It is advertised as safe to poll as often as you like and it was the one
+/// request path in the tool with no cooldown gate: `Pacer::clear_to_send`
+/// charges the budget but never reads the `cooldowns` table, so nothing below
+/// it would have caught this. One `validate` plus one `web_profile_info` per
+/// configured account, on whatever interval a monitoring system polls at,
+/// knocking on a door Instagram had just closed.
+///
+/// Reported rather than skipped in silence: a cooldown is exactly what somebody
+/// running `check` wants to be told, and it lifts on its own, so it is a
+/// warning and not a failure.
+#[tokio::test]
+async fn watch_check_spends_nothing_during_a_cooldown() {
+    use snob_cli::engine::check::{CheckReport, Verdict, with_a_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 2, 2).await;
+
+    budget
+        .start_cooldown("rate_limit", std::time::Duration::from_secs(2 * 3600))
+        .unwrap();
+
+    let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+        .with_service(&format!("snob-ig-test-check-{}", std::process::id()));
+
+    let mut report = CheckReport::default();
+    with_a_session(&app, &secrets, &[Watched::own()], &mut report).await;
+
+    assert_eq!(
+        requests(&server).await,
+        0,
+        "nothing may be spent during a cooldown, and this is a request path like any other"
+    );
+    assert_eq!(
+        report.verdict(),
+        Verdict::Warned,
+        "a cooldown lifts on its own, so it is not a failure"
+    );
+    assert!(
+        report
+            .checked
+            .iter()
+            .all(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown"))),
+        "and every line has to say why it was not checked: {:?}",
+        report.checked
+    );
+}
