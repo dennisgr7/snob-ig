@@ -341,6 +341,7 @@ impl Schedule {
             every: None,
             jitter: default_jitter(None),
         }
+        .fitted()
         .validated()
     }
 
@@ -351,7 +352,20 @@ impl Schedule {
             every: None,
             jitter: default_jitter(None),
         }
+        .fitted()
         .validated()
+    }
+
+    /// Brings the jitter down to what this schedule can absorb.
+    ///
+    /// The default is a flat fifteen minutes, which is `MIN_GAP_SECS` — so on
+    /// any grid tighter than half an hour the default alone was enough to eat
+    /// the next moment. Applied by the constructors, so the default is bounded
+    /// the same way an explicit `--jitter` is; [`Schedule::room_for_jitter`]
+    /// says why the bound is what it is.
+    fn fitted(mut self) -> Self {
+        self.jitter = self.jitter.min(self.room_for_jitter());
+        self
     }
 
     /// Adds a floor to a calendar, or a calendar to a floor.
@@ -363,7 +377,10 @@ impl Schedule {
         if self.calendar.is_none() {
             self.jitter = default_jitter(Some(interval));
         }
-        self.validated()
+        // Adding an interval to a calendar changes what separates two runs, and
+        // so changes the room there is between them. `--every 2w --on mon` has a
+        // weekly grid and a fortnightly floor, and no room at all.
+        self.fitted().validated()
     }
 
     /// Sets how far a run may be pushed past its due moment.
@@ -380,25 +397,54 @@ impl Schedule {
     /// five days, so a run due Monday at nine woke on Friday evening — a day the
     /// calendar does not allow, on a schedule that names one.
     pub fn with_jitter(mut self, jitter: Duration) -> Self {
-        let day = Duration::from_secs(24 * 3_600);
-        let from_calendar = self.calendar.as_ref().map(|c| {
-            c.tightest_gap()
-                .map(|gap| Duration::from_secs(gap as u64))
-                // One moment a day. Whatever the day fields allow, the next
-                // moment is at least a day away, so a day is the bound — and a
-                // roll is in `[0, 1)`, so the run still lands strictly before it.
-                .unwrap_or(day)
-        });
-        let ceiling = match (self.every, from_calendar) {
-            (Some(every), Some(gap)) => every.min(gap),
-            (Some(every), None) => every,
-            (None, Some(gap)) => gap,
-            // Neither half. `validated` refuses this, so it is unreachable; a
-            // day is the answer that cannot be wrong by much.
-            (None, None) => day,
-        };
-        self.jitter = jitter.min(ceiling);
+        self.jitter = jitter.min(self.room_for_jitter());
         self
+    }
+
+    /// The most a run may be pushed later without costing the next one.
+    ///
+    /// **The gap between two moments is not the room there is inside it.** The
+    /// floor is measured from where a run really landed, not from the grid, so
+    /// every second of jitter comes straight out of the next gap: a run at
+    /// moment `m` pushed to `m + s` cannot reach `m + gap` unless
+    /// `s <= gap - step`, where `step` is the floor between two runs.
+    ///
+    /// Nothing subtracted the step, and the default for a calendar was a flat
+    /// fifteen minutes — exactly `MIN_GAP_SECS`. So `--cron "*/15 * * * *"`, the
+    /// tightest expression this tool advertises as legal, ran every thirty
+    /// minutes with probability 899/900 while the banner printed `*/15`, and
+    /// `0,20,40` fired under twice an hour on an expression naming three.
+    ///
+    /// The step is the interval when there is one, because that is then what
+    /// separates two runs. `--every 2w --on mon` is a Monday in every two, and
+    /// its floor is a fortnight while its grid is a week: the subtraction
+    /// answers zero, which is right — any jitter at all turns it into three
+    /// weeks.
+    fn room_for_jitter(&self) -> Duration {
+        // One moment a day at most. Whatever the day fields allow, the next is
+        // at least a day away — and a roll is in `[0, 1)`, so a run still lands
+        // strictly before it.
+        const A_DAY: i64 = 24 * 3_600;
+
+        let step = self
+            .every
+            .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+            .max(MIN_GAP_SECS);
+
+        match &self.calendar {
+            Some(calendar) => {
+                let gap = calendar.tightest_gap().unwrap_or(A_DAY);
+                Duration::from_secs(gap.saturating_sub(step).max(0) as u64)
+            }
+            // No grid to miss. An interval is measured from the previous run, so
+            // what the jitter moves is the whole schedule rather than one run
+            // out of it, and the interval itself is the only bound needed.
+            //
+            // `validated` refuses a schedule with neither half, so the fallback
+            // is unreachable; a day is the answer that cannot be wrong by much.
+            None => self.every.unwrap_or(Duration::from_secs(A_DAY as u64)),
+        }
     }
 
     pub fn jitter(&self) -> Duration {
@@ -959,29 +1005,75 @@ mod tests {
         );
     }
 
-    /// A jitter larger than the gap it is jittering within is not a jitter.
+    /// A jitter larger than the room it is jittering within is not a jitter.
+    ///
+    /// The room is the gap **less the floor between two runs**, not the gap.
+    /// The floor is measured from where a run really landed, so every second of
+    /// jitter comes out of the next gap — which is why the two calendar
+    /// expectations here are not the round numbers they used to be.
     #[test]
     fn jitter_is_bounded_by_what_the_schedule_can_absorb() {
         let every = Duration::from_secs(hours(6) as u64);
         let schedule = Schedule::every(every)
             .unwrap()
             .with_jitter(Duration::from_secs(30 * 24 * 3_600));
-        assert_eq!(schedule.jitter(), every);
+        assert_eq!(
+            schedule.jitter(),
+            every,
+            "an interval has no grid to miss: what moves is the whole schedule"
+        );
 
         let calendar = Schedule::calendar(&[], &[(9, 0), (21, 0)])
             .unwrap()
             .with_jitter(Duration::from_secs(30 * 24 * 3_600));
-        assert_eq!(calendar.jitter(), Duration::from_secs(hours(12) as u64));
+        assert_eq!(
+            calendar.jitter(),
+            Duration::from_secs((hours(12) - MIN_GAP_SECS) as u64),
+            "a full twelve hours would put the nine o'clock run inside the floor \
+             of the nine in the evening"
+        );
 
-        // With both halves set, the tighter of the two bounds it. The interval
-        // alone used to, so `--every 2w --on mon --at 09:00 --jitter 5d` kept
-        // all five days and woke on a Friday, which the calendar forbids.
+        // With both halves set, what separates two runs is the interval, and
+        // here it is longer than the grid: a Monday in every two, on a weekly
+        // grid, has no room at all. It used to answer a whole day — and a day of
+        // jitter on a fortnightly Monday puts the next run past the Monday it
+        // was due on, so the fortnight quietly became three weeks.
         let both = Schedule::calendar(&[Weekday::Mon], &[(9, 0)])
             .unwrap()
             .and_every(Duration::from_secs(14 * 24 * 3_600))
             .unwrap()
             .with_jitter(Duration::from_secs(5 * 24 * 3_600));
-        assert_eq!(both.jitter(), Duration::from_secs(24 * 3_600));
+        assert_eq!(both.jitter(), Duration::ZERO);
+    }
+
+    /// Every moment a tight grid names is actually run, worst-case roll and all.
+    ///
+    /// The default for a calendar was a flat fifteen minutes, which is exactly
+    /// `MIN_GAP_SECS`, and nothing took the floor off the gap. So on
+    /// `*/15` — the tightest expression this tool advertises as legal — a run
+    /// pushed `s` seconds later put the next grid moment inside its own floor
+    /// for every `s` above zero: it ran every half hour, 899 times out of 900,
+    /// while the banner printed what the user typed.
+    #[test]
+    fn a_tight_grid_hits_every_moment_it_names_under_the_worst_roll() {
+        for (expression, grid) in [("*/15 * * * *", 15 * 60), ("0,20,40 * * * *", 20 * 60)] {
+            let schedule = Schedule::cron(expression).unwrap();
+            let start = at(hours(9));
+
+            // The worst case: pushed by the whole jitter, every time.
+            let mut last = with_jitter(start, schedule.jitter(), 0.999_999);
+            for step in 1..=4 {
+                let expected = start + step * grid;
+                match due(&schedule, Some(last), expected, &Utc) {
+                    Due::Now { .. } => {}
+                    other => panic!(
+                        "{expression} should be due at its own moment {expected} \
+                         after a run at {last}: {other:?}"
+                    ),
+                }
+                last = with_jitter(expected, schedule.jitter(), 0.999_999);
+            }
+        }
     }
 
     /// The midnight wrap is only a gap when there is a next day.
