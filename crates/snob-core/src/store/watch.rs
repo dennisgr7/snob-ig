@@ -484,25 +484,34 @@ pub fn commit_report(
 /// hop. `to` is what they are called *now*, read from `users`: if they have
 /// renamed again since, that is still the true and more useful answer, because
 /// the reader is going to go and look them up.
+/// `head` closes the window at the top, and it is not decoration. The caller
+/// reads it before comparing and files it as the point reached, on the strength
+/// of a comment saying nothing filed after it is inside the window — but nothing
+/// enforced that. The database is shared between processes, so a rename filed by
+/// an ordinary `snob followers` between the two reads was announced under this
+/// run's `run_id` and again under the next one's. Two ids for one event is
+/// precisely what the id-bounded window was introduced to stop, since `run_id`
+/// is what a receiver deduplicates on.
 pub fn renames_since(
     conn: &Connection,
     snapshot_id: i64,
     since: i64,
+    head: i64,
 ) -> Result<Vec<Rename>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT h.pk, h.username, u.username, h.changed_at
          FROM username_history h
          JOIN users u            ON u.pk = h.pk
          JOIN snapshot_members m ON m.user_pk = h.pk AND m.snapshot_id = ?1
-         WHERE h.id > ?2
+         WHERE h.id > ?2 AND h.id <= ?3
            AND h.id = (
              SELECT MIN(e.id) FROM username_history e
-             WHERE e.pk = h.pk AND e.id > ?2
+             WHERE e.pk = h.pk AND e.id > ?2 AND e.id <= ?3
            )
          ORDER BY h.id",
     )?;
 
-    let rows = stmt.query_map(params![snapshot_id, since], |row| {
+    let rows = stmt.query_map(params![snapshot_id, since, head], |row| {
         Ok(Rename {
             pk: pk_from_sql(row.get(0)?),
             from: row.get(1)?,
@@ -537,6 +546,13 @@ mod tests {
             is_verified: None,
             pfp_url: None,
         }
+    }
+
+    /// The top of the rename window, for a test that only cares about the
+    /// bottom of it. A run reads this before comparing, so "everything filed so
+    /// far" is what these are asking for.
+    fn head_now(conn: &Connection) -> i64 {
+        history_head(conn).unwrap()
     }
 
     /// An account with one capture holding `members`, ready to be marked.
@@ -635,7 +651,7 @@ mod tests {
         // The walk that sees the new name is what files the history row.
         users::upsert(db.conn(), &user(1, "after")).unwrap();
 
-        let found = renames_since(db.conn(), id, 0).unwrap();
+        let found = renames_since(db.conn(), id, 0, head_now(db.conn())).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].pk, 1);
         assert_eq!(found[0].from, "before");
@@ -653,13 +669,54 @@ mod tests {
         let id = account_with_capture(&mut db, 7, &[user(1, "before")]);
         users::upsert(db.conn(), &user(1, "after")).unwrap();
 
-        assert_eq!(renames_since(db.conn(), id, 0).unwrap().len(), 1);
+        assert_eq!(
+            renames_since(db.conn(), id, 0, head_now(db.conn()))
+                .unwrap()
+                .len(),
+            1
+        );
 
         let head = history_head(db.conn()).unwrap();
         assert!(
-            renames_since(db.conn(), id, head).unwrap().is_empty(),
+            renames_since(db.conn(), id, head, head_now(db.conn()))
+                .unwrap()
+                .is_empty(),
             "the run that reported it stopped at that id, so the next window starts after it"
         );
+    }
+
+    /// The window has a top as well as a bottom, and a rename filed above it is
+    /// left for the next run.
+    ///
+    /// The caller reads `head` before comparing and then files it as the point
+    /// reached, on the strength of a comment saying nothing filed after it is
+    /// inside the window. Nothing enforced that: the query bounded on `h.id >
+    /// since` alone. The database is shared between processes, so an ordinary
+    /// `snob followers` filing a rename while a tick is comparing got that
+    /// rename announced under this run's `run_id` and again under the next
+    /// one's — two ids for one event, and `run_id` is exactly what a receiver
+    /// deduplicates on.
+    #[test]
+    fn a_rename_filed_after_the_head_was_read_waits_for_the_next_window() {
+        let mut db = Store::in_memory().unwrap();
+        let id = account_with_capture(&mut db, 7, &[user(1, "before"), user(2, "other")]);
+
+        // What this run will report on, and the head it read before comparing.
+        users::upsert(db.conn(), &user(1, "after")).unwrap();
+        let head = head_now(db.conn());
+
+        // And what another process files while the comparison is running.
+        users::upsert(db.conn(), &user(2, "other_after")).unwrap();
+
+        let found = renames_since(db.conn(), id, 0, head).unwrap();
+        assert_eq!(found.len(), 1, "only what was inside the window: {found:?}");
+        assert_eq!(found[0].pk, 1);
+
+        // And the next run, starting where this one stopped, picks up the one
+        // that arrived late rather than losing it.
+        let next = renames_since(db.conn(), id, head, head_now(db.conn())).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].pk, 2);
     }
 
     /// Zero is what a mark that has never reported carries, and an empty
@@ -926,7 +983,11 @@ mod tests {
         users::upsert(db.conn(), &user(2, "stranger")).unwrap();
         users::upsert(db.conn(), &user(2, "stranger_renamed")).unwrap();
 
-        assert!(renames_since(db.conn(), id, 0).unwrap().is_empty());
+        assert!(
+            renames_since(db.conn(), id, 0, head_now(db.conn()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Somebody who changed their name twice moved once, from where they
@@ -940,7 +1001,7 @@ mod tests {
         users::upsert(db.conn(), &user(1, "second")).unwrap();
         users::upsert(db.conn(), &user(1, "third")).unwrap();
 
-        let found = renames_since(db.conn(), id, 0).unwrap();
+        let found = renames_since(db.conn(), id, 0, head_now(db.conn())).unwrap();
         assert_eq!(found.len(), 1, "one account moved, so one line about it");
         assert_eq!(found[0].from, "first");
         assert_eq!(found[0].to, "third");
@@ -957,6 +1018,10 @@ mod tests {
         users::upsert(db.conn(), &user(1, "briefly")).unwrap();
         users::upsert(db.conn(), &user(1, "original")).unwrap();
 
-        assert!(renames_since(db.conn(), id, 0).unwrap().is_empty());
+        assert!(
+            renames_since(db.conn(), id, 0, head_now(db.conn()))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -603,22 +603,67 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
         .collect();
 
     let mut renamed: Vec<Rename> = Vec::new();
-    let mut covered = None;
     if !verified.is_empty() {
         let since = store::rename_cursor(app.db().conn(), pk)?;
         let mut seen = std::collections::HashSet::new();
         for report in &verified {
-            for rename in store::renames_since(app.db().conn(), report.basis.mark_to(), since)? {
+            for rename in
+                store::renames_since(app.db().conn(), report.basis.mark_to(), since, head)?
+            {
                 if seen.insert(rename.pk) {
                     renamed.push(rename);
                 }
             }
         }
-        // A window was read, so it may be filed as reported. Nothing filed after
-        // `head` is inside it, which is the point of reading the head before the
-        // comparison rather than after.
-        covered = Some(head);
     }
+
+    // Whether the cursor may move, which is a different question from whether
+    // there was anything to report, and it used to be answered by the same
+    // `if`.
+    //
+    // It is **every list this account has a capture of**, and it counts a
+    // baseline. Two defects came out of the old answer, in opposite directions:
+    //
+    // - `verified()` excludes a baseline, so after a first run that laid one
+    //   down the cursor was still zero. The next run's lists are `Unchanged`,
+    //   which does count, so it read the window from the beginning of time:
+    //   every `username_history` row written by every ordinary `snob followers`
+    //   since the first release, announced as news. Excluding the baseline
+    //   deferred the very window it was written to suppress by exactly one run.
+    // - `renames_since` joins the members of one capture, so it only ever sees
+    //   the lists that were verified — but the cursor moved as soon as *any* of
+    //   them was, and there is one cursor for the account. On an account whose
+    //   `following` meets the truncation wall every tick, a rename of somebody
+    //   only in `following` was stepped over permanently: no later run and no
+    //   `snob watch diff` would ever surface it, because a rename moves nobody
+    //   in or out of a list. `006_rename_cursor.sql` calls that shape a defect
+    //   in as many words.
+    //
+    // A list the account has never had a capture of does not hold the cursor
+    // back: there are no members to have missed a rename among. And a run that
+    // reported on no list at all read no window, so there is nothing to file as
+    // covered — an account nothing has ever walked does not even have a row for
+    // the cursor to hang off.
+    let reported_on: Vec<ListKind> = [followers.as_ref(), following.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|report| report.kind)
+        .collect();
+
+    let mut every_list_accounted_for = true;
+    for kind in [ListKind::Followers, ListKind::Following] {
+        if reported_on.contains(&kind) {
+            continue;
+        }
+        if snapshots::latest_complete(app.db().conn(), pk, kind)?.is_some() {
+            every_list_accounted_for = false;
+        }
+    }
+
+    // Nothing filed after `head` is inside the window — enforced by
+    // `renames_since` rather than asserted here, which is what the comment used
+    // to do.
+    let covered = (!reported_on.is_empty() && every_list_accounted_for).then_some(head);
 
     // The lists this report actually spoke about, for whoever commits it.
     //

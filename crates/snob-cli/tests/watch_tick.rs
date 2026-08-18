@@ -541,3 +541,185 @@ async fn a_canceled_run_does_not_walk_the_second_list() {
         "nothing may be spent after the user asked it to stop"
     );
 }
+
+/// A list served with names rather than only ids, so a rename can be arranged.
+async fn mount_named(server: &MockServer, kind: &str, users: &[(u64, &str)]) {
+    let users: Vec<String> = users
+        .iter()
+        .map(|(pk, name)| format!(r#"{{"pk":{pk},"username":"{name}"}}"#))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/friendships/42/{kind}/")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"users":[{}]}}"#, users.join(","))),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The rename cursor does not step over a list this run could not read.
+///
+/// `renames_since` joins the members of one capture, so it only ever sees the
+/// lists that were verified — but the cursor moved as soon as *any* of them was,
+/// and there is one cursor for the account. On an account whose `following` is
+/// refused, a rename of somebody only in `following` was stepped over
+/// permanently: no later run and no `snob watch diff` would ever surface it,
+/// because a rename moves nobody in or out of a list. `006_rename_cursor.sql`
+/// calls that shape a defect in as many words.
+///
+/// Driven through `tick`, because that is the only entry point where a list is
+/// refused at all — `look` reads every capture there is, so the test beside it
+/// in `tests/watch.rs` cannot reach this.
+///
+/// A server per run, like the counter test above: a run that walks both lists
+/// polls the profile twice, because `App::resolved_target` drops the remembered
+/// counters as soon as the pacer has moved, so one server answering in sequence
+/// cannot be lined up with the runs.
+#[tokio::test]
+async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Run one: both lists laid down as baselines. Nobody is in both, so a
+    // rename in one is invisible to the other.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 1, 1).await;
+        mount_named(&server, "followers", &[(1, "one")]).await;
+        mount_named(&server, "following", &[(2, "two")]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        run(&mut app, &Watched::own()).await;
+
+        // A rename filed between runs, of somebody who is only in `following`.
+        // Filing it through the store is what an ordinary `snob followers` by
+        // hand does.
+        snob_core::store::users::upsert(
+            app.db().conn(),
+            &snob_core::model::User {
+                pk: 2,
+                username: "two_renamed".into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            },
+        )
+        .unwrap();
+    }
+
+    // Run two: both counters have moved so both lists are walked, followers
+    // answers and following does not.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 2).await;
+        mount_named(&server, "followers", &[(1, "one"), (3, "three")]).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/42/following/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("not the JSON this endpoint returns"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+
+        assert!(
+            tick.lists
+                .iter()
+                .any(|l| l.kind == ListKind::Following && l.skipped.is_some()),
+            "the following list has to be the refused one: {:?}",
+            tick.lists
+        );
+        assert!(
+            tick.report.changes().renamed.is_empty(),
+            "the renamed account is not in the list this run could read"
+        );
+    }
+
+    // Run three: the counters match what is stored, so both lists are verified
+    // without a walk — and the rename the refused list holds is finally
+    // reportable, which it can only be if the cursor stayed where it was.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 1).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+
+        let renamed = tick.report.changes().renamed;
+        assert_eq!(
+            renamed.len(),
+            1,
+            "a rename in a list that was refused is owed, not lost: {renamed:?}"
+        );
+        assert_eq!(renamed[0].pk, 2);
+        assert_eq!(renamed[0].from, "two");
+        assert_eq!(renamed[0].to, "two_renamed");
+    }
+}
+
+/// The first run seeds the rename cursor, so the second does not announce
+/// history from before the monitor existed.
+///
+/// `covered` was set only for a list this run *verified*, and `verified()`
+/// excludes a baseline — so after a first run that laid one down the cursor was
+/// still zero. The next run's lists are `Unchanged`, which does count, so it
+/// read the window from the beginning of time: every `username_history` row
+/// written by every ordinary `snob followers` since the first release,
+/// announced as news on the monitor's second run. Excluding the baseline
+/// deferred the very window it was written to suppress by exactly one run.
+#[tokio::test]
+async fn a_baseline_run_seeds_the_rename_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // History from before the monitor: this account was walked by hand and
+    // somebody in it changed their name.
+    {
+        let db = open_db(tmp.path());
+        snob_core::store::users::ensure(db.conn(), 42).unwrap();
+        snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+        for name in ["before", "after"] {
+            snob_core::store::users::upsert(
+                db.conn(),
+                &snob_core::model::User {
+                    pk: 1,
+                    username: name.into(),
+                    full_name: None,
+                    is_private: None,
+                    is_verified: None,
+                    pfp_url: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            snob_core::store::watch::history_head(db.conn()).unwrap(),
+            1,
+            "there is a rename on record before the monitor ever runs"
+        );
+    }
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 1, 1).await;
+    mount_named(&server, "followers", &[(1, "after")]).await;
+    mount_named(&server, "following", &[(1, "after")]).await;
+
+    // The first run: baselines, and it must say nothing.
+    let mut app = app(&server, open_db(tmp.path()));
+    let first = run(&mut app, &Watched::own()).await;
+    assert!(
+        first.report.changes().renamed.is_empty(),
+        "a baseline has nothing to compare against"
+    );
+
+    // And the second, with both counters unchanged, must not announce the
+    // rename that was already on record before any of this started.
+    let second = run(&mut app, &Watched::own()).await;
+    assert!(
+        second.report.changes().renamed.is_empty(),
+        "run two announced history from before the monitor: {:?}",
+        second.report.changes().renamed
+    );
+}
