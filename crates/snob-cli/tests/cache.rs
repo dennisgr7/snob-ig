@@ -589,3 +589,137 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     check_same_moment(&followers, &following)
         .expect("the two walks touched, so nothing happened that only one of them saw");
 }
+
+/// An interrupted walk is continued, not begun again.
+///
+/// The store half and the pager half are each tested on their own — `resumable`
+/// hands back a partial, and a walker given a cursor sends it — but nothing
+/// tested the wiring between them, and the wiring is `walk::open_snapshot`.
+/// `let pending = None;` there passes the whole suite while every interrupted
+/// walk restarts at page one and pays again for the requests it had already
+/// spent, with the advice on screen promising the opposite. `no_resume` is
+/// `false` at all three construction sites and was never `true` in a test
+/// either, so the flag that turns this off had no coverage at all.
+#[tokio::test]
+async fn an_interrupted_walk_continues_from_the_cursor_it_stored() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 2).await;
+
+    // Page two first: wiremock matches in the order mocks were mounted, and
+    // the page-one mock below matches any request to this path.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .and(query_param("max_id", "next"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"users":[{"pk":2,"username":"u2"}]}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"users":[{"pk":1,"username":"u1"}],"next_max_id":"next"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A walk stopped after one page, with a cursor saved.
+    let mut capped = args();
+    capped.max_pages = Some(1);
+    execute(&server, tmp.path(), &capped).await.unwrap();
+
+    let partial: i64 = open_db(tmp.path())
+        .conn()
+        .query_row("SELECT id FROM snapshots WHERE complete = 0", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    // And the run after it, with no cap, which has to pick that one up.
+    let (found, _) = execute(&server, tmp.path(), &args()).await.unwrap();
+
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.url.query().map(str::to_string))
+        .collect();
+    assert!(
+        asked.iter().any(|q| q.contains("max_id=next")),
+        "the stored cursor has to be sent, or the requests already spent are spent again: \
+         {asked:?}"
+    );
+
+    let (id, members, resumes): (i64, i64, i64) = open_db(tmp.path())
+        .conn()
+        .query_row(
+            "SELECT id, member_count, resumes FROM snapshots WHERE complete = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        id, partial,
+        "it continued the capture rather than opening one"
+    );
+    assert_eq!(resumes, 1, "and recorded that it did");
+    assert_eq!(members, 2, "page one's members survived the resume");
+    assert_eq!(found.len(), 2);
+}
+
+/// And `--no-resume` is what starts over, which nothing exercised either.
+///
+/// Measured in requests rather than in the capture's id: SQLite reuses a rowid
+/// after a delete — the same property `run_id` exists because of — so the fresh
+/// capture is very often numbered the same as the one it replaced.
+#[tokio::test]
+async fn no_resume_walks_the_list_again_from_the_first_page() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 2).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .and(query_param("max_id", "next"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"users":[{"pk":2,"username":"u2"}]}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"users":[{"pk":1,"username":"u1"}],"next_max_id":"next"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut capped = args();
+    capped.max_pages = Some(1);
+    execute(&server, tmp.path(), &capped).await.unwrap();
+    let after_the_first = requests(&server).await;
+
+    let mut fresh = args();
+    fresh.no_resume = true;
+    execute(&server, tmp.path(), &fresh).await.unwrap();
+
+    let resumes: i64 = open_db(tmp.path())
+        .conn()
+        .query_row(
+            "SELECT resumes FROM snapshots WHERE complete = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(resumes, 0, "--no-resume continues nothing");
+    assert_eq!(
+        requests(&server).await - after_the_first,
+        3,
+        "the counter poll and both pages again, where a resume would have asked for one"
+    );
+}
