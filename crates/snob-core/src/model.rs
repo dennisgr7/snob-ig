@@ -33,6 +33,22 @@ const IN_A_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMER
     .remove(b'_')
     .remove(b'~');
 
+/// A name, ready to be one segment of a URL path.
+///
+/// Public for the same reason [`printable`] is: a username reaches an address
+/// from more than one place, and [`User::profile_url`] is not all of them. The
+/// `Referer` header the Instagram client sends names the page a browser would
+/// have called from, which is built out of the username as typed — and a
+/// header value cannot hold a byte below 0x20 at all, so an unencoded name
+/// there does not produce a wrong address, it produces no request.
+///
+/// Encoded rather than filtered, for the reason [`User::profile_url`] gives at
+/// length: removing a character from a name yields the address of a different
+/// account.
+pub fn in_a_path(name: &str) -> String {
+    percent_encoding::utf8_percent_encode(name, IN_A_PATH).to_string()
+}
+
 impl User {
     /// The address of this account, with the name encoded into it.
     ///
@@ -51,10 +67,7 @@ impl User {
     /// sequence early and let the rest of the name open one of its own, so the
     /// cell showed a filtered name and pointed wherever the name said.
     pub fn profile_url(&self) -> String {
-        format!(
-            "https://www.instagram.com/{}/",
-            percent_encoding::utf8_percent_encode(&self.username, IN_A_PATH)
-        )
+        format!("https://www.instagram.com/{}/", in_a_path(&self.username))
     }
 
     /// The full name with control characters taken out, for anything a
