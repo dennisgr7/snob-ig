@@ -657,24 +657,23 @@ fn health(config: Option<&WatchConfig>, runs: &[watch_store::Run], owed: usize) 
 fn describe_config(config: &WatchConfig) -> Vec<String> {
     let mut lines = Vec::new();
 
-    let mut when = Vec::new();
-    if let Some(every) = config.every {
-        when.push(format!("every {}", duration::format(every)));
-    }
-    if !config.on.is_empty() {
-        when.push(format!("on {}", printable(&config.on.join(", "))));
-    }
-    if !config.at.is_empty() {
-        when.push(format!("at {}", printable(&config.at.join(", "))));
-    }
-    if let Some(cron) = &config.cron {
-        when.push(format!("cron \"{}\"", printable(cron)));
-    }
+    let when =
+        report::schedule_clauses(config.every, &config.on, &config.at, config.cron.as_deref());
     lines.push(if when.is_empty() {
         "no schedule: it will not run until one is set".to_string()
     } else {
         format!("Runs {}", when.join(", "))
     });
+
+    // What the file says, not what a `Schedule` would clamp it to. This is the
+    // place a person reads their configuration back, and a hand-edited
+    // `jitter = "1h"` reached no line of it at all — the one setting you could
+    // write into the file and never see again.
+    if let Some(jitter) = config.jitter
+        && let Some(sentence) = report::jitter_sentence(jitter)
+    {
+        lines.push(sentence);
+    }
 
     match &config.webhook {
         Some(webhook) => {
@@ -739,6 +738,25 @@ mod tests {
              [[account]]\ntarget = \"someone\"\n[account.consent]\nagreed_at = 1\n",
         ));
         assert!(lines.join("\n").contains("1 other"), "{lines:?}");
+    }
+
+    /// The one setting somebody could write into the file and never see again.
+    ///
+    /// `status` and the replace-this-file confirmation are where a person reads
+    /// their configuration back, and `WatchConfig.jitter` reached neither.
+    #[test]
+    fn a_configured_jitter_is_read_back() {
+        let lines = describe_config(&config("schema = 1\nevery = \"6h\"\njitter = \"1h\"\n"));
+        assert!(
+            lines.join("\n").contains("pushed up to 1h later"),
+            "{lines:?}"
+        );
+
+        let none = describe_config(&config("schema = 1\nevery = \"6h\"\njitter = \"0\"\n"));
+        assert!(
+            !none.join("\n").contains("pushed up to"),
+            "a jitter that was turned off has nothing to say: {none:?}"
+        );
     }
 
     /// The line `setup` writes has to be one the parser reads back. It is built
