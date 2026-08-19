@@ -447,17 +447,13 @@ fn with_recorded_consent(name: &str, configured: Option<&WatchConfig>) -> Watche
     }
 }
 
-fn target_label(target: Option<&str>) -> String {
-    match target {
-        Some(name) => format!("@{}", printable(name)),
-        None => "your account".to_string(),
-    }
-}
-
 /// What the opening line names, so somebody starting the service can see that
 /// it understood which accounts it is for.
 fn watching_label(watched: &[Watched]) -> String {
-    let names: Vec<String> = watched.iter().map(|w| target_label(w.name())).collect();
+    let names: Vec<String> = watched
+        .iter()
+        .map(|w| crate::app::target_label(w.name()))
+        .collect();
 
     match names.len() {
         0 => "nothing".to_string(),
@@ -880,10 +876,7 @@ pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<
                 following,
                 ..
             } => (
-                match target {
-                    Some(name) => format!("@{}", printable(name)),
-                    None => "your account".to_string(),
-                },
+                crate::app::target_label(target.as_deref()),
                 match (followers, following) {
                     (Some(a), Some(b)) => format!("{a} followers, {b} following"),
                     _ => String::new(),

@@ -66,6 +66,22 @@ pub fn label(pk: Pk, username: Option<&str>) -> String {
     }
 }
 
+/// The same rule where the absent case means the viewer rather than an account
+/// whose name is not known yet.
+///
+/// [`label`] answers "which account is this" and falls back to an id; this
+/// answers "whose lists are we talking about" and falls back to "your account".
+/// Two different questions, which is why they are two functions — and it was
+/// written out three times: the banner a scheduled run opens with, the line
+/// `watch check` prints per account, and the context on a failed walk, that
+/// last one built inside `engine`, where wording does not belong.
+pub fn target_label(target: Option<&str>) -> String {
+    match target {
+        Some(name) => format!("@{}", snob_core::model::printable(name)),
+        None => "your account".to_string(),
+    }
+}
+
 /// The one place a [`Pacer`] is assembled.
 ///
 /// Three things have to be true of every one of them and only this had them all:
@@ -339,7 +355,22 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::Viewer;
+    use super::{Viewer, target_label};
+
+    /// The three copies of this rule all called `printable`, and none of them
+    /// had anything watching that they did.
+    ///
+    /// Two of the three take the name from `watch.toml`, which validates a
+    /// username not at all, and one of those is the banner a scheduled service
+    /// opens with — the first thing a monitor ever prints.
+    #[test]
+    fn naming_a_target_takes_out_what_a_terminal_would_obey() {
+        let shown = target_label(Some("friend\u{1b}[2K"));
+        assert!(!shown.contains('\x1b'), "{shown:?}");
+        assert_eq!(shown, "@friend[2K");
+
+        assert_eq!(target_label(None), "your account");
+    }
 
     /// The name here came from Instagram — `whoami` writes it out of
     /// `resolve_username` — not from the command line, and it ends up as the

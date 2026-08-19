@@ -6,7 +6,7 @@
 //! run destructors.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, User, printable};
+use snob_core::model::{ListKind, User};
 use snob_core::store::{now, snapshots};
 use snob_ig::pace::Pace;
 use snob_ig::pager::{ListRequest, ListWalker, WalkError};
@@ -80,10 +80,7 @@ pub async fn fetch(
         // same reason every other account name this tool prints does: it came
         // off Instagram, not out of anybody's keyboard.
         Err(error) => {
-            let who = match target.username.as_deref() {
-                Some(name) => format!("@{}", printable(name)),
-                None => "your account".to_string(),
-            };
+            let who = crate::app::target_label(target.username.as_deref());
             return Err(
                 anyhow::Error::new(error).context(format!("could not read {who}'s {kind} list"))
             );
