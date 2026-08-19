@@ -133,7 +133,25 @@ fn build_client(
 /// `text()` would buffer whatever arrives, which lets the far end decide how
 /// much memory this process uses. Read in chunks so that a response with no
 /// `Content-Length` — which is most of them — is bounded too.
-async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<String, IgError> {
+async fn read_capped(response: reqwest::Response, cap: u64) -> Result<String, IgError> {
+    // Lossy rather than strict: a body that is not valid UTF-8 is not JSON
+    // either, and saying "could not parse" is more use than "invalid encoding".
+    Ok(String::from_utf8_lossy(&read_capped_bytes(response, cap).await?).into_owned())
+}
+
+/// The ceiling itself: refuse a declared length over it, and read in chunks so
+/// that a response without a `Content-Length` — which is most of them — is
+/// bounded too.
+///
+/// One copy for both callers. The API body and the CDN download had the same
+/// declared-length check, the same chunked read and the same `TooLarge` written
+/// out separately, and the CDN is the wrong one to leave behind at the next
+/// tightening: its URL comes out of Instagram's own answer, so it is the one
+/// place a response chooses where the next request goes.
+///
+/// `http::read_capped` stays where it is. Its doc names why it truncates rather
+/// than refusing, which is a different rule for a different reader.
+async fn read_capped_bytes(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8>, IgError> {
     let too_large = || IgError::TooLarge {
         limit: cap as usize,
     };
@@ -151,10 +169,7 @@ async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<String
         }
         bytes.extend_from_slice(&chunk);
     }
-
-    // Lossy rather than strict: a body that is not valid UTF-8 is not JSON
-    // either, and saying "could not parse" is more use than "invalid encoding".
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 /// Which side of the relationship is being requested.
@@ -471,7 +486,7 @@ impl IgClient {
         // Deliberately not paced: the CDN is a different host with its own
         // limits, and charging a picture against Instagram's budget would make
         // the number mean two things at once.
-        let mut response = self.cdn()?.get(url).send().await?;
+        let response = self.cdn()?.get(url).send().await?;
         let status = response.status();
 
         // Deliberately not `classify`: that reads Instagram's API vocabulary,
@@ -485,23 +500,7 @@ impl IgClient {
             });
         }
 
-        let too_large = || IgError::TooLarge { limit: cap };
-        if let Some(declared) = response.content_length()
-            && declared > cap as u64
-        {
-            return Err(too_large());
-        }
-
-        // Read in chunks rather than all at once: a response with no
-        // Content-Length would otherwise sail past the check above.
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if bytes.len() + chunk.len() > cap {
-                return Err(too_large());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        read_capped_bytes(response, cap as u64).await
     }
 
     /// One request to Instagram's API, with the headers a browser would send.
