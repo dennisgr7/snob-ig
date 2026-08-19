@@ -14,7 +14,7 @@ use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
 use snob_core::secrets::{Kind, SecretStore};
 use snob_core::store::{Store, deliveries, watch as watch_store};
-use snob_core::watch::config::{self, WatchConfig};
+use snob_core::watch::config::{self, AccountConfig, WatchConfig};
 use snob_core::{duration, watch::schedule};
 
 use crate::cli::{WatchSetupArgs, WatchStatusArgs};
@@ -685,14 +685,31 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
         None => lines.push("Sends nothing: the report goes to standard output".to_string()),
     }
 
-    let others = config.accounts.iter().filter(|a| !a.is_own()).count();
-    if others > 0 {
-        lines.push(format!(
-            "Watches your account and {others} other{}",
-            if others == 1 { "" } else { "s" }
-        ));
-    }
+    lines.push(watching_line(config));
     lines
+}
+
+/// Who a run over this file would actually walk.
+///
+/// Derived from the same predicate `watched_from` runs on, because the two used
+/// to disagree. This counted the strangers and then said "your account and N
+/// other" regardless, while `watched_from` falls back to the viewer **only when
+/// the list is empty** — so a hand-edited file naming one stranger is walked as
+/// that stranger alone, and both of the two places a person reads the
+/// configuration back said otherwise.
+fn watching_line(config: &WatchConfig) -> String {
+    let own = config.accounts.is_empty() || config.accounts.iter().any(AccountConfig::is_own);
+    let others = config.accounts.iter().filter(|a| !a.is_own()).count();
+
+    match (own, others) {
+        (true, 0) => "Watches your account".to_string(),
+        (true, n) => format!("Watches your account and {n} other{}", plural(n)),
+        (false, n) => format!("Watches {n} account{}, and not your own", plural(n)),
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 #[cfg(test)]
@@ -737,7 +754,38 @@ mod tests {
             "schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"self\"\n\n\
              [[account]]\ntarget = \"someone\"\n[account.consent]\nagreed_at = 1\n",
         ));
-        assert!(lines.join("\n").contains("1 other"), "{lines:?}");
+        assert!(
+            lines.join("\n").contains("your account and 1 other"),
+            "{lines:?}"
+        );
+    }
+
+    /// A file that names one stranger is walked as that stranger alone:
+    /// `watched_from` falls back to the viewer only when the list is empty. Both
+    /// of the two places a person reads the configuration back said otherwise,
+    /// because this counted the strangers and then claimed the viewer anyway.
+    #[test]
+    fn it_does_not_claim_your_account_when_the_file_does_not_list_it() {
+        let lines = describe_config(&config(
+            "schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"friend\"\n\
+             [account.consent]\nagreed_at = 1\n",
+        ));
+        let text = lines.join("\n");
+
+        assert!(!text.contains("your account"), "{text}");
+        assert!(text.contains("1 account, and not your own"), "{text}");
+    }
+
+    /// A file with no `[[account]]` at all means the obvious thing, and this is
+    /// the one shape where the old wording happened to be right by accident --
+    /// it printed nothing.
+    #[test]
+    fn a_file_naming_nobody_watches_the_viewer() {
+        let lines = describe_config(&config("schema = 1\nevery = \"6h\"\n"));
+        assert!(
+            lines.join("\n").contains("Watches your account"),
+            "{lines:?}"
+        );
     }
 
     /// The one setting somebody could write into the file and never see again.
