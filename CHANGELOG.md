@@ -45,9 +45,10 @@ at-least-once, so a repeat is possible and the receiver can drop it. Every
 answer your endpoint gives is worth another try — a 404 from an n8n workflow
 that was not registered, a 403 from a proxy reloading, a 401 from a token that
 expired — because the alternative is losing the only copy of that change. One
-that keeps failing is given up on after a few hours rather than retried forever,
-and the line you get then says the change was not reported rather than implying
-it is still queued.
+that keeps failing is given up on after a day rather than retried forever, and
+the line you get then says the change was not reported rather than implying it
+is still queued. A day, because that is how long a receiver can plausibly be
+down over a weekend and still be worth waiting for.
 
 A queued report remembers the address it was made for, so pointing a run
 somewhere else with `--webhook` to see what the payload looks like does not
