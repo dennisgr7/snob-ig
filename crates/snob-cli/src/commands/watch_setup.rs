@@ -686,6 +686,18 @@ fn health(config: Option<&WatchConfig>, runs: &[RunOf<'_>], owed: usize, now: i6
         notes.push("it has not run yet".to_string());
     }
 
+    // A schedule the scheduler refuses is a monitor that cannot start.
+    //
+    // `describe_config` prints the clauses without evaluating anything, so
+    // `status` said "Runs every 5m" and exited 0 about a file that kills every
+    // invocation at `schedule_from`. Nothing here built a schedule at all.
+    if let Some(config) = config
+        && let Err(e) = super::watch::schedule_from(&Default::default(), Some(config))
+    {
+        at_least(Verdict::Failed);
+        notes.push(format!("the configured schedule cannot be built: {e}"));
+    }
+
     // **Whether it is still running at all**, which nothing here used to ask.
     //
     // Runs were read for their `outcome` and nothing else, so as long as the
@@ -1051,6 +1063,43 @@ every = \"6h\"
         let nothing = health(None, &[], 0, NOW);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
+    }
+
+    /// A file whose schedule the scheduler refuses is a monitor that cannot
+    /// start, and both read-only probes said it was fine.
+    ///
+    /// `check` discarded the error with `.ok()` and pushed a schedule line only
+    /// on `Some`, so the report carried no schedule line at all and
+    /// `verdict()` — `max().unwrap_or(Ok)` — exited 0. `health` never built a
+    /// schedule, and `describe_config` prints the clauses without evaluating
+    /// anything, so `status` printed "Runs every 5m" and exited 0 too.
+    ///
+    /// Every one of these gets into the file through a hand-edit, which the
+    /// first line of `watch.toml` says is fine, and every one passes
+    /// `config::parse` — which reads TOML, the schema number and one key clash.
+    #[test]
+    fn a_schedule_the_scheduler_refuses_is_not_healthy() {
+        for refused in [
+            "schema = 1\nevery = \"5m\"\n",
+            "schema = 1\ncron = \"0 9 * *\"\n",
+            "schema = 1\nat = [\"25:00\"]\n",
+            "schema = 1\nevery = \"2w\"\non = [\"mon\"]\n",
+        ] {
+            let configured = config(refused);
+            let ok = ran("ok");
+            let health = health(Some(&configured), &[of(&ok)], 0, NOW);
+            assert_eq!(
+                health.verdict,
+                Verdict::Failed,
+                "{refused:?} kills every run: {:?}",
+                health.notes
+            );
+        }
+
+        // And one that builds is still fine.
+        let good = config("schema = 1\nevery = \"6h\"\n");
+        let ok = ran("ok");
+        assert_eq!(health(Some(&good), &[of(&ok)], 0, NOW).verdict, Verdict::Ok);
     }
 
     /// A monitor that stopped is not a healthy monitor.
