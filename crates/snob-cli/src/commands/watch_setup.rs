@@ -469,10 +469,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 })).collect::<Vec<_>>(),
             }))?
         );
-        return Ok(match health.verdict {
-            Verdict::Failed => ExitCode::Error,
-            _ => ExitCode::Ok,
-        });
+        return Ok(health.verdict.exit_code());
     }
 
     match &config {
@@ -567,13 +564,8 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     }
 
     // Non-zero when the monitor is not doing what it was configured to do, so
-    // this is usable as a probe rather than only as something to read. A
-    // warning is not a failure: a monitor that has not run yet, or one sitting
-    // out a cooldown, is working.
-    Ok(match health.verdict {
-        Verdict::Failed => ExitCode::Error,
-        _ => ExitCode::Ok,
-    })
+    // this is usable as a probe rather than only as something to read.
+    Ok(health.verdict.exit_code())
 }
 
 /// Whether the monitor is doing what it was configured to do.

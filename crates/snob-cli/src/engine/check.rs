@@ -24,6 +24,8 @@
 use snob_core::Pk;
 use snob_core::secrets::SecretStore;
 use snob_core::store::snapshots;
+
+use crate::exit::ExitCode;
 use snob_core::watch::config::WatchConfig;
 use snob_core::watch::schedule::{self, Schedule};
 
@@ -46,6 +48,26 @@ impl Verdict {
             Self::Ok => "ok",
             Self::Warned => "warning",
             Self::Failed => "failed",
+        }
+    }
+
+    /// What a command exits with after reaching this verdict.
+    ///
+    /// Written out at three call sites — `check`, `status`, and `status
+    /// --json`, that last one behind an early return — which is three places
+    /// for one of them to be missed. The miss that mattered would have made
+    /// `status --json` and `status` exit differently on identical state, which
+    /// is exactly the thing a probe cannot be asked to work around.
+    ///
+    /// **`Warned` exits zero, deliberately.** A monitor with no baseline yet
+    /// will work; it just has nothing to say on its first run, and one sitting
+    /// out a cooldown is working too. If a probe ever wants to tell a warning
+    /// from a clean run without reading the JSON, this is the one line to
+    /// change — and the README's exit table is what it costs.
+    pub fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Failed => ExitCode::Error,
+            Self::Ok | Self::Warned => ExitCode::Ok,
         }
     }
 }
@@ -453,6 +475,22 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// One verdict, one code, whichever command asked and in whichever format.
+    ///
+    /// Three call sites spelled this out — `check`, `status`, and `status
+    /// --json` behind an early return — and the miss that mattered would have
+    /// made `status --json` and `status` exit differently on identical state,
+    /// which is the one thing a probe cannot be asked to work around.
+    #[test]
+    fn a_verdict_decides_one_exit_code() {
+        assert_eq!(Verdict::Failed.exit_code(), ExitCode::Error);
+
+        // A monitor with no baseline yet will work; it just has nothing to say
+        // on its first run, and one sitting out a cooldown is working too.
+        assert_eq!(Verdict::Warned.exit_code(), ExitCode::Ok);
+        assert_eq!(Verdict::Ok.exit_code(), ExitCode::Ok);
+    }
 
     /// The moments a schedule names, worked out through the evaluator that
     /// actually decides them.
