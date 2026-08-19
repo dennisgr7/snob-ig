@@ -57,7 +57,16 @@ pub async fn decide_and_fetch(
 
     if !args.refresh
         && let Some(snapshot) = &stored
-        && is_still_good(snapshot, declared, args.max_age.as_secs() as i64)
+        // Saturating rather than casting. `duration::parse` refuses anything
+        // this could not hold, so nothing reaches here that would wrap — but
+        // "it is checked somewhere else" is how the wrap got written in the
+        // first place, and the next reader of a `Duration` inherits an answer
+        // this way rather than a hole. Same shape as `schedule.rs`.
+        && is_still_good(
+            snapshot,
+            declared,
+            i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX),
+        )
     {
         // The counter was polled just now and had not moved, so this describes
         // the account as it is however old the snapshot is. That is what makes
@@ -171,6 +180,25 @@ mod tests {
     fn an_old_list_is_walked_however_still_the_counter_is() {
         let old = snapshot(now() - SIX_HOURS - 1, Some(300));
         assert!(!is_still_good(&old, Some(300), SIX_HOURS));
+    }
+
+    /// The longest maximum age anyone can write must not mean the shortest.
+    ///
+    /// `duration::parse` now refuses what will not fit in an `i64`, so this is
+    /// the second lock on the same door: a `Duration` built any other way still
+    /// saturates instead of wrapping, and a saturated bound reuses everything
+    /// rather than walking everything.
+    #[test]
+    fn an_absurd_maximum_age_reuses_rather_than_walks() {
+        let ancient = snapshot(0, Some(300));
+        let forever =
+            i64::try_from(std::time::Duration::from_secs(u64::MAX).as_secs()).unwrap_or(i64::MAX);
+
+        assert_eq!(forever, i64::MAX);
+        assert!(
+            is_still_good(&ancient, Some(300), forever),
+            "the longest age anyone can write is the one that expires nothing"
+        );
     }
 
     /// Not knowing the counter is not the same as knowing it stayed put. If an
