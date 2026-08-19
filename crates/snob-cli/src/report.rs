@@ -28,18 +28,31 @@ use crate::exit::{ExitCode, ExitError};
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
 pub fn print_error(error: &anyhow::Error) {
+    eprint!("{}", rendered(error));
+}
+
+/// The block `print_error` writes, built rather than printed.
+///
+/// Separate so a test can read it. Printing was four `eprintln!` calls and one
+/// early `return`, and the `return` was the branch that skipped the filter:
+/// there is no way to catch that from outside the process, so the way to catch
+/// it is to have something to assert on.
+fn rendered(error: &anyhow::Error) -> String {
     let code = ExitCode::from_chain(error);
     if code == Some(ExitCode::Interrupted) {
-        eprintln!("{error}");
-        return;
+        // No label, so nothing to indent under — but the filter is not the
+        // label's business. It applies here for the same reason it applies
+        // below: the sentence names an account, and the name came from
+        // `watch.toml` or from a terminal, not from this program.
+        return format!("{}\n", filtered(&error.to_string(), "\n"));
     }
 
     let label = console::style("error:").red().bold().for_stderr();
-    eprintln!("{label} {}", indented(&error.to_string()));
+    let mut out = format!("{label} {}\n", indented(&error.to_string()));
 
     for cause in error.chain().skip(1) {
         let caused = console::style("caused by:").dim().for_stderr();
-        eprintln!("  {caused} {}", indented(&cause.to_string()));
+        out.push_str(&format!("  {caused} {}\n", indented(&cause.to_string())));
     }
 
     if let Some(hint) = error
@@ -48,8 +61,10 @@ pub fn print_error(error: &anyhow::Error) {
         .and_then(ExitError::hint)
     {
         let label = console::style("hint:").cyan().bold().for_stderr();
-        eprintln!("{label}  {}", indented(hint));
+        out.push_str(&format!("{label}  {}\n", indented(hint)));
     }
+
+    out
 }
 
 /// Lines after the first start under the label rather than at column zero.
@@ -59,22 +74,30 @@ pub fn print_error(error: &anyhow::Error) {
 /// would eventually split a URL or `snob login --paste` across a line. The
 /// terminal already soft-wraps at the width it really has.
 ///
-/// It is also where every string this function prints is filtered, which makes
-/// it the boundary the rule asks for: a name is filtered before anything draws
-/// it, whoever it came from. Each of these messages is built by interpolating
+fn indented(text: &str) -> String {
+    filtered(text, "\n       ")
+}
+
+/// The filter every string this module prints goes through, which makes it the
+/// boundary the rule asks for: a name is filtered before anything draws it,
+/// whoever it came from. Each of these messages is built by interpolating
 /// something into a sentence, and each interpolation was one more place to
 /// remember — `checked_url` and `Blocked::AccountUnknown` were both forgotten.
 ///
 /// **Line by line, not over the whole string.** `printable` turns any
 /// whitespace into a space, newlines included, so filtering the text whole
-/// would collapse the deliberate paragraph breaks this function exists to lay
+/// would collapse the deliberate paragraph breaks [`indented`] exists to lay
 /// out. Split first and the real breaks survive while an escape sequence
 /// injected into a name does not.
-fn indented(text: &str) -> String {
+///
+/// `join` is how the caller puts the lines back together: under the label for
+/// a reported failure, and with a bare newline where there is no label to
+/// indent under.
+fn filtered(text: &str, join: &str) -> String {
     text.split('\n')
         .map(printable)
         .collect::<Vec<_>>()
-        .join("\n       ")
+        .join(join)
 }
 
 /// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
@@ -378,6 +401,44 @@ mod tests {
         );
         assert!(out.starts_with("first line"));
         assert!(out.trim_end().ends_with("second line"));
+    }
+
+    /// A run somebody stopped gets no label, and for a while that meant it got
+    /// no filter either: the branch printed the error and returned above
+    /// everything else. The refusal below is the one a scheduled run raises,
+    /// and the name in it comes from `watch.toml`, where nothing validates a
+    /// username.
+    #[test]
+    fn a_stopped_run_is_filtered_even_though_it_carries_no_label() {
+        let hostile = "gh\u{1b}[2K\u{1b}[A";
+        let error: anyhow::Error = ExitError::new(
+            ExitCode::Interrupted,
+            format!(
+                "reading @{hostile}'s lists needs confirmation, and a scheduled run has \
+                 nobody to ask.\nRun \"snob watch setup\" to answer it once."
+            ),
+        )
+        .into();
+
+        let out = rendered(&error);
+
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "{out:?} reaches a terminal"
+        );
+        assert!(out.contains("@gh"), "the name is still shown: {out}");
+        assert!(
+            !out.contains("error:"),
+            "stopping a run is not a failure to report: {out}"
+        );
+        // No label above it, so the second sentence stays at column zero.
+        let mut lines = out.lines();
+        assert!(lines.next().is_some_and(|l| l.starts_with("reading @gh")));
+        assert_eq!(
+            lines.next(),
+            Some("Run \"snob watch setup\" to answer it once.")
+        );
+        assert_eq!(lines.next(), None);
     }
 
     /// An account name reaches the cooldown refusal without anybody typing it:

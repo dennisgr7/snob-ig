@@ -71,17 +71,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // six hours and then exits because it was never allowed to read that
     // account is a service that looked healthy all afternoon.
     if let Some(unallowed) = watched.iter().find(|w| !w.may_run_unattended()) {
-        let name = unallowed.name().unwrap_or_default();
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!(
-                "reading @{}'s lists needs confirmation, and a scheduled run has nobody to \
-                 ask.\nRun \"snob watch setup\" to answer it once, or \"snob watch once {name}\" \
-                 while you are here.",
-                printable(name),
-            ),
-        )
-        .into());
+        return Err(refuse_unattended(unallowed.name().unwrap_or_default()));
     }
 
     ui::info(&format!(
@@ -207,6 +197,26 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             return Ok(ExitCode::Interrupted);
         }
     }
+}
+
+/// The refusal a scheduled run raises for an account nobody confirmed.
+///
+/// Its own function so a test can read it. The name lands in two slots of one
+/// sentence — the account being refused, and the command that answers for it —
+/// and only the first of the two used to be filtered. It comes from
+/// `watch.toml`, where nothing validates a username, so an escape sequence in
+/// it reached the terminal and the journal through the second slot.
+fn refuse_unattended(name: &str) -> anyhow::Error {
+    let shown = printable(name);
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!(
+            "reading @{shown}'s lists needs confirmation, and a scheduled run has nobody to \
+             ask.\nRun \"snob watch setup\" to answer it once, or \"snob watch once {shown}\" \
+             while you are here."
+        ),
+    )
+    .into()
 }
 
 /// How far the clock may move between two turns of the loop and still be
@@ -1892,6 +1902,26 @@ mod tests {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// Both slots of the refusal take the same name, so both must be filtered.
+    ///
+    /// The account comes from `watch.toml`, which nothing validates, and the
+    /// refusal is the one place the monitor prints it before any client
+    /// exists — the earliest a hostile name can reach a terminal.
+    #[test]
+    fn the_unattended_refusal_filters_the_name_in_both_slots() {
+        let message = refuse_unattended("gh\u{1b}[2K\u{1b}[A").to_string();
+
+        assert!(
+            !message.chars().any(|c| c.is_control() && c != '\n'),
+            "{message:?} is printed to a terminal and written to the journal"
+        );
+        assert_eq!(
+            message.matches("gh[2K[A").count(),
+            2,
+            "the account and the command that answers for it name the same person: {message}"
+        );
+    }
 
     /// Nothing is sent when nothing changed, and `--heartbeat` is what asks
     /// for the opposite.
