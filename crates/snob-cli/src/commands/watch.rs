@@ -300,12 +300,80 @@ async fn run_one(
     watched: &[Watched],
     delivery: Option<&Delivery>,
 ) -> Result<()> {
-    // One `App` for all of them, unlike one per run: they share a session and a
-    // request budget, and opening a second would be a second connection to the
-    // same database for no reason. A failure on one account does not stop the
-    // rest — a private account somebody stopped being allowed to read must not
-    // silence the monitor's own.
-    let mut failed = None;
+    let outcome = run_accounts(app, watched, delivery, Printing::unattended(args.json)).await;
+    match outcome.failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// How much a run says out loud about a tick.
+///
+/// The two modes differ here and nowhere else. A scheduled service writes one
+/// line per run down a pipe and stays quiet when there is no news, which is
+/// what makes `snob watch >> events.ndjson` and "silence means nothing changed"
+/// both true. `once` is looked at while it runs, so it says so either way and
+/// lays its JSON out to be read rather than appended to.
+#[derive(Clone, Copy)]
+struct Printing {
+    json: bool,
+    watching: bool,
+}
+
+impl Printing {
+    fn unattended(json: bool) -> Self {
+        Self {
+            json,
+            watching: false,
+        }
+    }
+
+    fn watched(json: bool) -> Self {
+        Self {
+            json,
+            watching: true,
+        }
+    }
+}
+
+/// What a run over several accounts came to.
+struct RunOutcome {
+    /// Requests spent by every account that got as far as spending any.
+    spent: u32,
+    /// The worst verdict a successful tick reported.
+    code: ExitCode,
+    /// The last failure, unprinted. Every earlier one has already been printed,
+    /// because only one can be handed back and the caller prints the one it
+    /// gets — `scheduled` so the service keeps running, `main` so `once` exits
+    /// with the right code. Printing here *and* returning is what wrote the
+    /// whole `error:` / `caused by:` / `hint:` block twice per failing run.
+    failed: Option<anyhow::Error>,
+}
+
+/// Every account of one run, and the three things that happen once around them.
+///
+/// One `App` for all of them, unlike one per run: they share a session and a
+/// request budget, and opening a second would be a second connection to the
+/// same database for no reason. A failure on one account does not stop the
+/// rest — a private account somebody stopped being allowed to read must not
+/// silence the monitor's own.
+///
+/// This was written twice, seven steps each, and the copies had drifted: `once`
+/// took the print-when-somebody-else-will-not half and not the guard on the
+/// return, and it put the drain and the expiry behind a `?`, so an ordinary
+/// failure took both with it. AGENTS.md names both modes in the rule that the
+/// queue is drained once per run, after every account, and only one of them was
+/// reachable by a test.
+async fn run_accounts(
+    app: &mut crate::app::App,
+    watched: &[Watched],
+    delivery: Option<&Delivery>,
+    printing: Printing,
+) -> RunOutcome {
+    let mut spent = 0;
+    let mut code = ExitCode::Ok;
+    let mut failures = Vec::new();
+
     for account in watched {
         // Ctrl+C stops the run rather than only the account it landed in.
         // Without this the loop walked every remaining account after the user
@@ -313,22 +381,24 @@ async fn run_one(
         if app.cancel().is_canceled() {
             break;
         }
-        if let Err(e) = tick_one(args, app, account, delivery).await {
-            // Printed here only when nobody else will print it. With one
-            // watched account — the default — this loop printed the whole
-            // `error:` / `caused by:` / `hint:` block and then returned the
-            // error for `scheduled` to print again, so every failing run wrote
-            // two copies of it into the journal.
-            if watched.len() > 1 {
-                report::print_error(&e);
+        match tick_one(app, account, delivery, printing).await {
+            Ok(tick) => {
+                spent += tick.requests;
+                if code == ExitCode::Ok {
+                    code = tick.outcome();
+                }
             }
-            failed = Some(e);
+            Err(e) => failures.push(e),
         }
     }
 
-    // Once, after every account. Whatever is owed from earlier runs goes out
-    // here — including when no account had news of its own, which is the common
-    // case and the one that used to leave the queue untouched.
+    // Once, after every account, and whatever the accounts did. Whatever is
+    // owed from earlier runs goes out here — including when no account had news
+    // of its own, which is the common case and the one that used to leave the
+    // queue untouched. A machine whose hourly run failed all day left rows
+    // ageing past `MAX_AGE_SECS`, where `due` no longer returns them and
+    // `failed` — the only thing that expires one — is never reached, while
+    // `status` went on promising the next run would try them.
     //
     // Not after a cancellation, though: the queue is `DRAIN_LIMIT` POSTs of up
     // to thirty seconds each, so draining it there was up to five more minutes
@@ -340,32 +410,61 @@ async fn run_one(
     {
         drain(app, delivery).await;
     }
-    // And once whatever the accounts did, for the reason on `settle`.
     crate::engine::watch::settle(app.db(), snob_core::store::now());
 
-    match failed {
-        Some(e) if watched.len() == 1 => Err(e),
-        // Already printed, and the run as a whole did something.
-        _ => Ok(()),
+    let (print_here, failed) = to_print_and_to_return(failures);
+    for earlier in print_here {
+        report::print_error(&earlier);
     }
+
+    RunOutcome {
+        spent,
+        code,
+        failed,
+    }
+}
+
+/// Splits a run's failures into the ones it prints and the one it hands back.
+///
+/// Only one can be returned, and whoever gets it prints it — `scheduled` so the
+/// service keeps going, `main` so `once` exits with the right code. So the rest
+/// are printed here, in the order they happened, and each failure reaches the
+/// journal exactly once.
+///
+/// This is the line the defect lived on. Printing every failure here *and*
+/// returning one wrote the whole `error:` / `caused by:` / `hint:` block twice
+/// per failing run — and the guard that avoided it, `if watched.len() > 1`,
+/// bought that by returning `Ok` from a run in which an account had failed.
+fn to_print_and_to_return(
+    failures: Vec<anyhow::Error>,
+) -> (Vec<anyhow::Error>, Option<anyhow::Error>) {
+    let mut failures = failures.into_iter();
+    let last = failures.next_back();
+    (failures.collect(), last)
 }
 
 /// One account, inside a run that may cover several.
 async fn tick_one(
-    args: &WatchRunArgs,
     app: &mut crate::app::App,
     watched: &Watched,
     delivery: Option<&Delivery>,
-) -> Result<()> {
+    printing: Printing,
+) -> Result<TickReport> {
     let tick = crate::engine::watch::tick(app, watched).await;
     app.progress().finish();
     let tick = tick?;
 
-    // One line per run down a pipe, so `snob watch >> events.ndjson` is a
-    // complete way to use this without a webhook.
-    if args.json {
-        println!("{}", serde_json::to_string(&tick_json(&tick))?);
-    } else if !tick.report.changes().is_empty() {
+    if printing.json {
+        let json = tick_json(&tick);
+        println!(
+            "{}",
+            if printing.watching {
+                serde_json::to_string_pretty(&json)?
+            } else {
+                serde_json::to_string(&json)?
+            }
+        );
+    } else if printing.watching || !tick.report.changes().is_empty() {
         for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             println!("{line}");
         }
@@ -373,7 +472,8 @@ async fn tick_one(
 
     warn_about_refusals(&tick);
 
-    deliver(app, &tick, delivery).await
+    deliver(app, &tick, delivery).await?;
+    Ok(tick)
 }
 
 /// Says out loud which lists this run could not look at, and why.
@@ -651,51 +751,23 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
 
     let watched = watched_from(args.target.clone(), configured.as_ref());
 
-    let mut spent = 0;
-    let mut outcome = ExitCode::Ok;
-    let mut failed = None;
-    for account in &watched {
-        if app.cancel().is_canceled() {
-            break;
-        }
-        match once_one(&args, &mut app, account, delivery.as_ref()).await {
-            Ok(tick) => {
-                spent += tick.requests;
-                if outcome == ExitCode::Ok {
-                    outcome = tick.outcome();
-                }
-            }
-            Err(e) => {
-                if watched.len() > 1 {
-                    report::print_error(&e);
-                }
-                failed = Some(e);
-            }
-        }
-    }
+    let outcome = run_accounts(
+        &mut app,
+        &watched,
+        delivery.as_ref(),
+        Printing::watched(args.json),
+    )
+    .await;
 
-    // Unconditional, and after the accounts rather than inside the `?`.
-    //
-    // Both used to sit past a `let tick = tick?;` and a `deliver(..).await?`,
-    // so an ordinary failure — a cooldown, a name that would not resolve, a
-    // walk that stopped — took the queue drain and the expiry with it. A
-    // machine whose hourly run failed all day left rows owed past the age where
-    // anything can reach them again. `run_one` has always done the opposite,
-    // and AGENTS.md names `once` in the rule.
-    if let Some(delivery) = delivery.as_ref()
-        && !app.cancel().is_canceled()
-    {
-        drain(&app, delivery).await;
-    }
-    crate::engine::watch::settle(app.db(), snob_core::store::now());
-
+    // Said whether or not an account failed: a run that stopped halfway still
+    // spent requests, and this is the mode somebody is watching.
     ui::info(&format!(
         "{} - {}",
         report::stored_on(snob_core::store::now()),
-        report::requests(spent)
+        report::requests(outcome.spent)
     ));
 
-    if let Some(e) = failed {
+    if let Some(e) = outcome.failed {
         return Err(e);
     }
 
@@ -703,33 +775,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     // then thrown away in favor of a literal zero. The exit codes exist so a
     // caller on a timer can tell "wait" from "log in again" without parsing
     // text, and `once` is the mode that is put on a timer.
-    Ok(outcome)
-}
-
-/// One account of a `once` run. Prints more than the scheduled mode does,
-/// because somebody is looking at this one.
-async fn once_one(
-    args: &WatchOnceArgs,
-    app: &mut crate::app::App,
-    watched: &Watched,
-    delivery: Option<&Delivery>,
-) -> Result<TickReport> {
-    let tick = crate::engine::watch::tick(app, watched).await;
-    app.progress().finish();
-    let tick = tick?;
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&tick_json(&tick))?);
-    } else {
-        for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
-            println!("{line}");
-        }
-    }
-
-    warn_about_refusals(&tick);
-
-    deliver(app, &tick, delivery).await?;
-    Ok(tick)
+    Ok(outcome.code)
 }
 
 /// Checks the configuration would work, before it runs unattended.
@@ -1894,6 +1940,38 @@ mod tests {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// Each failure reaches the journal once, and the run still carries one.
+    ///
+    /// `once` and the scheduled loop both looped over the accounts, and the
+    /// copies had drifted: `once` took the print-when-nobody-else-will half and
+    /// not the guard on the return, so a multi-account run printed every
+    /// failing account's whole block and then handed one back for `main` to
+    /// print again. The guard itself was no better — it bought "printed once"
+    /// by returning `Ok` from a run in which an account had failed.
+    #[test]
+    fn every_failure_is_printed_once_and_the_run_still_carries_one() {
+        let (printed, returned) = to_print_and_to_return(vec![
+            anyhow::anyhow!("first"),
+            anyhow::anyhow!("second"),
+            anyhow::anyhow!("third"),
+        ]);
+        assert_eq!(
+            printed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["first", "second"],
+            "in the order they happened"
+        );
+        assert_eq!(returned.unwrap().to_string(), "third");
+
+        // One watched account is the default, and the case that used to print
+        // twice: nothing prints here, so the caller's print is the only one.
+        let (printed, returned) = to_print_and_to_return(vec![anyhow::anyhow!("only")]);
+        assert!(printed.is_empty());
+        assert_eq!(returned.unwrap().to_string(), "only");
+
+        let (printed, returned) = to_print_and_to_return(Vec::new());
+        assert!(printed.is_empty() && returned.is_none());
+    }
 
     /// Both slots of the refusal take the same name, so both must be filtered.
     ///
