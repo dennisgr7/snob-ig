@@ -110,6 +110,14 @@ pub fn enqueue(
 /// request bin with the team's token on them, and marked them delivered. Leaked,
 /// and lost for the address they were made for.
 ///
+/// **The whole address, not its origin.** This is a URL and it is compared as
+/// one. An origin cannot tell two workflows on one host apart, and that is the
+/// shape the tool is most often pointed at: n8n publishes a workflow at
+/// `/webhook/name` and the same workflow's test run at `/webhook-test/name`, so
+/// the two differ in the path alone. Filtering by origin sent the production
+/// backlog to the test workflow, with the production token on it, and marked it
+/// delivered — the very failure described above, one URL level up.
+///
 /// A row with no destination was queued before the column existed. It matches
 /// whatever is asked — the old behavior, kept for those rows rather than a guess
 /// about where they belong.
@@ -521,6 +529,46 @@ mod tests {
             .map(|d| d.id)
             .collect();
         assert_eq!(there, vec![elsewhere, legacy]);
+    }
+
+    /// Two workflows on one host are two addresses.
+    ///
+    /// The test above uses two different *hosts*, which is what let the filter
+    /// pass while it compared origins: an origin tells `bin.example` from
+    /// `receiver.example` and cannot tell `/webhook/snob` from
+    /// `/webhook-test/snob`. That pair is not a corner case, it is how n8n
+    /// publishes a workflow and its test run — so `snob watch once --webhook
+    /// https://n8n.local/webhook-test/snob`, typed to see what the payload
+    /// looks like, drained the production backlog into the test workflow with
+    /// the production token on it and marked it delivered.
+    #[test]
+    fn a_report_is_not_drained_to_a_different_path_on_the_same_host() {
+        const PUBLISHED: &str = "https://n8n.local/webhook/snob";
+        const TEST_RUN: &str = "https://n8n.local/webhook-test/snob";
+
+        let db = store();
+        let owed = enqueue(db.conn(), "run-1", ME, "{}", 1_000, Some(PUBLISHED)).unwrap();
+
+        let to_the_test_run: Vec<i64> = due(db.conn(), 1_000, 10, TEST_RUN)
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        assert!(
+            to_the_test_run.is_empty(),
+            "a report addressed to {PUBLISHED} was drained to {TEST_RUN}"
+        );
+
+        let to_where_it_belongs: Vec<i64> = due(db.conn(), 1_000, 10, PUBLISHED)
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(
+            to_where_it_belongs,
+            vec![owed],
+            "and it is still owed at the address it was addressed to"
+        );
     }
 
     /// The id the receiver deduplicates on has to be unique, or two runs could

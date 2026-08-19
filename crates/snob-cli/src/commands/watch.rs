@@ -1275,10 +1275,25 @@ fn delivery_from(
 
 /// The address a report is addressed to, as the outbox records it.
 ///
-/// The origin, not the whole URL: a path that changed is the same destination
-/// and the same credential, where a host that changed is neither.
+/// **The whole URL, and deliberately not the origin `plan` compares.** Two
+/// questions look alike here and want different units:
+///
+/// - *May this credential travel there?* The origin. A path that changed is the
+///   same destination and the same credential, where a host that changed is
+///   neither. That question is asked in [`plan`], against `Url::origin()`, and
+///   it is right as it stands.
+/// - *May this queued report go there?* The address it was addressed to, which
+///   is a URL. This used to answer with the origin too, and an origin cannot
+///   tell two workflows on one host apart — which is exactly the shape n8n
+///   ships with: `https://n8n.local/webhook/snob` in the file and
+///   `https://n8n.local/webhook-test/snob` typed to see what the payload looks
+///   like. `plan` correctly attaches the token, because the origin really is
+///   the same; then `drain` handed the production backlog to the test workflow
+///   with that token on it and marked it delivered. Verbatim the failure
+///   `deliveries::due` documents and `005_destination.sql` was written to
+///   close, with the guard drawn one URL level too high.
 fn destination_of(url: &Url) -> String {
-    url.origin().ascii_serialization()
+    url.as_str().to_string()
 }
 
 /// Commits the report and gets it to the webhook, if there is one.
@@ -1932,6 +1947,34 @@ mod tests {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// Two workflows on one host are two addresses.
+    ///
+    /// The store's own filter was always an exact match, so the test there
+    /// passes either way — it enqueues the value it then asks for. The unit was
+    /// decided here, and an origin cannot tell `/webhook/snob` from
+    /// `/webhook-test/snob`. That pair is not a corner case: it is how n8n
+    /// publishes a workflow and its test run.
+    #[test]
+    fn the_outbox_records_the_address_not_the_origin() {
+        let published = Url::parse("https://n8n.local/webhook/snob").unwrap();
+        let test_run = Url::parse("https://n8n.local/webhook-test/snob").unwrap();
+
+        assert_ne!(
+            destination_of(&published),
+            destination_of(&test_run),
+            "the production backlog would drain into the test workflow"
+        );
+        assert_eq!(destination_of(&published), "https://n8n.local/webhook/snob");
+
+        // And the other question, which is a different one: for a credential the
+        // same host *is* the same destination, and `plan` still asks it that way.
+        assert_eq!(
+            published.origin(),
+            test_run.origin(),
+            "the credential gate is not what changed"
+        );
+    }
 
     /// Each failure reaches the journal once, and the run still carries one.
     ///
