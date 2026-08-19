@@ -298,6 +298,56 @@ async fn refresh_walks_again_even_with_no_changes() {
     assert_eq!(outcome.source(), ResultSource::Fetched);
 }
 
+/// `--refresh` reads "walk the list again", and a failed counter poll answered
+/// it with whatever was stored: any age, exit 0, nothing on screen saying
+/// which. The arm that serves the stored list returns above the statement that
+/// consults the flag, so the flag was never reached.
+///
+/// The second half is the rule that arm exists for, still standing: without
+/// the flag, a poll that failed is a reason to reuse rather than to walk.
+#[tokio::test]
+async fn refresh_walks_again_when_the_counter_poll_fails() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 30).await;
+    mount_list(&server, 30).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    execute(&server, tmp.path(), &args()).await.unwrap();
+
+    // The profile endpoint stops answering. The list still does, which is the
+    // case that matters: the counter is the cheap question, not the only one.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/web_profile_info/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mount_list(&server, 30).await;
+
+    let mut refreshing = args();
+    refreshing.refresh = true;
+    let (found, outcome) = execute(&server, tmp.path(), &refreshing).await.unwrap();
+
+    assert_eq!(
+        outcome.provenance,
+        Provenance::Walked,
+        "the flag asked for a walk and nothing else can answer it"
+    );
+    assert_eq!(outcome.source(), ResultSource::Fetched);
+    assert_eq!(found.len(), 30);
+
+    let (_, outcome) = execute(&server, tmp.path(), &args()).await.unwrap();
+    assert_eq!(
+        outcome.provenance,
+        Provenance::PollFailed,
+        "without the flag, a service already in trouble is not walked"
+    );
+    assert!(
+        !outcome.provenance.describes_now(),
+        "and what it served cannot be crossed"
+    );
+}
+
 #[tokio::test]
 async fn an_old_snapshot_is_walked_again() {
     let server = MockServer::start().await;

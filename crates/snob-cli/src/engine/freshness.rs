@@ -29,7 +29,19 @@ pub async fn decide_and_fetch(
         Err(e) => {
             // Walking the whole list right when Instagram is already having
             // trouble is the worst possible reaction, so anything stored wins.
-            if let Some(snapshot) = &stored {
+            //
+            // Except under `--refresh`, whose whole help text is "walk the list
+            // again". This arm answered it with whatever was stored — a capture
+            // from any month, printed with exit 0 and nothing on screen saying
+            // which — because the flag was not consulted until two statements
+            // below, and this one returns first. Falling through puts the flag
+            // exactly where a first-ever run already is: no counter to compare
+            // against, so walk. It costs one request against an endpoint that
+            // just failed, which is the price of the flag meaning what it says;
+            // the pager does not retry a push-back, so it is one and not four.
+            if let Some(snapshot) = &stored
+                && !args.refresh
+            {
                 app.warn(&format!(
                     "could not check for changes ({e}); using the stored list"
                 ));
