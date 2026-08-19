@@ -120,7 +120,7 @@ pub struct App {
     progress: Progress,
     cancel: CancelToken,
     viewer: Viewer,
-    consented: bool,
+    consented: Option<String>,
     /// What was asked for, what it resolved to, and the request count at the
     /// moment it did.
     ///
@@ -206,7 +206,7 @@ impl App {
             progress,
             cancel,
             viewer,
-            consented: false,
+            consented: None,
             resolved: None,
         }))
     }
@@ -231,7 +231,7 @@ impl App {
             progress: Progress::new(false),
             cancel,
             viewer,
-            consented: false,
+            consented: None,
             resolved: None,
         }
     }
@@ -276,12 +276,26 @@ impl App {
     ///
     /// Only a real answer sets it. The cooldown path never asks, so it can
     /// never vouch for one.
-    pub fn has_consent(&self) -> bool {
+    ///
+    /// **The account is part of the key, not just the answer.** This was a bare
+    /// `bool`, which is indistinguishable from correct while one `App` means one
+    /// account — the very shape the `resolved` memo below records as having
+    /// already bitten here once, and been fixed by keying on the question.
+    /// `run_accounts` walks every configured account through one `App`, on
+    /// purpose ("One `App` for all of them"), so a yes about @alice let @bob's
+    /// followers *and* following be enumerated with no question printed.
+    ///
+    /// Compared case-insensitively, because Instagram treats two spellings that
+    /// differ only in case as one account, and one `Option` is enough because
+    /// the accounts of a run are ticked one after another.
+    pub fn has_consent(&self, asked: &str) -> bool {
         self.consented
+            .as_deref()
+            .is_some_and(|given| given.eq_ignore_ascii_case(asked))
     }
 
-    pub fn record_consent(&mut self) {
-        self.consented = true;
+    pub fn record_consent(&mut self, asked: &str) {
+        self.consented = Some(asked.to_string());
     }
 
     /// The target this run already worked out, if anything did.
