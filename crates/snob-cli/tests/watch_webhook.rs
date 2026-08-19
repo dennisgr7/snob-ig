@@ -469,11 +469,15 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
 async fn a_preflight_that_cannot_be_delivered_fails_the_check() {
     use snob_cli::engine::check::Verdict;
 
-    // Started and then dropped, so the port is closed and nothing answers.
-    let address = {
-        let gone = MockServer::start().await;
-        gone.uri()
-    };
+    // Port 1, which nothing binds and which is outside the ephemeral range.
+    //
+    // This used to start a `MockServer` and drop it, on the reasoning that the
+    // port was then closed. It is closed for about as long as it takes another
+    // test in the same binary to be given it: the suite runs in parallel, every
+    // other test here starts a server on an ephemeral port, and when one landed
+    // on this one the connection succeeded and the verdict came back `Ok`. A
+    // test that fails once a week teaches people to re-run it.
+    let address = "http://127.0.0.1:1".to_string();
 
     let client = WebhookClient::new(Webhook {
         url: Url::parse(&format!("{address}/hook")).unwrap(),
