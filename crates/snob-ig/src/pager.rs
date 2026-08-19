@@ -45,7 +45,6 @@ pub enum WaitKind {
     Micro,
     Cycle,
     Long,
-    Backoff,
 }
 
 /// What happens as the walk proceeds.
@@ -816,7 +815,6 @@ mod tests {
                 WaitKind::Micro => (500, 2_000),
                 WaitKind::Cycle => (1_000, 1_300),
                 WaitKind::Long => (5_000, 15_000),
-                other => panic!("unexpected wait: {other:?}"),
             };
             assert!(
                 (range.0..=range.1).contains(ms),
