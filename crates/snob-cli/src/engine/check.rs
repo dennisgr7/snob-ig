@@ -186,9 +186,14 @@ pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
 }
 
 /// Everything that can be checked without a session.
+/// `schedule` is what building one out of the configuration produced: `None`
+/// when there was no configuration to build from, and `Err` when there was and
+/// the scheduler refused it. That last case used to arrive as `None` too, so
+/// the report carried no schedule line and `verdict()` — `max().unwrap_or(Ok)`
+/// — exited 0 about a monitor that cannot start.
 pub fn without_a_session(
     configured: Option<&WatchConfig>,
-    schedule: Option<&Schedule>,
+    schedule: Option<&Result<Schedule, String>>,
     now: i64,
 ) -> CheckReport {
     let mut report = CheckReport::default();
@@ -204,8 +209,14 @@ pub fn without_a_session(
         );
     }
 
-    if let Some(schedule) = schedule {
-        report.checked.push(schedule_of(schedule, now));
+    match schedule {
+        Some(Ok(schedule)) => report.checked.push(schedule_of(schedule, now)),
+        Some(Err(why)) => report.push(
+            What::Schedule { next: Vec::new() },
+            Verdict::Failed,
+            Some(format!("this schedule cannot be built: {why}")),
+        ),
+        None => {}
     }
 
     report
@@ -534,6 +545,36 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A schedule the scheduler refuses is reported, not omitted.
+    ///
+    /// The error used to be dropped with `.ok()` and a schedule line pushed
+    /// only on `Some`, so the report carried **no** schedule line — and
+    /// `verdict()` is `max().unwrap_or(Ok)`, so `check` exited 0 about a file
+    /// that kills `snob watch` at `schedule_from` on every invocation. The
+    /// `NotConfigured` warning does not cover it, because a file exists.
+    #[test]
+    fn a_schedule_the_scheduler_refuses_is_reported_rather_than_omitted() {
+        let configured = snob_core::watch::config::parse(
+            "schema = 1\nevery = \"5m\"\n",
+            std::path::Path::new("watch.toml"),
+        )
+        .expect("config::parse reads TOML and a schema number, not what the values mean");
+        let refused: Result<Schedule, String> = Err("5m is too often".to_string());
+
+        let report = without_a_session(Some(&configured), Some(&refused), 1_700_000_000);
+
+        assert_eq!(report.verdict(), Verdict::Failed);
+        assert_eq!(report.checked.len(), 1, "{:?}", report.checked);
+        assert!(
+            report.checked[0]
+                .problem
+                .as_deref()
+                .is_some_and(|p| p.contains("5m is too often")),
+            "the line has to carry what the scheduler said: {:?}",
+            report.checked
+        );
+    }
 
     /// One verdict, one code, whichever command asked and in whichever format.
     ///

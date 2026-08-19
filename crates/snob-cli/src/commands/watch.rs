@@ -825,7 +825,22 @@ pub(super) async fn preflight(
     // Built the same way a run builds it, or this would be checking a schedule
     // nobody is on. A configuration with none at all is not an error here — it
     // is one of the things worth reporting.
-    let schedule = schedule_from(&WatchRunArgs::default(), configured.as_ref()).ok();
+    //
+    // **The error is kept.** This used to be `.ok()`, and `without_a_session`
+    // pushed a schedule line only on `Some`, so a file whose schedule the
+    // scheduler refuses produced no schedule line at all — and
+    // `CheckReport::verdict()` is `max().unwrap_or(Ok)`, so `check` exited 0
+    // about a monitor that dies at `schedule_from` on every single invocation.
+    // The `NotConfigured` warning does not cover it either, because a file
+    // exists. `schedule_of`'s own doc says it "is what catches a file the
+    // scheduler would refuse at every run"; it was never reached for that case.
+    // Every shape gets here through a hand-edit, which the first line of
+    // `watch.toml` says is fine: `every = "5m"`, `cron = "0 9 * *"`,
+    // `at = ["25:00"]`, `every` with `on` and no `at`. All pass `config::parse`,
+    // which reads TOML, the schema number and one key clash, and nothing else.
+    let schedule = configured
+        .as_ref()
+        .map(|c| schedule_from(&WatchRunArgs::default(), Some(c)).map_err(|e| e.to_string()));
     let mut report = check::without_a_session(configured.as_ref(), schedule.as_ref(), now);
 
     // Before the session, like `once` does, so an address that could never work
