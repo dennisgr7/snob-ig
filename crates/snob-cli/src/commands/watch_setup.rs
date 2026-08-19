@@ -266,18 +266,9 @@ fn calendar_line(days: &str, times: &str) -> Result<String> {
     let days = listed(days);
     let times = listed(times);
 
-    let parsed_days = days
-        .iter()
-        .map(|d| {
-            schedule::Weekday::parse(d)
-                .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let parsed_times = times
-        .iter()
-        .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
-        .collect::<Result<Vec<_>>>()?;
-    schedule::Schedule::calendar(&parsed_days, &parsed_times)?;
+    // Through the very function a run parses the file with, so the wizard
+    // cannot accept a calendar the scheduler would then refuse.
+    super::watch::calendar_from(&days, &times)?;
 
     let mut line = String::new();
     if !days.is_empty() {
@@ -950,6 +941,48 @@ every = \"6h\"
             "at = [\"09:00\"]",
             "no days means every day, and no `on` key at all"
         );
+    }
+
+    /// The wizard and a run read a calendar with the same function now, so what
+    /// one accepts the other accepts, and the refusals are word for word.
+    ///
+    /// They were two implementations of one contract: the same two maps, the
+    /// same `Schedule::calendar`, down to the sentence that says what a day
+    /// looks like. A contract with two implementations is one that can be
+    /// half-changed, and this is the half where the person who could fix it is
+    /// still at the keyboard.
+    #[test]
+    fn the_wizard_reads_a_calendar_the_way_a_run_does() {
+        for (days, times) in [
+            ("mon,thu", "09:00"),
+            ("", "09:00,21:00"),
+            ("tues", "09:00"),
+            ("mon", "25:00"),
+            ("", "09:00,09:05"),
+        ] {
+            let wizard = calendar_line(days, times);
+            let run = super::super::watch::calendar_from(
+                &days
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .collect::<Vec<_>>(),
+                &times
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>(),
+            );
+
+            assert_eq!(
+                wizard.is_ok(),
+                run.is_ok(),
+                "{days:?} {times:?}: the wizard and a run disagree"
+            );
+            if let (Err(a), Err(b)) = (&wizard, &run) {
+                assert_eq!(a.to_string(), b.to_string(), "{days:?} {times:?}");
+            }
+        }
     }
 
     /// What comes back from those lines has to parse as the file it is going

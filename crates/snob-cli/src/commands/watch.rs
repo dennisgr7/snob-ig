@@ -536,6 +536,29 @@ fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
     }
 }
 
+/// The two halves of a calendar, parsed and checked together.
+///
+/// This was written out twice: the wizard validating what it is about to write,
+/// and a run validating what it read back. The same two maps, the same
+/// `Schedule::calendar`, down to the sentence that says what a day looks like —
+/// two halves of one contract, and a contract with two implementations is one
+/// that can be half-changed.
+pub(crate) fn calendar_from<S: AsRef<str>>(days: &[S], times: &[S]) -> Result<Schedule> {
+    let days = days
+        .iter()
+        .map(|day| {
+            let day = day.as_ref();
+            Weekday::parse(day)
+                .ok_or_else(|| anyhow::anyhow!("\"{day}\" is not a day (try mon, thu)"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let times = times
+        .iter()
+        .map(|time| schedule::parse_time(time.as_ref()).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schedule::calendar(&days, &times)?)
+}
+
 fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Result<Schedule> {
     let When {
         cron,
@@ -548,18 +571,7 @@ fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Resul
     let mut schedule = if let Some(expression) = &cron {
         Schedule::cron(expression)?
     } else if !at.is_empty() || !on.is_empty() {
-        let days = on
-            .iter()
-            .map(|d| {
-                Weekday::parse(d)
-                    .ok_or_else(|| anyhow::anyhow!("\"{d}\" is not a day (try mon, thu)"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let times = at
-            .iter()
-            .map(|t| schedule::parse_time(t).map_err(anyhow::Error::from))
-            .collect::<Result<Vec<_>>>()?;
-        Schedule::calendar(&days, &times)?
+        calendar_from(&on, &at)?
     } else if let Some(every) = every {
         Schedule::every(every)?
     } else {
