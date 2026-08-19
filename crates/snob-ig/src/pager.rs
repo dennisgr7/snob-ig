@@ -199,6 +199,38 @@ impl<'a> ListWalker<'a> {
             if self.cancel.is_canceled() {
                 break StopReason::Canceled;
             }
+
+            // Asked again on every page, not only before the first.
+            //
+            // `check_cooldown` above answers for the moment the walk started,
+            // and this loop is the longest unbroken run of requests the tool
+            // produces. Nothing else re-reads the table on the way through:
+            // `Pacer::clear_to_send` consults the cancel token and the budget,
+            // and `SqliteRateBudget::reserve` touches `rate_budget` alone. So a
+            // cooldown another process writes while this walk is in flight is
+            // invisible to it — `snob whoami` in a second terminal drawing a
+            // 429 stops *that* process and leaves this one paging into a door
+            // Instagram has just closed. The database is shared per user, which
+            // is what makes that an ordinary Tuesday rather than a corner case.
+            //
+            // It does not self-limit either, unless the push-back happens to
+            // cover `/api/v1/friendships/` as well: an endpoint-specific
+            // throttle leaves this walk answering normally to the end.
+            //
+            // `break` rather than `Err`, so the partial keeps its cursor and
+            // stays resumable — `verify_completion` passes a non-`Completed`
+            // reason through untouched. One local SQLite read against a wait of
+            // at least 1.5 s per page.
+            if self
+                .client
+                .pacer()
+                .cooldown()
+                .map_err(WalkError::Budget)?
+                .is_some()
+            {
+                break StopReason::RateLimit;
+            }
+
             if let Some(end) = state.cap_reached(&request) {
                 break end;
             }
@@ -1169,6 +1201,71 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             0,
             "in cooldown not a single request is made"
+        );
+    }
+
+    /// A cooldown another process writes stops a walk already in flight.
+    ///
+    /// The database is shared per user, so this is the ordinary case rather
+    /// than a contrived one: `snob watch` is eight minutes into a long walk,
+    /// `snob whoami` in another terminal draws a 429, and the cooldown that
+    /// stops *that* process was invisible to this one. The walk is the longest
+    /// unbroken run of requests the tool produces and nothing on the way
+    /// through re-read the table.
+    ///
+    /// The pages carry **distinct** users on purpose: with repeats,
+    /// `MAX_PAGES_WITHOUT_NEW` would end the walk on its own and prove nothing.
+    #[tokio::test]
+    async fn a_cooldown_written_mid_walk_stops_the_walk() {
+        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+
+        /// Answers `None` until the walk is under way, then `Some` — the shape
+        /// of another process writing the row while this one pages.
+        #[derive(Default)]
+        struct CooldownAfterTwo(std::sync::atomic::AtomicUsize);
+        impl RateBudget for CooldownAfterTwo {
+            fn reserve(&self) -> Result<Duration, RateBudgetError> {
+                Ok(Duration::ZERO)
+            }
+            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+                let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok((asked >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+            }
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
+                Ok(0)
+            }
+        }
+
+        let server = server(vec![
+            ok(body(0, 50, Some("c1"))),
+            ok(body(50, 50, Some("c2"))),
+            ok(body(100, 50, Some("c3"))),
+            ok(body(150, 50, Some("c4"))),
+        ])
+        .await;
+
+        let client = client_with(
+            &server,
+            Pacer::new(std::sync::Arc::new(CooldownAfterTwo::default())),
+        );
+        let walker = ListWalker::new(&client);
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.reason,
+            StopReason::RateLimit,
+            "the walk stopped for the reason it really stopped for"
+        );
+        assert!(
+            server.received_requests().await.unwrap().len() < 4,
+            "pages kept going out after the cooldown was written"
+        );
+        assert!(
+            summary.pending_cursor.is_some(),
+            "stopping is not the same as throwing the partial away"
         );
     }
 
