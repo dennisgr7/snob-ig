@@ -164,7 +164,7 @@ pub fn from_store(app: &App, typed: Option<&str>, kind: ListKind) -> Result<Targ
 
     let typed = clean(typed);
     let Some(pk) = accounts::find_pk_by_username(app.db().conn(), typed)? else {
-        bail!("no snapshot of the {kind} list is stored; drop --cache to fetch it");
+        return Err(crate::report::refuse_nothing_stored(kind));
     };
 
     Ok(Target {

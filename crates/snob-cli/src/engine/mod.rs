@@ -16,7 +16,7 @@ pub mod target;
 pub mod walk;
 pub mod watch;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::store::{accounts, snapshots, users};
@@ -321,7 +321,7 @@ async fn decide(
 
     if args.cache {
         let Some(snapshot) = stored else {
-            bail!("no snapshot of the {kind} list is stored; drop --cache to fetch it");
+            return Err(crate::report::refuse_nothing_stored(kind));
         };
         return Ok((
             snob_core::store::snapshots::members(app.db().conn(), snapshot.id)?,
