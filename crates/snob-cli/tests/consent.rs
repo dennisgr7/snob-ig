@@ -224,3 +224,60 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
         "and nothing may be asked of Instagram either"
     );
 }
+
+/// A yes about one account does not cover the next one.
+///
+/// `run_accounts` walks every configured account through one `App`, deliberately
+/// — they share a session and a request budget. The consent flag on it was a
+/// bare `bool`, which is indistinguishable from correct while one `App` means
+/// one account, and is exactly the shape the `resolved` memo one field below it
+/// records as having already bitten here once.
+///
+/// So an attended `snob watch once` over a hand-edited file naming two
+/// unconsented strangers asked about the first, and enumerated the second one's
+/// followers *and* following with no question printed.
+#[tokio::test]
+async fn an_answer_about_one_account_does_not_cover_another() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Store::open_at(&tmp.path().join("test.db")).unwrap();
+
+    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+    let client = IgClient::new(session, Pacer::unlimited())
+        .unwrap()
+        .with_base_url(Url::parse(&server.uri()).unwrap());
+    let mut app = App::for_test(
+        client,
+        db,
+        Viewer {
+            pk: 42,
+            username: Some("me".into()),
+        },
+    );
+
+    // Somebody answered yes about alice, the way the prompt does.
+    app.record_consent("alice");
+
+    // Asking again about alice is not asking again — that is what the flag is
+    // for, and a crossing wants two lists and a summary four.
+    engine::ask_consent_with(&mut app, &args("alice"), false)
+        .await
+        .expect("the same account was already answered for");
+
+    // Bob was not.
+    let error = engine::ask_consent_with(&mut app, &args("bob"), false)
+        .await
+        .expect_err("an answer about alice says nothing about bob");
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Interrupted));
+
+    // And the at sign is not a different account.
+    engine::ask_consent_with(&mut app, &args("@alice"), false)
+        .await
+        .expect("@alice and alice are one account");
+
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        0,
+        "none of this may cost a request"
+    );
+}

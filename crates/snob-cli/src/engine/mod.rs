@@ -364,11 +364,15 @@ pub async fn ask_consent_with(
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
-    if args.yes || app.has_consent() {
+    // Cleaned before it is used as a key, so the answer is filed under the
+    // account rather than under a spelling of it. `clean` only strips a leading
+    // at sign and is idempotent, so this holds whether or not the name arrives
+    // already cleaned.
+    let name = target::clean(typed);
+    if args.yes || app.has_consent(name) {
         return Ok(());
     }
 
-    let name = target::clean(typed);
     // Compared raw, deliberately. A typed name with a zero-width character in
     // it is not your own account, and filtering before this comparison would
     // make it match — which skips the question for somebody else's lists.
@@ -427,7 +431,7 @@ pub async fn ask_consent_with(
     }
     // Asked and answered. A crossing wants two lists and a summary four, and
     // asking again about the same account reads as not having listened.
-    app.record_consent();
+    app.record_consent(name);
     Ok(())
 }
 
