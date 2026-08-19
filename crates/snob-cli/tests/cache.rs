@@ -437,7 +437,15 @@ async fn cache_with_an_unknown_target_fails_without_the_network() {
     args.target = Some("@nobody".into());
     let error = execute(&server, tmp.path(), &args).await.unwrap_err();
 
-    assert!(error.to_string().contains("no snapshot"), "{error}");
+    assert!(
+        error.to_string().contains("--cache says not to look"),
+        "{error}"
+    );
+    assert_eq!(
+        snob_cli::exit::ExitCode::from_chain(&error),
+        Some(snob_cli::exit::ExitCode::Error),
+        "and it carries the code and the advice its four siblings carry"
+    );
     assert_eq!(requests(&server).await, 0);
 }
 

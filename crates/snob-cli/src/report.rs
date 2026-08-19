@@ -374,6 +374,27 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
     }
 }
 
+/// Nothing stored to answer with, and `--cache` said not to look.
+///
+/// Two situations reach this: the account has never been seen at all, and the
+/// account is known but this list of it has never been walked. They get the
+/// same answer because there is one thing to do about either — and they were
+/// written out separately, character for character, in two functions of
+/// `engine`. Reword one and they become two explanations of one situation with
+/// nothing comparing them.
+///
+/// It carries the `hint:` its four siblings here carry. It gains no exit code:
+/// the `anyhow` fallback is already `Error`, and this is the shape that keeps
+/// the advice apart from what happened.
+pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Error,
+        format!("no {kind} list is stored, and --cache says not to look for one"),
+    )
+    .with_hint(format!("run \"snob {kind}\" once, or drop --cache"))
+    .into()
+}
+
 /// "pepito, carlos and 4 others", or `None` when there is nobody to name.
 ///
 /// The cap is not about width. Past a handful the line stops being "people you
