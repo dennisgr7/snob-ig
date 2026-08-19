@@ -232,26 +232,15 @@ pub async fn with_a_session(
     // its own, so it is a warning rather than a failure.
     match app.client().pacer().cooldown() {
         Ok(Some(until_ms)) => {
-            let waiting = |what: What| Checked {
-                what,
-                verdict: Verdict::Warned,
-                problem: Some(format!(
-                    "not checked: the account is in cooldown until {}",
-                    crate::report::cooldown_ends_at(until_ms)
-                )),
-            };
-            report.checked.push(waiting(What::Session {
-                viewer: app.viewer().username.clone(),
-                backend: secrets.backend().as_str(),
-            }));
+            report.checked.push(waiting_out(
+                What::Session {
+                    viewer: app.viewer().username.clone(),
+                    backend: secrets.backend().as_str(),
+                },
+                until_ms,
+            ));
             for account in watched {
-                report.checked.push(waiting(What::Account {
-                    target: account.name().map(str::to_string),
-                    pk: None,
-                    followers: None,
-                    following: None,
-                    may_run_unattended: account.may_run_unattended(),
-                }));
+                report.checked.push(not_asked_about(account, until_ms));
             }
             return;
         }
@@ -292,7 +281,28 @@ pub async fn with_a_session(
     let session_works = session.verdict == Verdict::Ok;
     report.checked.push(session);
 
-    for account in watched {
+    for (asked, account) in watched.iter().enumerate() {
+        // Asked again before every account, because one of them can earn a
+        // cooldown while this loop is running.
+        //
+        // The gate above answers for the moment `check` started, and
+        // `account_of` folds any error — a 429, a challenge, `feedback_required`
+        // — into a `Failed` line rather than propagating, so the loop used to
+        // walk straight on to the next account and knock again. What that costs
+        // is not the extra requests, it is the escalation ladder:
+        // `start_cooldown` doubles whenever the previous one was set inside
+        // twenty-four hours, so one `check` over three accounts turns a
+        // two-hour throttle into eight, and over five into the daily cap. From
+        // the command advertised as safe to point a probe at.
+        if asked > 0
+            && let Ok(Some(until_ms)) = app.client().pacer().cooldown()
+        {
+            for remaining in &watched[asked..] {
+                report.checked.push(not_asked_about(remaining, until_ms));
+            }
+            return;
+        }
+
         let checked = account_of(app, account, session_works).await;
         // The baseline is asked about with the id this check just resolved, so
         // it is the same account the scheduled run would compare.
@@ -304,6 +314,55 @@ pub async fn with_a_session(
         if let Some(pk) = pk {
             report.checked.push(baseline_of(app, pk));
         }
+    }
+}
+
+/// The line something gets when a cooldown means it was not asked about.
+///
+/// Warned rather than Failed: a cooldown lifts on its own, and it is exactly
+/// the sort of thing somebody running `check` wants to be told rather than have
+/// skipped in silence.
+fn waiting_out(what: What, until_ms: i64) -> Checked {
+    Checked {
+        what,
+        verdict: Verdict::Warned,
+        problem: Some(format!(
+            "not checked: the account is in cooldown until {}",
+            crate::report::cooldown_ends_at(until_ms)
+        )),
+    }
+}
+
+/// The same, for an account — except for the one thing a cooldown has nothing
+/// to do with.
+///
+/// Whether an unattended run may read this account is a fact about the
+/// configuration file. It is decided before any request, no cooldown affects
+/// it, and `commands::watch` refuses to **start** without it. Reporting it as a
+/// warning because a cooldown happened to be standing made `check` exit 0 about
+/// a monitor that cannot run at all — from the command whose whole job is to
+/// answer that question before a run does.
+fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
+    let may_run_unattended = account.may_run_unattended();
+    let what = What::Account {
+        target: account.name().map(str::to_string),
+        pk: None,
+        followers: None,
+        following: None,
+        may_run_unattended,
+    };
+
+    if may_run_unattended {
+        return waiting_out(what, until_ms);
+    }
+    Checked {
+        what,
+        verdict: Verdict::Failed,
+        problem: Some(
+            "no recorded consent, so an unattended run will refuse to read it \
+             (and it is in cooldown, so nothing else was checked)"
+                .to_string(),
+        ),
     }
 }
 

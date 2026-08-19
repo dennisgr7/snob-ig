@@ -780,3 +780,121 @@ async fn watch_check_spends_nothing_during_a_cooldown() {
         report.checked
     );
 }
+
+/// One account earning a cooldown stops the ones after it being asked about.
+///
+/// The gate above answers for the moment `check` started, and `account_of`
+/// folds a 429 into a `Failed` line rather than propagating — so the loop
+/// walked on and knocked again. What that costs is not the extra requests, it
+/// is the escalation ladder: `start_cooldown` doubles whenever the previous one
+/// was set inside a day, so one `check` over three accounts turns a two-hour
+/// throttle into eight.
+#[tokio::test]
+async fn check_stops_asking_once_an_account_earns_a_cooldown() {
+    use snob_cli::engine::check::{CheckReport, Verdict, with_a_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+
+    let server = MockServer::start().await;
+    // `validate()` asks a different endpoint, and it answers.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/following/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"users":[]}"#))
+        .mount(&server)
+        .await;
+    // Every profile poll is thrown back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/web_profile_info/"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"message":"","spam":true}"#))
+        .mount(&server)
+        .await;
+
+    let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+        .with_service(&format!("snob-ig-test-throttle-{}", std::process::id()));
+
+    let watched = [
+        Watched::consented(
+            "one".into(),
+            snob_cli::engine::watch::Consent { given_at: 1 },
+        ),
+        Watched::consented(
+            "two".into(),
+            snob_cli::engine::watch::Consent { given_at: 1 },
+        ),
+        Watched::consented(
+            "three".into(),
+            snob_cli::engine::watch::Consent { given_at: 1 },
+        ),
+    ];
+
+    let mut report = CheckReport::default();
+    with_a_session(&app, &secrets, &watched, &mut report).await;
+
+    let polls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/users/web_profile_info/")
+        .count();
+    assert_eq!(
+        polls, 1,
+        "the first account earned the cooldown; the rest must not knock again"
+    );
+    assert_eq!(report.verdict(), Verdict::Failed);
+    assert!(
+        report
+            .checked
+            .iter()
+            .filter(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown")))
+            .count()
+            >= 2,
+        "and the ones that were not asked about say why: {:?}",
+        report.checked
+    );
+}
+
+/// A cooldown is not a reason to call a monitor that cannot start healthy.
+///
+/// Whether an unattended run may read an account is a fact about the file. No
+/// cooldown affects it, and `commands::watch` refuses to start without it — so
+/// reporting it as a warning because a cooldown happened to be standing had
+/// `check` exit 0 about a monitor that cannot run at all.
+#[tokio::test]
+async fn a_cooldown_does_not_downgrade_a_missing_consent() {
+    use snob_cli::engine::check::{CheckReport, Verdict, with_a_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+    budget
+        .start_cooldown("rate_limit", std::time::Duration::from_secs(2 * 3600))
+        .unwrap();
+
+    let server = MockServer::start().await;
+    let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+        .with_service(&format!("snob-ig-test-consent-{}", std::process::id()));
+
+    let mut report = CheckReport::default();
+    with_a_session(
+        &app,
+        &secrets,
+        &[Watched::asking("stranger".into())],
+        &mut report,
+    )
+    .await;
+
+    assert_eq!(requests(&server).await, 0, "still nothing is spent");
+    assert_eq!(
+        report.verdict(),
+        Verdict::Failed,
+        "a scheduled run would refuse to start, and the probe has to say so: {:?}",
+        report.checked
+    );
+}
