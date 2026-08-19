@@ -795,8 +795,6 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
 /// schedule, and a broken schedule does not hide a webhook that has stopped
 /// answering: every line is reported, and the exit code is the worst of them.
 async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    use crate::engine::check::Verdict;
-
     let report = preflight(&args, &secrets, paths).await?;
 
     if args.json {
@@ -807,13 +805,7 @@ async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> 
         }
     }
 
-    // Warnings are not failures: a monitor with no baseline yet will work, it
-    // just has nothing to say on its first run. Only what would stop a run
-    // reaches the exit code.
-    Ok(match report.verdict() {
-        Verdict::Failed => ExitCode::Error,
-        _ => ExitCode::Ok,
-    })
+    Ok(report.verdict().exit_code())
 }
 
 /// The checks themselves, without the printing, so `setup` can run them too.
