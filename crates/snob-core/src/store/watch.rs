@@ -199,36 +199,6 @@ pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
     Ok(conn.last_insert_rowid())
 }
 
-/// The most recent run of one account.
-///
-/// Per account, because a run covers every configured one and each writes its
-/// own row. Without the predicate the answer was always whichever account came
-/// last in the file, so `status` said "found nothing" on a tick where an earlier
-/// account had found five, and reported `ok` for a tick where another was rate
-/// limited. It also made `watch_runs_lookup` — the index 002 added for exactly
-/// this query — unusable, so the query scanned and sorted in a temp b-tree.
-pub fn last_run(conn: &Connection, account_pk: Pk) -> Result<Option<Run>, StoreError> {
-    let run = conn
-        .query_row(
-            "SELECT account_pk, started_at, finished_at, requests, outcome, changes
-             FROM watch_runs WHERE account_pk = ?1
-             ORDER BY started_at DESC, id DESC LIMIT 1",
-            params![pk_to_sql(account_pk)],
-            |row| {
-                Ok(Run {
-                    account_pk: pk_from_sql(row.get(0)?),
-                    started_at: row.get(1)?,
-                    finished_at: row.get(2)?,
-                    requests: row.get(3)?,
-                    outcome: row.get(4)?,
-                    changes: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(run)
-}
-
 /// The most recent run of every account that has ever run, newest row per
 /// account.
 ///
@@ -267,7 +237,7 @@ pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
 
 /// When the monitor last started a run, for any account.
 ///
-/// Not per account, unlike [`last_run`], and that is the question being asked:
+/// Not per account, unlike [`last_runs`], and that is the question being asked:
 /// one loop covers every watched account, so "when did this last run" is one
 /// moment. The scheduled loop seeds its `--every` clock from it.
 ///
@@ -556,6 +526,16 @@ mod tests {
     use super::*;
     use crate::model::User;
     use crate::store::{Store, accounts, snapshots, users};
+
+    /// The newest run of one account, read out of the answer the production
+    /// code reads. `last_run` used to be a second query for this, with a row
+    /// mapper byte-identical to the one above and no caller outside these
+    /// assertions.
+    fn one_of(runs: &[Run], account_pk: Pk) -> &Run {
+        runs.iter()
+            .find(|run| run.account_pk == account_pk)
+            .unwrap_or_else(|| panic!("no run recorded for {account_pk}"))
+    }
 
     fn user(pk: Pk, name: &str) -> User {
         User {
@@ -1002,7 +982,7 @@ mod tests {
             .unwrap();
         assert_eq!(left, 1, "the old one goes and the recent one stays");
         assert_eq!(
-            last_run(db.conn(), 7).unwrap().unwrap().started_at,
+            one_of(&last_runs(db.conn()).unwrap(), 7).started_at,
             now - 60
         );
     }
@@ -1034,8 +1014,8 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(last_run(db.conn(), 7).unwrap().unwrap().changes, 5);
-        assert_eq!(last_run(db.conn(), 8).unwrap().unwrap().changes, 0);
+        assert_eq!(one_of(&last_runs(db.conn()).unwrap(), 7).changes, 5);
+        assert_eq!(one_of(&last_runs(db.conn()).unwrap(), 8).changes, 0);
     }
 
     /// `username_history` holds everybody this tool has ever seen. A diff about
