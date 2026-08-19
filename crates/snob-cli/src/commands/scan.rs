@@ -309,8 +309,15 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         .map(|n| n.to_string().len())
         .max()
         .unwrap_or(1);
+    // No at sign, and this is the only string in the tree that hands one over
+    // to be typed back. AGENTS.md settles what happens next: `@` is
+    // PowerShell's splatting operator, so an unquoted `@someone` is gone before
+    // `main` runs and the tool cheerfully answers about the user's own account,
+    // with exit 0 and nothing to suggest a different question was asked. A name
+    // is accepted either way, so leaving it off is a hint that works in every
+    // shell rather than one that needs quoting explained next to it.
     let suffix = if summary.explicit_target {
-        format!(" @{}", summary.target)
+        format!(" {}", summary.target)
     } else {
         String::new()
     };
@@ -711,7 +718,30 @@ mod tests {
     fn the_hints_repeat_an_explicit_target() {
         let outcomes = (outcome(), outcome());
         let text = rendered_text(&summary(counts(), true, &outcomes), Format::Table, true);
-        assert!(text.contains("for details, run \"snob fans @someone\""));
+        assert!(text.contains("for details, run \"snob fans someone\""));
+    }
+
+    /// A hint is written to be typed back, and this is the only one in the tree
+    /// that carries a username.
+    ///
+    /// On PowerShell `@` is the splatting operator: an unquoted `@someone` is
+    /// gone before `main` runs, so the command answers about the reader's own
+    /// account with exit 0 and no sign that a different question was asked. The
+    /// row above it still shows the at sign, because that one is a label rather
+    /// than something to copy.
+    #[test]
+    fn the_hints_never_hand_over_an_unquoted_at_name() {
+        let outcomes = (outcome(), outcome());
+        let text = rendered_text(&summary(counts(), true, &outcomes), Format::Table, true);
+
+        for line in text.lines().filter(|l| l.contains("run \"snob ")) {
+            let command = line.split("run \"snob ").nth(1).unwrap();
+            assert!(
+                !command.contains('@'),
+                "a command written to be typed back carries an at sign: {line}"
+            );
+        }
+        assert!(text.contains("Account:      @someone"), "{text}");
     }
 
     /// The summary is counts, not accounts, so its row formats are one row

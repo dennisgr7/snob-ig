@@ -309,6 +309,72 @@ fn no_run_of_spaces_is_left_inside_a_sentence() {
     );
 }
 
+/// A `snob …` command written to be typed back, carrying an at sign.
+///
+/// On PowerShell `@` is the splatting operator, so an unquoted `@someone` is
+/// gone before `main` runs: the command answers about the reader's own account,
+/// with exit 0 and nothing on screen to say a different question was asked.
+/// Quoting it is the documented escape, but a name is accepted with or without
+/// the sign, so a command that leaves it off needs no explanation next to it.
+///
+/// The command is read from `snob ` to whatever closes the literal it sits in —
+/// a quote or a backtick — or to the end of the line. Prose around it is not
+/// searched, which is what keeps `@someone` in the sentence *explaining* the
+/// rule from tripping it.
+fn at_name_in_a_command(line: &str) -> Option<String> {
+    let mut rest = line;
+    while let Some(at) = rest.find("snob ") {
+        let after = &rest[at + "snob ".len()..];
+        let command = after.split(['"', '`']).next().unwrap_or(after);
+        if command.contains('@') {
+            return Some(format!("snob {}", command.trim_end()));
+        }
+        rest = after;
+    }
+    None
+}
+
+/// Nothing this repository prints or documents hands over a command with an
+/// unquoted `@name` in it.
+#[test]
+fn no_command_is_written_with_an_at_name_to_type_back() {
+    let Some(root) = repo_root() else {
+        return; // packaged build, nothing to walk
+    };
+
+    let mut violations = Vec::new();
+    for file in source_files(&root) {
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // This file holds the examples, so it flags itself -- the same trap
+        // the two allowlists above record, for the same reason.
+        if relative == "crates/snob-core/tests/language.rs" {
+            continue;
+        }
+
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for (number, line) in contents.lines().enumerate() {
+            if let Some(found) = at_name_in_a_command(line) {
+                violations.push(format!("{relative}:{}: {found}", number + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "{} command(s) a reader would copy and lose the name from:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
 /// Walks up from the manifest until a `Cargo.lock` shows up.
 fn repo_root() -> Option<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -360,7 +426,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{spanish_in, stray_spaces_in};
+    use super::{at_name_in_a_command, spanish_in, stray_spaces_in};
 
     #[test]
     fn it_catches_the_three_kinds_of_giveaway() {
@@ -414,6 +480,36 @@ mod tests {
             "        indented(code);",
         ] {
             assert!(stray_spaces_in(line).is_none(), "false positive on: {line}");
+        }
+    }
+
+    /// The offender the guard was written for, in the shape it shipped in.
+    #[test]
+    fn a_command_that_hands_over_an_at_name_is_found() {
+        assert!(
+            at_name_in_a_command(r#"row.push_str("  for details, run \"snob fans @someone\"")"#)
+                .is_some()
+        );
+        assert!(at_name_in_a_command("Run `snob followers @someone` once.").is_some());
+        assert!(at_name_in_a_command("    snob unfollowers @someone").is_some());
+    }
+
+    /// The sentence that *explains* the rule names an at sign next to the word
+    /// `snob` all over the documentation. Flagging those is how this becomes
+    /// noise, so the command is read only as far as the literal it sits in.
+    #[test]
+    fn prose_around_a_command_is_not_the_command() {
+        for line in [
+            r#"Run \"snob followers {}\" once and the monitor will have @someone stored."#,
+            "Run `snob scan someone` to see @someone's picture.",
+            "A username may be written with or without a leading @.",
+            r#"assert!(text.contains("for details, run \"snob fans someone\""));"#,
+            "  snob unfollowers                    who does not follow you back",
+        ] {
+            assert!(
+                at_name_in_a_command(line).is_none(),
+                "false positive on: {line}"
+            );
         }
     }
 
