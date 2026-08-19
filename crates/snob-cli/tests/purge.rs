@@ -319,6 +319,18 @@ fn purge_removes_the_monitors_secrets_with_no_session_stored() {
     // service name, which is what makes this a question about the keyring
     // rather than about a handle.
     let after = SecretStore::new(paths.clone(), true).with_service(&service("monitor-secrets"));
-    assert!(after.load_secret(Kind::WatchToken).unwrap().is_none());
-    assert!(after.load_secret(Kind::WatchSigningKey).unwrap().is_none());
+    assert!(
+        after
+            .load_secret(Kind::WatchToken)
+            .unwrap()
+            .found()
+            .is_none()
+    );
+    assert!(
+        after
+            .load_secret(Kind::WatchSigningKey)
+            .unwrap()
+            .found()
+            .is_none()
+    );
 }

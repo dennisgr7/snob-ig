@@ -44,6 +44,50 @@ const KEYRING_USER: &str = "session";
 /// Separate keyring entry used only to check that writing works.
 const KEYRING_PROBE_USER: &str = "write-probe";
 
+/// What the credential store said when it was asked for one secret.
+///
+/// **Three answers, not two.** This used to be an `Option`, and `None` meant
+/// both "the store holds nothing under that name" and "this process cannot
+/// reach the store at all". Those are not the same fact and they do not deserve
+/// the same reaction: the first is a configuration the user chose, the second
+/// is a machine that cannot honor the one they did choose.
+///
+/// What that cost is in `commands::watch::plan`. Both of its warning arms sit
+/// inside `if let Some(...)`, so two absent secrets produced **no** warnings and
+/// a webhook client with no `Authorization` and no signing key. On a box where
+/// the session is in the file fallback and the keyring is not reachable — a
+/// `login --no-keyring`, then `setup`, then cron with no session bus — the
+/// monitor posted a document naming the user's followers unauthenticated and
+/// unsigned, and the only trace was a `debug!` line nobody sees at the default
+/// level. `WatchConfig` records nothing about what `setup` stored, so no later
+/// run could notice either.
+///
+/// An enum rather than a second predicate the caller has to remember to ask:
+/// this project has the rule that a guard living in a doc-comment is not a
+/// guard.
+#[derive(Debug)]
+pub enum Stored {
+    Found(Secret),
+    /// The store answered, and holds nothing under this name.
+    Nothing,
+    /// The store could not be opened. Whether anything is in it is unknown.
+    Unreachable,
+}
+
+impl Stored {
+    /// The secret, for callers that genuinely do not care why there is none.
+    pub fn found(self) -> Option<Secret> {
+        match self {
+            Self::Found(secret) => Some(secret),
+            Self::Nothing | Self::Unreachable => None,
+        }
+    }
+
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable)
+    }
+}
+
 /// Everything this tool may keep in the keyring.
 ///
 /// An enum with an `ALL` rather than a set of loose strings, and the reason is
@@ -368,18 +412,18 @@ impl SecretStore {
     }
 
     /// Reads one back, if it is there.
-    pub fn load_secret(&self, kind: Kind) -> Result<Option<Secret>, SecretsError> {
+    pub fn load_secret(&self, kind: Kind) -> Result<Stored, SecretsError> {
         match self.entry_for(kind.entry_name()) {
             Ok(entry) => match entry.get_password() {
-                Ok(value) => Ok(Some(Secret::new(value))),
-                Err(keyring::Error::NoEntry) => Ok(None),
+                Ok(value) => Ok(Stored::Found(Secret::new(value))),
+                Err(keyring::Error::NoEntry) => Ok(Stored::Nothing),
                 Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
             },
-            // No keyring at all is not an error here: it means there is no
-            // secret stored, and the caller falls back to what it was given.
+            // Not an error — the tool works without one — but not "nothing is
+            // stored" either, which is what this used to answer.
             Err(e) => {
                 tracing::debug!(error = %e, "there is no keyring to read from");
-                Ok(None)
+                Ok(Stored::Unreachable)
             }
         }
     }
@@ -431,7 +475,7 @@ impl SecretStore {
         Kind::ALL
             .into_iter()
             .filter(|kind| *kind != Kind::Session)
-            .filter(|kind| matches!(self.load_secret(*kind), Ok(Some(_))))
+            .filter(|kind| matches!(self.load_secret(*kind), Ok(Stored::Found(_))))
             .collect()
     }
 
@@ -974,7 +1018,7 @@ mod tests {
         );
         for kind in Kind::ALL {
             assert!(
-                store.load_secret(kind).unwrap().is_none(),
+                store.load_secret(kind).unwrap().found().is_none(),
                 "{kind:?} survived a purge"
             );
         }
@@ -1087,7 +1131,7 @@ mod tests {
                 continue;
             }
             assert!(
-                store.load_secret(kind).unwrap().is_some(),
+                store.load_secret(kind).unwrap().found().is_some(),
                 "logout took {kind:?} with it"
             );
         }
@@ -1107,12 +1151,19 @@ mod tests {
             store
                 .load_secret(Kind::WatchToken)
                 .unwrap()
+                .found()
                 .unwrap()
                 .expose(),
             "Bearer abc"
         );
         store.forget_secret(Kind::WatchToken).unwrap();
-        assert!(store.load_secret(Kind::WatchToken).unwrap().is_none());
+        assert!(
+            store
+                .load_secret(Kind::WatchToken)
+                .unwrap()
+                .found()
+                .is_none()
+        );
         // Forgetting one that is not there is not an error: `setup` run again
         // with no token has to be able to clear whatever was there before.
         store.forget_secret(Kind::WatchToken).unwrap();

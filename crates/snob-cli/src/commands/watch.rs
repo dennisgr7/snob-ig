@@ -17,7 +17,7 @@ use snob_core::Pk;
 use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
-use snob_core::secrets::{Kind, SecretStore};
+use snob_core::secrets::{Kind, SecretStore, Stored};
 use snob_core::store::deliveries;
 use snob_core::watch::config::{self, WatchConfig, WebhookConfig};
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
@@ -1073,10 +1073,25 @@ struct Planned {
 fn plan(
     args: &WebhookArgs,
     from_file: Option<&WebhookConfig>,
-    stored_token: Option<Secret>,
-    stored_key: Option<Secret>,
+    stored_token: Stored,
+    stored_key: Stored,
 ) -> Result<(Option<Planned>, Vec<String>)> {
     let mut warnings: Vec<String> = Vec::new();
+
+    // Whether the credential store could be consulted at all, asked before the
+    // secrets are unwrapped.
+    //
+    // "Nothing is stored" and "this process cannot reach the store" used to be
+    // the same answer, and both of the warning arms below sit inside a `Some`,
+    // so two absent secrets produced no warning and a client with neither an
+    // `Authorization` nor a signing key. The report went out naming the user's
+    // followers, unauthenticated and unsigned, and the only trace was a
+    // `debug!` line nobody sees. `setup` stores the token keyring-only whatever
+    // `--no-keyring` said, so the box where the session is in the file fallback
+    // and the keyring is not reachable — a login with `--no-keyring`, then
+    // `setup`, then cron with no session bus — is the reachable one.
+    let store_unreadable = stored_token.is_unreachable() || stored_key.is_unreachable();
+    let (stored_token, stored_key) = (stored_token.found(), stored_key.found());
 
     let Some(url) = args
         .webhook
@@ -1226,6 +1241,19 @@ fn plan(
             None
         }
     };
+
+    // Said whatever the file asks for, because the file is what says a
+    // credential was ever meant to travel. It cannot be asked whether one was
+    // stored -- that is the question that could not be answered.
+    if store_unreadable && from_file.is_some() {
+        warnings.push(
+            "the system keyring could not be read, so any token or signing key stored by \
+             \"snob watch setup\" is not being used: this report goes out unauthenticated and \
+             unsigned. Pass them with --header and --sign-with, or run where the keyring is \
+             reachable."
+                .to_string(),
+        );
+    }
 
     Ok((
         Some(Planned {
@@ -2386,6 +2414,43 @@ consent = { agreed_at = 1700 }
     /// A credential set up for one address does not follow `--webhook` to
     /// another.
     ///
+    /// A keyring that cannot be read is not a keyring with nothing in it.
+    ///
+    /// Both warning arms below sit inside a `Some`, so two absent secrets used
+    /// to produce **no** warning and a client with neither an `Authorization`
+    /// nor a signing key: the report went out naming the user's followers,
+    /// unauthenticated and unsigned, with the only trace a `debug!` line nobody
+    /// sees at the default level. `WatchConfig` records nothing about what
+    /// `setup` stored, so no later run could notice either.
+    ///
+    /// The reachable box is the one where the session is in the file fallback
+    /// and the keyring is not there: `snob login --no-keyring`, then `setup` —
+    /// whose `save_secret` is keyring-only whatever `--no-keyring` said — then
+    /// cron with no session bus.
+    #[test]
+    fn a_keyring_that_cannot_be_read_is_said_out_loud() {
+        let file = configured("https://n8n.local/webhook/snob", &[]);
+        let args = WebhookArgs::default();
+
+        let (planned, warnings) =
+            plan(&args, Some(&file), Stored::Unreachable, Stored::Unreachable).unwrap();
+        let planned = planned.expect("the file names an address");
+
+        assert_eq!(sent_as(&planned, "Authorization"), Vec::<&str>::new());
+        assert!(planned.webhook.key.is_none());
+        assert_eq!(
+            warnings.len(),
+            1,
+            "going out unauthenticated and unsigned is not something to do quietly: {warnings:?}"
+        );
+        assert!(warnings[0].contains("keyring"), "{warnings:?}");
+
+        // And the answer that really does mean "nothing was stored" still says
+        // nothing, because there is nothing to say.
+        let (_, quiet) = plan(&args, Some(&file), Stored::Nothing, Stored::Nothing).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
     /// Pointing a run at a request bin to see what the payload looks like is the
     /// first thing anybody does, and it used to send the team's `X-Api-Key` and
     /// the bearer token `snob watch setup` had stored to that bin. `check` was
@@ -2407,8 +2472,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &args,
             Some(&file),
-            Some(Secret::from("Bearer stored".to_string())),
-            None,
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Nothing,
         )
         .unwrap();
         let planned = planned.expect("there is an address to post to");
@@ -2631,8 +2696,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &args,
             None,
-            Some(Secret::from("Bearer stored".to_string())),
-            None,
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Nothing,
         )
         .unwrap();
         let planned = planned.expect("there is an address to post to");
@@ -2657,8 +2722,8 @@ consent = { agreed_at = 1700 }
         let (planned, _) = plan(
             &args,
             Some(&file),
-            Some(Secret::from("Bearer stored".to_string())),
-            Some(Secret::from("k".to_string())),
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Found(Secret::from("k".to_string())),
         )
         .unwrap();
         let planned = planned.expect("there is an address to post to");
@@ -2687,8 +2752,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &args,
             Some(&file),
-            None,
-            Some(Secret::from("shared-secret".to_string())),
+            Stored::Nothing,
+            Stored::Found(Secret::from("shared-secret".to_string())),
         )
         .unwrap();
         let planned = planned.expect("there is an address to post to");
@@ -2716,8 +2781,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &args,
             Some(&file),
-            None,
-            Some(Secret::from("shared-secret".to_string())),
+            Stored::Nothing,
+            Stored::Found(Secret::from("shared-secret".to_string())),
         )
         .unwrap();
         let planned = planned.expect("there is an address to post to");
@@ -2738,8 +2803,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &WebhookArgs::default(),
             Some(&file),
-            Some(Secret::from("Bearer stored".to_string())),
-            Some(Secret::from("shared-secret".to_string())),
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Found(Secret::from("shared-secret".to_string())),
         )
         .unwrap();
         let planned = planned.expect("the file names an address");
@@ -2763,8 +2828,8 @@ consent = { agreed_at = 1700 }
         let (planned, warnings) = plan(
             &args,
             Some(&file),
-            Some(Secret::from("Bearer stored".to_string())),
-            None,
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Nothing,
         )
         .unwrap();
 
@@ -2791,8 +2856,8 @@ consent = { agreed_at = 1700 }
         let (planned, _) = plan(
             &WebhookArgs::default(),
             Some(&file),
-            Some(Secret::from("Bearer stored".to_string())),
-            None,
+            Stored::Found(Secret::from("Bearer stored".to_string())),
+            Stored::Nothing,
         )
         .unwrap();
 
@@ -2820,7 +2885,9 @@ consent = { agreed_at = 1700 }
             // Mapped away rather than unwrapped: the error carries a `Planned`,
             // which holds the merged headers, and those hold the token in the
             // clear.
-            let refused = plan(&args, None, None, None).map(|_| ()).unwrap_err();
+            let refused = plan(&args, None, Stored::Nothing, Stored::Nothing)
+                .map(|_| ())
+                .unwrap_err();
             assert!(refused.to_string().contains("empty value"), "{refused}");
         }
     }
@@ -2836,7 +2903,7 @@ consent = { agreed_at = 1700 }
             ..Default::default()
         };
 
-        let (planned, _) = plan(&args, Some(&file), None, None).unwrap();
+        let (planned, _) = plan(&args, Some(&file), Stored::Nothing, Stored::Nothing).unwrap();
 
         assert_eq!(
             sent_as(&planned.unwrap(), "X-Source"),
@@ -2854,7 +2921,7 @@ consent = { agreed_at = 1700 }
             ..Default::default()
         };
 
-        let (planned, warnings) = plan(&args, None, None, None).unwrap();
+        let (planned, warnings) = plan(&args, None, Stored::Nothing, Stored::Nothing).unwrap();
 
         assert!(planned.is_none());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
