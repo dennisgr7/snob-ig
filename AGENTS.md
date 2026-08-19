@@ -190,8 +190,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
 | Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
-| A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target`. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too |
-| A name inside a URL is encoded, never filtered | `User::profile_url` — filtering removes characters, and a name with one removed is the address of a different account |
+| A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `app::target_label`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target` — and, for everything a failure prints, through `report::filtered`, which every branch of `print_error` goes through including the one that carries no label. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too. `printable` covers the invisibles that are `Cf` **and** the four Hangul fillers, which are ordinary letters by category and blank by rendering |
+| A name inside a URL or a header is encoded, never filtered | `model::in_a_path`, used by `User::profile_url` and by the `Referer` the Instagram client sends — filtering removes characters, and a name with one removed is the address of a different account. A header value cannot hold a byte below 0x20 at all, so an unencoded name there produces no request rather than a wrong one, and reqwest reports that as `Network`, which the pager retries |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` — and takes its waits from `IgClient::is_live`, so "walk Instagram with no pauses" is not a thing a caller can ask for |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
@@ -209,7 +209,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 | Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all`, which `purge::execute` calls unconditionally — gating it on there being a session left the monitor's secrets behind after `logout`. `logout` calls `delete`, which takes the session and nothing else |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
-| Owed reports are retried by any run, not only by one that had news | `run_one` and `once` drain the queue once per run, after every account, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not. `run_one` takes an `App` rather than opening one, so a test can watch it happen |
+| Owed reports are retried by any run, not only by one that had news | `run_accounts` drains the queue once per run, after every account and whatever the accounts did, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not. Both modes go through it, which is what stops one of the two keeping the rule and the other not. It takes an `App` rather than opening one, so a test can watch it happen |
 | A queued report can only go to the address it was addressed to | `watch_deliveries.destination`, which `deliveries::due` filters on |
 | A credential set up for one host is not sent to another | `delivery_from` compares origins before attaching the keyring token or the file's headers |
 | A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every list this run verified, from the account's one cursor, and deduplicates by `pk` |
@@ -246,7 +246,7 @@ less protected than the user expected is its own kind of failure. `--no-keyring`
 still forces the file directly.
 
 Everything else already works without a terminal: `prompt_secret` reads a plain
-line when standard input is not a TTY, the progress bar hides itself, `table`
+line when either stream it uses is not a TTY, the progress bar hides itself, `table`
 becomes one name per line down a pipe, and the output format defaults to JSON.
 The login **method** must be given explicitly there (`--paste`), since there is
 no menu to show.
@@ -255,9 +255,14 @@ no menu to show.
 prompt is written to standard error and answered on standard input, so
 `ui::can_be_asked` asks about standard input alone and nothing gates on standard
 output: `snob scan someone | jq` reaches the consent question and can answer it.
-The one exception is `ui::can_show_a_menu`, which also needs standard **error**
-to be a terminal, because that is where `dialoguer` draws — not standard output,
-which no prompt here touches.
+
+The two exceptions are the prompts that **draw** rather than only ask, and both
+need standard **error** to be a terminal as well — not standard output, which no
+prompt here touches. `ui::can_show_a_menu` gates the menu, because that is where
+`dialoguer` draws. `ui::can_mask` gates the masked secret prompt, which reads
+its keys through `console::Term::stderr()`: that call answers `Key::Unknown`
+immediately and forever when the stream is not a TTY, so gated on standard input
+alone `snob login --paste 2> log` spun a core and never read what was pasted.
 
 Two judgement calls worth understanding before touching them:
 
@@ -314,8 +319,12 @@ Two judgement calls worth understanding before touching them:
   most daily, and never when the user pinned one.
 - **`@someone` never reaches us on PowerShell.** `@` is the splatting operator,
   so the argument is gone before `main` runs and the tool answers about the
-  user's own account. Nothing can detect it from here — do not write unquoted
-  `@name` in examples aimed at PowerShell users.
+  user's own account, with exit 0 and nothing to say a different question was
+  asked. Nothing can detect it at run time — but a command written to be typed
+  back can be, and `tests/language.rs` walks the sources for one: a `snob …`
+  command carrying an at sign fails the build. Do not write unquoted `@name` in
+  examples aimed at PowerShell users; a name is accepted without the sign, which
+  is the spelling that needs no explanation next to it.
 - **Everything is per user, never per directory.** The session, the database and
   the cache come from `directories`, so running `snob` from two folders is one
   session and one cache. The only thing the working directory decides is where
