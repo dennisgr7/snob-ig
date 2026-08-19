@@ -67,9 +67,14 @@ struct Summary<'a> {
     explicit_target: bool,
     filtered: bool,
     /// The accounts you follow who also follow this one. `None` on your own
-    /// account, where the question is what `snob friends` answers, and when
-    /// nothing is stored to answer it with.
+    /// account, where the question is what `snob friends` answers, when nothing
+    /// is stored to answer it with, and when what is stored is older than
+    /// `--max-age`.
     followed_by: Option<&'a [User]>,
+    /// When the capture behind `followed_by` was taken. Carried beside it so
+    /// this answer dates itself the way every other stored figure in the same
+    /// object does.
+    followed_by_at: Option<i64>,
     followers: &'a ListOutcome,
     following: &'a ListOutcome,
 }
@@ -117,17 +122,30 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // was typed against the stored username: that name can be absent, can be
     // spelled differently, and on a fresh session is not known at all.
     let is_self = followers_outcome.is_own(&viewer);
-    let followed_by = if is_self {
+    let found = if is_self {
         None
     } else {
         people::in_common(&app, &followers)?
     };
 
+    // Held to the same age bound as every other stored answer in this object.
+    // Nothing refreshes this one — no flag walks it, and `check_same_moment`
+    // covers only the two lists that were walked — so without the bound the
+    // opening line could name accounts unfollowed months ago while reading
+    // exactly like one worked out this minute.
+    let max_age = i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX);
+    let now = snob_core::store::now();
+    let stale = found.as_ref().is_some_and(|f| !f.is_current(max_age, now));
+    let followed_by = found.filter(|_| !stale);
+
     if !is_self && followed_by.is_none() && destination.is_interactive() {
-        ui::info(
+        ui::info(if stale {
+            "Who you both follow is not shown: the stored list of your own following is older \
+             than --max-age. Run \"snob following\" to bring it up to date."
+        } else {
             "Who you both follow is not shown: nothing of your own following is stored yet. \
-             Run \"snob following\" once and it will appear from then on.",
-        );
+             Run \"snob following\" once and it will appear from then on."
+        });
     }
 
     let filtered = !filter.is_empty();
@@ -136,7 +154,8 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         target: &target,
         explicit_target,
         filtered,
-        followed_by: followed_by.as_deref(),
+        followed_by: followed_by.as_ref().map(|f| f.people.as_slice()),
+        followed_by_at: followed_by.as_ref().map(|f| f.taken_at),
         followers: &followers_outcome,
         following: &following_outcome,
     };
@@ -264,6 +283,9 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
                 "followed_by": summary.followed_by.map(|people| serde_json::json!({
                     "count": people.len(),
                     "accounts": people,
+                    // The one figure in this object that used to arrive without
+                    // a date, from a capture nothing here refreshes.
+                    "taken_at": summary.followed_by_at,
                 })),
                 "lists": {
                     "followers": list_object(summary.followers),
@@ -290,7 +312,7 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
     }))
 }
 
-/// "Followed by @ana, @luis and @eva and 2 others".
+/// "Followed by @ana, @luis, @eva and 2 others, as of 07/07 at 14:12".
 ///
 /// `None` when there is nobody to name, which includes both "you follow nobody
 /// who follows them" and "we have no stored list to check against". The
@@ -298,7 +320,14 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
 /// summary is not the place to explain what is missing from it.
 fn followed_by_line(summary: &Summary<'_>) -> Option<String> {
     let people = summary.followed_by?;
-    people::name_a_few(people, NAMES_SHOWN).map(|names| format!("Followed by {names}"))
+    let names = report::name_a_few(people, NAMES_SHOWN)?;
+    // Dated, like the two walked lists below it. This one comes entirely out of
+    // storage and no flag walks it again, so the date is the only thing that
+    // tells a line worked out this minute from one built on last month's list.
+    Some(match summary.followed_by_at {
+        Some(taken_at) => format!("Followed by {names}, as of {}", report::stored_on(taken_at)),
+        None => format!("Followed by {names}"),
+    })
 }
 
 fn text_table(summary: &Summary<'_>, hints: bool) -> String {
@@ -574,6 +603,7 @@ mod tests {
             explicit_target,
             filtered: false,
             followed_by: None,
+            followed_by_at: None,
             followers: &outcomes.0,
             following: &outcomes.1,
         }
@@ -820,6 +850,40 @@ mod tests {
         assert!(text.contains("Account:      @someone"), "{text}");
     }
 
+    /// The opening line dates itself, like everything else in this summary.
+    ///
+    /// It is worked out entirely from storage, and no flag walks it again —
+    /// `--refresh` walks the two lists of the account being scanned, not your
+    /// own following. Undated it read exactly like a line worked out this
+    /// minute while naming accounts unfollowed months ago, in the one place
+    /// `snob scan` opens with and nobody asked for.
+    #[test]
+    fn the_opening_line_says_which_capture_it_came_from() {
+        let outcomes = (outcome(), outcome());
+        let known = vec![user(1, "ana"), user(2, "luis")];
+        let dated = Summary {
+            followed_by_at: Some(1_720_360_320),
+            ..with_people(&outcomes, &known)
+        };
+
+        let text = rendered_text(&dated, Format::Table, false);
+        assert!(
+            text.starts_with(&format!(
+                "Followed by @ana and @luis, as of {}\n",
+                report::stored_on(1_720_360_320)
+            )),
+            "{text}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered_text(&dated, Format::Json, false)).unwrap();
+        assert_eq!(
+            json["followed_by"]["taken_at"].as_i64(),
+            Some(1_720_360_320),
+            "epoch seconds, the same unit the two lists answer in"
+        );
+    }
+
     /// The row formats say the same thing about provenance that the JSON does.
     /// `scan` is the one command whose whole output is derived numbers, so a
     /// row appended to a tracking spreadsheet with no date beside it cannot be
@@ -908,7 +972,7 @@ mod tests {
         ];
         let md = rendered_text(&with_people(&outcomes, &known), Format::Md, false);
         assert!(
-            md.contains("Followed by @ana, @luis and @eva and 1 other"),
+            md.contains("Followed by @ana, @luis, @eva and 1 other"),
             "{md}"
         );
     }
