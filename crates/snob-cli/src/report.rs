@@ -4,7 +4,7 @@
 //! between commands, and two copies of "run it again" that drifted apart would
 //! read as two different pieces of advice about the same situation.
 
-use snob_core::model::{ListKind, StopReason, printable};
+use snob_core::model::{ListKind, StopReason, User, printable};
 
 use crate::engine::Provenance;
 
@@ -374,6 +374,49 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
     }
 }
 
+/// "pepito, carlos and 4 others", or `None` when there is nobody to name.
+///
+/// The cap is not about width. Past a handful the line stops being "people you
+/// know" and becomes a list, and a list is what the `friends` command is for.
+///
+/// It lives here rather than in `engine` because it is a finished English
+/// sentence: it prefixes each name with `@`, joins with commas, swaps the last
+/// separator for "and" and picks between "1 other" and "N others". Wording is
+/// what `report` holds and what `engine` does not, and the drift had already
+/// started — with the count as a separate clause the line read "@ana, @luis and
+/// @eva and 2 others", two lists stapled together, because only one of the two
+/// joins knew about the other. The count is the last item now.
+pub fn name_a_few(people: &[User], cap: usize) -> Option<String> {
+    // A cap of zero would name nobody and count everybody, which is not a
+    // sentence anyone wants to read. At least one name, always.
+    let shown = cap.max(1).min(people.len());
+    if shown == 0 {
+        return None;
+    }
+
+    // Filtered here rather than at each consumer: this line is the first thing
+    // `snob scan` prints, with no flag needed, and it also goes into the
+    // markdown summary, whose escaping is about table cells rather than about
+    // what a terminal obeys.
+    let mut parts: Vec<String> = people[..shown]
+        .iter()
+        .map(|u| format!("@{}", u.safe_username()))
+        .collect();
+    parts.extend(match people.len() - shown {
+        0 => None,
+        1 => Some("1 other".to_string()),
+        n => Some(format!("{n} others")),
+    });
+
+    Some(match parts.as_slice() {
+        [one] => one.clone(),
+        // The last one joins with "and" rather than a comma, because this is a
+        // sentence rather than a column.
+        [start @ .., last] => format!("{} and {last}", start.join(", ")),
+        [] => unreachable!("the empty case returned above"),
+    })
+}
+
 /// A schedule as clauses, ready to be joined into a sentence.
 ///
 /// Two places read a schedule back to a person — the banner a run opens with,
@@ -451,6 +494,73 @@ mod tests {
         );
         assert!(out.starts_with("first line"));
         assert!(out.trim_end().ends_with("second line"));
+    }
+
+    fn people(names: &[&str]) -> Vec<User> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| User {
+                pk: i as u64 + 1,
+                username: (*name).into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nobody_is_not_a_sentence() {
+        assert_eq!(name_a_few(&[], 3), None);
+    }
+
+    /// This line opens `snob scan` with no flag asked for, so a username is
+    /// the shortest route from somebody else's profile to the terminal.
+    #[test]
+    fn a_hostile_name_cannot_drive_the_terminal() {
+        let hostile = people(&["ana\u{1b}[2K", "lu\u{202e}is"]);
+        let line = name_a_few(&hostile, 3).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert_eq!(line, "@ana[2K and @luis");
+    }
+
+    #[test]
+    fn one_name_stands_alone() {
+        assert_eq!(name_a_few(&people(&["ana"]), 3).unwrap(), "@ana");
+    }
+
+    #[test]
+    fn the_last_one_joins_with_and() {
+        assert_eq!(
+            name_a_few(&people(&["ana", "luis"]), 3).unwrap(),
+            "@ana and @luis"
+        );
+        assert_eq!(
+            name_a_few(&people(&["ana", "luis", "eva"]), 3).unwrap(),
+            "@ana, @luis and @eva"
+        );
+    }
+
+    /// The count is the last item of the one list, not a second list after it.
+    #[test]
+    fn past_the_cap_the_rest_are_counted() {
+        let five = people(&["ana", "luis", "eva", "juan", "sara"]);
+        assert_eq!(
+            name_a_few(&five, 3).unwrap(),
+            "@ana, @luis, @eva and 2 others"
+        );
+        assert_eq!(
+            name_a_few(&five, 4).unwrap(),
+            "@ana, @luis, @eva, @juan and 1 other"
+        );
+        // Exactly at the cap nothing is left over to count.
+        assert_eq!(
+            name_a_few(&five, 5).unwrap(),
+            "@ana, @luis, @eva, @juan and @sara"
+        );
     }
 
     /// A run somebody stopped gets no label, and for a while that meant it got

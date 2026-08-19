@@ -102,7 +102,11 @@ async fn it_names_the_accounts_you_follow_who_follow_them_too() {
 
     // Ordered by my own following list, not by theirs: these are names I am
     // meant to recognize, and that is the list I know.
-    assert_eq!(names(&found), vec!["ana", "luis"]);
+    assert_eq!(names(&found.people), vec!["ana", "luis"]);
+    assert!(
+        found.taken_at > 0,
+        "the answer says which capture it was worked out from"
+    );
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
 
@@ -116,18 +120,17 @@ async fn nobody_in_common_is_not_the_same_as_nothing_stored() {
 
     let (_server, app) = app_over(db).await;
     let strangers = vec![user(9, "stranger")];
-    assert_eq!(
-        people::in_common(&app, &strangers).unwrap(),
-        Some(Vec::new()),
+    let found = people::in_common(&app, &strangers).unwrap();
+    assert!(
+        found.is_some_and(|f| f.people.is_empty()),
         "an empty overlap is an answer"
     );
 
     // A second database, with no list of my own in it at all.
     let empty = tempfile::tempdir().unwrap();
     let (_server, app) = app_over(Store::open_at(&empty.path().join("test.db")).unwrap()).await;
-    assert_eq!(
-        people::in_common(&app, &strangers).unwrap(),
-        None,
+    assert!(
+        people::in_common(&app, &strangers).unwrap().is_none(),
         "with nothing stored there is no answer to give"
     );
 }
@@ -143,9 +146,8 @@ async fn a_half_finished_list_of_my_own_is_not_used() {
     let (_server, app) = app_over(db).await;
     let theirs = vec![user(1, "ana")];
 
-    assert_eq!(
-        people::in_common(&app, &theirs).unwrap(),
-        None,
+    assert!(
+        people::in_common(&app, &theirs).unwrap().is_none(),
         "an incomplete list of my own would understate the overlap"
     );
 }
@@ -159,9 +161,10 @@ async fn the_wrong_list_of_mine_does_not_answer() {
     store_list(&mut db, ME, ListKind::Followers, &[user(1, "ana")]);
 
     let (_server, app) = app_over(db).await;
-    assert_eq!(
-        people::in_common(&app, &[user(1, "ana")]).unwrap(),
-        None,
+    assert!(
+        people::in_common(&app, &[user(1, "ana")])
+            .unwrap()
+            .is_none(),
         "only my own following list can answer this"
     );
 }
