@@ -63,6 +63,18 @@ pub fn this_process() -> &'static str {
     ID.get_or_init(|| format!("{}-{}", std::process::id(), now_ms()))
 }
 
+/// A capture, as much of it as anything reads.
+///
+/// **`complete`, `requests` and `resumes` are columns and not fields.** They
+/// were hydrated on every lookup and read by nobody, and `complete` was the
+/// dangerous one: it is constant per construction path — `latest_complete` and
+/// `find_usable` both select from `usable_snapshots`, and `resumable` selects
+/// `complete = 0` — so `if snapshot.complete` read as the store's central
+/// safety check while deciding nothing at all. The check is the view, and it is
+/// held there rather than by whoever remembers to ask.
+///
+/// The columns stay: `pages` and `requests` are what a walk cost, and the next
+/// thing that wants to say so should find them written down rather than lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub id: i64,
@@ -70,13 +82,10 @@ pub struct Snapshot {
     pub kind: ListKind,
     pub started_at: i64,
     pub taken_at: Option<i64>,
-    pub complete: bool,
     pub member_count: u64,
     pub declared_count: Option<u64>,
     pub pages: u32,
-    pub requests: u32,
     pub next_cursor: Option<String>,
-    pub resumes: u32,
 }
 
 /// What changed when a page was saved.
@@ -171,8 +180,8 @@ pub fn resumable(
                       OR claimed_at IS NULL OR claimed_at < ?6)
                ORDER BY started_at DESC LIMIT 1
              )
-             RETURNING id, account_pk, kind, started_at, taken_at, complete, member_count,
-                       declared_count, pages, requests, next_cursor, resumes",
+             RETURNING id, account_pk, kind, started_at, taken_at, member_count,
+                       declared_count, pages, next_cursor",
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
@@ -395,8 +404,8 @@ pub fn latest_complete(
 ) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(
-            "SELECT id, account_pk, kind, started_at, taken_at, complete, member_count,
-                    declared_count, pages, requests, next_cursor, resumes
+            "SELECT id, account_pk, kind, started_at, taken_at, member_count,
+                    declared_count, pages, next_cursor
              FROM usable_snapshots
              WHERE account_pk = ?1 AND kind = ?2
              ORDER BY taken_at DESC, id DESC LIMIT 1",
@@ -417,8 +426,8 @@ pub fn latest_complete(
 pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(
-            "SELECT id, account_pk, kind, started_at, taken_at, complete, member_count,
-                    declared_count, pages, requests, next_cursor, resumes
+            "SELECT id, account_pk, kind, started_at, taken_at, member_count,
+                    declared_count, pages, next_cursor
              FROM usable_snapshots WHERE id = ?1",
             params![id],
             row_to_snapshot,
@@ -481,13 +490,10 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
         },
         started_at: row.get(3)?,
         taken_at: row.get(4)?,
-        complete: row.get(5)?,
-        member_count: row.get::<_, i64>(6)? as u64,
-        declared_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-        pages: row.get::<_, i64>(8)? as u32,
-        requests: row.get::<_, i64>(9)? as u32,
-        next_cursor: row.get(10)?,
-        resumes: row.get::<_, i64>(11)? as u32,
+        member_count: row.get::<_, i64>(5)? as u64,
+        declared_count: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+        pages: row.get::<_, i64>(7)? as u32,
+        next_cursor: row.get(8)?,
     })
 }
 

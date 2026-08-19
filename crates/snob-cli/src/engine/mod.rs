@@ -443,13 +443,10 @@ mod tests {
             kind: ListKind::Followers,
             started_at: 0,
             taken_at: Some(0),
-            complete: true,
             member_count: 0,
             declared_count: None,
             pages: 0,
-            requests: 0,
             next_cursor: None,
-            resumes: 0,
         };
         let outcome = ListOutcome::cached(&snapshot, Provenance::CounterVerified);
         assert!(outcome.is_complete());
