@@ -84,6 +84,27 @@ pub fn find_pk_by_username(conn: &Connection, username: &str) -> Result<Option<P
     Ok(pk.map(super::pk_from_sql))
 }
 
+/// The account the session belongs to, as this database has recorded it.
+///
+/// `None` on a machine that has never run anything against a session, which is
+/// a real state rather than an error: `snob watch status` opens the store
+/// without one and has to answer anyway.
+///
+/// One row is expected — `is_self` is written by `upsert` from what the engine
+/// resolved — but logging in as somebody else leaves the old row behind, so the
+/// most recently polled one wins, the way `find_pk_by_username` settles the
+/// same kind of tie.
+pub fn own(conn: &Connection) -> Result<Option<Pk>, StoreError> {
+    let pk = conn
+        .query_row(
+            "SELECT pk FROM accounts WHERE is_self = 1 ORDER BY polled_at DESC, pk LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(pk.map(super::pk_from_sql))
+}
+
 pub fn find(conn: &Connection, pk: Pk) -> Result<Option<Account>, StoreError> {
     let account = conn
         .query_row(

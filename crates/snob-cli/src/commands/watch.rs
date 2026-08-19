@@ -659,7 +659,10 @@ pub(crate) fn calendar_from<S: AsRef<str>>(days: &[S], times: &[S]) -> Result<Sc
     Ok(Schedule::calendar(&days, &times)?)
 }
 
-fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Result<Schedule> {
+pub(super) fn schedule_from(
+    args: &WatchRunArgs,
+    configured: Option<&WatchConfig>,
+) -> Result<Schedule> {
     let When {
         cron,
         at,
