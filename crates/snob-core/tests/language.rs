@@ -17,7 +17,8 @@
 //! the indentation is suddenly part of what the user reads. Two rounds of
 //! reading missed it. Its escape hatch is `layout-allow`.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::{relative, repo_root, source_files};
 
 /// Characters that only Spanish uses. Cheap and very high signal.
 const SPANISH_CHARS: [char; 15] = [
@@ -149,12 +150,8 @@ fn no_spanish_is_left_in_the_repository() {
     };
 
     let mut violations = Vec::new();
-    for file in source_files(&root) {
-        let relative = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for file in source_files(&root, &EXTENSIONS) {
+        let relative = relative(&root, &file);
 
         if ALLOWLIST.contains(&relative.as_str()) {
             continue;
@@ -273,15 +270,8 @@ fn no_run_of_spaces_is_left_inside_a_sentence() {
     };
 
     let mut violations = Vec::new();
-    for file in source_files(&root) {
-        if file.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let relative = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for file in source_files(&root, &["rs"]) {
+        let relative = relative(&root, &file);
 
         if LAYOUT_ALLOWLIST.contains(&relative.as_str()) {
             continue;
@@ -343,12 +333,8 @@ fn no_command_is_written_with_an_at_name_to_type_back() {
     };
 
     let mut violations = Vec::new();
-    for file in source_files(&root) {
-        let relative = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for file in source_files(&root, &EXTENSIONS) {
+        let relative = relative(&root, &file);
 
         // This file holds the examples, so it flags itself -- the same trap
         // the two allowlists above record, for the same reason.
@@ -373,55 +359,6 @@ fn no_command_is_written_with_an_at_name_to_type_back() {
         violations.len(),
         violations.join("\n")
     );
-}
-
-/// Walks up from the manifest until a `Cargo.lock` shows up.
-fn repo_root() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .find(|d| d.join("Cargo.lock").is_file())
-        .map(Path::to_path_buf)
-}
-
-/// Directories this never descends into.
-///
-/// `target` and `.git` are the obvious ones. The rest are where a developer's
-/// own files live, and since `json` joined the extension list the walk reaches
-/// things that are nobody's source: an editor's settings, and — the one that
-/// matters — an Instagram data export or a `snob lists -o out.json` written
-/// from the repository root. Those are full of real names with real accents,
-/// so the test would fail on them **and print them into the assertion
-/// message**. That is the "permanent noise and someone switches it off"
-/// outcome the language rule warns about, arriving with someone else's
-/// personal data attached.
-const SKIP_DIRS: [&str; 6] = ["target", ".git", ".claude", ".vscode", ".idea", "exports"];
-
-fn source_files(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if path.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    pending.push(path);
-                }
-            } else if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTENSIONS.contains(&e))
-            {
-                found.push(path);
-            }
-        }
-    }
-    found
 }
 
 #[cfg(test)]

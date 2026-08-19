@@ -26,7 +26,8 @@
 //! is meant to be: it is the cheap direction to be wrong in, since the worst it
 //! does is ask for `with_service` on a line that did not need it.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::{relative, repo_root, source_files};
 
 #[test]
 fn no_test_builds_a_secret_store_pointing_at_the_real_service() {
@@ -35,12 +36,8 @@ fn no_test_builds_a_secret_store_pointing_at_the_real_service() {
     };
 
     let mut offenders = Vec::new();
-    for file in rust_files(&root) {
-        let relative = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for file in source_files(&root, &["rs"]) {
+        let relative = relative(&root, &file);
 
         if ALLOWLIST.contains(&relative.as_str()) {
             continue;
@@ -190,41 +187,9 @@ mod tests {
     );
 }
 
-fn repo_root() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .find(|d| d.join("Cargo.lock").is_file())
-        .map(Path::to_path_buf)
-}
-
 /// Files exempt from the walk.
 ///
 /// The trap everyone forgets, and the one `tests/language.rs` records for the
 /// same reason: this file holds the shapes it is looking for, so it flags
 /// itself.
 const ALLOWLIST: [&str; 1] = ["crates/snob-core/tests/keyring.rs"];
-
-const SKIP_DIRS: [&str; 6] = ["target", ".git", ".claude", ".vscode", ".idea", "exports"];
-
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if !SKIP_DIRS.contains(&name.as_ref()) {
-                    pending.push(path);
-                }
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                found.push(path);
-            }
-        }
-    }
-    found
-}
