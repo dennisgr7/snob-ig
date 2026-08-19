@@ -386,7 +386,7 @@ impl IgClient {
             .get(
                 "/api/v1/users/web_profile_info/",
                 &[("username", username)],
-                &format!("{username}/"),
+                &format!("{}/", snob_core::model::in_a_path(username)),
             )
             .await
             .map_err(|e| match e {
@@ -423,7 +423,7 @@ impl IgClient {
             &if username.is_empty() {
                 String::new()
             } else {
-                format!("{username}/{segment}/")
+                format!("{}/{segment}/", snob_core::model::in_a_path(username))
             },
         )
         .await
@@ -549,7 +549,20 @@ impl IgClient {
             .header("Sec-Fetch-Site", "same-origin")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
-            .header("Referer", format!("{BASE_URL}/{referer}"))
+            // Built rather than interpolated. Every caller encodes the name it
+            // puts in here, so this cannot fail today — but a header value
+            // that will not build is not an error reqwest raises where it is
+            // made. It carries it to `send()`, where `?` classifies it as
+            // `Network`, whose reaction is `Retry`: the pager would send the
+            // same impossible request three more times, each one paid for by a
+            // budget that thinks it bought a request. The site's own address
+            // is a truthful referer, and a slightly less specific one costs
+            // nothing next to that.
+            .header(
+                "Referer",
+                reqwest::header::HeaderValue::try_from(format!("{BASE_URL}/{referer}"))
+                    .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(BASE_URL)),
+            )
             .header("Cookie", self.session.cookie_header().as_str());
 
         // Deliberately no `Origin`: the Fetch standard omits it on same-origin
@@ -970,6 +983,89 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "https://www.instagram.com/someone/followers/"
+        );
+    }
+
+    /// A name that cannot go in a header verbatim must still get an answer
+    /// about the name.
+    ///
+    /// `target::clean` strips a leading `@` and nothing else, and `watch.toml`
+    /// does not validate a username at all, so the referer is the one
+    /// name-in-a-URL in this crate that arrives as typed. Any byte below 0x20
+    /// makes the header unbuildable; reqwest holds that failure until `send()`,
+    /// where `?` reads it as `Network` — a *retryable* fault, so the pager
+    /// sends the same doomed request three more times and the pacer charges
+    /// for four requests that never left the machine. The name it was asking
+    /// about is never mentioned.
+    #[tokio::test]
+    async fn a_hostile_name_still_reaches_the_not_found_arm() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{"user":null}}"#))
+            .mount(&server)
+            .await;
+
+        let hostile = "gh\u{1b}[2K";
+        let error = client(&server)
+            .await
+            .web_profile_info(hostile)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, IgError::NotFound { what: Some(name) } if name == hostile),
+            "{error:?}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the request the budget paid for went out"
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://www.instagram.com/gh%1B%5B2K/",
+            "encoded, not filtered: a name with a character removed is a different account"
+        );
+    }
+
+    /// The net under the encoding above, reached the only way it can be: by
+    /// handing `get` a referer no caller builds any more.
+    ///
+    /// It matters because of what the alternative costs. A header that will not
+    /// build is not refused where it is written — reqwest carries it to
+    /// `send()`, `?` turns it into `Network`, and `Network`'s reaction is
+    /// `Retry`. Four requests charged to the budget, none of them sent, and the
+    /// answer says the network is at fault.
+    #[tokio::test]
+    async fn a_referer_that_will_not_build_falls_back_to_the_site() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let _: serde_json::Value = client(&server)
+            .await
+            .get("/api/v1/users/web_profile_info/", &[], "gh\u{1b}[2K/")
+            .await
+            .expect("a referer is not worth failing a request over");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BASE_URL,
+            "less specific, and still true"
         );
     }
 
