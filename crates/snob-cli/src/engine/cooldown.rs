@@ -170,13 +170,10 @@ mod tests {
             kind: ListKind::Followers,
             started_at,
             taken_at: Some(taken_at),
-            complete: true,
             member_count: 0,
             declared_count: None,
             pages: 0,
-            requests: 0,
             next_cursor: None,
-            resumes: 0,
         }
     }
 

@@ -152,13 +152,10 @@ mod tests {
             kind: ListKind::Followers,
             started_at: taken_at,
             taken_at: Some(taken_at),
-            complete: true,
             member_count: 10,
             declared_count: declared,
             pages: 1,
-            requests: 1,
             next_cursor: None,
-            resumes: 0,
         }
     }
 
