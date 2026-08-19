@@ -171,19 +171,6 @@ impl IgError {
         matches!(self, Self::RateLimited | Self::Network(_))
     }
 
-    /// Whether it forces the whole run to stop rather than skipping one item.
-    /// Pushing on after one of these is exactly what triggers a block.
-    pub fn is_hard_stop(&self) -> bool {
-        matches!(
-            self,
-            Self::SessionExpired
-                | Self::UserAgentMismatch
-                | Self::Challenge { .. }
-                | Self::Checkpoint { .. }
-                | Self::FeedbackRequired
-        )
-    }
-
     /// Whether it invalidates the stored session, and so must not be persisted.
     pub fn invalidates_session(&self) -> bool {
         matches!(
@@ -403,7 +390,9 @@ mod tests {
     fn a_mismatched_user_agent() {
         let e = classify(401, r#"{"message":"useragent mismatch","status":"fail"}"#);
         assert!(matches!(e, IgError::UserAgentMismatch));
-        assert!(e.is_hard_stop());
+        // Through the function that decides it, rather than a predicate nothing
+        // consulted: `reaction` is what the retry loop asks.
+        assert_eq!(e.reaction(), Reaction::Abort);
     }
 
     /// Regression: during a walk, throttling is **never** retried, however
@@ -566,7 +555,7 @@ mod tests {
     fn feedback_required_stops_the_run() {
         let e = classify(400, r#"{"message":"feedback_required","status":"fail"}"#);
         assert!(matches!(e, IgError::FeedbackRequired));
-        assert!(e.is_hard_stop());
+        assert_eq!(e.reaction(), Reaction::Cooldown);
     }
 
     #[test]
