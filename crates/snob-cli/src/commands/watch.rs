@@ -593,29 +593,16 @@ fn schedule_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> Resul
 /// branches read nothing but the jitter — so a monitor about to sit for a
 /// fortnight opened with a sentence about seconds.
 fn describe_schedule(when: &When, schedule: &Schedule, now: bool) -> String {
-    let mut parts = Vec::new();
-    if let Some(every) = when.every {
-        parts.push(format!("every {}", snob_core::duration::format(every)));
-    }
-    if !when.on.is_empty() {
-        parts.push(format!("on {}", printable(&when.on.join(", "))));
-    }
-    if !when.at.is_empty() {
-        parts.push(format!("at {}", printable(&when.at.join(", "))));
-    }
-    if let Some(cron) = &when.cron {
-        parts.push(format!("on the schedule \"{}\"", printable(cron)));
-    }
+    let parts = report::schedule_clauses(when.every, &when.on, &when.at, when.cron.as_deref());
 
     let mut line = format!("Running {}.", parts.join(", "));
 
-    let jitter = schedule.jitter();
-    if !jitter.is_zero() {
-        line.push_str(&format!(
-            " Each run is pushed up to {} later, so it does not land on the same second every \
-             time.",
-            snob_core::duration::format(jitter)
-        ));
+    // `Schedule::jitter()` rather than what was typed: this is the announcement
+    // of what is about to happen, and the schedule has already clamped the
+    // spread to what its calendar can absorb.
+    if let Some(sentence) = report::jitter_sentence(schedule.jitter()) {
+        line.push(' ');
+        line.push_str(&sentence);
     }
     if now {
         line.push_str(" Starting with one now.");

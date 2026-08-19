@@ -374,6 +374,56 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
     }
 }
 
+/// A schedule as clauses, ready to be joined into a sentence.
+///
+/// Two places read a schedule back to a person — the banner a run opens with,
+/// and the summary `status` and `setup` print — and both built these four
+/// clauses out of the same four fields, down to the quoting around the cron
+/// expression and the `printable` on each one. They disagreed only on how to
+/// name the cron clause, which is exactly the kind of drift that makes a reader
+/// wonder whether the two are describing the same thing.
+///
+/// The caller supplies the verb, because "Runs …" and "Running …" are the
+/// difference between a description and an announcement.
+pub fn schedule_clauses(
+    every: Option<std::time::Duration>,
+    on: &[String],
+    at: &[String],
+    cron: Option<&str>,
+) -> Vec<String> {
+    let mut clauses = Vec::new();
+    if let Some(every) = every {
+        clauses.push(format!("every {}", snob_core::duration::format(every)));
+    }
+    if !on.is_empty() {
+        clauses.push(format!("on {}", printable(&on.join(", "))));
+    }
+    if !at.is_empty() {
+        clauses.push(format!("at {}", printable(&at.join(", "))));
+    }
+    if let Some(cron) = cron {
+        clauses.push(format!("on the schedule \"{}\"", printable(cron)));
+    }
+    clauses
+}
+
+/// What the jitter does, or nothing at all when there is none.
+///
+/// **The wording is shared and the number is not.** The banner reports
+/// `Schedule::jitter()`, which is clamped to what the calendar can absorb; the
+/// summary reports what the file says. Those are two different facts about the
+/// same setting, and a reader comparing them is entitled to see both — so each
+/// caller passes its own.
+pub fn jitter_sentence(jitter: std::time::Duration) -> Option<String> {
+    (!jitter.is_zero()).then(|| {
+        format!(
+            "Each run is pushed up to {} later, so it does not land on the same second every \
+             time.",
+            snob_core::duration::format(jitter)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
