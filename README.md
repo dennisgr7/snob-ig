@@ -346,9 +346,14 @@ exit with the code of whatever stopped them. Only a cap you asked for,
 list is a 1, and throttling is a 5. Something has to be able to tell those
 apart, and the printed names cannot.
 
-`unfollowers`, `fans`, `friends` and `scan` cross two lists, so an incomplete
-one there makes the answer wrong rather than short — those refuse outright, and
-exit the same way.
+`unfollowers`, `fans` and `friends` cross two lists, and the two halves are not
+the same question. The list being crossed **against** has to be whole: an
+account missing from it shows up in the answer without deserving to, which is
+wrong rather than short, so that one refuses outright and exits with whatever
+stopped it. The list the results come **out of** is the ordinary case — the
+answer is short but every name in it is true — so it prints with a warning and
+follows the rule above, cap you asked for included. `scan` needs both lists
+whole, because each of its five numbers leans on both, and refuses either way.
 
 ## Inspiration
 

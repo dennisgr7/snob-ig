@@ -103,7 +103,7 @@ is only one present state and nothing to catch up on.
 calendar or a cron expression that amounts to the same thing, nor two runs that
 jitter happened to push together.
 
-Four things here change what a script sees, so they come first:
+Seven things here change what a script sees, so they come first:
 
 - **`snob purge` with no terminal to ask at now exits 130 instead of 1**, and
   says so on standard error rather than standard output. 130 is what the
@@ -123,6 +123,20 @@ Four things here change what a script sees, so they come first:
   countdowns it used to lose.** They were suppressed along with the progress
   bar, which meant `snob followers 2>log` recorded nothing about why a walk
   stopped.
+- **`snob unfollowers`, `fans` and `friends` now exit 0 when `--max-pages`
+  stopped the list**, which is what the exit-code table has always promised and
+  what `snob following --max-pages 2` already did for the identical stop
+  reason. The result was written and the shortfall warned about either way; only
+  the code disagreed.
+- **`--refresh` now walks even when the counter poll is what failed.** It used
+  to answer with whatever capture was on disk, from any month, with exit 0 and
+  nothing on screen saying which. Without the flag a failed poll is still a
+  reason to reuse rather than to walk.
+- **`snob scan --json` reports when the people-you-both-know line was
+  captured.** `followed_by` gains `taken_at`, in the epoch seconds the rest of
+  the object uses. The line itself now says the date as well, and is left out
+  when the stored list behind it is older than `--max-age` — it is the one
+  figure in that answer no flag refreshes.
 
 And the corrections worth knowing about:
 
@@ -151,6 +165,29 @@ And the corrections worth knowing about:
 - The wait before the next request counts down instead of insisting it has
   fifteen seconds left, and the progress bar keeps drawing through the second
   half of a crossing.
+- `snob login --paste 2> log` no longer hangs. The masked prompt draws to
+  standard error and was gated on standard input alone, so with standard error
+  redirected it spun with nothing on screen and never read what was pasted.
+- An `--exclude-list` written by PowerShell's `Set-Content -Encoding UTF8`, or
+  by Notepad, now hides the first name in it as well. The byte-order mark those
+  add is not whitespace, so the first line matched nobody while every line after
+  it worked — which is what made the file look like it was being read.
+- A username with a soft hyphen, a Mongolian vowel separator or one of the
+  Hangul fillers in it can no longer render as a name that already exists. Those
+  are letters as far as any character property goes, and blank on screen.
+- A long username no longer breaks the table it is in. Its profile link was
+  measured by one parser and wrapped by another, so a narrow terminal cut the
+  address in half and swallowed the borders and the rows below it; the table
+  falls back to plain names and one line saying where profiles live.
+- A name that cannot go in a header verbatim gets an answer about the name
+  rather than four retried requests that never leave the machine.
+- A duration too large to compare against a timestamp is refused where it is
+  written, instead of turning `--max-age` from "never expire" into "walk the
+  list again, every time".
+- The drill-down hints `snob scan` prints no longer carry an at sign. On
+  PowerShell an unquoted one is eaten before the command runs, and the answer
+  comes back about your own account with exit 0.
+- "Followed by @ana, @luis and @eva and 2 others" reads as one list now.
 
 ## 0.1.1 — 2026-08-05
 
