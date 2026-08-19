@@ -88,6 +88,17 @@ pub struct Snapshot {
     pub next_cursor: Option<String>,
 }
 
+/// The columns [`row_to_snapshot`] reads, in the order it reads them.
+///
+/// It reads **by position**, and three statements spelled the list out
+/// separately with nothing tying them to it or to each other. `source` and
+/// `stopped_by` are already columns the projection leaves out, so the next
+/// field to be added is one somebody adds here and forgets there — and a miss
+/// is not a compile error but an `InvalidColumnIndex` at runtime, on whichever
+/// of the three paths was missed. Two of the three are ordinary lookups and the
+/// third is the resume path, which only a walk that was interrupted ever takes.
+const SNAPSHOT_COLUMNS: &str = "id, account_pk, kind, started_at, taken_at, member_count,                                 declared_count, pages, next_cursor";
+
 /// What changed when a page was saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedPage {
@@ -170,18 +181,19 @@ pub fn resumable(
     // process's claim.
     let snapshot = conn
         .query_row(
-            "UPDATE snapshots
-             SET claimed_by = ?4, claimed_at = ?5
-             WHERE id = (
-               SELECT id FROM snapshots
-               WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-                 AND next_cursor IS NOT NULL AND started_at >= ?3
-                 AND (claimed_by IS NULL OR claimed_by = ?4
-                      OR claimed_at IS NULL OR claimed_at < ?6)
-               ORDER BY started_at DESC LIMIT 1
-             )
-             RETURNING id, account_pk, kind, started_at, taken_at, member_count,
-                       declared_count, pages, next_cursor",
+            &format!(
+                "UPDATE snapshots
+                 SET claimed_by = ?4, claimed_at = ?5
+                 WHERE id = (
+                   SELECT id FROM snapshots
+                   WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
+                     AND next_cursor IS NOT NULL AND started_at >= ?3
+                     AND (claimed_by IS NULL OR claimed_by = ?4
+                          OR claimed_at IS NULL OR claimed_at < ?6)
+                   ORDER BY started_at DESC LIMIT 1
+                 )
+                 RETURNING {SNAPSHOT_COLUMNS}"
+            ),
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
@@ -404,11 +416,12 @@ pub fn latest_complete(
 ) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(
-            "SELECT id, account_pk, kind, started_at, taken_at, member_count,
-                    declared_count, pages, next_cursor
-             FROM usable_snapshots
-             WHERE account_pk = ?1 AND kind = ?2
-             ORDER BY taken_at DESC, id DESC LIMIT 1",
+            &format!(
+                "SELECT {SNAPSHOT_COLUMNS}
+                 FROM usable_snapshots
+                 WHERE account_pk = ?1 AND kind = ?2
+                 ORDER BY taken_at DESC, id DESC LIMIT 1"
+            ),
             params![pk_to_sql(account_pk), kind.as_str()],
             row_to_snapshot,
         )
@@ -426,9 +439,7 @@ pub fn latest_complete(
 pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(
-            "SELECT id, account_pk, kind, started_at, taken_at, member_count,
-                    declared_count, pages, next_cursor
-             FROM usable_snapshots WHERE id = ?1",
+            &format!("SELECT {SNAPSHOT_COLUMNS} FROM usable_snapshots WHERE id = ?1"),
             params![id],
             row_to_snapshot,
         )
