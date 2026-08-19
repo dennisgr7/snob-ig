@@ -58,7 +58,12 @@ impl Filter {
     }
 
     pub fn allows(&self, u: &User) -> bool {
-        if self.excluded.contains(&u.username.to_lowercase()) {
+        // The emptiness check is not redundant with `apply`'s: that one fires
+        // only when the whole filter is empty, and `scan::summarize` calls this
+        // directly, three times per account, over both lists. Without it every
+        // one of those allocates a lowercased copy of a name to look it up in a
+        // set that has nothing in it.
+        if !self.excluded.is_empty() && self.excluded.contains(&u.username.to_lowercase()) {
             return false;
         }
         if self.hide.iter().any(|a| a.matches(u)) {
