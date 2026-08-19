@@ -123,13 +123,6 @@ pub fn find(conn: &Connection, pk: Pk) -> Result<Option<User>, StoreError> {
     Ok(u)
 }
 
-pub fn previous_usernames(conn: &Connection, pk: Pk) -> Result<Vec<String>, StoreError> {
-    let mut stmt = conn
-        .prepare("SELECT username FROM username_history WHERE pk = ?1 ORDER BY changed_at DESC")?;
-    let rows = stmt.query_map(params![pk_to_sql(pk)], |row| row.get::<_, String>(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
-
 pub(crate) fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
         pk: pk_from_sql(row.get(0)?),
@@ -145,6 +138,24 @@ pub(crate) fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    /// The names filed against an account, oldest first.
+    ///
+    /// A test helper rather than public API. It used to be one, kept alive by
+    /// these three assertions and sitting where somebody looking for "show me
+    /// this account's old names" would find it first — while ordering by
+    /// `changed_at`, which the production reader deliberately does not:
+    /// `watch::renames_since` orders by `id`, because two names filed in the
+    /// same second have no order at all by the clock and one by arrival.
+    fn previous_usernames(conn: &Connection, pk: Pk) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT username FROM username_history WHERE pk = ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![pk_to_sql(pk)], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
 
     fn user(pk: Pk, name: &str) -> User {
         User {
@@ -173,7 +184,7 @@ mod tests {
 
         assert_eq!(find(db.conn(), 7).unwrap().unwrap().username, "realname");
         assert!(
-            previous_usernames(db.conn(), 7).unwrap().is_empty(),
+            previous_usernames(db.conn(), 7).is_empty(),
             "nothing was renamed, so nothing may be filed as a rename"
         );
     }
@@ -186,7 +197,7 @@ mod tests {
         ensure(db.conn(), 7).unwrap();
 
         assert_eq!(upsert(db.conn(), &user(7, "realname")).unwrap(), None);
-        assert!(previous_usernames(db.conn(), 7).unwrap().is_empty());
+        assert!(previous_usernames(db.conn(), 7).is_empty());
 
         // A genuine rename still is one.
         assert_eq!(
@@ -227,7 +238,7 @@ mod tests {
 
         let previous = upsert(db.conn(), &user(1, "new_name")).unwrap();
         assert_eq!(previous.as_deref(), Some("old_name"));
-        assert_eq!(previous_usernames(db.conn(), 1).unwrap(), vec!["old_name"]);
+        assert_eq!(previous_usernames(db.conn(), 1), vec!["old_name"]);
 
         let unchanged = upsert(db.conn(), &user(1, "new_name")).unwrap();
         assert_eq!(unchanged, None);
