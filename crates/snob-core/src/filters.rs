@@ -85,10 +85,20 @@ impl Filter {
 ///
 /// Tolerates a leading at sign, surrounding space, blank lines and comments,
 /// because a hand-written file will have them.
+///
+/// **And a byte-order mark, which is the one that was not obvious.** `str::trim`
+/// trims by the `White_Space` property and U+FEFF is not in it — it is `Cf`,
+/// the same category the invisible characters in a name are. So the first key
+/// out of a file written by PowerShell 5.1's `Set-Content -Encoding UTF8`, or
+/// by Notepad, was `"\u{feff}alice"`, which no username can equal. Every line
+/// after it worked, so the file looked right: exit 0, no warning, and the one
+/// person it was written to hide in the answer. Stripped here rather than in
+/// the reader so the next caller inherits it.
 pub fn parse_username_list(contents: &str) -> HashSet<String> {
     contents
+        .trim_start_matches('\u{feff}')
         .lines()
-        .map(str::trim)
+        .map(|l| l.trim().trim_matches('\u{feff}').trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.trim_start_matches('@').to_lowercase())
         .collect()
@@ -218,6 +228,31 @@ mod tests {
         assert!(read.contains("one"));
         assert!(read.contains("two"));
         assert!(read.contains("three"));
+    }
+
+    /// The file the tool is handed on Windows most of the time.
+    ///
+    /// `str::trim` goes by `White_Space`, which does not contain U+FEFF, so the
+    /// first key came out as `"\u{feff}alice"` — a string no username equals.
+    /// Only the first line was affected, which is what made it look like the
+    /// file was being read: the exclusion silently applied to everyone in it
+    /// except the person on line one.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_name() {
+        let read = parse_username_list("\u{feff}alice\nbob\n");
+
+        assert!(read.contains("alice"), "{read:?}");
+        assert!(read.contains("bob"), "{read:?}");
+        assert_eq!(read.len(), 2);
+
+        let f = Filter {
+            excluded: read,
+            ..Default::default()
+        };
+        assert!(
+            !f.allows(&user("alice")),
+            "the name the file exists to hide"
+        );
     }
 
     #[test]
