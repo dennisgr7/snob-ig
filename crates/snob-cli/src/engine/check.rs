@@ -22,9 +22,8 @@
 //! says, is `commands::watch_setup`'s question.
 
 use snob_core::Pk;
-use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
-use snob_core::store::{snapshots, watch as store};
+use snob_core::store::snapshots;
 use snob_core::watch::config::WatchConfig;
 use snob_core::watch::schedule::{self, Schedule};
 
@@ -448,14 +447,6 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
                 .to_string()
         }),
     }
-}
-
-/// Whether the monitor has ever run, for the line about what to expect first.
-pub fn has_ever_run(paths: &AppPaths) -> bool {
-    snob_core::store::Store::open(paths)
-        .ok()
-        .and_then(|db| store::last_runs(db.conn()).ok())
-        .is_some_and(|runs| !runs.is_empty())
 }
 
 #[cfg(test)]
