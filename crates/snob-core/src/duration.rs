@@ -31,8 +31,19 @@ pub fn parse(text: &str) -> Result<Duration, String> {
 
     // A number long enough to overflow is not a duration anyone means, and
     // wrapping it would silently turn "never expire" into "expire at once".
+    //
+    // Bounded by `i64`, not by `u64`, and the comment above used to describe
+    // exactly the failure it did not prevent. Every consumer of one of these
+    // compares it against a timestamp — `now() - taken_at <= max_age_secs`,
+    // and the same shape in the scheduler — so the number leaves as `u64` and
+    // arrives as `i64`. `--max-age 15251000000000w` fit in a `u64` and came out
+    // of the cast negative, which is false for every capture there has ever
+    // been: "never expire" becomes "walk the list again, every time", about
+    // 250 requests an invocation on a six-thousand-follower account, with
+    // nothing said.
     let seconds = value
         .checked_mul(factor)
+        .filter(|s| i64::try_from(*s).is_ok())
         .ok_or_else(|| format!("\"{text}\" is too long to be a duration"))?;
 
     Ok(Duration::from_secs(seconds))
@@ -93,6 +104,34 @@ mod tests {
     #[test]
     fn a_duration_too_long_to_hold_is_refused_rather_than_wrapped() {
         assert!(parse(&format!("{}w", u64::MAX)).is_err());
+    }
+
+    /// The half `checked_mul` does not cover, and the one that is reachable.
+    ///
+    /// Every reader of one of these compares it against a timestamp, so the
+    /// number leaves here as `u64` and arrives as `i64`. Between the two
+    /// bounds sits a whole range that multiplies without overflowing and then
+    /// casts negative — `now() - taken_at <= max_age` false for every capture
+    /// that exists, so the longest maximum age anyone can write is the one
+    /// that walks the list every single time.
+    #[test]
+    fn a_duration_no_timestamp_could_be_compared_against_is_refused_too() {
+        let past_i64 = (i64::MAX as u64) / 604_800 + 1;
+        let text = format!("{past_i64}w");
+
+        assert!(
+            past_i64.checked_mul(604_800).is_some(),
+            "the point of this case is that it fits in a u64"
+        );
+        assert!(parse(&text).is_err(), "{text} parsed");
+
+        // And the largest one that does fit still parses, so the bound is
+        // where it says it is rather than a round number near it.
+        let largest = (i64::MAX as u64) / 604_800;
+        assert_eq!(
+            parse(&format!("{largest}w")).unwrap().as_secs(),
+            largest * 604_800
+        );
     }
 
     /// What is written has to read back as what it was, or the configuration
