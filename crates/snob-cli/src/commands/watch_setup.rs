@@ -435,7 +435,23 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // monitor that had been running all week.
     let last_runs = watch_store::last_runs(db.conn())?;
 
-    let health = health(config.as_ref(), &last_runs, owed);
+    // Resolved once, here, because the store is open here and `health` must not
+    // reach for it. Two facts it cannot work out on its own: what to call each
+    // account, and whether the file still names it.
+    let watched = watched_pks(&db, config.as_ref())?;
+    let mut runs_of = Vec::with_capacity(last_runs.len());
+    for run in &last_runs {
+        let name = snob_core::store::users::name(db.conn(), run.account_pk)?;
+        runs_of.push(RunOf {
+            run,
+            who: crate::app::label(run.account_pk, name.as_deref()),
+            watched: watched
+                .as_ref()
+                .is_none_or(|pks| pks.contains(&run.account_pk)),
+        });
+    }
+
+    let health = health(config.as_ref(), &runs_of, owed, snob_core::store::now());
 
     if args.json {
         println!(
@@ -582,7 +598,78 @@ struct Health {
     notes: Vec<String>,
 }
 
-fn health(config: Option<&WatchConfig>, runs: &[watch_store::Run], owed: usize) -> Health {
+/// The accounts the configuration names right now, as ids.
+///
+/// `None` means it could not be settled, and every run is then treated as
+/// watched — the direction that does not fail a probe on a guess. That happens
+/// with no configuration at all, and when the file's own account is meant on a
+/// machine that has never recorded which one that is.
+///
+/// The predicate matches `watched_from`'s: an empty `[[account]]` list means the
+/// viewer, and `self` names it explicitly.
+fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<snob_core::Pk>>> {
+    let conn = db.conn();
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let own = config.accounts.is_empty() || config.accounts.iter().any(AccountConfig::is_own);
+    let mut pks = Vec::new();
+    if own {
+        match snob_core::store::accounts::own(conn)? {
+            Some(pk) => pks.push(pk),
+            // The file watches this machine's own account and the machine has
+            // never recorded which one that is. Nothing here can be settled.
+            None => return Ok(None),
+        }
+    }
+    for account in config.accounts.iter().filter(|a| !a.is_own()) {
+        if let Some(pk) = snob_core::store::accounts::find_pk_by_username(conn, &account.target)? {
+            pks.push(pk);
+        }
+    }
+    Ok(Some(pks))
+}
+
+/// One account's newest run, with the two things [`health`] cannot work out for
+/// itself: what to call the account, and whether the file still names it.
+///
+/// Built by `status`, which has the store open and is already resolving both
+/// for its own lines.
+struct RunOf<'a> {
+    run: &'a watch_store::Run,
+    /// `@name`, or the id when the name was never learned.
+    who: String,
+    /// Whether `watch.toml` still lists this account. `true` when it cannot be
+    /// settled, which is the direction that does not fail a probe on a guess.
+    watched: bool,
+}
+
+/// How many scheduled runs may be missed before silence is a failure rather
+/// than a warning.
+///
+/// One missed run is a machine that was asleep, a laptop that was shut, a
+/// cooldown that ran long. Three is nobody coming back.
+const MISSED_BEFORE_FAILED: i64 = 3;
+
+/// How long this configuration means the monitor should be silent for.
+///
+/// Asked of the schedule rather than guessed at, by taking the distance between
+/// the next two moments it names: six hours for `--every 6h`, and a week for
+/// `--on mon --at 09:00`, which is the point — a weekly monitor that has not run
+/// since Tuesday is not late.
+///
+/// `None` when the file has no schedule this can build, or names one that never
+/// fires. Both of those are their own line elsewhere and neither is a reason to
+/// call the monitor late as well.
+fn expected_gap(config: &WatchConfig, now: i64) -> Option<i64> {
+    let schedule = super::watch::schedule_from(&Default::default(), Some(config)).ok()?;
+    let first = schedule::next_moment(&schedule, Some(now), now, &chrono::Local)?;
+    let second = schedule::next_moment(&schedule, Some(first), first, &chrono::Local)?;
+    (second > first).then_some(second - first)
+}
+
+fn health(config: Option<&WatchConfig>, runs: &[RunOf<'_>], owed: usize, now: i64) -> Health {
     let mut notes = Vec::new();
     let mut verdict = Verdict::Ok;
     let mut at_least = |level: Verdict| verdict = verdict.max(level);
@@ -599,20 +686,72 @@ fn health(config: Option<&WatchConfig>, runs: &[watch_store::Run], owed: usize) 
         notes.push("it has not run yet".to_string());
     }
 
+    // **Whether it is still running at all**, which nothing here used to ask.
+    //
+    // Runs were read for their `outcome` and nothing else, so as long as the
+    // newest row per account had succeeded the verdict was `Ok` however old it
+    // was — and `prune` keeps the newest row per account whatever its age,
+    // precisely so this can read it, so it never aged into the "it has not run
+    // yet" warning either. A unit that was disabled, a container nobody
+    // restarted, a process the kernel killed: three weeks silent, verdict `Ok`,
+    // exit 0, and the Health block not printed at all because `notes` was
+    // empty. `002_watch.sql` says `watch_runs` exists because "a monitor that
+    // quietly stopped looks exactly like a quiet account", and this is the
+    // reader that was supposed to tell them apart.
+    //
+    // The gap comes from the schedule rather than from a guess, so a weekly
+    // monitor is not called late after two days.
+    if let Some(gap) = config.and_then(|c| expected_gap(c, now))
+        && let Some(newest) = runs.iter().map(|r| r.run.started_at).max()
+    {
+        let silent = now - newest;
+        let missed = silent / gap.max(1);
+        if missed >= MISSED_BEFORE_FAILED {
+            at_least(Verdict::Failed);
+            notes.push(format!(
+                "it has not run since {}, which is {missed} scheduled runs ago",
+                report::stored_on(newest)
+            ));
+        } else if missed >= 1 {
+            at_least(Verdict::Warned);
+            notes.push(format!(
+                "it has not run since {}, and one was due by now",
+                report::stored_on(newest)
+            ));
+        }
+    }
+
     // What stopped the last run of each account. A cooldown lifts on its own
     // and is worth saying rather than alarming about; a session that has gone
     // will not come back without somebody logging in, and every run until then
     // does nothing.
-    for run in runs {
-        match run.outcome.as_deref() {
-            Some("ok") | None => {}
-            Some(code @ ("rate_limited" | "interrupted")) => {
+    //
+    // **Only for accounts the file still names.** `last_runs` answers about
+    // every account that has ever run, and it was never compared against the
+    // configuration — so one old failed run for a stranger since removed from
+    // `watch.toml` pinned the verdict at `Failed` for good, on a monitor with
+    // nothing wrong with it. That is how people learn to ignore a probe. It is
+    // still worth a line, because a row nobody watches is worth explaining, and
+    // the line names the account: the note used to omit it, so several accounts
+    // printed the identical sentence N times.
+    for RunOf { run, who, watched } in runs {
+        let Some(code) = run.outcome.as_deref().filter(|c| *c != "ok") else {
+            continue;
+        };
+        if !watched {
+            notes.push(format!(
+                "{who} last ended in {code}, and the configuration no longer names it"
+            ));
+            continue;
+        }
+        match code {
+            "rate_limited" | "interrupted" => {
                 at_least(Verdict::Warned);
-                notes.push(format!("the last run ended in {code}"));
+                notes.push(format!("{who}'s last run ended in {code}"));
             }
-            Some(code) => {
+            _ => {
                 at_least(Verdict::Failed);
-                notes.push(format!("the last run ended in {code}"));
+                notes.push(format!("{who}'s last run ended in {code}"));
             }
         }
     }
@@ -816,14 +955,33 @@ mod tests {
         assert_eq!(quoted_list(&[]), "");
     }
 
+    /// A fixed present, so how old a run is is something these tests state
+    /// rather than something they inherit from the wall clock.
+    const NOW: i64 = 1_700_000_000;
+
+    /// A run that happened a minute ago.
+    ///
+    /// This used to be `started_at: 0`, which pinned the *absence* of a time
+    /// axis as correct: the suite asserted `Ok` for a run at the epoch under a
+    /// six-hourly schedule. Changing it looks like a regression and is the
+    /// opposite of one.
     fn ran(outcome: &str) -> watch_store::Run {
         watch_store::Run {
             account_pk: 42,
-            started_at: 0,
-            finished_at: Some(0),
+            started_at: NOW - 60,
+            finished_at: Some(NOW - 60),
             requests: 1,
             outcome: Some(outcome.to_string()),
             changes: 0,
+        }
+    }
+
+    /// A run belonging to an account the file still names.
+    fn of(run: &watch_store::Run) -> RunOf<'_> {
+        RunOf {
+            run,
+            who: "@me".to_string(),
+            watched: true,
         }
     }
 
@@ -845,17 +1003,19 @@ url = \"https://n8n.internal/hook\"
 ",
         );
 
+        let ok = ran("ok");
         assert_eq!(
-            health(Some(&configured), &[ran("ok")], 0).verdict,
+            health(Some(&configured), &[of(&ok)], 0, NOW).verdict,
             Verdict::Ok,
-            "configured, ran, nothing owed"
+            "configured, ran just now, nothing owed"
         );
 
         // A cooldown lifts on its own, and an interrupt was the user. Neither
         // is a monitor that needs attention.
         for lifts in ["rate_limited", "interrupted"] {
+            let run = ran(lifts);
             assert_eq!(
-                health(Some(&configured), &[ran(lifts)], 0).verdict,
+                health(Some(&configured), &[of(&run)], 0, NOW).verdict,
                 Verdict::Warned,
                 "{lifts} passes on its own"
             );
@@ -863,8 +1023,9 @@ url = \"https://n8n.internal/hook\"
 
         // A session that has gone will not come back without somebody logging
         // in, and every run until then does nothing at all.
+        let dead = ran("no_session");
         assert_eq!(
-            health(Some(&configured), &[ran("no_session")], 0).verdict,
+            health(Some(&configured), &[of(&dead)], 0, NOW).verdict,
             Verdict::Failed
         );
 
@@ -872,7 +1033,7 @@ url = \"https://n8n.internal/hook\"
         // they expire -- and the changes in them are already marked as
         // reported, so they are the only copy.
         assert_eq!(
-            health(Some(&configured), &[ran("ok")], 2).verdict,
+            health(Some(&configured), &[of(&ok)], 2, NOW).verdict,
             Verdict::Warned
         );
         let no_webhook = config(
@@ -881,15 +1042,112 @@ every = \"6h\"
 ",
         );
         assert_eq!(
-            health(Some(&no_webhook), &[ran("ok")], 2).verdict,
+            health(Some(&no_webhook), &[of(&ok)], 2, NOW).verdict,
             Verdict::Failed
         );
 
         // And a machine with nothing configured is not broken, but a bare
         // `snob watch` there has no schedule to run on.
-        let nothing = health(None, &[], 0);
+        let nothing = health(None, &[], 0, NOW);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
+    }
+
+    /// A monitor that stopped is not a healthy monitor.
+    ///
+    /// Runs were read for their `outcome` and nothing else, so a successful run
+    /// three weeks old came back `Ok` — and `prune` keeps the newest row per
+    /// account whatever its age, precisely so this can read it, so it never
+    /// aged into "it has not run yet" either. The Health block only prints when
+    /// there are notes, so the text output said nothing at all. That is the
+    /// likeliest real failure of an unattended service: a unit disabled, a
+    /// container nobody restarted, a process the kernel killed.
+    #[test]
+    fn a_monitor_that_stopped_is_not_healthy() {
+        let configured = config("schema = 1\nevery = \"6h\"\n");
+
+        let recent = ran("ok");
+        assert_eq!(
+            health(Some(&configured), &[of(&recent)], 0, NOW).verdict,
+            Verdict::Ok
+        );
+
+        // One six-hour gap missed is a laptop that was shut.
+        let late = watch_store::Run {
+            started_at: NOW - 7 * 3_600,
+            ..ran("ok")
+        };
+        let one = health(Some(&configured), &[of(&late)], 0, NOW);
+        assert_eq!(one.verdict, Verdict::Warned, "{:?}", one.notes);
+
+        // Three weeks is nobody coming back.
+        let gone = watch_store::Run {
+            started_at: NOW - 21 * 86_400,
+            ..ran("ok")
+        };
+        let stopped = health(Some(&configured), &[of(&gone)], 0, NOW);
+        assert_eq!(stopped.verdict, Verdict::Failed, "{:?}", stopped.notes);
+        assert!(
+            stopped
+                .notes
+                .iter()
+                .any(|n| n.contains("has not run since")),
+            "and it has to say so: {:?}",
+            stopped.notes
+        );
+    }
+
+    /// How late is late comes from the schedule, so a weekly monitor is not
+    /// called late after two days.
+    #[test]
+    fn how_late_is_late_depends_on_the_schedule() {
+        let two_days_ago = watch_store::Run {
+            started_at: NOW - 2 * 86_400,
+            ..ran("ok")
+        };
+
+        let weekly = config("schema = 1\non = [\"mon\"]\nat = [\"09:00\"]\n");
+        assert_eq!(
+            health(Some(&weekly), &[of(&two_days_ago)], 0, NOW).verdict,
+            Verdict::Ok,
+            "two days is not late for a weekly schedule"
+        );
+
+        let six_hourly = config("schema = 1\nevery = \"6h\"\n");
+        assert_ne!(
+            health(Some(&six_hourly), &[of(&two_days_ago)], 0, NOW).verdict,
+            Verdict::Ok,
+            "and it very much is for a six-hourly one"
+        );
+    }
+
+    /// A run belonging to an account the file no longer names is worth a line,
+    /// not a verdict.
+    ///
+    /// `last_runs` answers about every account that has ever run and was never
+    /// compared against the configuration, so one old failure for a stranger
+    /// since removed pinned the verdict at `Failed` for good — on a monitor
+    /// with nothing wrong with it, which is how people learn to ignore a probe.
+    /// The note omitted the account too, so several printed the identical
+    /// sentence N times.
+    #[test]
+    fn a_run_for_an_account_nobody_watches_any_more_does_not_fail_the_verdict() {
+        let configured = config("schema = 1\nevery = \"6h\"\n");
+        let failed = ran("no_session");
+
+        let orphan = RunOf {
+            run: &failed,
+            who: "@stranger".to_string(),
+            watched: false,
+        };
+        let health = health(Some(&configured), &[orphan], 0, NOW);
+
+        assert_eq!(health.verdict, Verdict::Ok, "{:?}", health.notes);
+        assert!(
+            health.notes.iter().any(|n| n.contains("@stranger")),
+            "the line has to say which account: {:?}",
+            health.notes
+        );
     }
 
     /// Setup refuses a schedule the scheduler would refuse anyway, but it does
