@@ -313,8 +313,10 @@ async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
     drop(app);
 
     let db = Store::open(&paths).unwrap();
-    let last = snob_core::store::watch::last_run(db.conn(), 42)
-        .unwrap()
+    let runs = snob_core::store::watch::last_runs(db.conn()).unwrap();
+    let last = runs
+        .iter()
+        .find(|run| run.account_pk == 42)
         .expect("a run that concluded nothing still ran");
 
     assert_eq!(
