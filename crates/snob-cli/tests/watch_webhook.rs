@@ -438,14 +438,24 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
     .await;
 
     assert_eq!(checked.verdict, Verdict::Ok, "{:?}", checked.problem);
-    assert!(matches!(
-        checked.what,
-        What::Webhook {
-            status: Some(204),
-            signed: true,
-            ..
-        }
-    ));
+    // The address is asserted with the code. The line is rebuilt in this arm
+    // and the only reason to rebuild it is the code, so `destination` is the
+    // field that rides along and the one an edit here drops -- and
+    // `describe_check` builds its whole sentence out of it. No `..`, so a field
+    // added to `What::Webhook` has to be looked at here rather than waved
+    // through.
+    assert!(
+        matches!(
+            &checked.what,
+            What::Webhook {
+                destination,
+                status: Some(204),
+                signed: true,
+            } if destination == "https://receiver.example"
+        ),
+        "{:?}",
+        checked.what
+    );
 
     let sent = &receiver.received_requests().await.unwrap()[0];
     let header = |name: &str| {
@@ -497,13 +507,15 @@ async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
     assert_eq!(checked.verdict, Verdict::Failed);
     assert!(
         matches!(
-            checked.what,
+            &checked.what,
             What::Webhook {
+                destination,
                 status: Some(404),
-                ..
-            }
+                signed: false,
+            } if *destination == server.uri()
         ),
-        "the code the far end answered with is the whole point of asking: {:?}",
+        "the code the far end answered with is the whole point of asking, and the address \
+         it answered from is the other half: {:?}",
         checked.what
     );
     let problem = checked.problem.expect("it has to say what went wrong");

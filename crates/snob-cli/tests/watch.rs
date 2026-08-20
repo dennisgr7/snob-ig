@@ -540,3 +540,100 @@ async fn an_unknown_account_is_refused_with_something_to_do_about_it() {
         "this command has no --cache: {text}"
     );
 }
+
+/// The rename cursor moves only over lists a mark was written for.
+///
+/// Which lists a report spoke about was worked out twice -- once for the cursor
+/// and once for the marks, fifty lines apart, from the same two `Option`s. They
+/// agreed, and the comment above the marks invites narrowing that copy the next
+/// time `list_report` answers `None` for something. Narrowing one alone leaves
+/// the cursor closing a window over a list no mark was written for, and a rename
+/// inside it can never be reported by anything again -- `snob watch diff`
+/// included, because a rename moves nobody in or out of a list.
+///
+/// So the two are asserted together rather than one at a time: the window was
+/// closed, and every list it covered has a receipt from the same commit.
+#[tokio::test]
+async fn the_rename_cursor_moves_only_over_lists_a_mark_was_written_for() {
+    use snob_core::store::watch as watch_store;
+
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "before")]));
+    walked(&mut db, ListKind::Following, &users(&[(2, "before_too")]));
+
+    let mut app = app(&server, db);
+    watch::record_from_store(&mut app, None).unwrap();
+
+    // Filed by something else -- another walk, or a `snob pfp` -- so neither
+    // list has a newer capture and both read as unchanged. That is the
+    // documented common case, and the one where the cursor and the marks are
+    // decided from exactly the same two reports.
+    users::upsert(app.db().conn(), &user(1, "after")).unwrap();
+
+    let report = watch::record_from_store(&mut app, None).unwrap();
+    assert_eq!(report.changes().renamed.len(), 1, "the rename was reported");
+
+    assert!(
+        watch_store::rename_cursor(app.db().conn(), ME).unwrap() > 0,
+        "a window that was read is a window that is closed"
+    );
+    for kind in [ListKind::Followers, ListKind::Following] {
+        assert!(
+            watch_store::mark(app.db().conn(), ME, kind)
+                .unwrap()
+                .is_some(),
+            "the cursor closed a window over {kind:?}, which no mark says was reported on"
+        );
+    }
+}
+
+/// The check's baseline warning and `setup`'s offer to lay one down are one
+/// question, answered in one place.
+///
+/// An account with one list reported on and the other never is not something a
+/// first run can compare against, and both readers have to say so. They used to
+/// test the length of the same `Vec` in two layers -- so the change that made a
+/// baseline mean "reported on" rather than "captured" had to be made twice, and
+/// making it once left `setup` silent about exactly the state the check had just
+/// started warning about, which is the state the whole line exists for.
+#[tokio::test]
+async fn one_list_reported_on_is_not_a_baseline_to_either_reader() {
+    use snob_cli::engine::check::{CheckReport, Verdict, baseline_of};
+
+    let server = MockServer::start().await;
+    let mut db = Store::in_memory().unwrap();
+    walked(&mut db, ListKind::Followers, &users(&[(1, "a")]));
+
+    let mut app = app(&server, db);
+    watch::record_from_store(&mut app, None).unwrap();
+
+    // The following list gets its first capture and nothing has reported on it.
+    // A first run there cannot tell an arrival from a first sighting.
+    walked_in(&mut app, ListKind::Following, &users(&[(2, "b")]));
+
+    // Both readers, asked together: the verdict the check prints, and the offer
+    // `setup` decides to make out of the same report.
+    let both = |app: &App| {
+        let checked = baseline_of(app, ME);
+        let verdict = checked.verdict;
+        let wants = CheckReport {
+            checked: vec![checked],
+        }
+        .wants_a_baseline();
+        (verdict, wants)
+    };
+
+    assert_eq!(
+        both(&app),
+        (Verdict::Warned, true),
+        "one list reported on and one never is not something to compare against"
+    );
+
+    watch::record_from_store(&mut app, None).unwrap();
+    assert_eq!(
+        both(&app),
+        (Verdict::Ok, false),
+        "and once both have been reported on, neither reader asks for a baseline"
+    );
+}
