@@ -14,7 +14,7 @@ use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
 use snob_core::secrets::{Kind, SecretStore};
 use snob_core::store::{Store, deliveries, watch as watch_store};
-use snob_core::watch::config::{self, AccountConfig, WatchConfig};
+use snob_core::watch::config::{self, WatchConfig};
 use snob_core::{duration, watch::schedule};
 
 use crate::cli::{WatchSetupArgs, WatchStatusArgs};
@@ -719,7 +719,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 
             let mut line = format!("{who} last ran on {}", report::stored_on(run.started_at));
             if let Some(outcome) = &run.outcome
-                && outcome != "ok"
+                && outcome != ExitCode::Ok.as_str()
             {
                 line.push_str(&format!(" and could not look ({outcome})"));
             } else if run.changes == 0 {
@@ -825,23 +825,27 @@ struct Health {
 /// with no configuration at all, and when the file's own account is meant on a
 /// machine that has never recorded which one that is.
 ///
-/// The predicate matches `watched_from`'s: an empty `[[account]]` list means the
-/// viewer, `self` names it explicitly, and the at sign is off the name before it
-/// is looked up. That last one is not shared code and has to be repeated here:
-/// `with_recorded_consent` cleans on the way to a `Watched`, and this reads the
-/// file straight. With `target = "@friend"` the lookup found nobody, every run
-/// of that account was scored as belonging to an account the configuration no
-/// longer names, and a genuinely failed run came out as a note instead of a
-/// verdict — the probe staying green about the one account it was pointed at.
+/// **Asked of `watched_from`, which is the function that decides it.** The
+/// predicate was written out here as well — an empty `[[account]]` list means
+/// the viewer, `self` names it explicitly, and the at sign comes off the name
+/// before it is looked up — which made this the third hand-written copy of one
+/// rule and the second one that had to be repaired separately when the at sign
+/// did. With `target = "@friend"` the lookup found nobody, so every run of that
+/// account was scored as belonging to an account the configuration no longer
+/// names, which is deliberately a note and never a verdict: a monitor whose one
+/// watched account fails every run then exits 0 for ever.
+///
+/// `None` for the target, because there is no command line here: this is what a
+/// scheduled run over this file alone would walk.
 fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<snob_core::Pk>>> {
     let conn = db.conn();
     let Some(config) = config else {
         return Ok(None);
     };
 
-    let own = config.accounts.is_empty() || config.accounts.iter().any(AccountConfig::is_own);
+    let watched = super::watch::watched_from(None, Some(config));
     let mut pks = Vec::new();
-    if own {
+    if watched.iter().any(|w| w.name().is_none()) {
         match snob_core::store::accounts::own(conn)? {
             Some(pk) => pks.push(pk),
             // The file watches this machine's own account and the machine has
@@ -849,8 +853,7 @@ fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<sn
             None => return Ok(None),
         }
     }
-    for account in config.accounts.iter().filter(|a| !a.is_own()) {
-        let named = crate::engine::target::clean(&account.target);
+    for named in watched.iter().filter_map(|w| w.name()) {
         if let Some(pk) = snob_core::store::accounts::find_pk_by_username(conn, named)? {
             pks.push(pk);
         }
@@ -1016,7 +1019,11 @@ fn health(
     // the line names the account: the note used to omit it, so several accounts
     // printed the identical sentence N times.
     for RunOf { run, who, watched } in runs {
-        let Some(code) = run.outcome.as_deref().filter(|c| *c != "ok") else {
+        let Some(code) = run
+            .outcome
+            .as_deref()
+            .filter(|c| *c != ExitCode::Ok.as_str())
+        else {
             continue;
         };
         if !watched {
@@ -1025,8 +1032,21 @@ fn health(
             ));
             continue;
         }
-        match code {
-            "rate_limited" | "interrupted" => {
+        // **Read as an `ExitCode`, not against three literals spelled again
+        // here.** `as_str`'s own doc says the vocabulary exists "so nothing has
+        // to invent tokens inline, which is how two spellings of one condition
+        // get shipped", and this was the place that invented them. Respell
+        // `rate_limited` there and every recorded cooldown lands in the arm
+        // below, so `status` exits 1 for a monitor that will resume on its own —
+        // and the fixture these tests build their rows from spelled the same
+        // literals, so it would have moved with the defect.
+        //
+        // A token this build does not know is a failure it cannot explain, which
+        // is the direction a probe should be wrong in.
+        match ExitCode::from_token(code) {
+            // A cooldown lifts by itself and an interrupt was the user. Neither
+            // is a monitor that needs anybody.
+            Some(ExitCode::RateLimited | ExitCode::Interrupted) => {
                 at_least(Verdict::Warned);
                 notes.push(format!("{who}'s last run ended in {code}"));
             }
@@ -1148,15 +1168,22 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
 
 /// Who a run over this file would actually walk.
 ///
-/// Derived from the same predicate `watched_from` runs on, because the two used
-/// to disagree. This counted the strangers and then said "your account and N
-/// other" regardless, while `watched_from` falls back to the viewer **only when
-/// the list is empty** — so a hand-edited file naming one stranger is walked as
-/// that stranger alone, and both of the two places a person reads the
-/// configuration back said otherwise.
+/// **Asked of `watched_from`, which is the function that decides it.** This doc
+/// already said it was derived from that predicate "because the two used to
+/// disagree", and then re-derived the predicate by hand a line below — so
+/// nothing enforced the agreement, and the shape that made them disagree is
+/// still the shape that is hard: a file naming one stranger and not you.
+/// `watched_from` falls back to the viewer only when the account list is empty,
+/// and this counted strangers and claimed the viewer regardless. Reading it
+/// through the same function means the sentence cannot be right about a run that
+/// does something else, whatever either of them is changed to next.
+///
+/// `None` for the target, because there is no command line here: this is what a
+/// scheduled run over this file alone would walk.
 fn watching_line(config: &WatchConfig) -> String {
-    let own = config.accounts.is_empty() || config.accounts.iter().any(AccountConfig::is_own);
-    let others = config.accounts.iter().filter(|a| !a.is_own()).count();
+    let watched = super::watch::watched_from(None, Some(config));
+    let own = watched.iter().any(|w| w.name().is_none());
+    let others = watched.iter().filter(|w| w.name().is_some()).count();
 
     match (own, others) {
         (true, 0) => "Watches your account".to_string(),
@@ -1374,6 +1401,57 @@ evry = \"6h\"
         assert!(!alone.contains("Their usernames"), "{alone}");
     }
 
+    /// The sentence names the accounts a run would actually walk, over every
+    /// shape the file can take.
+    ///
+    /// `watching_line`'s own doc says it is derived from the predicate
+    /// `watched_from` runs "because the two used to disagree" -- and then it
+    /// re-derived that predicate by hand, so nothing enforced the agreement. The
+    /// rule that makes it hard is the one they disagreed about: the viewer is
+    /// added only when the account list is empty, so a file naming one stranger
+    /// is walked as that stranger alone.
+    ///
+    /// The expected sentences are written out rather than computed from
+    /// `watched_from`, which would make this agree with itself whatever either
+    /// side did. Written out, a change to `watched_from` moves the sentence and
+    /// fails here -- which is the whole property, and is exactly what the
+    /// hand-written copy prevented.
+    #[test]
+    fn the_line_names_the_accounts_a_run_would_actually_walk() {
+        let friend = "[account.consent]\nagreed_at = 1\n";
+        for (body, expected) in [
+            (
+                "schema = 1\nevery = \"6h\"\n".to_string(),
+                "Watches your account",
+            ),
+            (
+                "schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"self\"\n".to_string(),
+                "Watches your account",
+            ),
+            (
+                format!("schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"friend\"\n{friend}"),
+                "Watches 1 account, and not your own",
+            ),
+            (
+                format!(
+                    "schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"self\"\n\n\
+                     [[account]]\ntarget = \"friend\"\n{friend}"
+                ),
+                "Watches your account and 1 other",
+            ),
+            (
+                format!(
+                    "schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"@friend\"\n{friend}\n\
+                     [[account]]\ntarget = \"other\"\n{friend}"
+                ),
+                "Watches 2 accounts, and not your own",
+            ),
+        ] {
+            let file = config(&body);
+            assert_eq!(watching_line(&file), expected, "for {body:?}");
+        }
+    }
+
     /// A file with no `[[account]]` at all means the obvious thing, and this is
     /// the one shape where the old wording happened to be right by accident --
     /// it printed nothing.
@@ -1509,13 +1587,16 @@ evry = \"6h\"
     /// axis as correct: the suite asserted `Ok` for a run at the epoch under a
     /// six-hourly schedule. Changing it looks like a regression and is the
     /// opposite of one.
-    fn ran(outcome: &str) -> watch_store::Run {
+    fn ran(outcome: ExitCode) -> watch_store::Run {
         watch_store::Run {
             account_pk: 42,
             started_at: NOW - 60,
             finished_at: Some(NOW - 60),
             requests: 1,
-            outcome: Some(outcome.to_string()),
+            // `as_str`, which is what `commit` writes. It took a `&str` and
+            // every call site spelled a token -- the same literals `health` was
+            // matching on, so the fixture and the defect moved together.
+            outcome: Some(outcome.as_str().to_string()),
             changes: 0,
         }
     }
@@ -1547,7 +1628,7 @@ url = \"https://n8n.internal/hook\"
 ",
         );
 
-        let ok = ran("ok");
+        let ok = ran(ExitCode::Ok);
         assert_eq!(
             health(
                 Some(&configured),
@@ -1563,7 +1644,7 @@ url = \"https://n8n.internal/hook\"
 
         // A cooldown lifts on its own, and an interrupt was the user. Neither
         // is a monitor that needs attention.
-        for lifts in ["rate_limited", "interrupted"] {
+        for lifts in [ExitCode::RateLimited, ExitCode::Interrupted] {
             let run = ran(lifts);
             assert_eq!(
                 health(
@@ -1575,13 +1656,13 @@ url = \"https://n8n.internal/hook\"
                 )
                 .verdict,
                 Verdict::Warned,
-                "{lifts} passes on its own"
+                "{lifts:?} passes on its own"
             );
         }
 
         // A session that has gone will not come back without somebody logging
         // in, and every run until then does nothing at all.
-        let dead = ran("no_session");
+        let dead = ran(ExitCode::NoSession);
         assert_eq!(
             health(
                 Some(&configured),
@@ -1643,6 +1724,70 @@ every = \"6h\"
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
     }
 
+    /// What stopped the last run is read in the vocabulary exit codes are
+    /// written in, not in three literals spelled again inside `health`.
+    ///
+    /// `as_str`'s doc says the vocabulary exists so that nothing invents tokens
+    /// inline, "which is how two spellings of one condition get shipped", and
+    /// this function was where they were invented. The cost of respelling one
+    /// was a monitor in an ordinary cooldown scored `Failed`, so `status` exits
+    /// 1 about something that resumes by itself -- and the fixture above spelled
+    /// the same literals, so the suite would have moved with it.
+    ///
+    /// Walked over `ExitCode::ALL`, so a code added later has to be placed
+    /// deliberately rather than defaulted into `Failed` by nobody mentioning it.
+    #[test]
+    fn what_stopped_the_last_run_is_read_in_the_tokens_exit_codes_are_written_in() {
+        let configured = config("schema = 1\nevery = \"6h\"\n");
+        let verdict_of = |run: &watch_store::Run| {
+            health(
+                Some(&configured),
+                &[of(run)],
+                &[],
+                deliveries::Owed::default(),
+                NOW,
+            )
+            .verdict
+        };
+
+        for code in ExitCode::ALL {
+            let run = ran(code);
+            let expected = match code {
+                ExitCode::Ok => Verdict::Ok,
+                ExitCode::RateLimited | ExitCode::Interrupted => Verdict::Warned,
+                _ => Verdict::Failed,
+            };
+            assert_eq!(
+                verdict_of(&run),
+                expected,
+                "a run recorded as {code:?} ({})",
+                code.as_str()
+            );
+        }
+
+        // Named on its own as well as inside the walk, because this is the one
+        // the mapping can lose without the walk noticing: drop a code from `ALL`
+        // and the loop simply stops testing it.
+        let cooled = ran(ExitCode::RateLimited);
+        assert_eq!(
+            verdict_of(&cooled),
+            Verdict::Warned,
+            "a cooldown lifts by itself; a probe that pages for one is a probe people switch off"
+        );
+
+        // And a row spelled by something that is not this build is a failure it
+        // cannot explain, rather than a quiet `Ok`.
+        let unknown = watch_store::Run {
+            outcome: Some("rate-limited".to_string()),
+            ..ran(ExitCode::Ok)
+        };
+        assert_eq!(
+            verdict_of(&unknown),
+            Verdict::Failed,
+            "a token this build does not know is not a healthy run"
+        );
+    }
+
     /// The two probes say the same thing about a machine with no `watch.toml`.
     ///
     /// `snob watch check` decides that sentence in `engine::check` and
@@ -1657,7 +1802,7 @@ every = \"6h\"
     /// search for a substring.
     #[test]
     fn both_probes_say_the_same_thing_about_an_unconfigured_machine() {
-        let ok = ran("ok");
+        let ok = ran(ExitCode::Ok);
         let status = health(None, &[of(&ok)], &[], deliveries::Owed::default(), NOW);
         assert_eq!(status.notes.len(), 1, "{:?}", status.notes);
 
@@ -1687,7 +1832,7 @@ every = \"6h\"
     /// counted as an ordinary wait and printed "the next run tries them".
     #[test]
     fn a_report_addressed_elsewhere_is_not_owed_to_this_run() {
-        let ok = ran("ok");
+        let ok = ran(ExitCode::Ok);
         let two_elsewhere = deliveries::Owed {
             waiting: 0,
             elsewhere: 2,
@@ -1753,7 +1898,7 @@ every = \"6h\"
             // where it is held down.
         ] {
             let configured = config(refused);
-            let ok = ran("ok");
+            let ok = ran(ExitCode::Ok);
             let health = health(
                 Some(&configured),
                 &[of(&ok)],
@@ -1771,7 +1916,7 @@ every = \"6h\"
 
         // And one that builds is still fine.
         let good = config("schema = 1\nevery = \"6h\"\n");
-        let ok = ran("ok");
+        let ok = ran(ExitCode::Ok);
         assert_eq!(
             health(
                 Some(&good),
@@ -1799,7 +1944,7 @@ every = \"6h\"
     #[test]
     fn one_list_never_being_read_is_not_a_healthy_monitor() {
         let configured = config("schema = 1\nevery = \"6h\"\n");
-        let ok = ran("ok");
+        let ok = ran(ExitCode::Ok);
 
         let half = HalfRead {
             who: "@me".to_string(),
@@ -1855,7 +2000,7 @@ every = \"6h\"
     fn a_monitor_that_stopped_is_not_healthy() {
         let configured = config("schema = 1\nevery = \"6h\"\n");
 
-        let recent = ran("ok");
+        let recent = ran(ExitCode::Ok);
         assert_eq!(
             health(
                 Some(&configured),
@@ -1871,7 +2016,7 @@ every = \"6h\"
         // One six-hour gap missed is a laptop that was shut.
         let late = watch_store::Run {
             started_at: NOW - 7 * 3_600,
-            ..ran("ok")
+            ..ran(ExitCode::Ok)
         };
         let one = health(
             Some(&configured),
@@ -1885,7 +2030,7 @@ every = \"6h\"
         // Three weeks is nobody coming back.
         let gone = watch_store::Run {
             started_at: NOW - 21 * 86_400,
-            ..ran("ok")
+            ..ran(ExitCode::Ok)
         };
         let stopped = health(
             Some(&configured),
@@ -1911,7 +2056,7 @@ every = \"6h\"
     fn how_late_is_late_depends_on_the_schedule() {
         let two_days_ago = watch_store::Run {
             started_at: NOW - 2 * 86_400,
-            ..ran("ok")
+            ..ran(ExitCode::Ok)
         };
 
         let weekly = config("schema = 1\non = [\"mon\"]\nat = [\"09:00\"]\n");
@@ -1955,7 +2100,7 @@ every = \"6h\"
     #[test]
     fn a_run_for_an_account_nobody_watches_any_more_does_not_fail_the_verdict() {
         let configured = config("schema = 1\nevery = \"6h\"\n");
-        let failed = ran("no_session");
+        let failed = ran(ExitCode::NoSession);
 
         let orphan = RunOf {
             run: &failed,

@@ -694,7 +694,10 @@ fn warn_about_refusals(tick: &TickReport) {
 /// only place a consent can have been recorded — and an unattended run that
 /// could be pointed at a stranger by an argument would make the recording
 /// pointless.
-fn watched_from(target: Option<String>, configured: Option<&WatchConfig>) -> Vec<Watched> {
+pub(super) fn watched_from(
+    target: Option<String>,
+    configured: Option<&WatchConfig>,
+) -> Vec<Watched> {
     if let Some(name) = target {
         return vec![with_recorded_consent(&name, configured)];
     }
@@ -779,18 +782,12 @@ fn watching_label(watched: &[Watched]) -> String {
     }
 }
 
-/// Builds the schedule from the flags, or the file, or explains what is
-/// missing.
-///
-/// **A flag replaces the schedule rather than merging with it.** Half from the
-/// file and half from the command line is a schedule nobody can read back: the
-/// only honest reading of `--every 6h` against a configured `--on mon` is the
-/// one the person typing meant, and there is no way to know which.
 /// The schedule as written, before it is built: whichever of the two sources
 /// won, in the words it was given in.
 ///
 /// The flags win as a set rather than field by field, because a schedule half
 /// from the file and half from the command line is one nobody can read.
+#[derive(Debug, Default, PartialEq, Eq)]
 struct When {
     cron: Option<String>,
     at: Vec<String>,
@@ -804,6 +801,16 @@ struct When {
 /// Asked by [`schedule_from`] and by the line printed at startup, so the
 /// sentence on screen cannot describe a different schedule from the one that
 /// runs.
+///
+/// **It chooses a source; it does not copy fields.** The five fields were
+/// spelled three times here and copied out by hand in two arms, and the jitter
+/// fell through that copy in *both* directions before anybody noticed — then it
+/// was repaired by special-casing the one field that had been forgotten rather
+/// than by taking the copy out. Which leaves the next field added to
+/// `watch.toml` dropped exactly the same way: silently, with the banner
+/// announcing whatever the default happened to be. The two `From` impls are the
+/// only place the fields are named, so a field added to either source arrives
+/// here by being a field.
 fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
     let given =
         args.cron.is_some() || !args.at.is_empty() || !args.on.is_empty() || args.every.is_some();
@@ -819,34 +826,44 @@ fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
     // turning jitter off, unqualified, and each direction leaves the banner
     // announcing a value nobody chose.
     //
-    // Worked out once, before the halves are decided, because it does not depend
-    // on which source won them.
+    // Worked out once, over both sources, because it does not depend on which of
+    // them won the halves — and applied after the choice rather than inside it,
+    // so it cannot be forgotten in one arm and not the other, which is how it
+    // went wrong the first time.
     let jitter = args.jitter.or_else(|| configured.and_then(|c| c.jitter));
 
-    if given {
-        return When {
+    let mut when = match (given, configured) {
+        (true, _) => When::from(args),
+        (false, Some(config)) => When::from(config),
+        (false, None) => When::default(),
+    };
+    when.jitter = jitter;
+    when
+}
+
+/// The schedule as the command line wrote it.
+impl From<&WatchRunArgs> for When {
+    fn from(args: &WatchRunArgs) -> Self {
+        Self {
             cron: args.cron.clone(),
             at: args.at.clone(),
             on: args.on.clone(),
             every: args.every,
-            jitter,
-        };
+            jitter: args.jitter,
+        }
     }
-    match configured {
-        Some(c) => When {
-            cron: c.cron.clone(),
-            at: c.at.clone(),
-            on: c.on.clone(),
-            every: c.every,
-            jitter,
-        },
-        None => When {
-            cron: None,
-            at: vec![],
-            on: vec![],
-            every: None,
-            jitter,
-        },
+}
+
+/// The schedule as the file wrote it.
+impl From<&WatchConfig> for When {
+    fn from(config: &WatchConfig) -> Self {
+        Self {
+            cron: config.cron.clone(),
+            at: config.at.clone(),
+            on: config.on.clone(),
+            every: config.every,
+            jitter: config.jitter,
+        }
     }
 }
 
@@ -888,6 +905,13 @@ fn days_from<S: AsRef<str>>(days: &[S], every: std::time::Duration) -> Result<Sc
     Ok(Schedule::days(&days_named(days)?, every)?)
 }
 
+/// Builds the schedule from the flags, or the file, or explains what is
+/// missing.
+///
+/// **A flag replaces the schedule rather than merging with it.** Half from the
+/// file and half from the command line is a schedule nobody can read back: the
+/// only honest reading of `--every 6h` against a configured `--on mon` is the
+/// one the person typing meant, and there is no way to know which.
 pub(super) fn schedule_from(
     args: &WatchRunArgs,
     configured: Option<&WatchConfig>,
@@ -3642,6 +3666,70 @@ consent = { agreed_at = 1700 }
             Ok(format!("{schedule:?}")),
             "typed and configured have to be the same schedule"
         );
+    }
+
+    /// Every schedule field either source has reaches the schedule that runs.
+    ///
+    /// The five fields were spelled three times in `when_from` and copied out by
+    /// hand in two arms, and the jitter fell through that copy in both
+    /// directions. It was repaired by special-casing the field that had been
+    /// forgotten, which leaves the next field added to `watch.toml` dropped the
+    /// same way, in silence, with the banner announcing a default nobody chose.
+    ///
+    /// Every field is given a value nothing else here has, so a field that is
+    /// dropped fails and a field that is copied into its neighbour fails too --
+    /// `at` and `on` are both `Vec<String>` and `every` and `jitter` are both
+    /// `Option<Duration>`, and a swap between either pair compiles.
+    ///
+    /// `cron` beside `at` is a shape `config::parse` refuses and `cli.rs`
+    /// declares as conflicting. It is built here anyway, because `When` only
+    /// carries the fields and the thing under test is the carrying: a copy has
+    /// to be checked over every field at once or it is checked over none.
+    #[test]
+    fn no_schedule_field_is_lost_between_a_source_and_the_run() {
+        use std::time::Duration;
+
+        let file = WatchConfig {
+            schema: 1,
+            every: Some(Duration::from_secs(3_600)),
+            at: vec!["09:00".to_string()],
+            on: vec!["mon".to_string()],
+            cron: Some("0 9 * * 1,4".to_string()),
+            jitter: Some(Duration::from_secs(120)),
+            webhook: None,
+            accounts: vec![],
+        };
+        let from_file = when_from(&WatchRunArgs::default(), Some(&file));
+        assert_eq!(from_file.every, file.every, "the file's interval");
+        assert_eq!(from_file.at, file.at, "the file's times of day");
+        assert_eq!(from_file.on, file.on, "the file's days");
+        assert_eq!(
+            from_file.cron, file.cron,
+            "the file's cron expression did not reach the run"
+        );
+        assert_eq!(from_file.jitter, file.jitter, "the file's jitter");
+
+        let typed = WatchRunArgs {
+            every: Some(Duration::from_secs(7_200)),
+            at: vec!["21:30".to_string()],
+            on: vec!["thu".to_string()],
+            cron: Some("0 21 * * 4".to_string()),
+            jitter: Some(Duration::from_secs(300)),
+            ..Default::default()
+        };
+        let from_flags = when_from(&typed, Some(&file));
+        assert_eq!(from_flags.every, typed.every, "the typed interval");
+        assert_eq!(from_flags.at, typed.at, "the typed times of day");
+        assert_eq!(from_flags.on, typed.on, "the typed days");
+        assert_eq!(
+            from_flags.cron, typed.cron,
+            "the typed cron expression did not reach the run"
+        );
+        assert_eq!(from_flags.jitter, typed.jitter, "the typed jitter");
+
+        // And with neither source there is nothing to carry, which is the third
+        // arm and the one that had its own hand-written copy of the field list.
+        assert_eq!(when_from(&WatchRunArgs::default(), None), When::default());
     }
 
     /// A stored token with no configured address is not sent to a typed one.
