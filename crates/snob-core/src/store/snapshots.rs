@@ -436,6 +436,30 @@ pub fn latest_complete(
 /// missing from it. That is the difference between a monitor saying nothing and
 /// a monitor announcing two hundred departures that never happened, and it is
 /// held here rather than by whoever remembers to check `complete`.
+/// Whether anything has ever been captured of this list, finished or not.
+///
+/// A deliberately weaker question than [`latest_complete`], and the difference
+/// is the whole point. A walk that stopped short is not a capture anything may
+/// be compared against — but it ran `save_page`, and `save_page` runs
+/// `users::upsert`, so it filed `username_history` rows for the people it did
+/// see. Those people are members of that list, and a rename among them is a
+/// rename this list could have reported.
+///
+/// So "has this list ever had a *complete* capture" is the wrong test for
+/// whether it may let the rename window close over it: on an account whose
+/// second list meets the truncation wall every time, the answer is `None`
+/// forever while the list goes on filing history rows every run.
+pub fn any_capture(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<bool, StoreError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM snapshots WHERE account_pk = ?1 AND kind = ?2 LIMIT 1",
+            params![pk_to_sql(account_pk), kind.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(

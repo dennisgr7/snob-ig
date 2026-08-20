@@ -395,6 +395,53 @@ pub fn set_rename_cursor(
     Ok(())
 }
 
+/// Which renames in the open window have already gone out for this account.
+///
+/// The cursor answers "how far have I scanned", and it is the wrong tool for
+/// "what have I already said". A tick that reads a window while one list is
+/// refused announces what it can see and must not move the cursor, so the next
+/// tick reads the identical window — and re-announces the identical renames
+/// under a fresh `run_id`, which is what a receiver deduplicates on.
+///
+/// A watermark of "announced" cannot stand in for this, and `007_renames_sent`
+/// records why at length: the rename that was never found sits below such a
+/// mark too, so the one run that could finally see it is the one forbidden to.
+///
+/// Bounded by the open window, so on an account whose lists are all readable
+/// this is empty.
+pub fn renames_already_sent(
+    conn: &Connection,
+    account_pk: Pk,
+) -> Result<std::collections::HashSet<i64>, StoreError> {
+    let mut stmt =
+        conn.prepare("SELECT history_id FROM watch_renames_sent WHERE account_pk = ?1")?;
+    let rows = stmt.query_map(params![pk_to_sql(account_pk)], |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Files the renames this report is announcing, so no later one repeats them.
+///
+/// Written in the same transaction as the report and the marks, for the reason
+/// [`commit_report`] gives about all three: a row that went out and was not
+/// recorded is a change announced twice, and one recorded without going out is
+/// a change announced never.
+fn record_renames_sent(
+    conn: &Connection,
+    account_pk: Pk,
+    history_ids: &[i64],
+    at: i64,
+) -> Result<(), StoreError> {
+    for id in history_ids {
+        conn.execute(
+            "INSERT INTO watch_renames_sent (account_pk, history_id, sent_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_pk, history_id) DO NOTHING",
+            params![pk_to_sql(account_pk), id, at],
+        )?;
+    }
+    Ok(())
+}
+
 /// Commits a report: queues it, and moves the marks it makes stale.
 ///
 /// **One transaction, and the order inside it is the point.** A change that has
@@ -424,6 +471,7 @@ pub fn commit_report(
     marks: &[(ListKind, i64)],
     at: i64,
     rename_cursor: Option<i64>,
+    renames_sent: &[i64],
     delivery: Option<Queued<'_>>,
 ) -> Result<Option<i64>, StoreError> {
     let tx = store.conn_mut().transaction()?;
@@ -449,6 +497,17 @@ pub fn commit_report(
     // reported that nothing looked at, and they can never be reported again.
     if let Some(cursor) = rename_cursor {
         set_rename_cursor(&tx, account_pk, cursor, at)?;
+    }
+
+    // What this report is announcing, so no later one repeats it — and, once
+    // the cursor has closed the window over them, dropped, because a row below
+    // the cursor is never read again anyway.
+    record_renames_sent(&tx, account_pk, renames_sent, at)?;
+    if let Some(cursor) = rename_cursor {
+        tx.execute(
+            "DELETE FROM watch_renames_sent WHERE account_pk = ?1 AND history_id <= ?2",
+            params![pk_to_sql(account_pk), cursor],
+        )?;
     }
 
     tx.commit()?;
@@ -489,7 +548,7 @@ pub fn renames_since(
     head: i64,
 ) -> Result<Vec<Rename>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT h.pk, h.username, u.username, h.changed_at
+        "SELECT h.pk, h.id, h.username, u.username, h.changed_at
          FROM username_history h
          JOIN users u            ON u.pk = h.pk
          JOIN snapshot_members m ON m.user_pk = h.pk AND m.snapshot_id = ?1
@@ -504,9 +563,10 @@ pub fn renames_since(
     let rows = stmt.query_map(params![snapshot_id, since, head], |row| {
         Ok(Rename {
             pk: pk_from_sql(row.get(0)?),
-            from: row.get(1)?,
-            to: row.get(2)?,
-            at: row.get(3)?,
+            history_id: row.get(1)?,
+            from: row.get(2)?,
+            to: row.get(3)?,
+            at: row.get(4)?,
         })
     })?;
 

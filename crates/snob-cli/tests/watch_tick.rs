@@ -662,6 +662,163 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
     }
 }
 
+/// A rename in the list that *was* read is not announced again next run.
+///
+/// The other half of the same cursor, and it pulls the opposite way. Whether a
+/// rename is reported is gated on there being any verified list; whether the
+/// cursor may move is gated on *every* list being accounted for. So a tick with
+/// one list refused announces what it can see and files nothing saying it did,
+/// and the next tick re-reads the identical window against the identical
+/// capture — under a fresh `run_id`, which is the value receivers are told to
+/// deduplicate on. No permanent wall is needed: one refused list is enough.
+#[tokio::test]
+async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Run one: baselines for both lists.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 1, 1).await;
+        mount_named(&server, "followers", &[(1, "one")]).await;
+        mount_named(&server, "following", &[(2, "two")]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        run(&mut app, &Watched::own()).await;
+
+        // A rename of somebody in the list that will be readable.
+        snob_core::store::users::upsert(
+            app.db().conn(),
+            &snob_core::model::User {
+                pk: 1,
+                username: "one_renamed".into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            },
+        )
+        .unwrap();
+    }
+
+    // Run two: followers answers and is compared, following is refused. The
+    // rename is announced, and the cursor may not move.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 2).await;
+        mount_named(&server, "followers", &[(1, "one_renamed"), (3, "three")]).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/42/following/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("not the JSON this endpoint returns"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+        let renamed = tick.report.changes().renamed;
+        assert_eq!(renamed.len(), 1, "announced once: {renamed:?}");
+        assert_eq!(renamed[0].pk, 1);
+    }
+
+    // Run three: both counters match what is stored, so both lists are verified
+    // without a walk and the same window is read again.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 1).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+
+        assert!(
+            tick.report.changes().renamed.is_empty(),
+            "it was announced last run; a second run_id for one event is what a \
+             receiver cannot deduplicate: {:?}",
+            tick.report.changes().renamed
+        );
+    }
+}
+
+/// A rename seen by a walk that stopped short is not stepped over.
+///
+/// `every_list_accounted_for` asks `latest_complete`, which is true of members
+/// and false of `username_history`: a walk that ends `Truncated` has already run
+/// `save_page` and `users::upsert`, so it raised `history_head` — while
+/// `renames_since` joins the members of a *verified* capture, so those rows are
+/// invisible. The cursor then closes over them, and recovery is shut: when that
+/// list finally completes it is a `Baseline`, which `verified()` excludes.
+#[tokio::test]
+async fn a_rename_seen_by_a_walk_that_stopped_short_is_not_stepped_over() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Run one: followers completes. Following declares a hundred and serves
+    // one, so it hits the truncation wall — a walk that saved a page and has no
+    // complete capture at all. `save_page` filed @two into `users` on the way.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 1, 100).await;
+        mount_named(&server, "followers", &[(1, "one")]).await;
+        mount_named(&server, "following", &[(2, "two")]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+        assert!(
+            tick.lists
+                .iter()
+                .any(|l| l.kind == ListKind::Following && l.skipped.is_some()),
+            "the following list has to be the walled one: {:?}",
+            tick.lists
+        );
+
+        // Somebody the walled walk saw renames.
+        snob_core::store::users::upsert(
+            app.db().conn(),
+            &snob_core::model::User {
+                pk: 2,
+                username: "two_renamed".into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            },
+        )
+        .unwrap();
+    }
+
+    // Run two: followers compares again, following is still walled. The rename
+    // is not found — @two is in no capture this run may read — and the cursor
+    // must not close over it.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 100).await;
+        mount_named(&server, "followers", &[(1, "one"), (3, "three")]).await;
+        mount_named(&server, "following", &[(2, "two_renamed")]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+        assert!(tick.report.changes().renamed.is_empty());
+    }
+
+    // Run three onwards: the wall lifts, following completes and then settles
+    // into `Unchanged`. The rename is owed, and it has to arrive exactly once.
+    let mut announced = 0;
+    for _ in 0..3 {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 1).await;
+        mount_named(&server, "followers", &[(1, "one"), (3, "three")]).await;
+        mount_named(&server, "following", &[(2, "two_renamed")]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        let tick = run(&mut app, &Watched::own()).await;
+        announced += tick.report.changes().renamed.len();
+    }
+
+    assert_eq!(
+        announced, 1,
+        "a rename the tool saw is reported once: not twice, and not never"
+    );
+}
+
 /// The first run seeds the rename cursor, so the second does not announce
 /// history from before the monitor existed.
 ///
