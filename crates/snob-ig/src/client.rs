@@ -486,7 +486,20 @@ impl IgClient {
         // Deliberately not paced: the CDN is a different host with its own
         // limits, and charging a picture against Instagram's budget would make
         // the number mean two things at once.
-        let response = self.cdn()?.get(url).send().await?;
+        //
+        // `Accept-Encoding` is the browser's, for the same reason it is on the
+        // API request and not for a different one. This request sends no header
+        // of its own, so reqwest inserted the string it assembles from whichever
+        // decoders were compiled in — `zstd,gzip,deflate,br`, which no browser
+        // has ever sent — under a User-Agent that says Chrome. Everything else
+        // about this client is deliberately unlike the API one; this is not one
+        // of those things.
+        let response = self
+            .cdn()?
+            .get(url)
+            .header("Accept-Encoding", self.hints.accept_encoding)
+            .send()
+            .await?;
         let status = response.status();
 
         // Deliberately not `classify`: that reads Instagram's API vocabulary,
@@ -534,12 +547,13 @@ impl IgClient {
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
             .header("Accept", "*/*")
-            // Set here rather than left to the HTTP client, which builds its
-            // own from whichever decoders were compiled in and produces
-            // `zstd,gzip,deflate,br` — a fixed string, on every request, that
-            // no browser has ever sent. This is Chrome's, and every codec in
-            // it is one the client can actually decode.
-            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            // Computed from the User-Agent like the rest of the set rather
+            // than written out, because Chromium began offering `zstd` in the
+            // same release it began sending `Priority`: as a literal, a session
+            // created with an older Chrome omitted the one and offered the
+            // other. `client_hints::ACCEPT_ENCODING` carries the value, and why
+            // it is not left to the HTTP client to invent.
+            .header("Accept-Encoding", self.hints.accept_encoding)
             // The one header here that comes from the person rather than from
             // the User-Agent. Every browser sends it on every request.
             .header("Accept-Language", client_hints::accept_language())

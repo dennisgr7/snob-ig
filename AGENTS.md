@@ -238,10 +238,13 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 Supported on purpose — a homelab is a first-class place to run this.
 
 `snob login` probes where the session can go **before** asking for anything,
-and on a machine with no keyring it uses the protected file instead of refusing.
-Secret Service needs a desktop session, so a server, a container or WSL has
-none; that is normal rather than an error. The fallback is never silent: the
-command says which backend it landed on, because a session stored somewhere
+and on a machine with no keyring it uses the file instead of refusing. Secret
+Service needs a desktop session, so a server, a container or WSL has none; that
+is normal rather than an error. On Windows that file is DPAPI-sealed and as
+strong as the credential store; everywhere else it is plain JSON at `0600`, so
+it is protected from other users of the machine and from nothing else — a copy
+of it is a working session anywhere. That is why the fallback is never silent:
+the command says which backend it landed on, because a session stored somewhere
 less protected than the user expected is its own kind of failure. `--no-keyring`
 still forces the file directly.
 
