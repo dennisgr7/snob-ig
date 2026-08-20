@@ -1995,8 +1995,17 @@ fn as_json(report: &WatchReport) -> serde_json::Value {
 /// derived from the arrays: empty changes mean "nothing happened" when the run
 /// looked and "I could not see" when it did not, and something watching for
 /// silence reads those as the same thing.
+///
+/// **`schema` is here for the same reason it is on the wire.** The README's own
+/// recipe is `snob watch --json >> events.ndjson`, which makes this file a data
+/// feed with readers of its own, and it was the one output of the three with no
+/// version on it: a receiver could version-check a webhook body and a preflight
+/// and not the file it was told to append to. The number is the same one, and
+/// it moves with the same rule, because it describes the same report -- the two
+/// differ in what the run says about itself, not in what a change looks like.
 fn tick_json(tick: &TickReport) -> serde_json::Value {
     let mut out = as_json(&tick.report);
+    out["schema"] = serde_json::json!(SCHEMA);
     out["run"] = serde_json::json!({
         "at": tick.at(),
         "looked": tick.looked(),
@@ -2089,6 +2098,19 @@ fn json_line(value: &serde_json::Value, printing: Printing) -> String {
     }
 }
 
+/// The version of the shape every message this tool emits has.
+///
+/// One number, in one place, because there are three emitters and they were
+/// three literals: the webhook body, the preflight, and the `--json` stream.
+/// Two spellings of one condition is how a receiver comes to be told a report
+/// is schema 1 and a preflight schema 2 for the same release, and this file
+/// already carries that lesson about `event`.
+///
+/// It moves when a field is removed or its meaning changes, and not when one is
+/// added: additive is what lets a receiver keep working, and `run.lists`
+/// arriving beside `counts` did not move it.
+const SCHEMA: u32 = 1;
+
 /// What goes on the wire.
 ///
 /// A contract with whatever is on the other end, so it is built here by hand
@@ -2123,7 +2145,7 @@ fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
     let changes = report.changes();
 
     serde_json::json!({
-        "schema": 1,
+        "schema": SCHEMA,
         "event": event,
         "run": {
             "id": run_id,
@@ -2189,7 +2211,7 @@ fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
 /// The `note` says so in words, for whoever opens one by hand.
 fn preflight_body(run_id: &str, at: i64) -> serde_json::Value {
     serde_json::json!({
-        "schema": 1,
+        "schema": SCHEMA,
         "event": crate::engine::check::PREFLIGHT_EVENT,
         "run": {
             "id": run_id,
@@ -4140,14 +4162,22 @@ consent = { agreed_at = 1700 }
         only_real_keys(&published, &real, "");
     }
 
-    /// Every message this tool posts can be version-checked, and every one puts
-    /// the id and the moment in the same place.
+    /// Every message this tool emits can be version-checked, and the two that
+    /// go to a receiver put the id and the moment in the same place.
     ///
-    /// Three events exist. Two go through `payload`; the preflight did not, so
-    /// it was the only body with no `schema` — the one message a receiver
-    /// cannot version-check — with `run_id` and `at` at the top level while the
-    /// other two carry them under `run`. `webhook_of`'s doc claimed the
-    /// opposite in as many words.
+    /// Three emitters exist and they were three literal `1`s and, for a while,
+    /// two shapes. The preflight was the only body with no `schema` at all —
+    /// the one message a receiver cannot version-check — with `run_id` and `at`
+    /// at the top level while the other two carried them under `run`;
+    /// `webhook_of`'s doc claimed the opposite in as many words.
+    ///
+    /// The `--json` stream was the third, and it had no version either. The
+    /// README's own recipe is `snob watch --json >> events.ndjson`, which makes
+    /// that file a data feed with readers of its own, so a receiver could
+    /// version-check a webhook body and a preflight and not the file it was told
+    /// to append to. It carries no `run.id`, and that is right rather than an
+    /// omission: an id exists to deduplicate an at-least-once delivery, and a
+    /// line written once to a local file is not one.
     #[test]
     fn every_message_carries_the_schema() {
         let report = payload(
@@ -4156,9 +4186,29 @@ consent = { agreed_at = 1700 }
             "watch.changes",
         );
         let preflight = preflight_body("run-2", 1_700_000_000);
+        let streamed = tick_json(&TickReport::for_test(
+            report_with(None, vec![]),
+            0,
+            1_700_000_000,
+        ));
+
+        for (which, message) in [
+            ("report", &report),
+            ("preflight", &preflight),
+            ("stream line", &streamed),
+        ] {
+            assert_eq!(message["schema"], 1, "{which} cannot be version-checked");
+            assert_eq!(
+                message["run"]["at"], 1_700_000_000,
+                "{which} does not say when"
+            );
+            assert!(
+                message.get("at").is_none(),
+                "{which} still has the moment at the top level"
+            );
+        }
 
         for (which, message) in [("report", &report), ("preflight", &preflight)] {
-            assert_eq!(message["schema"], 1, "{which} cannot be version-checked");
             assert!(
                 message["event"].as_str().is_some(),
                 "{which} has nothing for a Switch node to read"
@@ -4167,17 +4217,9 @@ consent = { agreed_at = 1700 }
                 message["run"]["id"].as_str().is_some(),
                 "{which} does not say which run it is"
             );
-            assert_eq!(
-                message["run"]["at"], 1_700_000_000,
-                "{which} does not say when"
-            );
             assert!(
                 message.get("run_id").is_none(),
                 "{which} still has the id at the top level"
-            );
-            assert!(
-                message.get("at").is_none(),
-                "{which} still has the moment at the top level"
             );
         }
 

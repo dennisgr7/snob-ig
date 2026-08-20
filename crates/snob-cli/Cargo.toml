@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "snob"
 path = "src/main.rs"
 
+# A build that can be driven end to end without Instagram.
+#
+# Off by default: `cargo build --release` produces a binary with neither the
+# flags nor the code behind them. `cargo test --features testing` is what turns
+# them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
+[features]
+testing = ["snob-ig/testing"]
+
 [dependencies]
 snob-core.workspace = true
 snob-ig.workspace = true

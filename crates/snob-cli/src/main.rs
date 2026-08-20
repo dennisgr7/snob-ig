@@ -42,6 +42,33 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// Where this run keeps its files, and whether the keyring is off.
+///
+/// One place, so the sandbox seam is one `cfg` block rather than a condition at
+/// every site that opens something. In a release build it is
+/// `AppPaths::discover()` and the flag the user typed, and nothing else exists.
+///
+/// `--sandbox-root` forces the file backend as well as the directory. Not a
+/// convenience: the keyring is per user and not per directory, so a sandbox run
+/// that used it would read, overwrite and — through `purge` — delete the real
+/// stored session of whoever is running the tests. The same rule
+/// `crates/snob-core/tests/keyring.rs` holds the test suite to, applied to the
+/// binary.
+fn wiring(cli: &Cli) -> anyhow::Result<(AppPaths, bool)> {
+    #[cfg(feature = "testing")]
+    if let Some(root) = &cli.sandbox_root {
+        if let Some(base) = cli.ig_base_url.clone() {
+            // Before any client is built, and once. Clap has already refused
+            // this flag without a sandbox root, so a redirected client can only
+            // carry a session out of the store inside `root`.
+            snob_ig::client::point_every_client_at(base)
+                .map_err(|already| anyhow::anyhow!("already pointed at {already}"))?;
+        }
+        return Ok((AppPaths::rooted_at(root), true));
+    }
+    Ok((AppPaths::discover()?, cli.no_keyring))
+}
+
 /// Looks for an Instagram error in the cause chain so the exit code is one the
 /// v2 service can interpret without reading text.
 fn exit_code_for(error: &anyhow::Error) -> ExitCode {
@@ -68,8 +95,8 @@ fn exit_code_for(error: &anyhow::Error) -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let paths = AppPaths::discover()?;
-    let store = SecretStore::new(paths.clone(), cli.no_keyring);
+    let (paths, no_keyring) = wiring(&cli)?;
+    let store = SecretStore::new(paths.clone(), no_keyring);
 
     match cli.command {
         Command::Login(args) => commands::login::run(args, store, &paths).await,

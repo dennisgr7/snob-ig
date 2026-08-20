@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# A build that can be pointed somewhere other than Instagram.
+#
+# Off by default, so a released binary does not contain the seam at all — not
+# the flag, not the code behind it. What it is for, and why it is a whole
+# feature rather than a hidden flag, is in `client::point_every_client_at`.
+[features]
+testing = []
+
 [dependencies]
 snob-core.workspace = true
 tokio.workspace = true
