@@ -57,20 +57,20 @@ pub async fn setup(
     }
 
     let schedule_line = ask_schedule()?;
-    let (webhook, heartbeat, headers, signing_key, token) = ask_webhook()?;
+    let answers = ask_webhook()?;
     // The address goes down with it. What somebody agrees to when they answer
     // for a stranger is read later as the authority for two different acts, and
     // the wizard is holding the second one at the moment it asks.
-    let accounts = ask_accounts(webhook.as_deref())?;
+    let accounts = ask_accounts(answers.url.as_deref())?;
 
     let text = config::template(
         &schedule_line,
         None,
-        webhook.as_deref(),
-        heartbeat,
-        &headers,
+        answers.url.as_deref(),
+        answers.heartbeat,
+        &answers.headers,
         &accounts,
-        signing_key.is_some(),
+        answers.signing_key.is_some(),
     );
 
     // Parsed before it is written, and before any secret is stored. A file the
@@ -96,8 +96,7 @@ pub async fn setup(
     // remember. This way round, a failure leaves an address with no credential,
     // which announces itself at the first run instead of sitting there.
     let written = config::write(paths, &text)?;
-    store_secret(&secrets, Kind::WatchSigningKey, signing_key)?;
-    store_secret(&secrets, Kind::WatchToken, token)?;
+    answers.store_secrets(&secrets)?;
 
     ui::info(&format!("Written to {}.", written.display()));
 
@@ -383,13 +382,52 @@ fn cron_line(expression: &str) -> Result<String> {
     Ok(format!("cron = \"{}\"", expression.trim()))
 }
 
-type WebhookAnswers = (
-    Option<String>,
-    bool,
-    Vec<(String, String)>,
-    Option<Secret>,
-    Option<Secret>,
-);
+/// What the webhook questions settled.
+///
+/// **Named fields, because two of them were `Option<Secret>` and the two are not
+/// interchangeable.** They were elements four and five of a tuple, told apart by
+/// position across three sites, and swapping them compiles: the signing key
+/// would be sent to the user's server as the `Authorization` value on every
+/// request, and the token — which that server already holds — would become the
+/// shared secret every signature is computed with, so a signature would prove
+/// nothing to the only party that checks it. Nothing downstream can notice
+/// either half. `plan` reads whichever secret is under `Kind::WatchToken` and
+/// puts it in a header; `sign` reads whichever is under `Kind::WatchSigningKey`
+/// and MACs the body with it. Neither has any way to know what it was given.
+///
+/// [`WebhookAnswers::store_secrets`] is the only thing that writes them, and it
+/// is one function so there is one place to read the pairing off.
+struct WebhookAnswers {
+    /// Where reports go, exactly as typed. `None` is no webhook at all, and then
+    /// everything below is empty.
+    url: Option<String>,
+    heartbeat: bool,
+    /// The extra headers that go in the file.
+    headers: Vec<(String, String)>,
+    /// The shared secret the body is signed with. Goes to
+    /// [`Kind::WatchSigningKey`] and is **never sent anywhere** — only a MAC
+    /// computed from it is.
+    signing_key: Option<Secret>,
+    /// The whole `Authorization` header value. Goes to [`Kind::WatchToken`] and
+    /// **is sent**, verbatim, to the user's server on every request.
+    token: Option<Secret>,
+}
+
+impl WebhookAnswers {
+    /// Puts the two secrets in the keyring, each under the `Kind` that says what
+    /// it is for.
+    ///
+    /// One function, and the only one, so the pairing is in one place and a test
+    /// can assert it. It was two calls in the middle of `setup`, which is behind
+    /// a terminal check and therefore unreachable from a test — so the one line
+    /// in the program where a signing key could become a bearer token had
+    /// nothing watching it at all.
+    fn store_secrets(self, secrets: &SecretStore) -> Result<()> {
+        store_secret(secrets, Kind::WatchSigningKey, self.signing_key)?;
+        store_secret(secrets, Kind::WatchToken, self.token)?;
+        Ok(())
+    }
+}
 
 fn ask_webhook() -> Result<WebhookAnswers> {
     if !ui::confirm("Send each report to a webhook?", true)? {
@@ -397,7 +435,13 @@ fn ask_webhook() -> Result<WebhookAnswers> {
             "Nothing will be sent. \"snob watch --json >> events.ndjson\" is a complete way to \
              use it without one.",
         );
-        return Ok((None, false, vec![], None, None));
+        return Ok(WebhookAnswers {
+            url: None,
+            heartbeat: false,
+            headers: vec![],
+            signing_key: None,
+            token: None,
+        });
     }
 
     let url = ui::prompt_line("Where? (https://n8n.local/webhook/snob)")?;
@@ -470,13 +514,16 @@ fn ask_webhook() -> Result<WebhookAnswers> {
         false,
     )?;
 
-    Ok((
-        Some(url.trim().to_string()),
+    // By name. This was a five-element tuple whose fourth and fifth elements
+    // were both `Option<Secret>`, so the one construction site that could put
+    // the signing key where the token goes did it by ordering two lines.
+    Ok(WebhookAnswers {
+        url: Some(url.trim().to_string()),
         heartbeat,
         headers,
         signing_key,
         token,
-    ))
+    })
 }
 
 /// The headers a run of typed answers describes, a name given twice keeping the
@@ -1501,6 +1548,74 @@ evry = \"6h\"
                 "{line:?} produced a file with no schedule in it"
             );
         }
+    }
+
+    /// Each webhook secret is stored under the `Kind` that says what it is for.
+    ///
+    /// The two were elements four and five of a tuple, both `Option<Secret>`,
+    /// told apart by position across three sites -- and swapping them compiles.
+    /// One of them is sent verbatim to the user's server as the `Authorization`
+    /// value on every request; the other is the shared secret every signature is
+    /// computed from and must never leave this machine. Swapped, the signing key
+    /// is handed to the receiver as a bearer token, and every signature is
+    /// computed with a value that receiver already had -- so the signature
+    /// proves nothing to the only party who checks it. `plan` reads whatever is
+    /// under `Kind::WatchToken` and puts it in a header; `sign` reads whatever is
+    /// under `Kind::WatchSigningKey` and MACs the body with it. Neither can tell
+    /// what it was given, and nothing downstream ever notices.
+    ///
+    /// The two secrets carry different values on purpose: a test using one
+    /// string cannot fail on a swap, which is the whole failure.
+    ///
+    /// `store_secrets` is reachable and `setup` is not -- `ui::can_show_a_menu()`
+    /// is false under `cargo test` -- so the pairing lives on the type rather
+    /// than in the middle of the wizard.
+    #[test]
+    fn each_webhook_secret_is_stored_under_the_kind_that_says_what_it_is_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(tmp.path());
+        // Its own service name, always. The keyring belongs to the operating
+        // system and not to this process.
+        let secrets = SecretStore::new(paths, true).with_service(&format!(
+            "snob-ig-test-webhook-answers-{}",
+            std::process::id()
+        ));
+
+        let answers = WebhookAnswers {
+            url: Some("https://n8n.local/webhook/snob".to_string()),
+            heartbeat: false,
+            headers: vec![],
+            signing_key: Some(Secret::new("signing-key-never-leaves-this-machine")),
+            token: Some(Secret::new("Bearer token-the-receiver-already-has")),
+        };
+
+        if answers.store_secrets(&secrets).is_err() {
+            return; // no keyring on this machine; `save_secret` says why
+        }
+
+        let stored = |kind| {
+            secrets
+                .load_secret(kind)
+                .unwrap()
+                .found()
+                .map(|s| s.expose().to_string())
+        };
+
+        assert_eq!(
+            stored(Kind::WatchSigningKey).as_deref(),
+            Some("signing-key-never-leaves-this-machine"),
+            "the signing key became the Authorization value, and is now sent to the \
+             receiver on every request"
+        );
+        assert_eq!(
+            stored(Kind::WatchToken).as_deref(),
+            Some("Bearer token-the-receiver-already-has"),
+            "the token became the signing key, so every signature is computed with a \
+             value the receiver already holds"
+        );
+
+        secrets.forget_secret(Kind::WatchSigningKey).unwrap();
+        secrets.forget_secret(Kind::WatchToken).unwrap();
     }
 
     /// A name typed twice must not produce a file the wizard cannot read back.
