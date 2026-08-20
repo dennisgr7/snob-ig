@@ -81,10 +81,12 @@ session, and which store the credential landed in; each watched account —
 that it resolves, that an unattended run may read it, and its counters, so an
 account past the size this tool can walk is found before six hours of walking
 rather than after; and the webhook, by posting one `watch.preflight` message to
-it with your headers and your signature. It writes nothing and walks no list, so
-it is safe to run as often as you like, and it exits non-zero when something
-would stop a run — which makes it usable as a probe rather than only as
-something to read. `snob watch status` gained the same verdict, over what it
+it with your headers and your signature. It writes nothing and walks no list,
+and it exits non-zero when something would stop a run — which makes it usable as
+a probe rather than only as something to read. Poll it hourly rather than by the
+minute: it costs one request for the session and one per account, charged to the
+same daily budget the walks draw on, and a probe that drains that budget causes
+the condition it is watching for. `snob watch status` gained the same verdict, over what it
 already knew.
 
 `snob watch setup` now finishes by running that check, and then offers to take

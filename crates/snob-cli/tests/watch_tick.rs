@@ -971,8 +971,8 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
 
 /// `snob watch check` spends nothing while the account is in cooldown.
 ///
-/// It is advertised as safe to poll as often as you like and it was the one
-/// request path in the tool with no cooldown gate: `Pacer::clear_to_send`
+/// It is built to be polled, and it was the one request path in the tool with
+/// no cooldown gate: `Pacer::clear_to_send`
 /// charges the budget but never reads the `cooldowns` table, so nothing below
 /// it would have caught this. One `validate` plus one `web_profile_info` per
 /// configured account, on whatever interval a monitoring system polls at,
@@ -1139,5 +1139,139 @@ async fn a_cooldown_does_not_downgrade_a_missing_consent() {
         Verdict::Failed,
         "a scheduled run would refuse to start, and the probe has to say so: {:?}",
         report.checked
+    );
+}
+
+/// A session that has never learned its own name is resolved, not waved through.
+///
+/// The arm that handled it returned `Ok` under a comment saying resolving was
+/// "what `validate` above has just done for free". It had not: `validate`
+/// requests `/api/v1/friendships/{id}/following/?count=1`, which names no
+/// account and takes `&self`, so it could not have stored one. Two checks were
+/// reported as passed without being made -- the account, and the baseline, which
+/// `with_a_session` only asks about when the account line carries a pk.
+///
+/// Not a corner case. `snob login --paste` during a cooldown stores the session
+/// without validating it, so the name stays empty, and only `whoami` ever fills
+/// it in -- which nothing on a headless machine runs.
+#[tokio::test]
+async fn a_session_with_no_stored_username_is_resolved_rather_than_waved_through() {
+    use snob_cli::engine::check::{CheckReport, What, with_a_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+
+    let server = MockServer::start().await;
+    // `validate()`: the session works.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/following/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"users":[]}"#))
+        .mount(&server)
+        .await;
+    // The one request this arm has to make, and did not.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/42/info/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"user":{"username":"me"}}"#))
+        .mount(&server)
+        .await;
+    mount_profile(&server, 7, 3).await;
+
+    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+    let client = IgClient::new(session, Pacer::new(Arc::new(UnlimitedRateBudget)))
+        .unwrap()
+        .with_base_url(Url::parse(&server.uri()).unwrap());
+    let app = App::for_test(
+        client,
+        Store::open(&paths).unwrap(),
+        Viewer {
+            pk: 42,
+            username: None,
+        },
+    );
+    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+        .with_service(&format!("snob-ig-test-noname-{}", std::process::id()));
+
+    let mut report = CheckReport::default();
+    with_a_session(&app, &secrets, &[Watched::own()], &mut report).await;
+
+    let account = report
+        .checked
+        .iter()
+        .find_map(|c| match &c.what {
+            What::Account {
+                pk,
+                followers,
+                following,
+                ..
+            } => Some((*pk, *followers, *following)),
+            _ => None,
+        })
+        .expect("the account is checked");
+    assert_eq!(
+        account,
+        (Some(42), Some(7), Some(3)),
+        "the account line has to carry what was really checked: {:?}",
+        report.checked
+    );
+    assert!(
+        report
+            .checked
+            .iter()
+            .any(|c| matches!(c.what, What::Baseline { .. })),
+        "and the baseline is only asked about when the account line carries a pk: {:?}",
+        report.checked
+    );
+}
+
+/// And the number the help gives is the number that is really spent.
+///
+/// A sentence about cost is only worth having if something breaks when it stops
+/// being true. One `validate` for the session and one `web_profile_info` per
+/// configured account, every invocation, against a budget of roughly two
+/// thousand requests a day that the walks are also drawing on.
+///
+/// Twice rather than once, because a per-invocation cost is exactly what a probe
+/// multiplies: the question is not what one poll costs, it is what a thousand of
+/// them cost.
+#[tokio::test]
+async fn checking_twice_spends_twice() {
+    use snob_cli::engine::check::{CheckReport, with_a_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/following/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"users":[]}"#))
+        .mount(&server)
+        .await;
+    mount_profile(&server, 2, 2).await;
+
+    let app = app(&server, Store::open(&paths).unwrap());
+    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+        .with_service(&format!("snob-ig-test-cost-{}", std::process::id()));
+    let watched = [Watched::own()];
+
+    let before = app.client().pacer().spent();
+    let mut first = CheckReport::default();
+    with_a_session(&app, &secrets, &watched, &mut first).await;
+    let after_one = app.client().pacer().spent();
+
+    let mut second = CheckReport::default();
+    with_a_session(&app, &secrets, &watched, &mut second).await;
+    let after_two = app.client().pacer().spent();
+
+    assert_eq!(
+        after_one - before,
+        2,
+        "one for the session and one per configured account, which is what the help says"
+    );
+    assert_eq!(
+        after_two - after_one,
+        2,
+        "and a probe pays it again every time it is polled"
     );
 }

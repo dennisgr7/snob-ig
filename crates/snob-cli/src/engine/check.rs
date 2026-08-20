@@ -234,9 +234,9 @@ pub async fn with_a_session(
     // **Nothing is spent during a cooldown**, and this is the one request path
     // in the tool that did not say so. `Pacer::clear_to_send` charges the
     // budget but never reads the `cooldowns` table — every other caller gates
-    // explicitly — so a command advertised as safe to poll as often as you like
-    // was knocking on a door Instagram had just closed, once per configured
-    // account, on whatever interval a monitoring system polls at.
+    // explicitly — so a command built to be polled was knocking on a door
+    // Instagram had just closed, once per configured account, on whatever
+    // interval a monitoring system polls at.
     //
     // Reported rather than skipped in silence: a cooldown is exactly the sort
     // of thing somebody running `check` wants to be told about, and it lifts on
@@ -405,15 +405,53 @@ async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Ch
         Some(name) => name.clone(),
         None => match &app.viewer().username {
             Some(name) => name.clone(),
-            // The session carries an id but no name yet, and resolving one is
-            // what `validate` above has just done for free. Nothing to check.
-            None => {
-                return Checked {
-                    what,
-                    verdict: Verdict::Ok,
-                    problem: None,
-                };
-            }
+            // The session carries an id and no name, so the account has to be
+            // resolved before anything can be asked about it.
+            //
+            // The comment here used to say `validate` above had "just done for
+            // free" exactly that, and it had not. `validate` requests
+            // `/api/v1/friendships/{id}/following/?count=1`: it names no
+            // account, and it takes `&self`, so it could not have stored a name
+            // if it had learned one. This arm answered `Ok` for an account it
+            // had never resolved — and because `with_a_session` takes the pk out
+            // of the `What::Account` it returns and finds `None`, `baseline_of`
+            // was skipped for it too. Two checks reported as passed without
+            // being made, on a line indistinguishable from the one printed when
+            // they were.
+            //
+            // Reachable and persistent rather than a corner case:
+            // `snob login --paste` during a cooldown stores the session without
+            // validating it, so the name stays empty, and only `whoami` ever
+            // fills it in. Nothing on a headless machine runs `whoami`.
+            //
+            // `resolve_username` and not `whoami`, which calls `validate()`
+            // first: that would spend a second request on every ordinary user to
+            // repeat the check three lines above. This one is spent only by a
+            // session with no name yet, and `cli.rs` names it in the cost.
+            None => match app.client().resolve_username(app.viewer().pk).await {
+                Ok(Some(name)) => name,
+                // Instagram answered and carried no username. Nothing more can
+                // be asked, and a run is not stopped by it — a run resolves its
+                // own target — so this is the warning it is, not a failure.
+                Ok(None) => {
+                    return Checked {
+                        what,
+                        verdict: Verdict::Warned,
+                        problem: Some(
+                            "not checked: the session carries no username, and Instagram \
+                             did not name the account either"
+                                .to_string(),
+                        ),
+                    };
+                }
+                Err(e) => {
+                    return Checked {
+                        what,
+                        verdict: Verdict::Failed,
+                        problem: Some(e.to_string()),
+                    };
+                }
+            },
         },
     };
 
