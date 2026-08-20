@@ -361,16 +361,27 @@ impl TickReport {
     /// module can decide that — a caller that could set `committable` could
     /// retire the mark of a list the run refused.
     #[doc(hidden)]
-    pub fn for_test(report: WatchReport, requests: u32) -> Self {
+    pub fn for_test(report: WatchReport, requests: u32, at: i64) -> Self {
         Self {
             report,
             requests,
             lists: Vec::new(),
             committable: Vec::new(),
-            at: 0,
+            at,
             rename_cursor: None,
             renames_sent: Vec::new(),
         }
+    }
+
+    /// When this run concluded, in epoch seconds.
+    ///
+    /// Read once, inside [`tick`], just before the comparison, and handed out
+    /// rather than read again: this is the moment `commit_report` files the
+    /// mark at, and a body or a stream line that asked the clock a second time
+    /// would put a different moment on the same event. The field stays
+    /// private, so only a real tick can decide it.
+    pub fn at(&self) -> i64 {
+        self.at
     }
 
     /// Whether this run established anything at all.
