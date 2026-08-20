@@ -818,19 +818,34 @@ fn when_from(args: &WatchRunArgs, configured: Option<&WatchConfig>) -> When {
 /// two halves of one contract, and a contract with two implementations is one
 /// that can be half-changed.
 pub(crate) fn calendar_from<S: AsRef<str>>(days: &[S], times: &[S]) -> Result<Schedule> {
-    let days = days
-        .iter()
-        .map(|day| {
-            let day = day.as_ref();
-            Weekday::parse(day)
-                .ok_or_else(|| anyhow::anyhow!("\"{day}\" is not a day (try mon, thu)"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let days = days_named(days)?;
     let times = times
         .iter()
         .map(|time| schedule::parse_time(time.as_ref()).map_err(anyhow::Error::from))
         .collect::<Result<Vec<_>>>()?;
     Ok(Schedule::calendar(&days, &times)?)
+}
+
+/// The `--on` half, parsed, for both of the schedules that have one.
+///
+/// Shared for the reason the function above is: `--on tues` must not mean one
+/// thing to a calendar and another to a days-only schedule, and the sentence
+/// that says what a day looks like is part of that contract.
+fn days_named<S: AsRef<str>>(days: &[S]) -> Result<Vec<Weekday>> {
+    days.iter()
+        .map(|day| {
+            let day = day.as_ref();
+            Weekday::parse(day)
+                .ok_or_else(|| anyhow::anyhow!("\"{day}\" is not a day (try mon, thu)"))
+        })
+        .collect()
+}
+
+/// Days with no time of day, which is a schedule only because an interval says
+/// how often. [`snob_core::watch::schedule::Schedule::days`] says why the
+/// interval cannot be added afterwards.
+fn days_from<S: AsRef<str>>(days: &[S], every: std::time::Duration) -> Result<Schedule> {
+    Ok(Schedule::days(&days_named(days)?, every)?)
 }
 
 pub(super) fn schedule_from(
@@ -847,6 +862,16 @@ pub(super) fn schedule_from(
 
     let mut schedule = if let Some(expression) = &cron {
         Schedule::cron(expression)?
+    } else if at.is_empty()
+        && !on.is_empty()
+        && let Some(every) = every
+    {
+        // Days and an interval and no time of day. This branch has to come
+        // before the calendar one, which is where it used to land: a calendar is
+        // a set of minutes, days-only names none, and it was refused with "a
+        // calendar needs a time of day" without `every` being looked at — the
+        // one shape README.md, CHANGELOG.md and AGENTS.md all advertise.
+        days_from(&on, every)?
     } else if !at.is_empty() || !on.is_empty() {
         calendar_from(&on, &at)?
     } else if let Some(every) = every {
@@ -860,9 +885,13 @@ pub(super) fn schedule_from(
     };
 
     // An interval alongside a calendar is a floor on it, not a second schedule.
-    // `--every 2w --on mon` is "one Monday in every two weeks".
+    // `--every 2w --on mon --at 09:00` is "one Monday in every two weeks".
+    //
+    // Not for the days-only branch above: `Schedule::days` has already set the
+    // interval, because a grid naming every minute of the day does not survive
+    // `validated` without one.
     if let Some(every) = every
-        && (cron.is_some() || !at.is_empty() || !on.is_empty())
+        && (cron.is_some() || !at.is_empty())
     {
         schedule = schedule.and_every(every)?;
     }
@@ -3233,6 +3262,53 @@ consent = { agreed_at = 1700 }
         assert_eq!(
             seed_last_run(Some(at(0)), &interval, ten_to_nine),
             Some(at(0))
+        );
+    }
+
+    /// `--every 2w --on mon` is a schedule, and it is the one the README names.
+    ///
+    /// Days with no time of day were routed to `Schedule::calendar`, which is a
+    /// set of minutes and refuses one that names none -- so the interval was
+    /// never looked at and the answer was "a calendar needs a time of day".
+    /// README.md, CHANGELOG.md and AGENTS.md all print this shape as the thing
+    /// cron cannot express, and a user following the README was turned away and
+    /// pointed at a flag they had deliberately not typed. Through `watch.toml`
+    /// it is worse: `config::parse` accepts `every` beside `on`, so an installed
+    /// service refused at startup on every run over a file it had accepted.
+    #[test]
+    fn one_monday_in_every_two_is_what_the_readme_says_it_is() {
+        // Midnight UTC on Monday 2026-08-17, so the weekday arithmetic is
+        // checkable by hand.
+        const MONDAY_0000: i64 = 1_786_924_800;
+        const A_FORTNIGHT: i64 = 14 * 24 * 3600;
+
+        let typed = WatchRunArgs {
+            every: Some(std::time::Duration::from_secs(A_FORTNIGHT as u64)),
+            on: vec!["mon".to_string()],
+            ..Default::default()
+        };
+        let schedule = schedule_from(&typed, None).expect("the README prints this one");
+
+        // Run on the Monday at nine: the next moment is a Monday, and it is the
+        // one a fortnight later rather than the one a week later. That is the
+        // conjunction the shape exists for -- the interval is the floor and the
+        // days are the grid.
+        let ran_at = MONDAY_0000 + 9 * 3600;
+        assert_eq!(
+            schedule::next_moment(&schedule, Some(ran_at), ran_at + 60, &chrono::Utc),
+            Some(ran_at + A_FORTNIGHT),
+            "a weekly grid with a fortnightly floor is one Monday in every two"
+        );
+
+        // And the file says it the same way, which is where it really arrives
+        // from: nothing in `config::parse` stands between a hand-edit and this.
+        let file = watch_toml("every = \"2w\"\non = [\"mon\"]\n");
+        assert_eq!(
+            schedule_from(&WatchRunArgs::default(), Some(&file))
+                .map(|s| format!("{s:?}"))
+                .map_err(|e| e.to_string()),
+            Ok(format!("{schedule:?}")),
+            "typed and configured have to be the same schedule"
         );
     }
 
