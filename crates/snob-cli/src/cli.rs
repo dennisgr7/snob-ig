@@ -372,10 +372,14 @@ pub enum WatchCommand {
                       fix it: the schedule through the evaluator that actually decides it, the \
                       session, that each configured account resolves and may be read, and the \
                       webhook — by posting one \"watch.preflight\" message to it.\n\n\
-                      It writes nothing and walks no list, so it is safe to run as often as you \
-                      like, and it exits non-zero when something would stop a run. That makes it \
-                      usable as a monitoring probe.\n\n\
-                      Cost: one request to check the session, and one per configured account."
+                      It writes nothing and walks no list, and it exits non-zero when something \
+                      would stop a run, which is what makes it usable as a monitoring probe. \
+                      Poll it hourly rather than by the minute: every invocation is charged to \
+                      the same daily budget the walks draw on, and a probe that drains it \
+                      causes the condition it is watching for.\n\n\
+                      Cost: one request to check the session, one per configured account, and \
+                      one more while the session has not learned its own account's name — \
+                      which it does the first time \"snob whoami\" runs."
     )]
     Check(WatchCheckArgs),
 
@@ -488,6 +492,44 @@ mod tests {
     #[test]
     fn the_cli_definition_is_coherent() {
         Cli::command().debug_assert();
+    }
+
+    /// The one claim in the help that was not true, kept out.
+    ///
+    /// `snob watch check` charges 1 + N against the same GCRA budget the walks
+    /// draw on -- and `clear_to_send` charges at **reservation, before** the
+    /// owed sleep, so a probe that times out and is killed has already spent a
+    /// slot for a request that never went out. A one-minute blackbox probe on
+    /// two accounts is 4320 requests a day against a sustained ceiling of 2000;
+    /// once that is drained the budget owes about 43 seconds a request, which
+    /// is past every probe timeout. So the probe reports the monitor broken
+    /// while it is fine, and the budget it drained is the one the walk needed:
+    /// a probe that causes the condition it detects.
+    ///
+    /// The per-invocation cost was always stated. It was the safety claim above
+    /// it that was not, and this is what keeps it from coming back the next time
+    /// somebody tidies the paragraph.
+    #[test]
+    fn check_does_not_advertise_itself_as_free_to_poll() {
+        let watch = Cli::command()
+            .find_subcommand("watch")
+            .expect("watch is a subcommand")
+            .clone();
+        let help = watch
+            .find_subcommand("check")
+            .expect("check is a subcommand of watch")
+            .get_after_help()
+            .expect("check has an after_help")
+            .to_string();
+
+        assert!(
+            !help.contains("as often as you like"),
+            "every invocation is charged to the budget the walks need: {help}"
+        );
+        assert!(
+            help.contains("hourly"),
+            "and the help has to name an interval instead of taking it back: {help}"
+        );
     }
 
     /// What this wrapper actually adds: the error carries the text somebody
