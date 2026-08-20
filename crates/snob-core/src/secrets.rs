@@ -230,7 +230,15 @@ impl SecretStore {
         }
     }
 
-    /// Points at a different keyring entry. **Tests only.**
+    /// Points at a different set of keyring entries. **Tests and the sandbox.**
+    ///
+    /// Two callers, and they are the same rule from two directions: a test must
+    /// not delete the session of whoever is running it, and neither must a run
+    /// under `--sandbox-root`. Forcing [`Backend::File`] does not achieve
+    /// either on its own — this store reaches the keyring on every backend, to
+    /// clear a stale entry in [`SecretStore::save`] and because the secrets in
+    /// [`Kind`] other than the session have no file form — so the service name
+    /// is what actually separates them.
     #[doc(hidden)]
     pub fn with_service(mut self, service: &str) -> Self {
         self.service = service.to_string();
