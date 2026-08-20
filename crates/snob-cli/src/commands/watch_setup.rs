@@ -679,7 +679,13 @@ struct Health {
 /// machine that has never recorded which one that is.
 ///
 /// The predicate matches `watched_from`'s: an empty `[[account]]` list means the
-/// viewer, and `self` names it explicitly.
+/// viewer, `self` names it explicitly, and the at sign is off the name before it
+/// is looked up. That last one is not shared code and has to be repeated here:
+/// `with_recorded_consent` cleans on the way to a `Watched`, and this reads the
+/// file straight. With `target = "@friend"` the lookup found nobody, every run
+/// of that account was scored as belonging to an account the configuration no
+/// longer names, and a genuinely failed run came out as a note instead of a
+/// verdict — the probe staying green about the one account it was pointed at.
 fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<snob_core::Pk>>> {
     let conn = db.conn();
     let Some(config) = config else {
@@ -697,7 +703,8 @@ fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<sn
         }
     }
     for account in config.accounts.iter().filter(|a| !a.is_own()) {
-        if let Some(pk) = snob_core::store::accounts::find_pk_by_username(conn, &account.target)? {
+        let named = crate::engine::target::clean(&account.target);
+        if let Some(pk) = snob_core::store::accounts::find_pk_by_username(conn, named)? {
             pks.push(pk);
         }
     }
@@ -1149,6 +1156,40 @@ evry = \"6h\"
     fn quoting_a_list_gives_toml_a_parser_accepts() {
         assert_eq!(quoted_list(&["mon", "thu"]), "\"mon\", \"thu\"");
         assert_eq!(quoted_list(&[]), "");
+    }
+
+    /// A name written with an at sign still names the account it watches.
+    ///
+    /// `status` settles which accounts the file names by looking each one up by
+    /// username, and it read the file's spelling straight. With
+    /// `target = "@friend"` the lookup found nobody, so every run of that
+    /// account was scored as belonging to an account the configuration no longer
+    /// names -- which is deliberately only a note, never a verdict. A monitor
+    /// whose one watched account fails every run then exits 0 forever, which is
+    /// the quiet direction and the one nobody notices.
+    #[test]
+    fn a_name_written_with_an_at_sign_is_still_an_account_the_file_watches() {
+        let db = Store::in_memory().unwrap();
+        snob_core::store::users::upsert(
+            db.conn(),
+            &snob_core::model::User {
+                pk: 7,
+                username: "friend".into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            },
+        )
+        .unwrap();
+        snob_core::store::accounts::upsert(db.conn(), 7, false).unwrap();
+
+        let edited = config("schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"@friend\"\n");
+        assert_eq!(
+            watched_pks(&db, Some(&edited)).unwrap(),
+            Some(vec![7]),
+            "the file names @friend and the store knows friend; they are one account"
+        );
     }
 
     /// A fixed present, so how old a run is is something these tests state

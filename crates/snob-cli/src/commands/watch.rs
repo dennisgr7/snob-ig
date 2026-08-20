@@ -685,11 +685,29 @@ fn watched_from(target: Option<String>, configured: Option<&WatchConfig>) -> Vec
 ///
 /// The file is the only place a consent can have come from, which is what makes
 /// an unattended run safe: an argument cannot grant one.
+///
+/// **The at sign comes off here, on both sides**, which makes this the boundary
+/// a `Watched` is built at and every reader downstream of it. `Watched::target`
+/// used to carry the string exactly as typed or configured while every other
+/// reader in the tool cleaned — `target::resolve`, `target::from_store`,
+/// `target::label` — and the two that did not are both load-bearing. Typing
+/// `snob watch "@friend"` against a file recording an answer for `friend`
+/// matched nothing, so a correctly consented monitor refused at startup citing
+/// a consent written in the file it had just read, and `refuse_unattended`
+/// printed the doubled `@@friend` that gives it away. A hand-edited `target = "@friend"`
+/// went the other way and reached `engine::check`, which asked Instagram for
+/// `username=@friend` and reported a working configuration as broken. README.md
+/// promises without qualification that a username may be written either way, so
+/// this is that promise being kept rather than a special case.
 fn with_recorded_consent(name: &str, configured: Option<&WatchConfig>) -> Watched {
+    let name = crate::engine::target::clean(name);
     let recorded = configured
         .into_iter()
         .flat_map(|c| c.accounts.iter())
-        .find(|account| !account.is_own() && account.target.eq_ignore_ascii_case(name))
+        .find(|account| {
+            !account.is_own()
+                && crate::engine::target::clean(&account.target).eq_ignore_ascii_case(name)
+        })
         .and_then(|account| account.consent);
 
     match recorded {
@@ -2803,6 +2821,69 @@ target = "acquaintance"
         // line: that one is your own account, which needs nobody's permission,
         // and matching it would hand a stranger named `self` a consent.
         assert!(asked("self", Some(&file)));
+    }
+
+    /// The at sign a person types does not change which account is watched.
+    ///
+    /// Both spellings mean the same account and README.md says so without
+    /// qualification, but `Watched` was built from the raw string. Typing
+    /// `snob watch "@friend"` against a file recording an answer for
+    /// `friend` found no answer, so a correctly configured, correctly consented
+    /// service died at startup quoting a consent that is written in the file it
+    /// had just read -- and it died before the first tick, so it looked like a
+    /// configuration error rather than a spelling one. The name also travelled
+    /// on: `engine::check` sent it as `username=@friend` and called a working
+    /// monitor broken.
+    #[test]
+    fn an_at_sign_does_not_change_which_account_is_watched() {
+        let file = watch_toml(
+            r#"
+every = "6h"
+
+[[account]]
+target = "friend"
+consent = { agreed_at = 1700 }
+"#,
+        );
+
+        let typed = watched_from(Some("@friend".to_string()), Some(&file));
+        assert_eq!(typed.len(), 1);
+        assert_eq!(
+            typed[0].name(),
+            Some("friend"),
+            "what reaches the profile endpoint is a username, and the sign is not part of one"
+        );
+        assert!(
+            typed[0].may_run_unattended(),
+            "the file records an answer for this account, however it was spelled"
+        );
+
+        // And from the other side: the file is documented as safe to hand-edit,
+        // so the sign can be in it instead.
+        let edited = watch_toml(
+            r#"
+every = "6h"
+
+[[account]]
+target = "@friend"
+consent = { agreed_at = 1700 }
+"#,
+        );
+        let listed = watched_from(None, Some(&edited));
+        assert_eq!(
+            listed.iter().map(|w| w.name()).collect::<Vec<_>>(),
+            vec![Some("friend")]
+        );
+        assert!(listed[0].may_run_unattended());
+
+        // `@self` is the same line as `self`, and it is your own account. Read
+        // as a stranger it would send a scheduled run looking for confirmation
+        // to read an account it owns.
+        let own = watch_toml("every = \"6h\"\n\n[[account]]\ntarget = \"@self\"\n");
+        let listed = watched_from(None, Some(&own));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name(), None, "your own account names nobody");
+        assert!(listed[0].may_run_unattended());
     }
 
     /// Every account the file lists is watched, and a file that lists none
