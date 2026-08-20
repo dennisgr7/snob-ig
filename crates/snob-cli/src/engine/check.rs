@@ -24,6 +24,7 @@
 use snob_core::Pk;
 use snob_core::secrets::SecretStore;
 use snob_core::store::snapshots;
+use snob_core::store::watch as watch_store;
 
 use crate::exit::ExitCode;
 use snob_core::watch::config::WatchConfig;
@@ -572,19 +573,50 @@ pub async fn webhook_of(
     }
 }
 
+/// When the capture a run would compare against was taken, if there is one.
+///
+/// **Asked of `watch_marks`, not of the newest capture.** A run compares against
+/// what was last *reported*, which AGENTS.md states in as many words, and
+/// [`baseline_of`] asked `snapshots::latest_complete` — so any two complete
+/// captures made it `Ok`. One `snob followers` and one `snob following`, the two
+/// commands the README leads with, leave exactly that: two complete captures and
+/// no mark. The check then printed `ok  baseline`, suppressed the note that
+/// explains why a first run says nothing, and — because `offer_the_baseline`
+/// gates on the same count — the wizard's offer to take the first capture was
+/// never made either. The one state the whole line exists to warn about was the
+/// one it was silent for.
+///
+/// The moment is the marked capture's rather than the newest one's, for the same
+/// reason: a `snob followers` run after the last report leaves a newer capture
+/// no comparison will use, and printing its date would name a baseline that is
+/// not the baseline.
+///
+/// `find_usable` and not `find`, so a marked capture that retention took or that
+/// turns out incomplete answers `None` and the list correctly stops counting it.
+fn reported_baseline(
+    app: &App,
+    pk: Pk,
+    kind: snob_core::model::ListKind,
+) -> Result<Option<i64>, snob_core::store::StoreError> {
+    let Some(id) = watch_store::mark(app.db().conn(), pk, kind)?.and_then(|m| m.snapshot_id) else {
+        return Ok(None);
+    };
+    Ok(snapshots::find_usable(app.db().conn(), id)?.map(|s| s.taken_at.unwrap_or_default()))
+}
+
 /// Whether there is anything for the first scheduled run to compare against.
 ///
 /// A first run is a `Basis::Baseline`: it reports nothing, by design, and
-/// somebody who has just set the monitor up reads that as broken. Saying so
-/// here is cheaper than explaining it afterwards.
+/// somebody who has just set the monitor up reads that as broken. Saying so here
+/// is cheaper than explaining it afterwards.
 pub fn baseline_of(app: &App, pk: Pk) -> Checked {
     let mut taken_at = Vec::new();
     for kind in [
         snob_core::model::ListKind::Followers,
         snob_core::model::ListKind::Following,
     ] {
-        match snapshots::latest_complete(app.db().conn(), pk, kind) {
-            Ok(Some(snapshot)) => taken_at.push((kind, snapshot.taken_at.unwrap_or_default())),
+        match reported_baseline(app, pk, kind) {
+            Ok(Some(at)) => taken_at.push((kind, at)),
             Ok(None) => {}
             Err(e) => {
                 return Checked {

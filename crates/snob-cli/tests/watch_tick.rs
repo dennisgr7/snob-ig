@@ -155,6 +155,53 @@ async fn the_first_run_lays_a_baseline_and_reports_nothing() {
     assert_eq!(tick.report.followers.as_ref().unwrap().total, 3);
 }
 
+/// A capture nobody reported on is not a baseline.
+///
+/// A run compares against `watch_marks`, not against the newest capture, and
+/// this check asked the captures -- so any two complete ones made it `ok`. One
+/// `snob followers` and one `snob following`, which are the two commands the
+/// README leads with, leave exactly that state. The wizard then printed
+/// `ok  baseline`, suppressed the note that explains why a first scheduled run
+/// reports nothing, and never made the offer to take the capture now, because
+/// the offer gates on the same count. The one state the line exists to warn
+/// about was the state it was silent for, and it self-heals only after a whole
+/// interval has gone by with a user thinking the monitor is broken.
+#[tokio::test]
+async fn a_capture_nobody_reported_is_not_a_baseline() {
+    use snob_cli::engine::check::{Verdict, baseline_of};
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 3, 2).await;
+    mount_list(&server, "followers", &[1, 2, 3]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+
+    // Both lists walked and stored, and nothing reported on them. `tick` without
+    // `commit` is that state exactly: the marks are `commit`'s to move, which is
+    // what makes this what a hand-run of the list commands leaves behind.
+    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+
+    let before = baseline_of(&app, 42);
+    assert_eq!(
+        before.verdict,
+        Verdict::Warned,
+        "two captures nobody has reported on are not something to compare against"
+    );
+    assert!(
+        before.problem.is_some(),
+        "and the note saying the first run reports nothing is the whole point of saying so"
+    );
+
+    // One run of the monitor, and now there is one.
+    watch::commit(&mut app, &tick, None).unwrap();
+
+    let after = baseline_of(&app, 42);
+    assert_eq!(after.verdict, Verdict::Ok, "{:?}", after.problem);
+    assert!(after.problem.is_none());
+}
+
 /// A counter that moved is what makes the monitor go and look, and the diff is
 /// against what was last reported.
 #[tokio::test]
