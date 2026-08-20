@@ -34,7 +34,15 @@ with `--header "Authorization: Bearer ..."` for an endpoint that wants one and
 JSON is built for an automation to branch on: `counts.followers_lost` is there
 next to the arrays so a condition does not have to reach into one, `event` tells
 a report from a heartbeat without looking inside, and `run.looked` says whether
-this run could see at all — which empty arrays cannot.
+this run could see at all — which empty arrays cannot. `run.lists` says it per
+list, so a list a cooldown refused is told apart from one that was read and had
+not moved: both leave zeros in `counts`, and only one of them means "nothing
+happened". Every message carries the same `run` object — including the
+`watch.preflight` one `snob watch check` posts, so a receiver branches on it
+exactly as it branches on the rest — with the `run.id` to deduplicate on and
+`run.at` for when it happened. `--json` writes that same object on every line,
+one per tick, and a tick that failed leaves a line too, with `error.code` from
+the same vocabulary the exit table uses.
 
 Nothing is sent when nothing changed, unless `--heartbeat` asks for it, so every
 message that arrives means something. A report that cannot be delivered is

@@ -1009,12 +1009,7 @@ pub(super) async fn preflight(
         && !args.no_webhook
     {
         let id = run_id(now, 0);
-        let body = serde_json::to_string(&serde_json::json!({
-            "event": "watch.preflight",
-            "run_id": id,
-            "at": now,
-            "note": "snob watch check: this is not a report, and nothing is queued",
-        }))?;
+        let body = serde_json::to_string(&preflight_body(&id, now))?;
         report.checked.push(
             check::webhook_of(
                 &delivery.client,
@@ -1989,6 +1984,38 @@ fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
             "following_lost":   changes.following.lost.iter().map(account_json).collect::<Vec<_>>(),
             "renamed": changes.renamed.iter().map(rename_json).collect::<Vec<_>>(),
         },
+    })
+}
+
+/// What `snob watch check` posts.
+///
+/// The same skeleton [`payload`] uses, and it did not used to be. Three events
+/// exist; two go through `payload` and this one did not, so the preflight was
+/// the only message with no `schema` — the one a receiver cannot version-check
+/// — and it carried the id and the moment at the top level while every other
+/// message carries them under `run`. `webhook_of`'s own doc claimed "a receiver
+/// can branch on it exactly as it branches on the rest".
+///
+/// **Breaking**, for anybody reading `$json.run_id` or `$json.at` on a
+/// preflight, and bounded: a preflight is never queued, so no stored body has
+/// the old shape and there is nothing to migrate. `schema` stays 1 rather than
+/// becoming 2 — the preflight is joining the family, and bumping it would make
+/// every report receiver re-check a version over a message that did not change.
+///
+/// `looked`, `requests` and `lists` are deliberately absent: this run looked at
+/// nothing and spent nothing on the account, and a `false` there would read as
+/// a report that could not see rather than as a message that is not a report.
+/// The `note` says so in words, for whoever opens one by hand.
+fn preflight_body(run_id: &str, at: i64) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "event": crate::engine::check::PREFLIGHT_EVENT,
+        "run": {
+            "id": run_id,
+            "at": at,
+            "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
+        },
+        "note": "snob watch check: this is not a report, and nothing is queued",
     })
 }
 
@@ -3442,6 +3469,132 @@ consent = { agreed_at = 1700 }
         ] {
             assert_eq!(basis_token(basis), token);
         }
+    }
+
+    /// The README publishes the body, so it has to be the body.
+    ///
+    /// The example was the **stdout** shape minus its lists: `run` carried
+    /// `looked` and `requests` and neither `id` nor `at`. Those are the two
+    /// fields the surrounding prose depends on — the id is what "queued and
+    /// retried", at-least-once and `X-Snob-Delivery` are all about, and the
+    /// moment is the only timestamp in the message — so a receiver written from
+    /// the document had neither. `counts` showed three of six keys, and nothing
+    /// marked the object as abbreviated.
+    ///
+    /// It compares keys and not values, because the block is an example and
+    /// abbreviates the arrays. What it may not do is name a key the payload does
+    /// not emit, or leave one out of `run` — which is the object the drift
+    /// happened in.
+    ///
+    /// The version inside `tool` is deliberately not asserted: doing that makes
+    /// every release a README edit.
+    #[test]
+    fn the_readme_publishes_the_body_that_goes_out() {
+        // Walks up from this crate until a `Cargo.lock` shows up, the way the
+        // source-reading guards in `snob-core` do, and answers nothing from a
+        // packaged build where there is no repository to read.
+        let Some(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|d| d.join("Cargo.lock").is_file())
+        else {
+            return;
+        };
+
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert_eq!(
+            readme.matches("```json").count(),
+            1,
+            "the payload is the only JSON block, and this test takes the first"
+        );
+        let block = readme
+            .split("```json")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the README shows the payload");
+        let published: serde_json::Value =
+            serde_json::from_str(block).expect("the README's example has to be JSON");
+
+        let real = payload(
+            &TickReport::for_test(report_with(None, vec![]), 14, 1_700_000_000),
+            "run-1",
+            "watch.changes",
+        );
+
+        let keys = |value: &serde_json::Value| {
+            let mut names: Vec<String> = value
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            keys(&published["run"]),
+            keys(&real["run"]),
+            "the `run` object is published in full or not at all"
+        );
+
+        // One direction only: the example abbreviates, and it is allowed to.
+        // What it may not do is publish a field nothing sends.
+        fn only_real_keys(published: &serde_json::Value, real: &serde_json::Value, path: &str) {
+            let (Some(published), Some(real)) = (published.as_object(), real.as_object()) else {
+                return;
+            };
+            for (key, value) in published {
+                let here = format!("{path}.{key}");
+                let counterpart = real.get(key).unwrap_or_else(|| {
+                    panic!("the README publishes \"{here}\", which is not sent")
+                });
+                only_real_keys(value, counterpart, &here);
+            }
+        }
+        only_real_keys(&published, &real, "");
+    }
+
+    /// Every message this tool posts can be version-checked, and every one puts
+    /// the id and the moment in the same place.
+    ///
+    /// Three events exist. Two go through `payload`; the preflight did not, so
+    /// it was the only body with no `schema` — the one message a receiver
+    /// cannot version-check — with `run_id` and `at` at the top level while the
+    /// other two carry them under `run`. `webhook_of`'s doc claimed the
+    /// opposite in as many words.
+    #[test]
+    fn every_message_carries_the_schema() {
+        let report = payload(
+            &TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000),
+            "run-1",
+            "watch.changes",
+        );
+        let preflight = preflight_body("run-2", 1_700_000_000);
+
+        for (which, message) in [("report", &report), ("preflight", &preflight)] {
+            assert_eq!(message["schema"], 1, "{which} cannot be version-checked");
+            assert!(
+                message["event"].as_str().is_some(),
+                "{which} has nothing for a Switch node to read"
+            );
+            assert!(
+                message["run"]["id"].as_str().is_some(),
+                "{which} does not say which run it is"
+            );
+            assert_eq!(
+                message["run"]["at"], 1_700_000_000,
+                "{which} does not say when"
+            );
+            assert!(
+                message.get("run_id").is_none(),
+                "{which} still has the id at the top level"
+            );
+            assert!(
+                message.get("at").is_none(),
+                "{which} still has the moment at the top level"
+            );
+        }
+
+        // And the name is one constant, so the header and the body cannot come
+        // to disagree the way they did over heartbeats.
+        assert_eq!(preflight["event"], crate::engine::check::PREFLIGHT_EVENT);
     }
 
     /// A refused list is not a quiet one, and the body has to say which it was.
