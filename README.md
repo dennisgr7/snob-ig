@@ -219,11 +219,42 @@ it without digging through arrays:
 {
   "schema": 1,
   "event": "watch.changes",
-  "run": { "looked": true, "requests": 14 },
-  "counts": { "followers_gained": 1, "followers_lost": 2, "renamed": 1 },
-  "events": { "followers_lost": [{ "username": "someone", "profile_url": "…" }] }
+  "run": {
+    "id": "1755612000-9f3c1a04",
+    "at": 1755612000,
+    "looked": true,
+    "requests": 14,
+    "lists": [
+      { "kind": "followers", "skipped": null },
+      { "kind": "following", "skipped": null }
+    ],
+    "tool": { "name": "snob", "version": "0.1.1" }
+  },
+  "account": { "pk": 1234567, "username": "you", "is_self": true },
+  "counts": {
+    "followers_gained": 1,
+    "followers_lost": 2,
+    "following_gained": 0,
+    "following_lost": 0,
+    "renamed": 1,
+    "total": 4
+  },
+  "events": {
+    "followers_lost": [
+      { "pk": 7654321, "username": "someone", "profile_url": "https://www.instagram.com/someone/" }
+    ]
+  }
 }
 ```
+
+`run.id` is the value to deduplicate on: delivery is at-least-once and a retry
+carries the same one. `run.at` is when the run concluded, in epoch seconds, and
+`run.lists` says which of the two lists it actually read — a `skipped` of
+`not_verified` or `incomplete` means that list was not compared, so its zeros in
+`counts` mean "not looked at" rather than "nothing happened". `events` holds one
+array per kind of change and is shown here with one of them; `lists.followers`
+and `lists.following`, left out above, carry each list's basis and the window it
+covers, or `null` for a list this run did not compare.
 
 `--header "Authorization: Bearer …"` for an endpoint that wants one, and
 `--sign-with` to have the body signed with HMAC-SHA256 in an `X-Snob-Signature`

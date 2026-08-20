@@ -448,6 +448,16 @@ async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Ch
     }
 }
 
+/// What the preflight message calls itself, in the header and in the body.
+///
+/// One constant so the two cannot disagree, which they could while the name was
+/// written out in `webhook_of` and again where the body is built. That is the
+/// defect `event_for` exists to close — the header saying one thing while the
+/// body says another — reproduced on the one path that does not go through it,
+/// because a preflight is never queued and so is never read back off a stored
+/// body.
+pub const PREFLIGHT_EVENT: &str = "watch.preflight";
+
 /// Posts one message to the address a report would go to.
 ///
 /// The only way to know a webhook works is to use it. A parsed URL says nothing
@@ -476,7 +486,7 @@ pub async fn webhook_of(
         signed,
     };
 
-    match client.post(body, "watch.preflight", run_id, 1).await {
+    match client.post(body, PREFLIGHT_EVENT, run_id, 1).await {
         Attempt::Delivered { status } => Checked {
             what: match what {
                 What::Webhook {
