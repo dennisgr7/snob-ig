@@ -144,6 +144,97 @@ fn existing_to_replace(paths: &AppPaths, dry_run: bool) -> Result<Option<WatchCo
 /// exact — it is an estimate offered to a person, labelled as one.
 const ACCOUNTS_PER_REQUEST: u64 = 25;
 
+/// What taking the baseline now would walk, over every account it covers.
+///
+/// The sentence somebody agrees to was built with `find_map`, which stops at the
+/// first `What::Account` carrying a pair of counters, while `baseline_now` walks
+/// every `[[account]]` in the file. The two accounts the wizard itself writes
+/// are enough to part them: `self`, which usually has captures already and so
+/// supplies the counters, and the stranger somebody has just added, who has none
+/// and is the reason the offer is being made. The screen described one account's
+/// two lists in front of a walk over four — and the stranger's pair goes out at
+/// `Pace::third_party()`, whose every wait is two to three times the default, so
+/// the half left out of the sentence is also the slow half. This is the one
+/// place in the tool where hundreds of requests are spent on a bare
+/// confirmation, and the number under it has to be about the walk that follows.
+///
+/// It is an upper bound rather than a forecast, and deliberately so: an account
+/// whose counters have not moved since a capture nobody reported on is served
+/// out of storage for one request instead of walked. Overstating what a
+/// confirmation costs is the safe direction; `unwrap_or((0, 0))` understated it,
+/// which is how "roughly 0 requests" came to stand in front of a full walk.
+struct BaselineCost {
+    /// How many accounts the walk covers.
+    accounts: usize,
+    followers: u64,
+    following: u64,
+    /// Roughly how many requests they come to, accumulated per account rather
+    /// than by dividing the totals: each account pages separately, so the
+    /// rounding belongs to each of them.
+    requests: u64,
+    /// How many accounts the preflight could not read counters for. An account
+    /// it could not ask about — a cooldown standing, or Instagram naming
+    /// nobody — is walked all the same, so it is counted and said rather than
+    /// folded in as zero.
+    uncounted: usize,
+}
+
+impl BaselineCost {
+    /// The sentence somebody agrees to, naming what it covers.
+    fn sentence(&self) -> String {
+        let mut line = format!(
+            "Taking it now means walking {} followers and {} following across {} account{}: \
+             roughly {} requests, a few minutes.",
+            self.followers,
+            self.following,
+            self.accounts,
+            plural(self.accounts),
+            self.requests
+        );
+        if self.uncounted > 0 {
+            line.push_str(&format!(
+                " {} of them could not be counted, so it is longer than that.",
+                self.uncounted
+            ));
+        }
+        line
+    }
+}
+
+/// Adds up what the preflight learned about every account it checked.
+fn baseline_cost(report: &crate::engine::check::CheckReport) -> BaselineCost {
+    use crate::engine::check::What;
+
+    let mut cost = BaselineCost {
+        accounts: 0,
+        followers: 0,
+        following: 0,
+        requests: 0,
+        uncounted: 0,
+    };
+    for checked in &report.checked {
+        let What::Account {
+            followers,
+            following,
+            ..
+        } = &checked.what
+        else {
+            continue;
+        };
+        cost.accounts += 1;
+        match (followers, following) {
+            (Some(a), Some(b)) => {
+                cost.followers += a;
+                cost.following += b;
+                cost.requests +=
+                    a.div_ceil(ACCOUNTS_PER_REQUEST) + b.div_ceil(ACCOUNTS_PER_REQUEST);
+            }
+            _ => cost.uncounted += 1,
+        }
+    }
+    cost
+}
+
 /// Offers to take the first capture, saying what it costs.
 ///
 /// The first scheduled run is a `Basis::Baseline`: it reports nothing, by
@@ -181,27 +272,11 @@ async fn offer_the_baseline(
         return Ok(());
     }
 
-    let (followers, following) = report
-        .checked
-        .iter()
-        .find_map(|c| match &c.what {
-            What::Account {
-                followers: Some(a),
-                following: Some(b),
-                ..
-            } => Some((*a, *b)),
-            _ => None,
-        })
-        .unwrap_or((0, 0));
-    let requests =
-        followers.div_ceil(ACCOUNTS_PER_REQUEST) + following.div_ceil(ACCOUNTS_PER_REQUEST);
-
     println!();
     ui::info(&format!(
         "There is no capture to compare against yet, so the first scheduled run \
-         will lay one down and report nothing.\n\
-         Taking it now means walking {followers} followers and {following} following: \
-         roughly {requests} requests, a few minutes."
+         will lay one down and report nothing.\n{}",
+        baseline_cost(report).sentence()
     ));
     if !ui::confirm("Take the first capture now?", false)? {
         ui::info("Left for the first scheduled run, which will report nothing and say so.");
@@ -1008,6 +1083,71 @@ evry = \"6h\"
         assert!(
             existing_to_replace(&paths, false).is_err(),
             "a real run is about to overwrite it, so it still has to read it"
+        );
+    }
+
+    /// The offer describes the walk it is about to make.
+    ///
+    /// `baseline_now` walks every `[[account]]` the file names, and the sentence
+    /// under the confirmation was built from the first account line carrying a
+    /// pair of counters. The wizard writes two accounts the moment somebody adds
+    /// a friend, and the first of them is `self`, which usually has the captures
+    /// already -- so the account that made the offer necessary is the one left
+    /// out of the sentence, and it is also the slow one, walked at
+    /// `Pace::third_party()`. This is the only bare confirmation in the tool
+    /// that spends hundreds of requests.
+    ///
+    /// Asked of `baseline_cost` and not of `offer_the_baseline`: that one prints
+    /// and prompts, and returns before the sentence without a terminal, so while
+    /// the numbers were worked out inside it nothing could reach them.
+    #[test]
+    fn the_offer_describes_the_walk_it_is_about_to_make() {
+        use crate::engine::check::{CheckReport, Checked, What};
+
+        let account = |followers, following| Checked {
+            what: What::Account {
+                target: None,
+                pk: Some(1),
+                followers,
+                following,
+                may_run_unattended: true,
+            },
+            verdict: Verdict::Ok,
+            problem: None,
+        };
+
+        let both = CheckReport {
+            checked: vec![account(Some(512), Some(340)), account(Some(88), Some(12))],
+        };
+        let cost = baseline_cost(&both);
+        assert_eq!(
+            (cost.accounts, cost.followers, cost.following),
+            (2, 600, 352),
+            "every account the walk covers, not the first one with counters on it"
+        );
+        assert_eq!(
+            cost.requests,
+            35 + 5,
+            "counted per account, because each of them pages on its own"
+        );
+
+        let sentence = cost.sentence();
+        assert!(sentence.contains("600 followers"), "{sentence}");
+        assert!(sentence.contains("2 accounts"), "{sentence}");
+
+        // An account the preflight could not size is walked all the same, so it
+        // is said rather than folded in as nothing -- which is how "roughly 0
+        // requests" used to be printed in front of a full walk.
+        let partial = CheckReport {
+            checked: vec![account(Some(512), Some(340)), account(None, None)],
+        };
+        let cost = baseline_cost(&partial);
+        assert_eq!((cost.accounts, cost.uncounted), (2, 1));
+        assert_eq!(cost.requests, 35);
+        assert!(
+            cost.sentence().contains("could not be counted"),
+            "{}",
+            cost.sentence()
         );
     }
 
