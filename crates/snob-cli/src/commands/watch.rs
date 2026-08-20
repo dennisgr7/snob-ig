@@ -84,7 +84,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
 
-    let mut last_run = seed_last_run(last_started(paths)?, &schedule, snob_core::store::now());
+    let mut last_run = seed_for(paths, &schedule, snob_core::store::now())?;
 
     if args.now {
         // Run one, here, rather than by pretending nothing has ever run.
@@ -261,6 +261,41 @@ fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
 ///   here — there is no past to wait from, and no run to be too close to.
 fn seed_last_run(recorded: Option<i64>, schedule: &Schedule, now: i64) -> Option<i64> {
     recorded.or_else(|| (!schedule.is_on_a_calendar()).then_some(now))
+}
+
+/// The same answer, remembered across process starts.
+///
+/// [`seed_last_run`] is right and it was never written down. The invented `now`
+/// lived in a local variable, and `last_started` reads `watch_runs`, whose only
+/// writer is a tick that finished — so while that log stayed empty, **every
+/// start measured the interval from that start**. The doc above says this class
+/// of failure is fixed; it was fixed only from the second run onwards, and the
+/// second run is the one that never came.
+///
+/// `snob watch` in a login item with `--every 1d` — the wizard's own suggestion
+/// — on a laptop up eight hours a day is due at hour twenty-four and shut down
+/// at hour eight, every day, for ever. `--every 2w`, another of the wizard's
+/// three examples, needs a fortnight of unbroken uptime, and `Restart=always`
+/// after one crash puts it back to zero. `status` says "it has not run yet" the
+/// whole time, which is exactly true and reads as a tool that is new rather
+/// than one that is stuck.
+///
+/// A calendar seeds nothing, for the reason [`seed_last_run`] gives: inventing
+/// a run for it steps over every moment in the next quarter of an hour.
+fn seed_for(paths: &AppPaths, schedule: &Schedule, now: i64) -> Result<Option<i64>> {
+    if let Some(recorded) = last_started(paths)? {
+        return Ok(Some(recorded));
+    }
+    let Some(invented) = seed_last_run(None, schedule, now) else {
+        return Ok(None);
+    };
+
+    let store = snob_core::store::Store::open(paths)?;
+    if let Some(seeded) = snob_core::store::watch::interval_seeded_at(store.conn())? {
+        return Ok(Some(seeded));
+    }
+    snob_core::store::watch::set_interval_seeded_at(store.conn(), invented)?;
+    Ok(Some(invented))
 }
 
 /// One run inside the loop: open, tick, print, close.
@@ -2080,6 +2115,42 @@ mod tests {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// An interval measures from the first start, not from this one.
+    ///
+    /// The seeded instant lived in a local variable, and `last_started` reads
+    /// `watch_runs`, whose only writer is a tick that finished — so while that
+    /// log stayed empty, every process start measured the interval from itself.
+    /// A monitor with `--every 1d` on a laptop up eight hours a day is due at
+    /// hour twenty-four and shut down at hour eight, every day, for ever, while
+    /// `status` says "it has not run yet".
+    #[test]
+    fn an_interval_measures_from_the_first_start_and_not_from_this_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let every = Schedule::every(std::time::Duration::from_secs(24 * 3_600)).unwrap();
+
+        let first = seed_for(&paths, &every, 1_700_000_000).unwrap();
+        assert_eq!(first, Some(1_700_000_000));
+
+        // A second start two hours later, with the run log still empty.
+        let second = seed_for(&paths, &every, 1_700_007_200).unwrap();
+        assert_eq!(
+            second, first,
+            "a restart must not put the interval back to zero"
+        );
+    }
+
+    /// And a calendar still seeds nothing, because inventing a run for one
+    /// steps over every moment in the next quarter of an hour.
+    #[test]
+    fn a_calendar_is_not_seeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let at_nine = Schedule::calendar(&[], &[schedule::parse_time("09:00").unwrap()]).unwrap();
+
+        assert_eq!(seed_for(&paths, &at_nine, 1_700_000_000).unwrap(), None);
+    }
 
     /// A tick that failed is still a tick that happened, and it still spent.
     ///

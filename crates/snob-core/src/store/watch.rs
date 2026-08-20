@@ -395,6 +395,37 @@ pub fn set_rename_cursor(
     Ok(())
 }
 
+/// The key the interval seed is stored under. One row, one machine.
+const INTERVAL_SEED: &str = "interval_seeded_at";
+
+/// When an interval schedule started counting, if it ever wrote it down.
+///
+/// Read only while `watch_runs` is empty, which is the whole window in which the
+/// answer matters: once a run has finished, `last_started` is the better one.
+pub fn interval_seeded_at(conn: &Connection) -> Result<Option<i64>, StoreError> {
+    let at = conn
+        .query_row(
+            "SELECT value FROM watch_state WHERE key = ?1",
+            params![INTERVAL_SEED],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(at)
+}
+
+/// Writes it down once, so the next start does not begin again.
+///
+/// `INSERT OR IGNORE`, not an upsert: a later start must never move the instant
+/// the interval is measured from, which is the whole defect. Two processes
+/// racing to seed leave whichever got there first, and either answer is right.
+pub fn set_interval_seeded_at(conn: &Connection, at: i64) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO watch_state (key, value) VALUES (?1, ?2)",
+        params![INTERVAL_SEED, at],
+    )?;
+    Ok(())
+}
+
 /// Which renames in the open window have already gone out for this account.
 ///
 /// The cursor answers "how far have I scanned", and it is the wrong tool for
