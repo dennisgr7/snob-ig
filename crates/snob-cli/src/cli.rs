@@ -31,6 +31,42 @@ pub struct Cli {
     #[arg(long, global = true, display_order = 901)]
     pub verbose: bool,
 
+    /// Keep every file this run reads or writes under this directory
+    ///
+    /// A testing build only. Replaces the discovered data and configuration
+    /// directories, and puts the session in a file inside it rather than in the
+    /// system keyring — so a sandbox run cannot read, write or delete the real
+    /// one. That is the property [`Cli::ig_base_url`] leans on.
+    #[cfg(feature = "testing")]
+    #[arg(long, global = true, hide = true, display_order = 902)]
+    pub sandbox_root: Option<std::path::PathBuf>,
+
+    /// Ask this server instead of Instagram
+    ///
+    /// A testing build only, and it **requires `--sandbox-root`**. That is the
+    /// whole safety argument, and it is enforced by clap rather than described:
+    /// a redirected client can only ever carry a session out of a store inside
+    /// the sandbox root, so the session belonging to the person running this is
+    /// not reachable from a redirected run. Without that pairing the flag would
+    /// be a way to send a real session cookie to somebody else's server.
+    ///
+    /// Nothing about it is loopback-only, deliberately. `IgClient::is_live`
+    /// decides whether the pace is real by address, so a proxy on `127.0.0.1`
+    /// forwarding to Instagram would be a test server by address and Instagram
+    /// by content — a real account walked with no waits between pages. A
+    /// loopback restriction would look like the safe option and be the
+    /// dangerous one; an empty sandbox store is the thing that actually helps.
+    #[cfg(feature = "testing")]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        display_order = 903,
+        requires = "sandbox_root",
+        value_name = "URL"
+    )]
+    pub ig_base_url: Option<url::Url>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -492,6 +528,57 @@ mod tests {
     #[test]
     fn the_cli_definition_is_coherent() {
         Cli::command().debug_assert();
+    }
+
+    /// The sandbox flag cannot be given without the sandbox.
+    ///
+    /// This is the whole safety argument for `--ig-base-url` existing at all,
+    /// and it is enforced by clap rather than described in a comment: a
+    /// redirected client can only ever carry a session out of a store inside
+    /// the sandbox root, so the session belonging to the person running this is
+    /// not reachable from a redirected run. Alone, the flag would be a way to
+    /// send a live session cookie to somebody else's server.
+    ///
+    /// A testing build only. In a released one neither flag exists, which
+    /// `crates/snob-core/tests/sandbox.rs` reads the source to hold down.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_redirected_run_cannot_reach_the_real_session() {
+        let refused =
+            Cli::try_parse_from(["snob", "--ig-base-url", "http://127.0.0.1:9/", "whoami"]);
+        assert!(
+            refused.is_err(),
+            "a base URL with no sandbox root would carry the stored session there"
+        );
+
+        let tmp = std::env::temp_dir();
+        let paired = Cli::try_parse_from([
+            "snob",
+            "--sandbox-root",
+            tmp.to_str().expect("the temporary directory has a name"),
+            "--ig-base-url",
+            "http://127.0.0.1:9/",
+            "whoami",
+        ])
+        .expect("the pair is what a sandbox run is");
+        assert_eq!(
+            paired.ig_base_url.map(|u| u.to_string()).as_deref(),
+            Some("http://127.0.0.1:9/")
+        );
+        assert_eq!(paired.sandbox_root.as_deref(), Some(tmp.as_path()));
+
+        // And a sandbox root on its own is fine: it is what drives everything
+        // that does not need Instagram at all.
+        assert!(
+            Cli::try_parse_from([
+                "snob",
+                "--sandbox-root",
+                tmp.to_str().expect("the temporary directory has a name"),
+                "watch",
+                "status",
+            ])
+            .is_ok()
+        );
     }
 
     /// The one claim in the help that was not true, kept out.

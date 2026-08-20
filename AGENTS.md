@@ -83,9 +83,29 @@ cargo test -p snob-cli --test cache        # one integration file
 cargo test the_first_run_walks_the_list    # one test by name
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p snob-cli -- login --paste     # run it; mind the double dash
+
+cargo test -p snob-cli --features testing --test sandbox   # the binary itself
 ```
 
 Without the `--`, cargo keeps the flags instead of passing them through.
+
+**The `testing` feature is what lets a test drive the program.** Everything else
+in the suite drives a library: `watch_tick.rs` runs the comparison through
+`engine::watch::tick`, `watch_webhook.rs` runs the outbox through
+`WebhookClient`. Nothing ran `main` — not the dispatch, not `AppPaths::discover`,
+not the secret store choosing a backend, not the exit code a timer reads. The
+feature adds two flags for that and **a released binary contains neither them nor
+the code they reach**, which `crates/snob-core/tests/sandbox.rs` reads the source
+to hold down. `--sandbox-root` puts every file a run touches under one directory
+and forces the file backend, so the operating system's keyring is never opened —
+`crates/snob-core/tests/keyring.rs`'s rule, applied to the binary.
+`--ig-base-url` **requires** `--sandbox-root`, and that pairing is the whole
+safety argument: a redirected client can only carry a session out of a store
+inside that root, so the real stored session is not reachable from a redirected
+run. Nothing about it is loopback-only, deliberately — `IgClient::is_live`
+decides whether the pace is real by address, so a proxy on `127.0.0.1` forwarding
+to Instagram would be a test server by address and Instagram by content, and the
+walk it produced would be a real account read with no waits between pages.
 `cargo install --path crates/snob-cli` puts a release `snob` on the PATH, but it
 has to be repeated after every change; for iterating, `cargo run` is the one.
 

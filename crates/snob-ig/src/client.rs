@@ -219,8 +219,55 @@ pub struct IgClient {
 /// What a browser sends before the server has told it anything.
 const INITIAL_CLAIM: &str = "0";
 
+/// Where every client built after this call points, in a testing build.
+///
+/// **Compiled out of a release build entirely**, feature and all: a shipped
+/// binary has neither this function nor the flag that calls it, so there is no
+/// way to point it at another server and nothing to disable. That is what the
+/// whole Cargo feature buys over a hidden flag, and it is the reason it is a
+/// feature.
+///
+/// A process-global rather than an argument, which is normally the wrong answer
+/// and is the right one here. Three separate places build a client — `App`,
+/// `whoami`, and `login::validate`, which is in this crate and takes no path
+/// from the binary at all — so an argument would have to be threaded through
+/// five signatures that exist in the release build, to carry a value that never
+/// exists in it. It is set once from `main` before any client exists, and never
+/// again: [`OnceLock::set`] returns the value back on a second call rather than
+/// replacing it, so a run cannot be redirected halfway through.
+///
+/// It sets the **base URL**, not a "skip the pace" switch, which is the
+/// difference that matters. [`IgClient::is_live`] answers by address, so a
+/// client pointed here is genuinely not Instagram and turning the pace off is
+/// telling the truth. The failure that shape avoids is the one a loopback-only
+/// escape hatch would have created: a proxy on `127.0.0.1` forwarding to
+/// Instagram is a test server by address and Instagram by content, and the walk
+/// it produces is a real account read with no waits between pages.
+///
+/// The binary refuses `--ig-base-url` unless `--sandbox-root` is given too, so
+/// the session a redirected client carries comes out of a store inside that
+/// root. The stored session of the person running it is not reachable from
+/// here.
+#[cfg(feature = "testing")]
+static SANDBOX_BASE: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
+/// Points every client built from now on somewhere other than Instagram.
+///
+/// See [`SANDBOX_BASE`]. `Err` carries the base already set, on a second call.
+#[cfg(feature = "testing")]
+pub fn point_every_client_at(base: Url) -> Result<(), Url> {
+    SANDBOX_BASE.set(base)
+}
+
 impl IgClient {
     pub fn new(session: Session, pacer: Pacer) -> Result<Self, IgError> {
+        // Read here rather than at each call site, because `login::validate`
+        // builds a client inside this crate and never sees the binary's
+        // arguments. In a release build this line does not exist.
+        #[cfg(feature = "testing")]
+        if let Some(base) = SANDBOX_BASE.get() {
+            return Self::pointed_at(session, pacer, base.clone());
+        }
         Self::pointed_at(session, pacer, Url::parse(BASE_URL)?)
     }
 
