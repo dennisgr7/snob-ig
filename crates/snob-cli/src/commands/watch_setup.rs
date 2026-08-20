@@ -545,7 +545,16 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // what every other command does anyway, and nothing here writes.
     let db = Store::open(paths)?;
 
-    let owed = deliveries::pending(db.conn())?;
+    // The address this configuration could post to, spelled the way the outbox
+    // records it — `status` builds no delivery of its own, so it goes through
+    // the same function `delivery_from` does rather than comparing the file's
+    // raw string against a normalized URL.
+    let destination = config
+        .as_ref()
+        .and_then(|c| c.webhook.as_ref())
+        .and_then(|w| url::Url::parse(&w.url).ok())
+        .map(|url| super::watch::destination_of(&url));
+    let owed = deliveries::owed(db.conn(), destination.as_deref())?;
     let marks = watch_store::all_marks(db.conn())?;
     // Per account, and reported per account: a run covers every configured one,
     // so one unqualified "last ran" line is whichever account happened to be
@@ -607,7 +616,15 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "configured": config.is_some(),
                 "config_path": config::path(paths).display().to_string(),
-                "pending_deliveries": owed,
+                // The whole queue, unchanged, so a probe reading this field
+                // still gets what it always did — and beside it the split,
+                // because "the next run tries these" and "nothing here can send
+                // these" are two facts and this was one number.
+                "pending_deliveries": owed.waiting + owed.elsewhere,
+                "deliveries": {
+                    "waiting": owed.waiting,
+                    "elsewhere": owed.elsewhere,
+                },
                 // The verdict, so a caller reading this does not have to
                 // reimplement which combinations of the fields below mean the
                 // monitor has stopped doing its job.
@@ -695,28 +712,45 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         }
     }
 
-    // One block, because there used to be two and they contradicted each other:
-    // one said a queue with no webhook would never move, the other said the next
-    // run would try it, and both printed in that order on the same run. The
-    // first also carried a run of literal spaces before its pronoun, which came
-    // back when this was rewritten -- and came back longer. A test walks the
-    // source for that shape now, because two rounds of reading it did not.
-    if owed > 0 {
+    // Two lines, and this time they are about two different sets of rows.
+    //
+    // They used to be two claims about the *same* rows and they contradicted
+    // each other: one said a queue with no webhook would never move, the other
+    // said the next run would try it, and both printed in that order on the same
+    // run. Merging them into one sentence was the wrong repair, because the
+    // number underneath was `pending` — every row in the state — while only the
+    // ones addressed here are ever handed back. So the sentence was true of some
+    // of them and false of the rest, and which was which was exactly what the
+    // reader needed. The counts are split now, so each line is true of the rows
+    // it counts. The first version also carried a run of literal spaces before
+    // its pronoun, which came back when it was rewritten -- and came back
+    // longer. A test walks the source for that shape now, because two rounds of
+    // reading it did not.
+    if owed.waiting > 0 || owed.elsewhere > 0 {
         println!();
-        let (subject, it) = if owed == 1 {
+    }
+    if owed.waiting > 0 {
+        let (subject, it) = if owed.waiting == 1 {
             ("report is", "it")
         } else {
             ("reports are", "them")
         };
-        if config.as_ref().and_then(|c| c.webhook.as_ref()).is_none() {
-            println!(
-                "{owed} {subject} queued, but no webhook is configured, so nothing will send {it}. {} expire on {} own.",
-                if owed == 1 { "It" } else { "They" },
-                if owed == 1 { "its" } else { "their" }
-            );
+        println!(
+            "{} {subject} waiting to be delivered; the next run tries {it}.",
+            owed.waiting
+        );
+    }
+    if owed.elsewhere > 0 {
+        let (subject, they, their, it) = if owed.elsewhere == 1 {
+            ("report is", "It", "its", "it")
         } else {
-            println!("{owed} {subject} waiting to be delivered; the next run tries {it}.");
-        }
+            ("reports are", "They", "their", "them")
+        };
+        println!(
+            "{} {subject} addressed to a webhook this configuration does not send to, so \
+             nothing here will try {it}. {they} expire on {their} own.",
+            owed.elsewhere
+        );
     }
 
     if !health.notes.is_empty() {
@@ -840,7 +874,7 @@ fn health(
     config: Option<&WatchConfig>,
     runs: &[RunOf<'_>],
     reported: &[HalfRead],
-    owed: usize,
+    owed: deliveries::Owed,
     now: i64,
 ) -> Health {
     let mut notes = Vec::new();
@@ -967,19 +1001,48 @@ fn health(
         }
     }
 
-    if owed > 0 {
-        // Queued with nowhere to go is the worse half: those reports expire,
-        // and the changes in them are already marked as reported, so they are
-        // the only copy.
-        if config.and_then(|c| c.webhook.as_ref()).is_none() {
+    // **Which queue it is, asked of the queue.** One integer answered two
+    // questions and this branch read it wrongly in both directions. The count
+    // was `pending` — every row in the state — so a monitor whose `[webhook]
+    // url` had moved was scored on rows `due` can never return; and whether
+    // those rows were orphans was asked of the *file*, so a run given the
+    // address on the command line from a unit with no `watch.toml` — the
+    // README's own example — came back `Failed` and exit 1 on every poll, while
+    // its rows carried a real address the next run drains. A probe that pages
+    // for a healthy service is how people learn to ignore a probe.
+    if owed.elsewhere > 0 {
+        if config.and_then(|c| c.webhook.as_ref()).is_some() {
+            // The file names an address and these are for a different one, so
+            // nothing will ever post them: they expire where they are, and the
+            // changes in them are already marked as reported, which makes them
+            // the only copy.
             at_least(Verdict::Failed);
             notes.push(format!(
-                "{owed} queued report(s) with no webhook configured to send them to"
+                "{} queued report(s) are addressed somewhere this configuration does not send \
+                 to, so nothing here will try them",
+                owed.elsewhere
             ));
         } else {
+            // With no address in the file, a run given `--webhook` and a
+            // `[webhook]` somebody deleted look identical from here, and
+            // guessing in the alarming direction is what failed the supported
+            // one. Worth a line, not a verdict — the direction `watched_pks`
+            // already takes when it cannot settle who is watched.
             at_least(Verdict::Warned);
-            notes.push(format!("{owed} report(s) still waiting to be delivered"));
+            notes.push(format!(
+                "{} queued report(s) are addressed to a webhook this file does not name, so \
+                 only a run given --webhook can send them",
+                owed.elsewhere
+            ));
         }
+    }
+
+    if owed.waiting > 0 {
+        at_least(Verdict::Warned);
+        notes.push(format!(
+            "{} report(s) still waiting to be delivered",
+            owed.waiting
+        ));
     }
 
     Health { verdict, notes }
@@ -1015,10 +1078,35 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
                 lines.push("Sends a report even when nothing changed".to_string());
             }
         }
-        None => lines.push("Sends nothing: the report goes to standard output".to_string()),
+        // What the **file** says, which is not the whole of where a report can
+        // go. `--webhook` on the command line is a supported way to run this and
+        // leaves nothing here to read back, so a flat "sends nothing" described
+        // a monitor that delivers on every run as one that does not — the same
+        // wrong reading the health verdict made of the same field.
+        None => lines.push(
+            "No address here: the report goes to standard output unless a run is given \
+             --webhook"
+                .to_string(),
+        ),
     }
 
     lines.push(watching_line(config));
+
+    // The two facts above are one fact, and they were printed as two unrelated
+    // lines: "Reports to https://…" and "Watches your account and 1 other".
+    // Somebody else's names leaving this machine on every run is the part of
+    // this configuration a person would most want to be reminded of, and it is
+    // the part nothing said. "Their" rather than a count, because
+    // `watching_line` directly above has just said how many.
+    if let Some(webhook) = &config.webhook
+        && config.accounts.iter().any(|a| !a.is_own())
+    {
+        lines.push(format!(
+            "Their usernames and names go to {} with every report",
+            printable(&webhook.url)
+        ));
+    }
+
     lines
 }
 
@@ -1382,7 +1470,14 @@ url = \"https://n8n.internal/hook\"
 
         let ok = ran("ok");
         assert_eq!(
-            health(Some(&configured), &[of(&ok)], &[], 0, NOW).verdict,
+            health(
+                Some(&configured),
+                &[of(&ok)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok,
             "configured, ran just now, nothing owed"
         );
@@ -1392,7 +1487,14 @@ url = \"https://n8n.internal/hook\"
         for lifts in ["rate_limited", "interrupted"] {
             let run = ran(lifts);
             assert_eq!(
-                health(Some(&configured), &[of(&run)], &[], 0, NOW).verdict,
+                health(
+                    Some(&configured),
+                    &[of(&run)],
+                    &[],
+                    deliveries::Owed::default(),
+                    NOW
+                )
+                .verdict,
                 Verdict::Warned,
                 "{lifts} passes on its own"
             );
@@ -1402,32 +1504,116 @@ url = \"https://n8n.internal/hook\"
         // in, and every run until then does nothing at all.
         let dead = ran("no_session");
         assert_eq!(
-            health(Some(&configured), &[of(&dead)], &[], 0, NOW).verdict,
+            health(
+                Some(&configured),
+                &[of(&dead)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Failed
         );
 
-        // Owed reports with somewhere to send them are a wait. With nowhere,
-        // they expire -- and the changes in them are already marked as
-        // reported, so they are the only copy.
+        // Owed reports this configuration could post are a wait.
         assert_eq!(
-            health(Some(&configured), &[of(&ok)], &[], 2, NOW).verdict,
+            health(
+                Some(&configured),
+                &[of(&ok)],
+                &[],
+                deliveries::Owed {
+                    waiting: 2,
+                    elsewhere: 0
+                },
+                NOW
+            )
+            .verdict,
             Verdict::Warned
         );
+        // Addressed to somewhere this file does not name is a different
+        // question, and this one is the answer that used to be wrong: a file
+        // with no address cannot tell a run given --webhook from a [webhook]
+        // somebody deleted, and guessing failed the supported shape on every
+        // poll. `a_report_addressed_elsewhere_is_not_owed_to_this_run` holds
+        // both directions down.
         let no_webhook = config(
             "schema = 1
 every = \"6h\"
 ",
         );
         assert_eq!(
-            health(Some(&no_webhook), &[of(&ok)], &[], 2, NOW).verdict,
-            Verdict::Failed
+            health(
+                Some(&no_webhook),
+                &[of(&ok)],
+                &[],
+                deliveries::Owed {
+                    waiting: 0,
+                    elsewhere: 2
+                },
+                NOW
+            )
+            .verdict,
+            Verdict::Warned,
+            "a file with no address cannot tell --webhook from a deleted section"
         );
 
         // And a machine with nothing configured is not broken, but a bare
         // `snob watch` there has no schedule to run on.
-        let nothing = health(None, &[], &[], 0, NOW);
+        let nothing = health(None, &[], &[], deliveries::Owed::default(), NOW);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
+    }
+
+    /// A queue for an address the file does not name is not a monitor with
+    /// nowhere to send, and one for an address it *has* moved away from is.
+    ///
+    /// The old branch asked `config.webhook.is_none()` over a count of every
+    /// pending row, and got both directions wrong. A run given the address on
+    /// the command line from a unit with no `watch.toml` -- the README's own
+    /// systemd example -- was `Failed` and exit 1 on every poll with one
+    /// delivery failure behind it, while its rows carried a real address the
+    /// next run drains. Meanwhile the shape that really does lose changes, a
+    /// `[webhook] url` moved to a new host with the old queue still standing,
+    /// counted as an ordinary wait and printed "the next run tries them".
+    #[test]
+    fn a_report_addressed_elsewhere_is_not_owed_to_this_run() {
+        let ok = ran("ok");
+        let two_elsewhere = deliveries::Owed {
+            waiting: 0,
+            elsewhere: 2,
+        };
+
+        // The address moved. Those rows can never go, and the changes in them
+        // are already marked as reported, so they are the only copy.
+        let moved = config(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://n8n.new.local/hook\"\n",
+        );
+        let stranded = health(Some(&moved), &[of(&ok)], &[], two_elsewhere, NOW);
+        assert_eq!(stranded.verdict, Verdict::Failed, "{:?}", stranded.notes);
+
+        // The same rows with no `[webhook]` in the file are the shape the README
+        // leads with: the address is on the command line and the next run drains
+        // them. A guess in the alarming direction is what costs a probe its
+        // credibility.
+        let from_the_flag = config("schema = 1\nevery = \"6h\"\n");
+        let fine = health(Some(&from_the_flag), &[of(&ok)], &[], two_elsewhere, NOW);
+        assert_eq!(fine.verdict, Verdict::Warned, "{:?}", fine.notes);
+        assert_eq!(fine.verdict.exit_code(), ExitCode::Ok);
+        assert!(
+            fine.notes.iter().any(|n| n.contains("--webhook")),
+            "and it has to say what would send them: {:?}",
+            fine.notes
+        );
+
+        // And the file that says where reports go says so out loud, because
+        // "Sends nothing" was printed about a monitor that delivers on every
+        // run.
+        assert!(
+            !describe_config(&from_the_flag)
+                .join("\n")
+                .contains("Sends nothing"),
+            "the file names no address; that is not the same as sending nothing"
+        );
     }
 
     /// A file whose schedule the scheduler refuses is a monitor that cannot
@@ -1458,7 +1644,13 @@ every = \"6h\"
         ] {
             let configured = config(refused);
             let ok = ran("ok");
-            let health = health(Some(&configured), &[of(&ok)], &[], 0, NOW);
+            let health = health(
+                Some(&configured),
+                &[of(&ok)],
+                &[],
+                deliveries::Owed::default(),
+                NOW,
+            );
             assert_eq!(
                 health.verdict,
                 Verdict::Failed,
@@ -1471,7 +1663,14 @@ every = \"6h\"
         let good = config("schema = 1\nevery = \"6h\"\n");
         let ok = ran("ok");
         assert_eq!(
-            health(Some(&good), &[of(&ok)], &[], 0, NOW).verdict,
+            health(
+                Some(&good),
+                &[of(&ok)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok
         );
     }
@@ -1497,7 +1696,13 @@ every = \"6h\"
             reported: ListKind::Followers,
             missing: Some(ListKind::Following),
         };
-        let blind = health(Some(&configured), &[of(&ok)], &[half], 0, NOW);
+        let blind = health(
+            Some(&configured),
+            &[of(&ok)],
+            &[half],
+            deliveries::Owed::default(),
+            NOW,
+        );
         assert_eq!(blind.verdict, Verdict::Warned, "{:?}", blind.notes);
         assert!(
             blind
@@ -1515,7 +1720,14 @@ every = \"6h\"
             missing: None,
         };
         assert_eq!(
-            health(Some(&configured), &[of(&ok)], &[whole], 0, NOW).verdict,
+            health(
+                Some(&configured),
+                &[of(&ok)],
+                &[whole],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok
         );
     }
@@ -1535,7 +1747,14 @@ every = \"6h\"
 
         let recent = ran("ok");
         assert_eq!(
-            health(Some(&configured), &[of(&recent)], &[], 0, NOW).verdict,
+            health(
+                Some(&configured),
+                &[of(&recent)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok
         );
 
@@ -1544,7 +1763,13 @@ every = \"6h\"
             started_at: NOW - 7 * 3_600,
             ..ran("ok")
         };
-        let one = health(Some(&configured), &[of(&late)], &[], 0, NOW);
+        let one = health(
+            Some(&configured),
+            &[of(&late)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+        );
         assert_eq!(one.verdict, Verdict::Warned, "{:?}", one.notes);
 
         // Three weeks is nobody coming back.
@@ -1552,7 +1777,13 @@ every = \"6h\"
             started_at: NOW - 21 * 86_400,
             ..ran("ok")
         };
-        let stopped = health(Some(&configured), &[of(&gone)], &[], 0, NOW);
+        let stopped = health(
+            Some(&configured),
+            &[of(&gone)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+        );
         assert_eq!(stopped.verdict, Verdict::Failed, "{:?}", stopped.notes);
         assert!(
             stopped
@@ -1575,14 +1806,28 @@ every = \"6h\"
 
         let weekly = config("schema = 1\non = [\"mon\"]\nat = [\"09:00\"]\n");
         assert_eq!(
-            health(Some(&weekly), &[of(&two_days_ago)], &[], 0, NOW).verdict,
+            health(
+                Some(&weekly),
+                &[of(&two_days_ago)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok,
             "two days is not late for a weekly schedule"
         );
 
         let six_hourly = config("schema = 1\nevery = \"6h\"\n");
         assert_ne!(
-            health(Some(&six_hourly), &[of(&two_days_ago)], &[], 0, NOW).verdict,
+            health(
+                Some(&six_hourly),
+                &[of(&two_days_ago)],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
             Verdict::Ok,
             "and it very much is for a six-hourly one"
         );
@@ -1607,7 +1852,13 @@ every = \"6h\"
             who: "@stranger".to_string(),
             watched: false,
         };
-        let health = health(Some(&configured), &[orphan], &[], 0, NOW);
+        let health = health(
+            Some(&configured),
+            &[orphan],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+        );
 
         assert_eq!(health.verdict, Verdict::Ok, "{:?}", health.notes);
         assert!(
