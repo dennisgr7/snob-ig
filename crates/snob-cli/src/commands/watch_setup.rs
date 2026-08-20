@@ -41,9 +41,7 @@ pub async fn setup(
         .into());
     }
 
-    if let Some(existing) = config::load(paths)?
-        && !args.dry_run
-    {
+    if let Some(existing) = existing_to_replace(paths, args.dry_run)? {
         ui::info(&format!(
             "There is already a configuration at {}.",
             config::path(paths).display()
@@ -115,6 +113,27 @@ pub async fn setup(
 
     ui::info("Start it with \"snob watch\", or put \"snob watch once\" on a timer.");
     Ok(ExitCode::Ok)
+}
+
+/// The configuration this run would replace, if it would replace one.
+///
+/// The flag is an argument rather than a second condition on the read, because
+/// in a let-chain the scrutinee is evaluated first: `config::load(paths)?` fired
+/// before `!args.dry_run` could short-circuit, so the flag documented as "print
+/// what would be written and write nothing" died on a file it had already
+/// decided not to touch. One mistyped key does it — `evry = "6h"` — and the
+/// message is a good one, naming the file, the line and the key. What is wrong
+/// is that the command whose whole job is to show you what a correct file looks
+/// like is the one that refuses to run when yours is not.
+///
+/// A function rather than two lines inline so that the order can be tested at
+/// all: `setup` refuses without a terminal several statements before it reaches
+/// here, and nothing a test can call would otherwise ever get this far.
+fn existing_to_replace(paths: &AppPaths, dry_run: bool) -> Result<Option<WatchConfig>> {
+    if dry_run {
+        return Ok(None);
+    }
+    Ok(config::load(paths)?)
 }
 
 /// About how many accounts one request brings back.
@@ -921,6 +940,39 @@ mod tests {
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
+    }
+
+    /// `--dry-run` does not read the file it has already decided not to touch.
+    ///
+    /// The read was the scrutinee of a let-chain, so its `?` fired before the
+    /// flag could short-circuit, and `snob watch setup --dry-run` -- documented
+    /// as "print what would be written and write nothing" -- died on an existing
+    /// `watch.toml` with a typo in it. That is the file somebody runs
+    /// `--dry-run` to compare against.
+    ///
+    /// Both directions, because only one of them is the defect: a real run has
+    /// to keep reading, or it would replace a configuration without showing what
+    /// it was replacing.
+    #[test]
+    fn a_dry_run_does_not_read_the_file_it_will_not_touch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(tmp.path());
+        config::write(
+            &paths,
+            "schema = 1
+evry = \"6h\"
+",
+        )
+        .unwrap();
+
+        assert!(
+            existing_to_replace(&paths, true).unwrap().is_none(),
+            "a dry run writes nothing, so it has nothing to ask about replacing"
+        );
+        assert!(
+            existing_to_replace(&paths, false).is_err(),
+            "a real run is about to overwrite it, so it still has to read it"
+        );
     }
 
     #[test]
