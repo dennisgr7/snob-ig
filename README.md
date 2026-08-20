@@ -263,8 +263,14 @@ carries the same one. `run.at` is when the run concluded, in epoch seconds, and
 `not_verified` or `incomplete` means that list was not compared, so its zeros in
 `counts` mean "not looked at" rather than "nothing happened". `events` holds one
 array per kind of change and is shown here with one of them; `lists.followers`
-and `lists.following`, left out above, carry each list's basis and the window it
-covers, or `null` for a list this run did not compare.
+and `lists.following`, left out above, carry each list's basis, how many accounts
+it holds, and two moments, or `null` for a list this run did not compare. The two
+moments are not the ends of a window and one is not always before the other:
+`since` is when this list was last *reported* on and `until` is when the capture
+being reported was *taken*. A run that walked the list has `since` before
+`until`; a run that found the counters unmoved and served the list out of storage
+has it the other way round, because the receipt was written after the capture it
+points at.
 
 `--header "Authorization: Bearer …"` for an endpoint that wants one, and
 `--sign-with` to have the body signed with HMAC-SHA256 in an `X-Snob-Signature`
