@@ -211,9 +211,15 @@ impl WebhookClient {
                 // transient: n8n answers 404 for a workflow that is not
                 // currently registered, a reverse proxy answers 404 or 403 while
                 // it reloads, an expired bearer token answers 401. The far end
-                // is the user's own server, so eight attempts over five hours
-                // costs nothing that matters, and the attempt and age bounds
-                // still stop it going on for ever.
+                // is the user's own server, so retrying costs nothing that
+                // matters, and the attempt and age bounds still stop it going on
+                // for ever. The number is `deliveries::MAX_ATTEMPTS`, and it is
+                // deliberately not written out here: it was eight when this was
+                // written, and eight of a doubling backoff reaches its ceiling
+                // long before `MAX_AGE_SECS` does, so the age bound was
+                // unreachable and a receiver down over a weekend lost the
+                // change. A comment carrying the old number is where somebody
+                // finds it and puts it back.
                 //
                 // `Refused` is left for a request that could not be sent at all,
                 // which is the only failure retrying genuinely cannot change.

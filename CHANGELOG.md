@@ -31,10 +31,15 @@ without being told to.
 with `--header "Authorization: Bearer ..."` for an endpoint that wants one and
 `--sign-with` to have the body signed — HMAC-SHA256, sent as
 `X-Snob-Signature: sha256=...`, the shape you already have a snippet for. The
-JSON is built for an automation to branch on: `counts.followers_lost` is there
-next to the arrays so a condition does not have to reach into one, `event` tells
-a report from a heartbeat without looking inside, and `run.looked` says whether
-this run could see at all — which empty arrays cannot. `run.lists` says it per
+JSON is built for an automation to branch on: `schema` is the version of the
+shape, at the top where a receiver can check it before reading anything else —
+it moves when a field is removed or changes meaning, never when one is added, so
+a workflow written against schema 1 keeps working. Every message carries it: the
+report, the heartbeat, the preflight and each line of the `--json` stream.
+`counts.followers_lost` is there next to the arrays so a condition does not have
+to reach into one, `event` tells a report from a heartbeat without looking
+inside, and `run.looked` says whether this run could see at all — which empty
+arrays cannot. `run.lists` says it per
 list, so a list a cooldown refused is told apart from one that was read and had
 not moved: both leave zeros in `counts`, and only one of them means "nothing
 happened". Every message carries the same `run` object — including the
@@ -70,8 +75,20 @@ is checked when you give the address, not six hours later.
 Scheduler entry needs nothing but `snob watch`. It asks the questions, writes a
 `watch.toml` you can edit afterwards, and puts any token or signing key in the
 system keyring rather than in that file — which is what lets the unit file hold
-nothing sensitive. `snob watch status` reads back what is configured, when each
-list was last reported on, and what is still owed. `snob purge` takes the new
+nothing sensitive. It asks how far a run may be pushed past its moment as well,
+and writes it: that setting was readable everywhere and written nowhere, so the
+only way to set it was to edit the file by hand. It is refused if it is larger
+than the gap between two runs can spare, rather than being quietly clamped at
+every start, and on a schedule with no room to spare it says so instead of
+asking. When it records an answer for somebody else's account it names the
+address too, because that one answer authorizes two things: reading their lists,
+and sending their names to whatever is on the other end.
+
+`snob watch status` reads back what is configured, when each list was last
+reported on, and what is still owed — split in two, because a report addressed
+to somewhere this configuration no longer names is not one the next run will
+try. It says so for each, and `--json` carries both counts under `deliveries`
+beside the total it always had. `snob purge` takes the new
 keyring entries with it, like everything else.
 
 **`snob watch check` says whether a scheduled run would work**, before one runs
@@ -81,7 +98,11 @@ session, and which store the credential landed in; each watched account —
 that it resolves, that an unattended run may read it, and its counters, so an
 account past the size this tool can walk is found before six hours of walking
 rather than after; and the webhook, by posting one `watch.preflight` message to
-it with your headers and your signature. It writes nothing and walks no list,
+it with your headers and your signature. `--no-webhook` leaves the receiver
+alone and checks everything else — the address and every configured header still
+go through the same validation, and the report still names the address, so
+"nothing was posted" is told apart from "there is nowhere to post". It writes
+nothing and walks no list,
 and it exits non-zero when something would stop a run — which makes it usable as
 a probe rather than only as something to read. Poll it hourly rather than by the
 minute: it costs one request for the session and one per account, charged to the
@@ -150,6 +171,26 @@ Seven things here change what a script sees, so they come first:
   figure in that answer no flag refreshes.
 
 And the corrections worth knowing about:
+
+- A watched account named with a leading at sign is the same account as one
+  named without, whether it was typed at `snob watch` or written into
+  `watch.toml`. The two spellings used to be two accounts: a name typed with the
+  sign matched no recorded answer, so a monitor that had been set up correctly
+  refused to start over a consent it had just read out of the file, and one
+  written into the file with the sign was asked about at Instagram with the sign
+  still on it and reported as an account that does not exist.
+- Jitter is measured against the day the run is really due on, in your zone, and
+  not against a nominal 86400 seconds. On the one day a year a zone springs
+  forward, a large configured jitter could push a run past the next moment on
+  its own grid — which then read as one run for two days and none missed — or
+  onto a day the calendar does not name at all.
+- Old captures, settled deliveries and the run log are expired by a run that
+  cannot start as well as by one that runs. A session that had been logged out,
+  a webhook address the checks refuse, or a hand-edited schedule the scheduler
+  will not build each end a run before anything is opened — and while that
+  lasted nothing was ever expired: the queue went on counting reports no run
+  would ever hand back, with `snob watch status` promising the next one would
+  try them.
 
 - A crossing of two stored lists compares the gap between the two walks rather
   than between the moments they finished, so `unfollowers --cache` on an

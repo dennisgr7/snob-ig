@@ -176,8 +176,8 @@ something to say from then on.
 snob watch setup
 ```
 
-Asks how often to look and where to send the reports, then writes a file you can
-edit. It finishes by trying all of it — the schedule, the session, that each
+Asks how often to look, how far each run may be pushed past its moment, and
+where to send the reports, then writes a file you can edit. It finishes by trying all of it — the schedule, the session, that each
 account resolves and can be read, and the webhook, by posting one message to it
 — so a typo or an expired token turns up while you are still there rather than
 in an unattended run at three in the morning. Then it offers to take the first
@@ -191,11 +191,14 @@ snob watch check    # would a scheduled run work? exits non-zero if not
 snob watch status   # what is configured, when it last ran, and whether it is healthy
 ```
 
-`check` writes nothing and walks no list, so it is safe to run as often as you
-like — one request for the session and one per watched account. Both it and
-`status` exit non-zero when something would stop the monitor doing its job,
-which is what makes them usable from a monitoring system rather than only
-readable.
+`check` writes nothing and walks no list, so it is safe to repeat — but poll it
+hourly rather than by the minute. It costs one request for the session, one per
+watched account, and one more until the session has learned its own account's
+name, and all of them come out of the same daily budget the walks draw on: a
+probe that drains it causes the condition it is watching for. `--no-webhook`
+leaves the receiver alone and checks everything else. Both it and `status` exit
+non-zero when something would stop the monitor doing its job, which is what
+makes them usable from a monitoring system rather than only readable.
 
 Or say it directly: `--every 6h`, `--on mon,thu --at 09:00`, or
 `--cron "0 9 * * 1,4"` if you already have one written. The two combine, so
@@ -204,7 +207,9 @@ Or say it directly: `--every 6h`, `--on mon,thu --at 09:00`, or
 **A run with nothing to report costs one request.** It reads your counters and
 only walks a list if its counter moved, which is what makes running it every few
 hours reasonable. Each run is nudged a little past its due moment so the walks
-do not start on the same second every day.
+do not start on the same second every day; `--jitter` says how far and
+`--jitter 0` turns it off. A schedule whose runs are already as close together
+as the tool allows has no room to be nudged, and none is taken.
 
 ### Sending it somewhere
 
@@ -246,6 +251,11 @@ it without digging through arrays:
   }
 }
 ```
+
+`schema` is the version of this shape. It moves when a field is removed or
+changes meaning and never when one is added, so a workflow written against 1
+keeps working; every message carries it, including the one `snob watch check`
+posts and every line of the `--json` stream.
 
 `run.id` is the value to deduplicate on: delivery is at-least-once and a retry
 carries the same one. `run.at` is when the run concluded, in epoch seconds, and
