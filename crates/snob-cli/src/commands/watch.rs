@@ -1589,14 +1589,14 @@ async fn send_one(
         (Attempt::Delivered { .. }, _) => {}
         (_, Some(deliveries::Outcome::Retrying(at))) => ui::warn(&format!(
             "the report could not be delivered ({}); it is queued and will be tried again {}",
-            error_of(&outcome),
+            outcome.error(),
             describe_when(at, now)
         )),
         (_, Some(deliveries::Outcome::GaveUp(reason))) => ui::warn(&format!(
             "the report could not be delivered ({}). {} It will not be tried again, and what it \
              said is not reported a second time: the next run compares against what this one \
              already counted.",
-            error_of(&outcome),
+            outcome.error(),
             match reason {
                 deliveries::GaveUp::Refused => "The request could not be sent at all.",
                 deliveries::GaveUp::OutOfAttempts => "Every attempt was refused.",
@@ -1607,19 +1607,12 @@ async fn send_one(
         // run tries it again.
         (_, None) => ui::warn(&format!(
             "the report could not be delivered ({})",
-            error_of(&outcome)
+            outcome.error()
         )),
     }
 }
 
 /// The far end's answer, whatever shape the attempt came back in.
-fn error_of(attempt: &Attempt) -> &str {
-    match attempt {
-        Attempt::Delivered { .. } => "",
-        Attempt::Failed { error, .. } | Attempt::Refused { error, .. } => error,
-    }
-}
-
 /// "in 4m", for a moment in the near future.
 fn describe_when(at: i64, now: i64) -> String {
     match at.checked_sub(now) {
