@@ -191,6 +191,14 @@ wants to *know* whether a walk could be continued asks `is_resumable`, which
 does not claim — asking with `resumable` handed the claim back to the process
 that was exiting.
 
+The two of them ask one predicate — `RESUMABLE`, one string — and differ only in
+a bound value: `resumable` binds `this_process()`, so a run may take back its own
+claim after a restart inside the window, while `is_resumable` binds `None`, so
+`claimed_by = NULL` is NULL and the clause goes inert. That asymmetry is
+load-bearing in one direction only. Bind `this_process()` on the asking side and
+the advice on screen promises a continuation the next invocation refuses, which
+is the defect that made every interrupted walk start again at page one.
+
 Configuration is the other half, and it goes in the **roaming** directory where
 it belongs — one file, `watch.toml`, written by `snob watch setup`. Nothing else
 writes there and `ensure_dirs` still does not create it, so somebody who never
@@ -227,11 +235,14 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
+| There is one spelling of each outcome token | `ExitCode::as_str`, with `from_token` derived from it over `ExitCode::ALL` rather than written as a second match. `watch_setup::health` matched the literals inline: respell one there and every recorded cooldown falls through to the failing arm, so `status` exits 1 for a monitor that will resume on its own — and the fixture those tests build their rows from spelled the same literals, so the suite would have moved with the defect |
+| A report is too old to be news in one place | `deliveries::still_news_after`, which `due`, `failed` and `expire_stale` all read. It was three hand-written comparisons and they disagreed at exactly a day: `due` handed the report out as news, `failed` gave up on it, and `prune` left it `pending` for ever |
+| The row retention keeps is the row `status` shows | the `newest_run` view: `prune` exempts what it selects and `last_runs` reads from it, so `started_at DESC, id DESC` cannot mean one thing in one place and another in the other. `started_at` is whole seconds and two runs of one account inside a second are reachable — `snob watch once` beside a scheduled tick consults no schedule and no gap — so a tie-break added to one site alone has `prune` delete the row `status` is displaying |
 | Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all`, which `purge::execute` calls unconditionally — gating it on there being a session left the monitor's secrets behind after `logout`. `logout` calls `delete`, which takes the session and nothing else |
 | Expiring old captures never takes the one a comparison needs | `store::watch::prune`, which excludes what `watch_marks` points at |
 | Owed reports are retried by any run, not only by one that had news | `run_accounts` drains the queue once per run, after every account and whatever the accounts did, bounded by `DRAIN_LIMIT` — `deliver` deliberately does not. Both modes go through it, which is what stops one of the two keeping the rule and the other not. It takes an `App` rather than opening one, so a test can watch it happen |
 | A queued report can only go to the address it was addressed to | `watch_deliveries.destination`, which `deliveries::due` filters on |
-| A credential set up for one host is not sent to another | `delivery_from` compares origins before attaching the keyring token or the file's headers |
+| Headers configured for one host are not sent to another | `plan`, in the same origin comparison that gates the token — the file's `[webhook.headers]` are dropped when `--webhook` names a different origin, and a warning says which address they were configured for rather than the run sending them silently |
 | A rename is found wherever it happened, and reported once | `engine::watch::compare` reads every list this run verified, from the account's one cursor, and deduplicates by `pk` |
 | The rename cursor moves only when a window was read | `commit_report` takes `Option<i64>`; a run that compared nothing passes `None` |
 | A resolved account is reused only for the account it was resolved for | `App::resolved_target` keys on the question, not only the answer |
@@ -246,7 +257,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A push-back the body could not be read from is still a push-back | `IgClient::get` classifies from the status it already has when the body fails, rather than letting the read failure become a retryable network error |
 | A credential is sent only to the address it was stored for | `plan`, for the token **and** the signing key, treating an absent or unparseable configured origin as a different destination |
 | A calendar moment that went by is taken, not lost | `schedule::next_after` looks back from `now` to the floor before it looks forward |
-| Jitter cannot cost the next run | `Schedule::room_for_jitter` — the gap less the floor between two runs, applied to the default as well as to `--jitter` |
+| Jitter cannot cost the next run | `Schedule::room_for_jitter` bounds the grid — the gap less the floor between two runs, and no further than midnight when the days are restricted — applied to the default as well as to `--jitter`. `schedule::wake_at` narrows it again at each moment, in the zone, because seconds-of-day arithmetic is an hour too generous on the day a zone springs forward |
 | One wall-clock moment is one run, in a zone that repeats an hour | `schedule::already_run_at_this_wall_clock`, asked in the direction ambiguity exists in |
 | The rename cursor moves only over what this run could read | `engine::watch::compare` advances it only when every list the account has a capture of was accounted for, baselines included |
 | A rename filed mid-comparison waits for the next window | `store::watch::renames_since` bounds above by the `head` the caller read first |
@@ -524,9 +535,17 @@ deliberately unfinished:
     `s <= gap - step`. Nothing subtracted the step and the calendar default was
     a flat fifteen minutes — exactly `MIN_GAP_SECS` — so `--cron "*/15 * * * *"`
     ran every half hour while the banner printed what was typed.
-    `Schedule::room_for_jitter` is the whole of it, and it takes the interval as
+    `Schedule::room_for_jitter` bounds the grid, and it takes the interval as
     the step when there is one: `--every 2w --on mon` has a weekly grid and a
-    fortnightly floor, so its room is zero.
+    fortnightly floor, so its room is zero. It also stops at the last moment of
+    the day when the days are restricted, because past midnight is a day the
+    calendar does not name. That is not the whole of it: the arithmetic is
+    seconds-of-day, and a day a zone springs forward through is an hour shorter
+    than 86400, so on that one day it allows an hour the day does not hold.
+    `wake_at` is what the loop calls, and it asks the calendar in the zone from
+    the moment actually due — the next moment less the floor, and no further
+    than the local midnight after it. It only ever narrows, which is what keeps
+    the banner honest about what it has already printed.
   - **An hour a fall-back repeats is one run, not two.** `--at 01:30` in a zone
     that puts its clocks back names two instants an hour apart, and the floor is
     fifteen minutes. Two comments claimed this was handled and neither was:
@@ -557,6 +576,15 @@ deliberately unfinished:
     complete capture of each list (what the cache serves), and any incomplete
     one (a resume somebody may be mid-way through). `store::watch::prune` says
     so; `secure_delete` is on for exactly this.
+
+    Two other tables are swept in the same call. The run log goes at thirty
+    days, **except the newest row of each account, whatever its age** — that is
+    what `watch_setup::health` reads, and without the exemption a monitor whose
+    session expired would age out of "the last run ended in no_session" and exit
+    1 into "it has not run yet" and exit 0, which is a probe going green while
+    nothing was fixed. The outbox settles itself: `deliveries::expire_stale`
+    gives up on a report that reached a day, and `forget_settled` forgets a
+    delivered one after seven.
 
 ## Known walls
 
