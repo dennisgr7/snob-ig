@@ -1272,9 +1272,11 @@ struct Delivery {
     /// Whether the body will carry `X-Snob-Signature`. Held so `check` can say
     /// what it just sent rather than guessing at what the client did.
     signed: bool,
-    /// The origin this run posts to. Written onto every report it queues and used
-    /// to filter the outbox, so a queued report can only ever be sent to the
-    /// address it was addressed to.
+    /// The address this run posts to, as [`destination_of`] spells it. Written
+    /// onto every report it queues and used to filter the outbox, so a queued
+    /// report can only ever be sent to the address it was addressed to — and
+    /// read back by `snob watch status`, which has to ask the queue the same
+    /// question a run would.
     destination: String,
 }
 
@@ -1525,8 +1527,8 @@ fn delivery_from(
     webhook::check(&planned.webhook)?;
 
     Ok(Some(Delivery {
-        // The origin this run posts to, kept beside the client so the outbox can
-        // be filtered by it: a queued report belongs to the address it was
+        // The address this run posts to, kept beside the client so the outbox
+        // can be filtered by it: a queued report belongs to the address it was
         // addressed to, and `--webhook` must not flush a backlog somewhere else.
         destination: destination_of(&planned.webhook.url),
         signed: planned.webhook.key.is_some(),
@@ -1554,7 +1556,7 @@ fn delivery_from(
 ///   with that token on it and marked it delivered. Verbatim the failure
 ///   `deliveries::due` documents and `005_destination.sql` was written to
 ///   close, with the guard drawn one URL level too high.
-fn destination_of(url: &Url) -> String {
+pub(super) fn destination_of(url: &Url) -> String {
     url.as_str().to_string()
 }
 

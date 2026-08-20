@@ -259,7 +259,65 @@ fn backoff(attempts: i64) -> i64 {
         .min(MAX_BACKOFF_SECS)
 }
 
-/// How many reports are waiting, for `snob watch status` to report.
+/// A count of the queue, split by whether this configuration could post it.
+///
+/// One integer could not answer both questions, and two readers asked it the
+/// wrong one. [`pending`] counts every row in the state — no destination, no age
+/// bound — while [`due`] hands back only what is addressed here: so after
+/// `[webhook] url` moved from one receiver to another, `status` printed "2
+/// reports are waiting to be delivered; the next run tries them" about rows
+/// `due` can never return, and the health verdict failed the monitor over them.
+/// Nothing is lost by refusing an old-destination row — that is the settled
+/// rule, and `store::watch::prune` expires it at a day — but a probe told the
+/// wrong number in the alarming direction is one people switch off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Owed {
+    /// Reports this destination could post: addressed here, or carrying no
+    /// address at all because they were queued before the column existed.
+    pub waiting: usize,
+    /// Reports addressed elsewhere. Not owed to this run, and unless something
+    /// else posts to that address they expire where they are — which is worth
+    /// saying separately rather than counting in with the rest.
+    pub elsewhere: usize,
+}
+
+/// What is queued, for `snob watch status` to report.
+///
+/// `destination` is the address the caller could post to, in the spelling
+/// [`enqueue`] recorded — `commands::watch::destination_of`, for a caller that
+/// builds no delivery of its own. `None` is a configuration that names no
+/// address: it can post nothing, so nothing is owed to *it*, whatever the rows
+/// say. That is deliberately not the same as "orphaned". A run given `--webhook`
+/// on the command line — which is how the README's own systemd example runs —
+/// queues rows this file knows nothing about and drains them again on its next
+/// tick, and nothing here can tell that apart from a `[webhook]` somebody
+/// deleted. Whoever reads this decides what a guess is worth; this only counts.
+///
+/// The age bound `due` also applies is deliberately not repeated. A row past it
+/// is expired by `prune` on the next settle rather than left `pending`, so
+/// filtering it out here would print 0 while rows sit in the table — the same
+/// failure this exists to fix, in the other direction.
+pub fn owed(conn: &Connection, destination: Option<&str>) -> Result<Owed, StoreError> {
+    let (waiting, elsewhere): (i64, i64) = conn.query_row(
+        "SELECT
+           count(*) FILTER (WHERE ?1 IS NOT NULL AND (destination IS NULL OR destination = ?1)),
+           count(*) FILTER (WHERE ?1 IS NULL OR (destination IS NOT NULL AND destination <> ?1))
+         FROM watch_deliveries
+         WHERE state = 'pending'",
+        params![destination],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(Owed {
+        waiting: waiting as usize,
+        elsewhere: elsewhere as usize,
+    })
+}
+
+/// The whole queue, whoever it belongs to.
+///
+/// Kept for the tests that assert a row was settled. Anything reported to a
+/// person goes through [`owed`], which asks `due`'s question rather than this
+/// one.
 pub fn pending(conn: &Connection) -> Result<usize, StoreError> {
     let count: i64 = conn.query_row(
         "SELECT count(*) FROM watch_deliveries WHERE state = 'pending'",
@@ -569,6 +627,64 @@ mod tests {
             vec![owed],
             "and it is still owed at the address it was addressed to"
         );
+    }
+
+    /// What a person is told is owed is what a run could actually post.
+    ///
+    /// `pending` counts every pending row and two readers took it for `due`'s
+    /// answer. Move `[webhook] url` from one receiver to another with reports
+    /// queued and `snob watch status` says "2 reports are waiting to be
+    /// delivered; the next run tries them" about a row `due` can never return,
+    /// while the health verdict fails the monitor over it. Nothing is lost by
+    /// refusing the old row -- that is the settled rule, and `prune` expires it
+    /// at a day -- but a probe told the wrong number in the alarming direction
+    /// is one people switch off, and then the right number never reaches anybody
+    /// either.
+    #[test]
+    fn what_is_owed_is_split_from_what_is_addressed_elsewhere() {
+        let db = store();
+        enqueue(db.conn(), "here", ME, "{}", 1_000, Some(HERE)).unwrap();
+        enqueue(
+            db.conn(),
+            "there",
+            ME,
+            "{}",
+            1_000,
+            Some("https://bin.example"),
+        )
+        .unwrap();
+        // Queued before the column existed, so it belongs to whoever asks.
+        enqueue(db.conn(), "legacy", ME, "{}", 1_000, None).unwrap();
+
+        let here = owed(db.conn(), Some(HERE)).unwrap();
+        assert_eq!(
+            here,
+            Owed {
+                waiting: 2,
+                elsewhere: 1
+            },
+            "the row for {HERE} and the one with no address are owed here; the other is not"
+        );
+        assert_eq!(
+            due(db.conn(), 1_000, 10, HERE).unwrap().len(),
+            here.waiting,
+            "what is reported as owed has to be what a run would be handed"
+        );
+
+        // A configuration naming no address can post nothing at all, so nothing
+        // is owed to it -- and it cannot tell a row queued by a `--webhook` run
+        // from one whose `[webhook]` was deleted, which is why that is a
+        // separate number rather than a verdict.
+        assert_eq!(
+            owed(db.conn(), None).unwrap(),
+            Owed {
+                waiting: 0,
+                elsewhere: 3
+            }
+        );
+
+        // However it is split, nothing falls out of the total.
+        assert_eq!(here.waiting + here.elsewhere, pending(db.conn()).unwrap());
     }
 
     /// The id the receiver deduplicates on has to be unique, or two runs could
