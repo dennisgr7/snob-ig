@@ -446,7 +446,35 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
             continue;
         }
 
-        let (_, outcome) = engine::list(app, &args, kind).await?;
+        // A cooldown stops *this list*; everything else stops the run.
+        //
+        // The cancel branch above records a refusal and carries on, and an
+        // `Err` got no such treatment — so a completed followers walk whose
+        // diff names three departures was thrown away with the second list's
+        // failure, and no `watch_runs` row was written either. Nothing is lost
+        // permanently: the capture is stored and the mark did not move, so the
+        // next tick reports the same departures. On `--every 24h` that is a day
+        // late, which is a long time to sit on "three people left".
+        //
+        // Classified rather than blanket-caught, and that distinction is the
+        // whole item. Mapping every `Err` to a refusal would swallow a consent
+        // refusal, a session that has gone and a challenge as "one list was
+        // skipped" — turning the failures a run must surface into a short
+        // report nobody notices. `RateLimited` is the one that is genuinely
+        // scoped to what could be read now and lifts on its own, which is
+        // exactly what `Skipped` was written to describe, and it is what both
+        // `refuse_in_cooldown` and `refuse_cooldown_mid_walk` carry.
+        let outcome = match engine::list(app, &args, kind).await {
+            Ok((_, outcome)) => outcome,
+            Err(e) if ExitCode::from_chain(&e) == Some(ExitCode::RateLimited) => {
+                lists.push(TickList {
+                    kind,
+                    skipped: Some(Skipped::Incomplete(StopReason::RateLimit)),
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         pk = outcome.account_pk;
 
         let skipped = refusal(&outcome);

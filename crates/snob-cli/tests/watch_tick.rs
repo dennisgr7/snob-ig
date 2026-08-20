@@ -662,6 +662,92 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
     }
 }
 
+/// A cooldown on the second list does not throw the first one's news away.
+///
+/// The cancel branch records a refusal and carries on; an `Err` did not, so a
+/// completed followers walk whose diff names a departure was discarded with the
+/// second list's failure, and no `watch_runs` row was written either. Nothing
+/// was lost permanently — the capture is stored and the mark did not move — but
+/// on `--every 24h` that is a day late with "somebody left".
+///
+/// The classification is the point: only a cooldown is scoped to what could be
+/// read now. A consent refusal, a session that has gone or a challenge must
+/// still stop the run rather than become "one list was skipped".
+#[tokio::test]
+async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
+    use snob_core::store::rate_budget::RateBudgetError;
+
+    /// Free until the run has spent a couple of requests, then standing — the
+    /// shape of another process writing a cooldown while this one is between
+    /// its two lists. Counted on `reserve`, which is charged once per request
+    /// that really goes out.
+    struct CooldownAfterTheFirstList(std::sync::atomic::AtomicUsize);
+    impl RateBudget for CooldownAfterTheFirstList {
+        fn reserve(&self) -> Result<std::time::Duration, RateBudgetError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(std::time::Duration::ZERO)
+        }
+        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            let spent = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            Ok((spent >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+        }
+        fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {
+            Ok(0)
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Run one: a baseline for followers only. Following never gets a capture,
+    // so when the cooldown lands there is nothing stored to serve from it —
+    // which is what makes `engine::list` answer `Err` rather than a refusal.
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 1).await;
+        mount_list(&server, "followers", &[1, 2]).await;
+        // No route for `following` on purpose: its walk fails, so it ends this
+        // run with no capture at all. That is what makes the cooldown below
+        // answer `Err` — `cooldown::serve` has nothing stored to hand back —
+        // rather than quietly serving a stale list.
+
+        let mut app = app(&server, open_db(tmp.path()));
+        run(&mut app, &Watched::own()).await;
+        assert!(
+            snob_core::store::snapshots::latest_complete(app.db().conn(), 42, ListKind::Following)
+                .unwrap()
+                .is_none(),
+            "the fixture depends on following having nothing stored"
+        );
+    }
+
+    // Run two: followers loses somebody and is walked, and the cooldown lands
+    // once that is paid for.
+    let server = MockServer::start().await;
+    mount_profile(&server, 1, 1).await;
+    mount_list(&server, "followers", &[1]).await;
+    mount_list(&server, "following", &[9]).await;
+
+    let budget = Arc::new(CooldownAfterTheFirstList(Default::default()));
+    let mut app = app_with(&server, open_db(tmp.path()), budget);
+    let tick = watch::tick(&mut app, &Watched::own())
+        .await
+        .expect("the first list's news must survive the second list's cooldown");
+
+    assert_eq!(
+        tick.report.changes().followers.lost.len(),
+        1,
+        "the departure the first list found is what this run is for: {:?}",
+        tick.report.changes()
+    );
+    assert!(
+        tick.lists
+            .iter()
+            .any(|l| l.kind == ListKind::Following && l.skipped.is_some()),
+        "and the list that could not be read says so: {:?}",
+        tick.lists
+    );
+}
+
 /// A rename in the list that *was* read is not announced again next run.
 ///
 /// The other half of the same cursor, and it pulls the opposite way. Whether a
