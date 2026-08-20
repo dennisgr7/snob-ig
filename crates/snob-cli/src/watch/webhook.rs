@@ -75,6 +75,36 @@ pub enum Attempt {
     },
 }
 
+impl Attempt {
+    /// The HTTP code the far end answered with, when it answered at all.
+    ///
+    /// `Refused` is deliberately `None` even though it carries a `status: 0`:
+    /// that zero means the request was never built, and reporting it as an HTTP
+    /// code would say the server sent something it never sent.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Delivered { status } => Some(*status),
+            Self::Failed { status, .. } => *status,
+            Self::Refused { .. } => None,
+        }
+    }
+
+    /// What went wrong, in whatever words the far end or the client used.
+    ///
+    /// On the type rather than a free function beside one of the callers. It was
+    /// a private `error_of` in `commands::watch`, which meant `engine::check`
+    /// could not reach it and formatted the whole `Attempt` with `Debug`
+    /// instead — putting Rust struct syntax in front of the person and an
+    /// uncontracted rendering in front of a probe, from the module the rules say
+    /// decides how nothing looks.
+    pub fn error(&self) -> &str {
+        match self {
+            Self::Delivered { .. } => "",
+            Self::Failed { error, .. } | Self::Refused { error, .. } => error,
+        }
+    }
+}
+
 impl WebhookClient {
     /// Builds the client.
     ///

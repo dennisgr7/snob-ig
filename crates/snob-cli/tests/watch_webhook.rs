@@ -466,6 +466,55 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
 
 /// A receiver that is not there is a failure worth a red line, not a warning.
 #[tokio::test]
+async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
+    use snob_cli::engine::check::{Verdict, What};
+
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"message":"The requested webhook is not registered."}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let client = WebhookClient::new(Webhook {
+        url: Url::parse(&format!("{}/hook", server.uri())).unwrap(),
+        headers: vec![],
+        key: None,
+    })
+    .unwrap();
+
+    let checked = snob_cli::engine::check::webhook_of(
+        &client,
+        server.uri(),
+        false,
+        "preflight-404",
+        r#"{"event":"watch.preflight"}"#,
+    )
+    .await;
+
+    assert_eq!(checked.verdict, Verdict::Failed);
+    assert!(
+        matches!(
+            checked.what,
+            What::Webhook {
+                status: Some(404),
+                ..
+            }
+        ),
+        "the code the far end answered with is the whole point of asking: {:?}",
+        checked.what
+    );
+    let problem = checked.problem.expect("it has to say what went wrong");
+    assert!(
+        !problem.contains("Failed {"),
+        "Rust struct syntax in front of the person the command exists to help: {problem}"
+    );
+    assert!(problem.contains("404"), "{problem}");
+}
+
+#[tokio::test]
 async fn a_preflight_that_cannot_be_delivered_fails_the_check() {
     use snob_cli::engine::check::Verdict;
 

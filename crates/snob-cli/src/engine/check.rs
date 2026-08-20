@@ -493,10 +493,33 @@ pub async fn webhook_of(
             verdict: Verdict::Ok,
             problem: None,
         },
+        // **The code the far end answered with is carried through.** This arm
+        // returned `what` untouched, with its hardcoded `status: None`, while
+        // the `Attempt` in hand was holding `Some(404)` — so a probe could not
+        // tell "404, the workflow is not registered" from "the host does not
+        // resolve" without a regex over a `Debug` rendering no contract covers,
+        // and `describe_check` dropped the destination-and-code sentence too,
+        // because it formats `answered {code}` only in the `Some` arm.
+        //
+        // `Debug` here was also the architecture rule: `engine` returns data
+        // and never decides how anything looks, and `{other:?}` is Rust struct
+        // syntax put in front of the person at the terminal by the command
+        // whose whole job is to explain what is wrong.
         other => Checked {
-            what,
+            what: match what {
+                What::Webhook {
+                    destination,
+                    signed,
+                    ..
+                } => What::Webhook {
+                    destination,
+                    status: other.status(),
+                    signed,
+                },
+                other => other,
+            },
             verdict: Verdict::Failed,
-            problem: Some(format!("{other:?}")),
+            problem: Some(other.error().to_string()),
         },
     }
 }
