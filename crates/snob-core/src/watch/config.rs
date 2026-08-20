@@ -323,15 +323,32 @@ fn write_private(path: &Path, contents: &str) -> Result<(), ConfigError> {
 /// Written out rather than serialized, so every value can carry the sentence
 /// that explains it. What comes back has to parse — [`parse`] is what reads it
 /// — and a test writes one of these and reads it back for exactly that reason.
-pub fn template(
-    schedule_line: &str,
-    jitter: Option<Duration>,
-    webhook: Option<&str>,
-    heartbeat: bool,
-    headers: &[(String, String)],
-    accounts: &[(String, Option<i64>)],
-    signed: bool,
-) -> String {
+/// **It takes the type [`parse`] produces, so the round trip is a comparison
+/// rather than a description of one.** This was eight positional parameters: a
+/// schedule already rendered as text, a jitter, a URL, a bool, a slice of header
+/// pairs, a slice of account pairs and a bool. That is [`WatchConfig`] written
+/// out again in a shape it cannot be compared against, so the tests standing in
+/// for the round trip could each only assert that some field or other survived,
+/// and between them they never looked at most of the file — while `WatchConfig`
+/// has derived `Eq` the whole time.
+///
+/// Two of those parameters were also strictly weaker than the fields they stood
+/// for, and each weakness was reachable. `&[(String, String)]` of headers can
+/// hold one name twice; `[webhook.headers]` is a TOML table and cannot, so
+/// correcting a mistyped `X-Api-Key` produced a file the wizard could not read
+/// back, after every question had been answered and both secrets typed.
+/// `&[(String, Option<i64>)]` is [`AccountConfig`] with the meaning of the
+/// second element left to whoever is calling. A `&WatchConfig` can express
+/// neither.
+///
+/// `signed` stays a parameter, because it is not in the file and must not be: it
+/// says a key went into the keyring, and all this writes is the sentence telling
+/// the reader to look there.
+///
+/// `schema` is what this build writes rather than what the argument holds. That
+/// is also the only value [`parse`] ever returns, so the round trip is an
+/// equality for every configuration that can have come out of it.
+pub fn template(config: &WatchConfig, signed: bool) -> String {
     let mut out = String::new();
     out.push_str(
         "# snob watch. Written by \"snob watch setup\", and safe to edit by hand.\n\
@@ -342,10 +359,20 @@ pub fn template(
     out.push_str(&format!("schema = {SCHEMA}\n\n"));
 
     out.push_str("# When to run.\n");
-    out.push_str(schedule_line);
-    out.push('\n');
+    if let Some(every) = config.every {
+        out.push_str(&format!("every = \"{}\"\n", duration::format(every)));
+    }
+    if !config.on.is_empty() {
+        out.push_str(&format!("on = [{}]\n", quoted_list(&config.on)));
+    }
+    if !config.at.is_empty() {
+        out.push_str(&format!("at = [{}]\n", quoted_list(&config.at)));
+    }
+    if let Some(cron) = &config.cron {
+        out.push_str(&format!("cron = {}\n", quote(cron)));
+    }
 
-    if let Some(jitter) = jitter {
+    if let Some(jitter) = config.jitter {
         out.push_str(
             "\n# How far each run may be pushed past its due moment, so the walks do\n\
              # not start on the same second every day. \"0\" turns it off.\n",
@@ -353,41 +380,55 @@ pub fn template(
         out.push_str(&format!("jitter = \"{}\"\n", duration::format(jitter)));
     }
 
-    if let Some(url) = webhook {
+    if let Some(webhook) = &config.webhook {
         out.push_str("\n[webhook]\n");
-        out.push_str(&format!("url = {}\n", quote(url)));
+        out.push_str(&format!("url = {}\n", quote(&webhook.url)));
         out.push_str(
             "# Send a report even when nothing changed, so something watching for\n\
              # silence can tell \"nothing happened\" from \"it stopped running\".\n",
         );
-        out.push_str(&format!("heartbeat = {heartbeat}\n"));
+        out.push_str(&format!("heartbeat = {}\n", webhook.heartbeat));
         if signed {
             out.push_str(
                 "# The body is signed: the key is in the system keyring, not here.\n\
                  # So is any token below that you gave to \"snob watch setup\".\n",
             );
         }
-        if !headers.is_empty() {
+        if !webhook.headers.is_empty() {
             out.push_str("\n[webhook.headers]\n");
-            for (name, value) in headers {
+            for (name, value) in &webhook.headers {
                 out.push_str(&format!("{} = {}\n", quote(name), quote(value)));
             }
         }
     }
 
-    for (target, consented_at) in accounts {
+    for account in &config.accounts {
         out.push_str("\n[[account]]\n");
-        out.push_str(&format!("target = {}\n", quote(target)));
-        if let Some(at) = consented_at {
+        out.push_str(&format!("target = {}\n", quote(&account.target)));
+        if let Some(consent) = account.consent {
             out.push_str(
                 "# You were asked whether this may read that account's lists, and you\n\
                  # said yes. A scheduled run cannot ask, so it reads this instead.\n",
             );
             out.push_str("[account.consent]\n");
-            out.push_str(&format!("agreed_at = {at}\n"));
+            out.push_str(&format!("agreed_at = {}\n", consent.agreed_at));
         }
     }
     out
+}
+
+/// A TOML array of basic strings.
+///
+/// Through [`quote`] rather than a bare `"{v}"`, which is how the wizard wrote
+/// these. Every day and time in one is validated before it can reach here, so
+/// nothing can carry a quote today — and the file's own first line invites
+/// hand-editing, which is the route by which "nothing can" stops being true.
+fn quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| quote(value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A TOML basic string. The values here come from a person, so a quote or a
@@ -575,61 +616,81 @@ agreed_at = 1786925176
         assert_eq!(config.accounts[1].consent.unwrap().agreed_at, 1_786_925_176);
     }
 
-    /// The template is written by hand so it can explain itself, which means
-    /// nothing but a test stops it drifting away from the parser.
+    /// What the template writes is what the parser reads -- the whole of it, as
+    /// one comparison.
+    ///
+    /// The template is written by hand so it can explain itself, so nothing but
+    /// a test stops it drifting away from the parser. What stopped that test
+    /// being the obvious one was `template`'s shape: eight positional parameters
+    /// standing in for a `WatchConfig`, which meant the round trip could only
+    /// ever be described field by field, and between the three tests that did
+    /// the describing most of the file was never looked at. `parse` returns the
+    /// type `template` now takes, and `WatchConfig` has derived `Eq` the whole
+    /// time.
+    ///
+    /// Two configurations rather than one, because `cron` beside `at` or `on` is
+    /// a file `parse` deliberately refuses -- so the two syntaxes cannot be
+    /// covered by the same round trip and each has to have its own.
     #[test]
     fn what_the_template_writes_is_what_the_parser_reads() {
-        let text = template(
-            "every = \"6h\"",
-            Some(Duration::from_secs(900)),
-            Some("https://n8n.local/webhook/snob"),
-            true,
-            &[("X-Source".into(), "homelab".into())],
-            &[("self".into(), None), ("someone".into(), Some(1_700))],
-            true,
+        let calendar = WatchConfig {
+            schema: SCHEMA,
+            every: Some(Duration::from_secs(1_209_600)),
+            at: vec!["09:00".to_string(), "21:30".to_string()],
+            on: vec!["mon".to_string(), "thu".to_string()],
+            cron: None,
+            jitter: Some(Duration::from_secs(900)),
+            webhook: Some(WebhookConfig {
+                url: r#"https://n8n.local/webhook/a"b\c"#.to_string(),
+                headers: [
+                    ("X-Source".to_string(), "homelab".to_string()),
+                    ("X-Odd".to_string(), "a\"b".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                heartbeat: true,
+            }),
+            accounts: vec![
+                AccountConfig {
+                    target: "self".to_string(),
+                    consent: None,
+                },
+                AccountConfig {
+                    target: "someone".to_string(),
+                    consent: Some(ConsentConfig {
+                        agreed_at: 1_700_000_000,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(
+            at(&template(&calendar, true)).expect("the template has to parse"),
+            calendar,
+            "a field the template does not write is a setting that disappears"
         );
 
-        let config = at(&text).expect("the template has to parse");
-        assert_eq!(config.every, Some(Duration::from_secs(21_600)));
-        assert_eq!(config.jitter, Some(Duration::from_secs(900)));
-        assert!(config.webhook.as_ref().unwrap().heartbeat);
-        assert_eq!(config.accounts.len(), 2);
-        assert_eq!(config.accounts[1].consent.unwrap().agreed_at, 1_700);
-    }
+        // The other syntax, and the smallest whole file: no jitter, no webhook,
+        // no accounts. Each of those is an `if` in the template, and an `if`
+        // with no test is a branch that can write anything.
+        let cron = WatchConfig {
+            schema: SCHEMA,
+            every: None,
+            at: vec![],
+            on: vec![],
+            cron: Some("0 9 * * 1,4".to_string()),
+            jitter: None,
+            webhook: None,
+            accounts: vec![],
+        };
+        assert_eq!(at(&template(&cron, false)).unwrap(), cron);
 
-    #[test]
-    fn a_calendar_template_parses_too() {
-        let text = template(
-            "on = [\"mon\", \"thu\"]\nat = [\"09:00\"]",
-            None,
-            None,
-            false,
-            &[],
-            &[("self".into(), None)],
-            false,
+        // And `signed` is not in the file: it changes a sentence for the reader
+        // and nothing the parser sees.
+        assert_eq!(
+            at(&template(&calendar, false)).unwrap(),
+            at(&template(&calendar, true)).unwrap(),
+            "the signing note is prose, not configuration"
         );
-        let config = at(&text).unwrap();
-        assert_eq!(config.on, vec!["mon", "thu"]);
-        assert_eq!(config.at, vec!["09:00"]);
-    }
-
-    /// A URL or a header value with a quote in it has to survive the round
-    /// trip, or the file the tool wrote is one it cannot read.
-    #[test]
-    fn a_value_with_a_quote_in_it_survives_being_written() {
-        let text = template(
-            "every = \"6h\"",
-            None,
-            Some(r#"https://example.com/a"b\c"#),
-            false,
-            &[("X-Odd".into(), "a\"b".into())],
-            &[],
-            false,
-        );
-        let config = at(&text).unwrap();
-        let webhook = config.webhook.unwrap();
-        assert_eq!(webhook.url, r#"https://example.com/a"b\c"#);
-        assert_eq!(webhook.headers["X-Odd"], "a\"b");
     }
 
     /// A file with only a schedule is complete. Everything else is optional,

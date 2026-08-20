@@ -56,22 +56,30 @@ pub async fn setup(
         }
     }
 
-    let schedule_line = ask_schedule()?;
+    // The configuration is built up rather than rendered piece by piece: each
+    // question puts back the fields it validated, and the file is written from
+    // the same type a run reads. `config::template` says why.
+    let mut config = ask_schedule()?;
     let answers = ask_webhook()?;
     // The address goes down with it. What somebody agrees to when they answer
     // for a stranger is read later as the authority for two different acts, and
     // the wizard is holding the second one at the moment it asks.
     let accounts = ask_accounts(answers.url.as_deref())?;
 
-    let text = config::template(
-        &schedule_line,
-        None,
-        answers.url.as_deref(),
-        answers.heartbeat,
-        &answers.headers,
-        &accounts,
-        answers.signing_key.is_some(),
-    );
+    config.webhook = answers.url.as_ref().map(|url| config::WebhookConfig {
+        url: url.clone(),
+        headers: answers.headers.iter().cloned().collect(),
+        heartbeat: answers.heartbeat,
+    });
+    config.accounts = accounts
+        .into_iter()
+        .map(|(target, consent)| config::AccountConfig {
+            target,
+            consent: consent.map(|agreed_at| config::ConsentConfig { agreed_at }),
+        })
+        .collect();
+
+    let text = config::template(&config, answers.signing_key.is_some());
 
     // Parsed before it is written, and before any secret is stored. A file the
     // tool wrote and cannot read is the one failure a person cannot debug, and
@@ -307,7 +315,12 @@ fn store_secret(secrets: &SecretStore, kind: Kind, value: Option<Secret>) -> Res
     Ok(())
 }
 
-fn ask_schedule() -> Result<String> {
+/// The schedule questions, as the configuration they settle.
+///
+/// **The fields, not a rendered line.** The line was `config::template`'s only
+/// route to the schedule, so the file it wrote could not be compared against the
+/// configuration it stood for; `config::template` has the whole of it.
+fn ask_schedule() -> Result<WatchConfig> {
     let choice = ui::choose(
         "How often should it look?",
         &[
@@ -318,17 +331,122 @@ fn ask_schedule() -> Result<String> {
     )?
     .ok_or_else(|| ExitError::new(ExitCode::Interrupted, "nothing was changed".to_string()))?;
 
+    let mut config = WatchConfig {
+        schema: config::SCHEMA,
+        every: None,
+        at: vec![],
+        on: vec![],
+        cron: None,
+        jitter: None,
+        webhook: None,
+        accounts: vec![],
+    };
+
     match choice {
-        0 => interval_line(&ui::prompt_line("How often? (for example 6h)")?),
+        0 => {
+            config.every = Some(interval_of(&ui::prompt_line(
+                "How often? (for example 6h)",
+            )?)?)
+        }
         1 => {
             let days = ui::prompt_line("Which days? (mon,thu -- or blank for every day)")?;
             let times = ui::prompt_line("At what times? (09:00 or 09:00,21:00)")?;
-            calendar_line(&days, &times)
+            let (on, at) = calendar_of(&days, &times)?;
+            config.on = on;
+            config.at = at;
         }
-        _ => cron_line(&ui::prompt_line(
-            "The expression? (for example 0 9 * * 1,4)",
-        )?),
+        _ => {
+            config.cron = Some(cron_of(&ui::prompt_line(
+                "The expression? (for example 0 9 * * 1,4)",
+            )?)?);
+        }
     }
+
+    // The schedule a run would build out of what has just been answered, which
+    // is what decides how much room a jitter has -- and, on the way, the last
+    // gap between what the wizard accepts and what a run accepts: this is the
+    // function `snob watch` itself calls, over the configuration about to be
+    // written rather than over one answer at a time.
+    let schedule = super::watch::schedule_from(&Default::default(), Some(&config))?;
+    config.jitter = ask_jitter(&schedule)?;
+
+    Ok(config)
+}
+
+/// How far a run may be pushed past its moment, asked against the schedule that
+/// was just settled.
+///
+/// **It is asked because the read side is fully wired and the write side never
+/// wrote it.** `WatchConfig::jitter` is read by `when_from`, clamped by
+/// `Schedule::with_jitter`, printed by `describe_config` and announced by the
+/// banner — and `config::template`'s explanation of it had no caller that could
+/// pass a value, so it has never been written into a real file. The only route
+/// to the setting was `--help` or the source.
+///
+/// **And it is validated the way every other answer here is.** The schedule
+/// answers go through the very functions a run parses with, so that "5m" is
+/// refused while the person who typed it is still reading. Jitter is the one
+/// value whose validation can answer zero without saying anything:
+/// `Schedule::with_jitter` clamps silently to what the grid can absorb, and the
+/// room is nothing at all for `*/15 * * * *` and for `--every 2w --on mon`, both
+/// of which this tool advertises. A hand-written `jitter = "10m"` on either
+/// produces a file whose `status` reads back "Each run is pushed up to 10m
+/// later" while every run lands on its moment.
+///
+/// `Schedule::with_jitter(Duration::MAX).jitter()` is the room, exactly:
+/// `with_jitter` is `jitter.min(room_for_jitter())`, and `room_for_jitter` stays
+/// private because nothing outside the schedule should be doing that arithmetic
+/// itself.
+///
+/// `None` is "leave the key out", not "no jitter": the schedule's own default
+/// then applies, which is what somebody who pressed Enter meant. `"0"` is how
+/// the setting is turned off, and it writes `jitter = "0"`.
+fn ask_jitter(schedule: &schedule::Schedule) -> Result<Option<std::time::Duration>> {
+    let room = room_for(schedule);
+    if room.is_zero() {
+        ui::info(
+            "This schedule has no room to be pushed later: the gap between two runs is \
+             already the smallest one allowed, so every run happens on its moment.",
+        );
+        return Ok(None);
+    }
+
+    let typed = ui::prompt_line(&format!(
+        "How far may a run be pushed later, so it does not land on the same second every \
+         time? (blank for {}, \"0\" for none, at most {})",
+        duration::format(schedule.jitter()),
+        duration::format(room)
+    ))?;
+    if typed.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let wanted = duration::parse(typed.trim()).map_err(|e| anyhow::anyhow!(e))?;
+    // Through the clamp a run applies, rather than a comparison written again
+    // here. A value this schedule cannot absorb is refused now instead of
+    // quietly becoming a smaller one at every start.
+    if schedule.clone().with_jitter(wanted).jitter() < wanted {
+        bail!(
+            "{} is more room than this schedule has. At most {} can be taken out of the gap \
+             between two runs without costing the next one.",
+            duration::format(wanted),
+            duration::format(room)
+        );
+    }
+    Ok(Some(wanted))
+}
+
+/// The most this schedule could absorb, asked of the schedule.
+///
+/// `room_for_jitter` is private and stays private: a second copy of that
+/// arithmetic out here is how the wizard and a run come to disagree.
+/// `with_jitter` is `jitter.min(room_for_jitter())`, so the largest jitter it
+/// will accept is exactly the room.
+fn room_for(schedule: &schedule::Schedule) -> std::time::Duration {
+    schedule
+        .clone()
+        .with_jitter(std::time::Duration::MAX)
+        .jitter()
 }
 
 // The three below are the whole of what `ask_schedule` decides, split out from
@@ -343,17 +461,17 @@ fn ask_schedule() -> Result<String> {
 // person who typed it long gone. `config::parse` cannot catch it either: it
 // checks the TOML and the schema number, not what the values mean.
 
-/// The `every = "..."` line, or what is wrong with the interval.
-fn interval_line(text: &str) -> Result<String> {
+/// The `every` field, or what is wrong with the interval.
+fn interval_of(text: &str) -> Result<std::time::Duration> {
     let every = duration::parse(text).map_err(|e| anyhow::anyhow!(e))?;
     // Validated here rather than at the first run, so "5m" is refused while the
     // person who typed it is still reading.
     schedule::Schedule::every(every)?;
-    Ok(format!("every = \"{}\"", duration::format(every)))
+    Ok(every)
 }
 
-/// The `on = [...]` and `at = [...]` lines, or what is wrong with the calendar.
-fn calendar_line(days: &str, times: &str) -> Result<String> {
+/// The `on` and `at` fields, or what is wrong with the calendar.
+fn calendar_of(days: &str, times: &str) -> Result<(Vec<String>, Vec<String>)> {
     fn listed(text: &str) -> Vec<&str> {
         text.split(',')
             .map(str::trim)
@@ -368,18 +486,16 @@ fn calendar_line(days: &str, times: &str) -> Result<String> {
     // cannot accept a calendar the scheduler would then refuse.
     super::watch::calendar_from(&days, &times)?;
 
-    let mut line = String::new();
-    if !days.is_empty() {
-        line.push_str(&format!("on = [{}]\n", quoted_list(&days)));
-    }
-    line.push_str(&format!("at = [{}]", quoted_list(&times)));
-    Ok(line)
+    Ok((
+        days.iter().map(|d| (*d).to_string()).collect(),
+        times.iter().map(|t| (*t).to_string()).collect(),
+    ))
 }
 
-/// The `cron = "..."` line, or what is wrong with the expression.
-fn cron_line(expression: &str) -> Result<String> {
+/// The `cron` field, or what is wrong with the expression.
+fn cron_of(expression: &str) -> Result<String> {
     schedule::Schedule::cron(expression)?;
-    Ok(format!("cron = \"{}\"", expression.trim()))
+    Ok(expression.trim().to_string())
 }
 
 /// What the webhook questions settled.
@@ -613,14 +729,6 @@ fn consent_question(name: &str, webhook: Option<&str>) -> String {
             printable(name)
         ),
     }
-}
-
-fn quoted_list(values: &[&str]) -> String {
-    values
-        .iter()
-        .map(|v| format!("\"{v}\""))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Reports what is configured and what has happened.
@@ -1530,26 +1638,6 @@ evry = \"6h\"
         );
     }
 
-    /// The line `setup` writes has to be one the parser reads back. It is built
-    /// as text rather than serialized, so nothing but this stops it drifting.
-    #[test]
-    fn the_schedule_lines_setup_writes_are_readable() {
-        for line in [
-            "every = \"6h\"",
-            "on = [\"mon\", \"thu\"]\nat = [\"09:00\"]",
-            "at = [\"09:00\", \"21:00\"]",
-            "cron = \"0 9 * * 1,4\"",
-        ] {
-            let text = config::template(line, None, None, false, &[], &[], false);
-            let parsed = config::parse(&text, std::path::Path::new("watch.toml"))
-                .unwrap_or_else(|e| panic!("{line:?} did not read back: {e}"));
-            assert!(
-                parsed.every.is_some() || !parsed.at.is_empty() || parsed.cron.is_some(),
-                "{line:?} produced a file with no schedule in it"
-            );
-        }
-    }
-
     /// Each webhook secret is stored under the `Kind` that says what it is for.
     ///
     /// The two were elements four and five of a tuple, both `Option<Secret>`,
@@ -1634,12 +1722,15 @@ evry = \"6h\"
         ]);
 
         let text = config::template(
-            "every = \"6h\"",
-            None,
-            Some("https://n8n.local/webhook/snob"),
-            false,
-            &headers,
-            &[("self".to_string(), None)],
+            &config(&format!(
+                "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://n8n.local/hook\"\n\n\
+                 [webhook.headers]\n{}\n",
+                headers
+                    .iter()
+                    .map(|(name, value)| format!("\"{name}\" = \"{value}\""))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
             false,
         );
         let parsed = config::parse(&text, std::path::Path::new("watch.toml"))
@@ -1650,12 +1741,6 @@ evry = \"6h\"
             "b",
             "the value typed last is the one that was meant"
         );
-    }
-
-    #[test]
-    fn quoting_a_list_gives_toml_a_parser_accepts() {
-        assert_eq!(quoted_list(&["mon", "thu"]), "\"mon\", \"thu\"");
-        assert_eq!(quoted_list(&[]), "");
     }
 
     /// A name written with an at sign still names the account it watches.
@@ -2253,30 +2338,32 @@ every = \"6h\"
     /// was ever mentioned here.
     #[test]
     fn a_schedule_below_the_floor_is_refused_at_setup() {
-        assert!(interval_line("5m").is_err(), "five minutes is too often");
+        assert!(interval_of("5m").is_err(), "five minutes is too often");
         assert!(
-            cron_line("*/5 * * * *").is_err(),
+            cron_of("*/5 * * * *").is_err(),
             "the same five minutes, written the other way"
         );
         assert!(
-            calendar_line("", "09:00,09:05").is_err(),
+            calendar_of("", "09:00,09:05").is_err(),
             "and again, as two moments five minutes apart"
         );
 
-        // And the lines a good answer produces, since the file is written from
-        // them: TOML a parser accepts, in the keys `config::parse` reads.
-        assert_eq!(interval_line("6h").unwrap(), "every = \"6h\"");
+        // And the fields a good answer produces, since the file is written from
+        // them.
         assert_eq!(
-            cron_line(" 0 9 * * 1,4 ").unwrap(),
-            "cron = \"0 9 * * 1,4\""
+            interval_of("6h").unwrap(),
+            std::time::Duration::from_secs(21_600)
         );
+        assert_eq!(cron_of(" 0 9 * * 1,4 ").unwrap(), "0 9 * * 1,4");
         assert_eq!(
-            calendar_line("mon, thu", "09:00, 21:00").unwrap(),
-            "on = [\"mon\", \"thu\"]\nat = [\"09:00\", \"21:00\"]"
+            calendar_of("mon, thu", "09:00, 21:00").unwrap(),
+            (
+                vec!["mon".to_string(), "thu".to_string()],
+                vec!["09:00".to_string(), "21:00".to_string()]
+            )
         );
-        assert_eq!(
-            calendar_line("", "09:00").unwrap(),
-            "at = [\"09:00\"]",
+        assert!(
+            calendar_of("", "09:00").unwrap().0.is_empty(),
             "no days means every day, and no `on` key at all"
         );
     }
@@ -2298,7 +2385,7 @@ every = \"6h\"
             ("mon", "25:00"),
             ("", "09:00,09:05"),
         ] {
-            let wizard = calendar_line(days, times);
+            let wizard = calendar_of(days, times);
             let run = super::super::watch::calendar_from(
                 &days
                     .split(',')
@@ -2323,18 +2410,71 @@ every = \"6h\"
         }
     }
 
-    /// What comes back from those lines has to parse as the file it is going
-    /// into, or `setup` writes something the monitor cannot read.
+    /// The wizard offers only the jitter the schedule can absorb.
+    ///
+    /// `Schedule::with_jitter` clamps to what the grid can take and says
+    /// nothing, so a value larger than the room becomes a smaller one at every
+    /// start while `status` reads back what the file says. The room is zero for
+    /// two shapes this tool advertises -- `*/15 * * * *`, whose grid is exactly
+    /// the floor, and `--every 2w --on mon`, a weekly grid under a fortnightly
+    /// floor -- and on those the wizard has nothing to ask and says so.
+    ///
+    /// The ceiling is asked of the schedule rather than worked out here:
+    /// `room_for_jitter` is private, and a second copy of that arithmetic is how
+    /// the wizard and a run come to disagree.
+    ///
+    /// What this cannot reach, said plainly: `ask_jitter`'s prompt and its
+    /// refusal are behind `ui::prompt_line`, which answers nothing without a
+    /// terminal, so what is pinned is the ceiling they ask against and the
+    /// zero-room path that returns before asking. A schedule cannot have a
+    /// default jitter larger than its room -- `fitted` clamps it at
+    /// construction -- so the two are only ever told apart where there is room
+    /// to spare, which is the first assertion here.
     #[test]
-    fn the_lines_setup_writes_are_a_configuration_it_can_read_back() {
-        for line in [
-            interval_line("6h").unwrap(),
-            cron_line("0 9 * * 1,4").unwrap(),
-            calendar_line("mon", "09:00,21:00").unwrap(),
+    fn the_wizard_offers_only_the_jitter_the_schedule_can_absorb() {
+        // Six-hourly: the interval is the bound, because an interval measured
+        // from the previous run slides the whole schedule.
+        let interval = schedule::Schedule::every(std::time::Duration::from_secs(21_600)).unwrap();
+        assert_eq!(
+            room_for(&interval),
+            std::time::Duration::from_secs(21_600),
+            "an interval has no grid to miss, so the interval is the bound"
+        );
+
+        // The two with nothing to give. `ask_jitter` answers `None` on both
+        // without asking anything, so no `jitter` key is written.
+        for none_at_all in [
+            schedule::Schedule::cron("*/15 * * * *").unwrap(),
+            schedule::Schedule::days(
+                &[snob_core::watch::schedule::Weekday::Mon],
+                std::time::Duration::from_secs(14 * 24 * 3_600),
+            )
+            .unwrap(),
         ] {
-            let text = format!("schema = 1\n{line}\n");
-            config::parse(&text, std::path::Path::new("watch.toml"))
-                .unwrap_or_else(|e| panic!("{line:?} does not parse back: {e}"));
+            assert!(
+                room_for(&none_at_all).is_zero(),
+                "{none_at_all:?} has no room, and the question must not be asked"
+            );
+            assert_eq!(
+                ask_jitter(&none_at_all).unwrap(),
+                None,
+                "nothing to ask, so nothing is written"
+            );
         }
+
+        // And a schedule with room does not accept more than it has: a run at
+        // its moment pushed past the next one is the failure the ceiling exists
+        // for, and it is silent when the clamp does it.
+        let daily = schedule::Schedule::cron("0 9 * * *").unwrap();
+        let room = room_for(&daily);
+        assert!(!room.is_zero(), "a daily schedule has a day to play with");
+        assert_eq!(
+            daily
+                .clone()
+                .with_jitter(room + std::time::Duration::from_secs(60))
+                .jitter(),
+            room,
+            "the clamp is what the wizard has to refuse in front of, not repeat"
+        );
     }
 }
