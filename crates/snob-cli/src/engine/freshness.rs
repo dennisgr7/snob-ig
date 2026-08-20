@@ -154,7 +154,6 @@ mod tests {
             taken_at: Some(taken_at),
             member_count: 10,
             declared_count: declared,
-            pages: 1,
             next_cursor: None,
         }
     }

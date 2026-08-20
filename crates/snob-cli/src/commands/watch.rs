@@ -18,7 +18,7 @@ use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
 use snob_core::secrets::{Kind, SecretStore, Stored};
-use snob_core::store::deliveries;
+use snob_core::store::{deliveries, watch::Queued};
 use snob_core::watch::config::{self, WatchConfig, WebhookConfig};
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
@@ -30,7 +30,7 @@ use crate::cli::{
 };
 use crate::commands::common::{self, Session};
 use crate::engine::Provenance;
-use crate::engine::watch::{ListReport, Queued, Skipped, TickReport, WatchReport, Watched};
+use crate::engine::watch::{ListReport, Skipped, TickReport, WatchReport, Watched};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui;
@@ -149,7 +149,12 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
                     // every time round the loop, since the target would be
                     // computed from a `now` that keeps advancing.
                     Due::Now { missed } => (now, missed),
-                    Due::At(i64::MAX) => {
+                    // Not a literal any more, and not an arm order. This was
+                    // `Due::At(i64::MAX)` sitting above the general `At` arm, so
+                    // the only thing between a schedule that names nothing and
+                    // `wake_at` saturating was where these two arms happened to
+                    // be written. `Due::Never` makes the compiler ask.
+                    Due::Never => {
                         return Err(anyhow::anyhow!(
                             "this schedule can never come round: nothing matches it"
                         ));
@@ -1663,11 +1668,17 @@ async fn deliver(
     let queued = crate::engine::watch::commit(
         app,
         tick,
-        body.as_ref().map(|(run_id, body)| Queued {
-            run_id,
-            body,
-            destination: delivery.map(|d| d.destination.as_str()),
-        }),
+        // A report and the address it was made for are one thing: the body is
+        // built only when there is a delivery to build it for, so the pair is
+        // taken together rather than the address being fetched again and allowed
+        // to come back empty.
+        delivery
+            .zip(body.as_ref())
+            .map(|(to, (run_id, body))| Queued {
+                run_id,
+                body,
+                destination: to.destination.as_str(),
+            }),
     )?;
 
     let Some(delivery) = delivery else {
@@ -1694,7 +1705,7 @@ async fn deliver(
 ///
 /// The row id is a SQLite rowid with no AUTOINCREMENT, so it is reused after
 /// `prune` empties the table — which happens on any account quiet for longer
-/// than `KEEP_DELIVERIES_FOR_SECS`, the default case. A receiver doing exactly
+/// than `deliveries::KEEP_SETTLED_FOR_SECS`, the default case. A receiver doing
 /// what AGENTS.md, the CHANGELOG and the tests tell it to do would then drop a
 /// real report as a repeat. `run_id` is `UNIQUE` in the schema and already
 /// inside the body, so it is the one value that means what the header claims.
@@ -1731,8 +1742,12 @@ async fn send_one(
         // bearer token answers 401. None of those is a reason to throw the only
         // copy of a change away, and the far end is the user's own server, so
         // knocking again costs nothing that matters.
-        Attempt::Refused { status, error } => {
-            deliveries::failed(app.db().conn(), id, Some(*status), error, true, now).map(Some)
+        // No status: the request was never built, so no server answered
+        // anything. It used to pass `Some(0)` -- a code nothing can send, into a
+        // column whose comment is "the HTTP code, when there was one", where
+        // NULL already meant exactly that.
+        Attempt::Refused { error } => {
+            deliveries::failed(app.db().conn(), id, None, error, true, now).map(Some)
         }
     };
     let settled = match recorded {
@@ -2828,6 +2843,58 @@ mod tests {
             owed - sent,
             "the rest are still owed, for the next run"
         );
+    }
+
+    /// A request that was never built records no HTTP code at all.
+    ///
+    /// `Attempt::Refused` carried `status: 0` and `send_one` stored it, so
+    /// `watch_deliveries.last_status` -- "the HTTP code, when there was one" --
+    /// held a code no server can answer with, for a request no server ever saw.
+    /// NULL is what the column already had for that, and every other reader had
+    /// to know the convention to avoid reporting the zero as a code.
+    #[tokio::test]
+    async fn a_request_that_was_never_built_records_no_status() {
+        let server = wiremock::MockServer::start().await;
+        let (app, _) = app_posting_to(&server);
+
+        // A header `webhook::check` would have refused, which is the only way
+        // this state is reached: a file hand-edited past the preflight.
+        let url = Url::parse(&format!("{}/hook", server.uri())).unwrap();
+        let delivery = Delivery {
+            destination: destination_of(&url),
+            signed: false,
+            client: WebhookClient::new(Webhook {
+                url,
+                headers: vec![("Not a header".into(), "homelab".into())],
+                key: None,
+            })
+            .unwrap(),
+            heartbeat: false,
+        };
+
+        let id = deliveries::enqueue(
+            app.db().conn(),
+            "run-1",
+            42,
+            "{}",
+            snob_core::store::now(),
+            Some(&delivery.destination),
+        )
+        .unwrap();
+        send_one(&app, &delivery, id, "run-1", "{}", 1).await;
+
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing was sent, so nothing answered"
+        );
+        let status: Option<i64> = app
+            .db()
+            .conn()
+            .query_row("SELECT last_status FROM watch_deliveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, None, "a request nobody saw has no HTTP code");
     }
 
     /// A run the user stopped does not keep posting what it owes.

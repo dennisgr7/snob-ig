@@ -449,7 +449,6 @@ mod tests {
             taken_at: Some(0),
             member_count: 0,
             declared_count: None,
-            pages: 0,
             next_cursor: None,
         };
         let outcome = ListOutcome::cached(&snapshot, Provenance::CounterVerified);

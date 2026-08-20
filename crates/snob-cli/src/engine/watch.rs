@@ -254,18 +254,6 @@ pub struct TickReport {
     renames_sent: Vec<i64>,
 }
 
-/// A report on its way to somewhere, ready to be made durable.
-///
-/// The bytes rather than the events, because the signature covers bytes and a
-/// retry has to send the same string.
-pub struct Queued<'a> {
-    pub run_id: &'a str,
-    pub body: &'a str,
-    /// The address this report is addressed to, so a later run cannot drain it
-    /// through a client pointed somewhere else.
-    pub destination: Option<&'a str>,
-}
-
 /// Records that this report has been reported.
 ///
 /// Split from [`tick`] so the body can be built in between, which is where it
@@ -276,7 +264,7 @@ pub struct Queued<'a> {
 pub fn commit(
     app: &mut App,
     tick: &TickReport,
-    delivery: Option<Queued<'_>>,
+    delivery: Option<store::Queued<'_>>,
 ) -> Result<Option<i64>> {
     let pk = tick.report.account_pk;
     let at = tick.at;
@@ -289,11 +277,12 @@ pub fn commit(
         at,
         tick.rename_cursor,
         &tick.renames_sent,
-        delivery.map(|d| store::Queued {
-            run_id: d.run_id,
-            body: d.body,
-            destination: d.destination,
-        }),
+        // The store's own type, not a copy of it mapped across. The compiler
+        // catches a field added to the store's copy and says nothing about one
+        // added here that the mapper drops, and that is the direction a caller
+        // reaches for first. `commands` already names `deliveries::Outcome`
+        // directly, so the boundary bought nothing.
+        delivery,
     )?;
 
     // Recorded whatever came of it, including a run that concluded nothing.
