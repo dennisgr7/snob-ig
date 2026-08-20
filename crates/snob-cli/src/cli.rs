@@ -34,9 +34,17 @@ pub struct Cli {
     /// Keep every file this run reads or writes under this directory
     ///
     /// A testing build only. Replaces the discovered data and configuration
-    /// directories, and puts the session in a file inside it rather than in the
-    /// system keyring — so a sandbox run cannot read, write or delete the real
-    /// one. That is the property [`Cli::ig_base_url`] leans on.
+    /// directories, puts the session in a file inside it rather than in the
+    /// system keyring, **and gives the run a keyring namespace of its own** —
+    /// so a sandbox run cannot read, write or delete the real one. That is the
+    /// property [`Cli::ig_base_url`] leans on.
+    ///
+    /// All three, and the third is not decoration. The store reaches the
+    /// keyring whatever backend it is on, so with the real service name a
+    /// sandbox `login` deleted the developer's session and a sandbox that had
+    /// not logged in yet loaded the real cookie — which is the exact thing the
+    /// pairing below exists to prevent. `main::wiring` is where the namespace
+    /// is assigned and says the rest.
     #[cfg(feature = "testing")]
     #[arg(long, global = true, hide = true, display_order = 902)]
     pub sandbox_root: Option<std::path::PathBuf>,

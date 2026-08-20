@@ -96,9 +96,20 @@ in the suite drives a library: `watch_tick.rs` runs the comparison through
 not the secret store choosing a backend, not the exit code a timer reads. The
 feature adds two flags for that and **a released binary contains neither them nor
 the code they reach**, which `crates/snob-core/tests/sandbox.rs` reads the source
-to hold down. `--sandbox-root` puts every file a run touches under one directory
-and forces the file backend, so the operating system's keyring is never opened —
-`crates/snob-core/tests/keyring.rs`'s rule, applied to the binary.
+to hold down. `--sandbox-root` puts every file a run touches under one directory,
+forces the file backend, **and gives the run a keyring service name derived from
+that root** — `crates/snob-core/tests/keyring.rs`'s rule, applied to the binary.
+The third of those is what actually separates a sandbox from the real
+credentials, and forcing the backend was mistaken for it for a while.
+`SecretStore` reaches the keyring on every backend and has to: `save` clears the
+stale entry, because `load` reads the keyring first and would otherwise go on
+serving a session the file has replaced, and the watch token and signing key
+have no file form at all. Under the real service name that meant a sandbox
+`login` deleted the developer's session, a sandbox `purge` took the webhook
+secrets with it, and a sandbox that had not logged in yet loaded the **real**
+cookie — which, with the redirect flag set, is the one outcome this seam exists
+to make impossible. `main::wiring` assigns the namespace and carries the
+reasoning; its own tests hold it down.
 `--ig-base-url` **requires** `--sandbox-root`, and that pairing is the whole
 safety argument: a redirected client can only carry a session out of a store
 inside that root, so the real stored session is not reachable from a redirected
