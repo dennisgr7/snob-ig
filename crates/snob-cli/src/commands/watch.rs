@@ -1678,6 +1678,15 @@ fn event_of(body: &str) -> &str {
 /// `expired` before the run finished. It also made up to `accounts ×
 /// DRAIN_LIMIT` POSTs at somebody's server in one go, which is the thing
 /// `DRAIN_LIMIT` exists to bound.
+///
+/// **And it stops when the user does.** The caller checks the token before
+/// entering, with a comment naming the cost, and then nothing looked at it
+/// again: not this loop, not `send_one`, not `WebhookClient::post`, which holds
+/// no token at all. So a Ctrl+C during the second of ten POSTs at a receiver
+/// that accepts and stalls bought several more minutes of a run the terminal
+/// had already said was stopping, and the only way out was a second Ctrl+C,
+/// which is `exit(130)`. Nothing is gained by finishing: the rows stay pending
+/// and the next run drains them, which is the whole point of the queue.
 async fn drain(app: &crate::app::App, delivery: &Delivery) {
     let now = snob_core::store::now();
     let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT, &delivery.destination) {
@@ -1689,6 +1698,12 @@ async fn drain(app: &crate::app::App, delivery: &Delivery) {
     };
 
     for report in owed {
+        // Asked before each one rather than only before the first. A POST has
+        // its own timeout, so the token can be set at any point in this loop,
+        // and the answer has to be read where the next request would go out.
+        if app.cancel().is_canceled() {
+            return;
+        }
         send_one(
             app,
             delivery,
@@ -1706,6 +1721,10 @@ async fn drain(app: &crate::app::App, delivery: &Delivery) {
 /// Bounded so a queue that built up over a weekend does not turn one run into a
 /// hundred requests at somebody's server all at once. The rest go on the next
 /// run, and `deliveries::MAX_AGE_SECS` is what stops them lingering forever.
+///
+/// It is also the size of the interruption `drain` has to be able to stop in
+/// the middle of: ten POSTs at thirty seconds each is five minutes of a run the
+/// terminal has already said is stopping.
 const DRAIN_LIMIT: usize = 10;
 
 /// An id for this report, unique enough for a receiver to deduplicate on.
@@ -2585,6 +2604,43 @@ mod tests {
             deliveries::pending(app.db().conn()).unwrap() as usize,
             owed - sent,
             "the rest are still owed, for the next run"
+        );
+    }
+
+    /// A run the user stopped does not keep posting what it owes.
+    ///
+    /// `run_accounts` reads the token before entering the drain, with a comment
+    /// naming exactly this cost -- and then nothing read it again: not the loop,
+    /// not `send_one`, not `WebhookClient::post`, which holds no token. Ten owed
+    /// rows coming due together at a receiver that accepts and stalls is several
+    /// more minutes of a run the terminal has already said is stopping, and the
+    /// only escape is a second Ctrl+C, which is `exit(130)`.
+    ///
+    /// Nothing is lost by stopping, which is what the second assertion is for:
+    /// the rows are still owed afterwards and the next run takes them.
+    /// `deliver`'s own `send_one` is deliberately not covered by this -- that one
+    /// sends the report whose mark `commit` has already moved, so it has to go
+    /// out whatever the user typed.
+    #[tokio::test]
+    async fn a_canceled_run_stops_draining_the_queue() {
+        let server = wiremock::MockServer::start().await;
+        accepting(&server).await;
+        let (app, delivery) = app_posting_to(&server);
+        let owed = 5;
+        owe(&app, &delivery, owed, snob_core::store::now());
+
+        app.cancel().cancel();
+        drain(&app, &delivery).await;
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "the run was stopped before the drain began"
+        );
+        assert_eq!(
+            deliveries::pending(app.db().conn()).unwrap() as usize,
+            owed,
+            "what is owed stays owed, for the next run"
         );
     }
 
