@@ -164,13 +164,46 @@ pub fn load(paths: &AppPaths) -> Result<Option<WatchConfig>, ConfigError> {
 
 /// Parses one, naming the file in anything it complains about.
 pub fn parse(text: &str, path: &Path) -> Result<WatchConfig, ConfigError> {
+    // **The schema really is read first**, which is what the comment below used
+    // to claim while the code did the opposite.
+    //
+    // `WatchConfig` carries `deny_unknown_fields`, and a full parse ran before
+    // the check — so a file from a newer version, which by definition is a file
+    // with keys this build has never heard of, was refused as a typo:
+    //
+    //     schema = 99                        -> "says it is schema 99"      (right)
+    //     schema = 99, something_new = true  -> "unknown field `something_new`"
+    //     schema = 99, [webhook] retries = 3 -> "unknown field `retries`"
+    //
+    // The one diagnostic written to survive a version skew did not survive it,
+    // and what the user reads is a parse error about a file they have no reason
+    // to think is broken. Nothing here is reachable yet — `SCHEMA` has only ever
+    // been 1 — but the fix only helps anybody if it ships *before* schema 2
+    // does, which is now.
+    //
+    // Two lines and no `deny_unknown_fields`, so every other key is ignored;
+    // every top-level field of `WatchConfig` carries `serde(default)`, so a
+    // *missing* schema key still reaches the full parse and is refused there.
+    #[derive(serde::Deserialize)]
+    struct Version {
+        #[serde(default)]
+        schema: u32,
+    }
+    if let Ok(Version { schema }) = toml::from_str::<Version>(text)
+        && schema != SCHEMA
+        && schema != 0
+    {
+        return Err(ConfigError::Unknown {
+            path: path.to_path_buf(),
+            found: schema,
+        });
+    }
+
     let config: WatchConfig = toml::from_str(text).map_err(|e| ConfigError::Invalid {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
 
-    // Checked before any field is used, so a file from a newer version is
-    // refused as what it is rather than as a missing key.
     if config.schema != SCHEMA {
         return Err(ConfigError::Unknown {
             path: path.to_path_buf(),
@@ -472,6 +505,33 @@ at = ["09:00", "21:00"]
             "{error}"
         );
         assert!(error.to_string().contains("update"), "{error}");
+    }
+
+    /// And it is still refused for its schema when it carries a key this
+    /// version has never had — which is what a newer file actually looks like.
+    ///
+    /// The full parse ran first and `WatchConfig` denies unknown fields, so the
+    /// one diagnostic written to survive a version skew did not survive it: the
+    /// user got "unknown field `something_new`" about a file they have no
+    /// reason to think is broken. The test above cannot tell the two orders
+    /// apart, because `schema = 99` alone parses cleanly either way.
+    #[test]
+    fn a_newer_file_is_refused_for_its_schema_even_when_it_carries_a_key_this_version_never_had() {
+        for text in [
+            "schema = 99\nsomething_new = true\n",
+            "schema = 99\n[webhook]\nurl = \"https://n8n.local/hook\"\nretries = 3\n",
+        ] {
+            let error = at(text).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Unknown { found: 99, .. }),
+                "{text:?} was refused as a typo rather than as a newer file: {error}"
+            );
+        }
+
+        // A key this version does not know, on a file that claims *this*
+        // schema, is still a typo — which is what `deny_unknown_fields` is for.
+        let typo = at("schema = 1\nsomething_new = true\n").unwrap_err();
+        assert!(matches!(typo, ConfigError::Invalid { .. }), "{typo}");
     }
 
     #[test]
