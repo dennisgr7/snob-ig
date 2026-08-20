@@ -148,10 +148,18 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
                         ));
                     }
                     // Rolled once per due moment. The roll is made here rather
-                    // than inside `with_jitter` so that function reads no
-                    // randomness and its bounds stay testable.
+                    // than inside `wake_at` so that function reads no randomness
+                    // and its bounds stay testable.
+                    //
+                    // `wake_at` and not `with_jitter`: the jitter the banner
+                    // printed is measured against the grid, in seconds-of-day,
+                    // and a day a zone springs forward through is an hour
+                    // shorter than that. `wake_at` asks the calendar in the zone
+                    // from the moment actually due, so the roll cannot reach
+                    // past the next moment or spill onto a day the calendar
+                    // forbids. It only ever narrows, so the banner stays true.
                     Due::At(at) => (
-                        schedule::with_jitter(at, schedule.jitter(), fastrand::f64()),
+                        schedule::wake_at(&schedule, at, fastrand::f64(), &chrono::Local),
                         0,
                     ),
                 };

@@ -482,6 +482,54 @@ impl Schedule {
         }
     }
 
+    /// The room one particular moment really has, in real seconds.
+    ///
+    /// [`Schedule::room_for_jitter`] asks the same question of the grid, and the
+    /// grid is seconds-of-day arithmetic: its `A_DAY` is 86400 and
+    /// `room_before_midnight` is `86400 - latest`. A day a zone springs forward
+    /// through is 82800 seconds long, so both are an hour too generous on it —
+    /// once a year, in the one direction that costs a run.
+    ///
+    /// So this asks the calendar itself, in the zone, from where the run is
+    /// actually due: the next moment the schedule names, less the floor between
+    /// two runs, and — when the days are restricted — no further than the local
+    /// midnight after `due_at`, which is the bound `room_before_midnight` draws
+    /// and this is the real version of it.
+    ///
+    /// It only ever narrows, which is what keeps the banner honest: `jitter` has
+    /// already been capped at `room_for_jitter`, so what was printed stays an
+    /// upper bound on what is used.
+    ///
+    /// **An interval has no grid to miss**, and it is measured from where the
+    /// run landed rather than from a moment — the whole schedule slides, so
+    /// there is nothing to take off. Unbounded here, and bounded as before by
+    /// `room_for_jitter`.
+    fn room_at<Tz: TimeZone>(&self, due_at: i64, zone: &Tz) -> Duration {
+        let Some(calendar) = &self.calendar else {
+            return Duration::MAX;
+        };
+
+        let step = self
+            .every
+            .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+            .max(MIN_GAP_SECS);
+
+        // `None` is a calendar that names nothing after this moment, which has
+        // nothing left to lose.
+        let mut room = match next_after(self, Some(due_at), due_at, zone) {
+            Some(next) => (next - due_at).saturating_sub(step).max(0),
+            None => i64::MAX,
+        };
+
+        if calendar.days_are_restricted()
+            && let Some(midnight) = next_local_midnight(due_at, zone)
+        {
+            room = room.min((midnight - due_at).max(0));
+        }
+        Duration::from_secs(room as u64)
+    }
+
     pub fn jitter(&self) -> Duration {
         self.jitter
     }
@@ -938,9 +986,61 @@ const MAX_MISSED_COUNTED: u32 = 1_000;
 /// `roll` is a number in `[0, 1)` the caller supplies, so this stays pure and a
 /// test can pin it. **Forward only**: moving a run earlier could put it before
 /// the `--every` floor, which is the one thing the floor is there to prevent.
+///
+/// The bound is not applied here. [`wake_at`] is what the loop calls, because
+/// deciding how much room a moment has needs the zone, and this deliberately has
+/// no arithmetic in it beyond the multiplication.
 pub fn with_jitter(due_at: i64, jitter: Duration, roll: f64) -> i64 {
     let spread = jitter.as_secs() as f64 * roll.clamp(0.0, 1.0);
     due_at.saturating_add(spread as i64)
+}
+
+/// The first instant of the local day after `at`.
+///
+/// `None` when the zone skips its own midnight, which some have done: there is
+/// no such instant, and the calendar's own search is then the only bound left.
+fn next_local_midnight<Tz: TimeZone>(at: i64, zone: &Tz) -> Option<i64> {
+    let local = zone.timestamp_opt(at, 0).single()?;
+    let tomorrow = local.date_naive().succ_opt()?.and_hms_opt(0, 0, 0)?;
+    zone.from_local_datetime(&tomorrow)
+        .earliest()
+        .map(|midnight| midnight.timestamp())
+}
+
+/// The moment to wake at for a run due at `due_at`. What the loop calls.
+///
+/// [`with_jitter`] with the roll capped to what this moment really has room
+/// for — see [`Schedule::room_at`]. The two are apart because the cap needs a
+/// zone, and keeping the roll on this side is what lets the bound be tested
+/// against a zone with a transition in it rather than against a `FixedOffset`,
+/// which has none.
+///
+/// What it fixes happens once a year, and both halves were driven.
+/// `room_for_jitter` measures the day in seconds-of-day, so on a day a zone
+/// springs forward through it allows an hour more than the day holds:
+/// `--at 09:00 --jitter 24h` allowed 85500 against a real gap of 82800, and a
+/// roll near the top woke the run **past** the next day's own moment — which
+/// `moment_served` then snapped back onto, so two days ran once between them and
+/// `missed` counted none. `--on sun --at 01:00 --jitter 23h` allowed 82800
+/// against 79200 of real room and landed on a Monday, a day that calendar
+/// forbids. It takes an explicitly configured jitter within an hour of the
+/// ceiling; the default is 900 seconds and a breach needs
+/// `s > nominal_gap - 4500`.
+///
+/// **It does not close the whole class, and the neighbour has no jitter in it at
+/// all.** `MIN_GAP_SECS` is real seconds while the grid is local, so on the
+/// short day `--at 01:50,03:00` has 600 real seconds between its two moments
+/// where `tightest_gap` declared 4200 and `validated` accepted it: the run at
+/// 01:50 puts the floor at a local 03:05, past 03:00, and the second moment is
+/// dropped rather than run. The next answer is the following day's 01:50. That
+/// is the floor doing exactly what the floor is for, and nothing here can help
+/// with it.
+pub fn wake_at<Tz: TimeZone>(schedule: &Schedule, due_at: i64, roll: f64, zone: &Tz) -> i64 {
+    with_jitter(
+        due_at,
+        schedule.jitter().min(schedule.room_at(due_at, zone)),
+        roll,
+    )
 }
 
 /// A day of the week, as `--on mon,thu` names them.
@@ -1188,6 +1288,68 @@ mod tests {
         }
     }
 
+    /// A zone whose clocks go forward an hour, so one hour of the wall clock
+    /// never happens.
+    ///
+    /// The sibling of [`FallsBack`], and it exists for the other direction: a
+    /// day this zone springs forward through is 82800 seconds long, and every
+    /// bound on the jitter is written in seconds-of-day. `FixedOffset` cannot
+    /// stand in for it, for the same reason it could not stand in there.
+    ///
+    /// Five hours behind UTC until [`SPRING_FORWARD_AT`], four hours behind from
+    /// then on: local 02:00 becomes local 03:00, and 02:00 through 02:59 never
+    /// come round at all.
+    #[derive(Clone, Copy, Debug)]
+    struct SpringsForward;
+
+    /// Monday 07:00 UTC, which is 02:00 before the change and 03:00 after it.
+    const SPRING_FORWARD_AT: i64 = MONDAY_0000 + 7 * 3_600;
+
+    const WINTER: i32 = -5 * 3_600;
+    const SUMMER: i32 = -4 * 3_600;
+
+    impl TimeZone for SpringsForward {
+        type Offset = FixedOffset;
+
+        fn from_offset(_: &FixedOffset) -> Self {
+            SpringsForward
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            let wall = local.and_utc().timestamp();
+            let as_winter = wall - i64::from(WINTER) < SPRING_FORWARD_AT;
+            let as_summer = wall - i64::from(SUMMER) >= SPRING_FORWARD_AT;
+
+            match (as_winter, as_summer) {
+                // The hour the wall clock skipped: no instant reads it.
+                (false, false) => MappedLocalTime::None,
+                (true, false) => MappedLocalTime::Single(east(WINTER)),
+                (false, true) => MappedLocalTime::Single(east(SUMMER)),
+                // This zone has no fall-back, so nothing here is ambiguous.
+                (true, true) => MappedLocalTime::Ambiguous(east(WINTER), east(SUMMER)),
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if utc.and_utc().timestamp() < SPRING_FORWARD_AT {
+                east(WINTER)
+            } else {
+                east(SUMMER)
+            }
+        }
+    }
+
     /// Midnight UTC on Monday 2026-08-17. Every timestamp below is an offset
     /// from it, so the weekday arithmetic is checkable by hand.
     const MONDAY_0000: i64 = 1_786_924_800;
@@ -1413,6 +1575,79 @@ mod tests {
             daily.jitter(),
             Duration::from_secs(20 * 3_600),
             "nothing to protect when tomorrow is allowed too"
+        );
+    }
+
+    /// Jitter cannot swallow the next moment on a day that is an hour short.
+    ///
+    /// `room_for_jitter` measures the day in seconds-of-day: `A_DAY` is 86400,
+    /// so `--at 01:00` gets its whole gap whatever the calendar does that night.
+    /// On a spring-forward day the real gap between one moment and the next is
+    /// 82800, and a roll near the top woke the run *past* the following day's
+    /// own moment — which `moment_served` then snapped back onto, so the two
+    /// days ran once between them and nothing counted a missed run.
+    #[test]
+    fn jitter_cannot_reach_past_the_next_moment_on_a_short_day() {
+        // The fixture has to be the thing it claims: an hour that never happens.
+        let skipped = NaiveDate::from_ymd_opt(2026, 8, 17)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        assert!(
+            matches!(
+                SpringsForward.from_local_datetime(&skipped),
+                MappedLocalTime::None
+            ),
+            "the zone has to actually skip that hour"
+        );
+
+        let schedule = Schedule::calendar(&[], &[(1, 0)])
+            .unwrap()
+            .with_jitter(Duration::from_secs(24 * 3_600));
+
+        // Monday 01:00 local, and Tuesday 01:00 local, which is 23 hours later.
+        let due_at = at(hours(6));
+        let next = at(hours(29));
+        assert_eq!(
+            next - due_at,
+            hours(23),
+            "the fixture depends on the day being short"
+        );
+
+        let woken = wake_at(&schedule, due_at, 0.999, &SpringsForward);
+        assert!(
+            woken + MIN_GAP_SECS <= next,
+            "woke at {woken}, which leaves no room before the next moment at {next}"
+        );
+    }
+
+    /// And it cannot spill onto a forbidden day when the day is an hour short.
+    ///
+    /// `room_before_midnight` is `86400 - latest`, so `--on mon --at 01:00`
+    /// keeps 82800 seconds of room. On the short day there are only 79200
+    /// between 01:00 and midnight, and a roll of 0.96 landed the run on the
+    /// Tuesday — the failure `with_jitter`'s own doc says the bound exists to
+    /// stop, arriving through the hour the arithmetic does not know about.
+    #[test]
+    fn jitter_cannot_spill_onto_the_next_day_when_the_day_is_short() {
+        let schedule = Schedule::calendar(&[Weekday::Mon], &[(1, 0)])
+            .unwrap()
+            .with_jitter(Duration::from_secs(23 * 3_600));
+
+        let due_at = at(hours(6));
+        let midnight = at(hours(28));
+        assert_eq!(
+            midnight - due_at,
+            hours(22),
+            "01:00 to midnight is 22 real hours on this day, not 23"
+        );
+
+        let woken = wake_at(&schedule, due_at, 0.96, &SpringsForward);
+        let landed = SpringsForward.timestamp_opt(woken, 0).single().unwrap();
+        assert_eq!(
+            landed.weekday(),
+            chrono::Weekday::Mon,
+            "due Monday at one, woke {landed} — a day this schedule does not name"
         );
     }
 
