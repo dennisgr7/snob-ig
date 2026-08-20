@@ -55,6 +55,13 @@ pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Res
 /// literal timestamps. What is left here is sleeping and asking again, which
 /// is the part no test can usefully drive.
 async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    // Before anything that can refuse to start. Reading the file, building the
+    // schedule and checking the address can each end this process, and `settle`
+    // is the only caller of `store::prune` — so a service that dies at startup
+    // on a hand-edited file expires nothing for as long as nobody notices. This
+    // is the mode the README leads with, and it had no settle at all.
+    crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
+
     // Read first, so the flags can override it. A flag beats the file because
     // somebody typing one is saying something about this run in particular.
     let configured = config::load(paths)?;
@@ -324,6 +331,13 @@ async fn open_and_run(
         // Said by `common::open`, and there is nothing this run can do about it
         // — but the loop keeps going, because a session restored later should
         // be picked up without the service having to be restarted.
+        //
+        // Settled on the way out. This is a whole run, and a service whose
+        // session was logged out reaches this door on every one of them: with
+        // nothing here, a machine that ran for a week with no session expired
+        // nothing at all — not the owed reports, not old captures, not the run
+        // log.
+        crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
         return Ok(());
     };
 
@@ -935,6 +949,16 @@ fn describe_schedule(when: &When, schedule: &Schedule, now: bool) -> String {
 /// every unattended run, because `Watched::asking` discards the recorded
 /// consent that is the only thing such a run accepts.
 async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    // Settled before anything can refuse. This mode had the settle below and the
+    // scheduled one had none, and the two doors above them closed first in both:
+    // a session that has gone leaves owed reports ageing past `MAX_AGE_SECS`,
+    // where `due` no longer returns them and `failed` — the only thing that
+    // expires one — is never reached, while `status` goes on promising the next
+    // run will try them. A webhook address `webhook::check` refuses does the
+    // same thing one line earlier. One call, above both, so the pair cannot
+    // drift a third time.
+    crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
+
     // Before the session is opened and long before a request is spent, so a
     // webhook address that could never work costs nothing to find out about.
     // The file is read here too: `once` on a timer should need no more
@@ -944,14 +968,8 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
 
     let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
     else {
-        // Settled even here. This is the run that most needs it: a session that
-        // has gone leaves owed reports ageing past `MAX_AGE_SECS`, where `due`
-        // no longer returns them and `failed` — the only thing that expires one
-        // — is never reached, while `status` goes on promising the next run
-        // will try them. `last_started` already opens a store without a session.
-        if let Ok(db) = snob_core::store::Store::open(paths) {
-            crate::engine::watch::settle(&db, snob_core::store::now());
-        }
+        // Already settled, at the top: this run is the one that most needs it,
+        // and it is not the only door that closes before `run_accounts`.
         return Ok(ExitCode::NoSession);
     };
 
@@ -2786,6 +2804,105 @@ mod tests {
             "a run that had nothing to report still owes what it owed"
         );
         assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
+    }
+
+    /// A report queued longer ago than it can be news for, in a store at
+    /// `paths`. Nothing but a settle can move it: `due` will not hand back an
+    /// over-age row, and only a failed attempt expires one.
+    fn owed_long_ago(paths: &snob_core::paths::AppPaths, now: i64) -> i64 {
+        let db = snob_core::store::Store::open(paths).unwrap();
+        snob_core::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
+        snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+        deliveries::enqueue(
+            db.conn(),
+            "run-old",
+            42,
+            "{}",
+            now - deliveries::MAX_AGE_SECS - 1,
+            Some("https://receiver.example"),
+        )
+        .unwrap()
+    }
+
+    /// A run with no session still settles the queue.
+    ///
+    /// `settle` is the only caller of `store::prune` and both of its call sites
+    /// are behind doors this run never reaches -- `run_accounts` needs an `App`,
+    /// and this one returns the moment `common::open` says there is no session.
+    /// So `snob watch` under a unit after `snob logout`, or on a morning when
+    /// the keyring is locked, expires nothing at all for as long as that lasts:
+    /// not the owed reports, not old captures, not the run log. `status` goes on
+    /// counting a report `due` will never hand back and promising the next run
+    /// will try it.
+    #[tokio::test]
+    async fn a_scheduled_run_with_no_session_still_settles_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let now = snob_core::store::now();
+        let id = owed_long_ago(&paths, now);
+
+        let secrets = snob_core::secrets::SecretStore::new(paths.clone(), true)
+            .with_service(&format!("snob-ig-test-settle-{}", std::process::id()));
+        let args = WatchRunArgs {
+            no_progress: true,
+            ..WatchRunArgs::default()
+        };
+
+        open_and_run(&args, &[], None, &secrets, &paths)
+            .await
+            .expect("no session is not a failure; the loop keeps going");
+
+        let db = snob_core::store::Store::open(&paths).unwrap();
+        assert_eq!(
+            deliveries::state(db.conn(), id).unwrap().as_deref(),
+            Some("expired"),
+            "the run had no session, and retention still has to happen"
+        );
+    }
+
+    /// And neither does a webhook the run refuses.
+    ///
+    /// `delivery_from` ends in `webhook::check`, and both modes call it before
+    /// anything is opened -- deliberately, so an address that could never work
+    /// costs nothing to find out about. The cost was that a refused address took
+    /// retention with it. A header this tool already sends is a natural thing to
+    /// write into `[webhook.headers]`, since every header it sends starts
+    /// `X-Snob-`, and it stopped every run of both modes before either settle
+    /// site -- with `status` still saying the next run would try what was
+    /// queued.
+    #[tokio::test]
+    async fn a_webhook_the_run_refuses_still_lets_the_queue_settle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let now = snob_core::store::now();
+        let id = owed_long_ago(&paths, now);
+
+        let secrets = snob_core::secrets::SecretStore::new(paths.clone(), true)
+            .with_service(&format!("snob-ig-test-refused-{}", std::process::id()));
+        let args = WatchOnceArgs {
+            delivery: crate::cli::WebhookArgs {
+                webhook: Some("https://receiver.example/hook".to_string()),
+                header: vec!["X-Snob-Source: homelab".to_string()],
+                sign_with: None,
+                heartbeat: false,
+            },
+            target: None,
+            json: false,
+            no_progress: true,
+        };
+
+        let refused = once(args, secrets, &paths).await;
+        assert!(
+            refused.is_err(),
+            "that header is part of what snob sends, so the address is refused"
+        );
+
+        let db = snob_core::store::Store::open(&paths).unwrap();
+        assert_eq!(
+            deliveries::state(db.conn(), id).unwrap().as_deref(),
+            Some("expired"),
+            "the address was refused, and the database still has to be tidied"
+        );
     }
 
     /// A `watch.toml` as the tool would read one.
