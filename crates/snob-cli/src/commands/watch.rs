@@ -383,7 +383,9 @@ impl Printing {
 struct RunOutcome {
     /// Requests spent by every account that got as far as spending any.
     spent: u32,
-    /// The worst verdict a successful tick reported.
+    /// The first non-`Ok` verdict a tick reported, the accounts being in the
+    /// order the file names them. [`first_reason`] is where the choice between
+    /// first and worst is made, and why there is no worst to choose.
     code: ExitCode,
     /// The last failure, unprinted. Every earlier one has already been printed,
     /// because only one can be handed back and the caller prints the one it
@@ -440,11 +442,7 @@ async fn run_accounts(
         spent += charged;
 
         match outcome {
-            Ok(tick) => {
-                if code == ExitCode::Ok {
-                    code = tick.outcome();
-                }
-            }
+            Ok(tick) => code = first_reason(code, tick.outcome()),
             Err(e) => {
                 // A tick that failed is still a tick that happened.
                 //
@@ -586,6 +584,27 @@ fn to_print_and_to_return(
     let mut failures = failures.into_iter();
     let last = failures.next_back();
     (failures.collect(), last)
+}
+
+/// The verdict a run answers with, folded over the ticks that succeeded.
+///
+/// **The first non-`Ok` one, not the worst.** `ExitCode` is a handful of
+/// independent reasons rather than a severity scale: it derives no `Ord`, and
+/// its numbers are a shell convention — 130 is 128 plus SIGINT — so "the worst"
+/// is not something this could compute. The field's doc said "worst" anyway,
+/// which invites the fix that derives `Ord` and takes the maximum, and that
+/// ordering would put `Interrupted` above `NoSession`: a run somebody stopped
+/// would outrank a session that has gone, in the value `once` hands back as its
+/// process exit code.
+///
+/// So the rule is the order the accounts are already in, and the earliest reason
+/// wins. A tick that failed outright is not here at all — it leaves through
+/// `RunOutcome::failed`, and `once` returns this only when nothing failed.
+fn first_reason(so_far: ExitCode, tick: ExitCode) -> ExitCode {
+    match so_far {
+        ExitCode::Ok => tick,
+        earlier => earlier,
+    }
 }
 
 /// One account, inside a run that may cover several.
@@ -2421,6 +2440,40 @@ mod tests {
 
         let (printed, returned) = to_print_and_to_return(Vec::new());
         assert!(printed.is_empty() && returned.is_none());
+    }
+
+    /// The run's code is the first reason, and there is no worst to take.
+    ///
+    /// The field said "the worst verdict a successful tick reported" over a type
+    /// with no ordering. The fix that reading invites is deriving `Ord` on
+    /// `ExitCode` and taking the maximum -- and the discriminants are the shell
+    /// convention, so that order puts `Interrupted` (130) above `NoSession` (3)
+    /// and a run somebody stopped outranks a session that has gone. This is what
+    /// `once` hands back as its process exit code, and the codes exist so a
+    /// caller on a timer can tell "wait a while" from "log in again" without
+    /// parsing text.
+    #[test]
+    fn the_run_answers_with_the_first_reason_not_the_worst() {
+        assert_eq!(
+            first_reason(ExitCode::Ok, ExitCode::RateLimited),
+            ExitCode::RateLimited,
+            "the first account with something to say is what the run says"
+        );
+        assert_eq!(
+            first_reason(ExitCode::RateLimited, ExitCode::NoSession),
+            ExitCode::RateLimited,
+            "a later account does not overwrite an earlier reason"
+        );
+        assert_eq!(
+            first_reason(ExitCode::Interrupted, ExitCode::Error),
+            ExitCode::Interrupted,
+            "and not by being higher or lower than it"
+        );
+        assert_eq!(
+            first_reason(ExitCode::Ok, ExitCode::Ok),
+            ExitCode::Ok,
+            "a run where every account was fine is fine"
+        );
     }
 
     /// Both slots of the refusal take the same name, so both must be filtered.

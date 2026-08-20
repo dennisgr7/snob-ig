@@ -333,10 +333,12 @@ fn ask_webhook() -> Result<WebhookAnswers> {
     // with the comment above it, so `[webhook.headers]` could only ever be
     // written by hand while the wizard implied otherwise — and `X-Api-Key` on an
     // n8n instance is the ordinary case.
-    let mut headers = Vec::new();
+    let mut typed = Vec::new();
     if ui::confirm("Does it need any other headers?", false)? {
         loop {
-            let line = ui::prompt_line("Name: value (blank when there are no more)")?;
+            let line = ui::prompt_line(
+                "Name: value (blank when there are no more, a name typed twice keeps the last)",
+            )?;
             let line = line.trim();
             if line.is_empty() {
                 break;
@@ -347,9 +349,10 @@ fn ask_webhook() -> Result<WebhookAnswers> {
                     printable(line)
                 );
             };
-            headers.push((name.trim().to_string(), value.trim().to_string()));
+            typed.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
+    let headers = last_of_each(typed);
 
     // Checked while the person is still here, address and headers together. The
     // alternative is a service that starts, waits six hours, and then fails on
@@ -394,6 +397,32 @@ fn ask_webhook() -> Result<WebhookAnswers> {
         signing_key,
         token,
     ))
+}
+
+/// The headers a run of typed answers describes, a name given twice keeping the
+/// last value.
+///
+/// The answers were collected straight into a `Vec`, which can hold a name the
+/// file format cannot: `[webhook.headers]` is a TOML table, and TOML refuses a
+/// duplicate key. So typing `X-Api-Key: a` and then correcting it to
+/// `X-Api-Key: b` — the ordinary way somebody fixes a value they mistyped —
+/// produced a file `config::parse` could not read. That parse is deliberately
+/// the last thing before anything is written and before either secret is
+/// stored, so the wizard aborted with "the configuration this produced could not
+/// be read back; this is a bug" once every question had been answered and both
+/// secrets typed, kept none of it, and told the user it was the tool's fault
+/// rather than which line to change. `webhook::check` is no help here: it
+/// validates each pair on its own, and each of the two is fine.
+///
+/// Sorted rather than left in the order they were typed, which costs nothing:
+/// `WebhookConfig::headers` is a `BTreeMap`, so that is the order they come back
+/// out of the file anyway.
+fn last_of_each(typed: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut headers = std::collections::BTreeMap::new();
+    for (name, value) in typed {
+        headers.insert(name, value);
+    }
+    headers.into_iter().collect()
 }
 
 fn ask_accounts() -> Result<Vec<(String, Option<i64>)>> {
@@ -1080,6 +1109,40 @@ evry = \"6h\"
                 "{line:?} produced a file with no schedule in it"
             );
         }
+    }
+
+    /// A name typed twice must not produce a file the wizard cannot read back.
+    ///
+    /// `[webhook.headers]` is a TOML table and TOML refuses a duplicate key, so
+    /// correcting a mistyped `X-Api-Key` by typing it again wrote the name
+    /// twice. `config::parse` is deliberately the last thing before the file is
+    /// written and before either secret is stored, so it refused, and the wizard
+    /// threw away every answer -- including two secrets typed at a masked
+    /// prompt -- and told the user it was a bug in the tool.
+    #[test]
+    fn a_header_named_twice_does_not_produce_a_file_the_tool_cannot_read() {
+        let headers = last_of_each(vec![
+            ("X-Api-Key".to_string(), "a".to_string()),
+            ("X-Api-Key".to_string(), "b".to_string()),
+        ]);
+
+        let text = config::template(
+            "every = \"6h\"",
+            None,
+            Some("https://n8n.local/webhook/snob"),
+            false,
+            &headers,
+            &[("self".to_string(), None)],
+            false,
+        );
+        let parsed = config::parse(&text, std::path::Path::new("watch.toml"))
+            .expect("the wizard must not write a file it cannot read back");
+
+        assert_eq!(
+            parsed.webhook.unwrap().headers["X-Api-Key"],
+            "b",
+            "the value typed last is the one that was meant"
+        );
     }
 
     #[test]

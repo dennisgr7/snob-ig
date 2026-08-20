@@ -11,9 +11,25 @@
 //!
 //! - **Other users of the machine**: yes. The keyring is per account, and the
 //!   file is `0600` inside a `0700` directory.
-//! - **The file or the credential travelling to another machine**: yes. Every
-//!   backend ties the secret to this user on this computer — DPAPI on Windows,
-//!   the login keychain on macOS, the Secret Service collection on Linux.
+//! - **A bare copy of the store, read somewhere else**: yes. The keyring
+//!   database, the Windows credential and — on Windows — the file fallback are
+//!   sealed under a key that comes from the user's login: DPAPI there, the login
+//!   keychain on macOS, the Secret Service collection on Linux. The bytes on
+//!   their own are not a session.
+//! - **The secret leaving this computer**: **no**, though this file said
+//!   otherwise until it was read against the code. It is the claim somebody
+//!   checks before deciding whether backing up a profile, turning roaming on or
+//!   handing on a disk image is safe, so it is worth the three sentences. The
+//!   Windows credential is written `CRED_PERSIST_ENTERPRISE`, which Microsoft
+//!   documents as visible to this user on other computers wherever the account
+//!   has roamable state — it degrades to local storage on an account with none,
+//!   which is every ordinary machine, so the exposure is real and narrow;
+//!   `entry_for` says why it is not `CRED_PERSIST_LOCAL_MACHINE`. Outside
+//!   Windows the file fallback is `Protection::Plain` — plain JSON at `0600` —
+//!   so a copy of it is a working session anywhere, with no password and no key.
+//!   And a keychain or collection carried off together with the login password
+//!   opens wherever it is opened, because that password is the whole of what
+//!   seals it.
 //! - **Code running as the user themselves**: **no. Nowhere. By any backend.**
 //!   Windows documents no read restriction on `CRED_TYPE_GENERIC`, and any
 //!   process of the same logon can call `CredRead` or `CryptUnprotectData` and
@@ -1372,6 +1388,40 @@ mod tests {
     fn the_backend_token_is_stable() {
         assert_eq!(Backend::Keyring.as_str(), "keyring");
         assert_eq!(Backend::File.as_str(), "file");
+    }
+
+    /// The header says what the backends do, and no more than that.
+    ///
+    /// It claimed every backend "ties the secret to this user on this computer",
+    /// which two things in this same file contradict: `entry_for` records that
+    /// the Windows credential is written `CRED_PERSIST_ENTERPRISE` and roams
+    /// with the profile, and outside Windows `protect` stores
+    /// `Protection::Plain` -- plain JSON at `0600`, which is a working session
+    /// on any machine somebody copies it to. That bullet is what a person reads
+    /// before deciding whether to back up a profile or hand on a disk image, so
+    /// it gets a test rather than a proofread. `include_str!` because the claim
+    /// is the artifact under test; there is nothing else to call.
+    #[test]
+    fn the_header_does_not_promise_more_than_the_backends_do() {
+        let header = include_str!("secrets.rs")
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !header.contains("ties the secret to this user on this computer"),
+            "the header promises the secret cannot travel, and two backends let it"
+        );
+        assert!(
+            header.contains("CRED_PERSIST_ENTERPRISE"),
+            "the Windows credential roams, and the header is where that is read"
+        );
+        assert!(
+            header.contains("Protection::Plain"),
+            "the file fallback outside Windows is plain JSON, and the header is \
+             where that is read"
+        );
     }
 
     #[test]
