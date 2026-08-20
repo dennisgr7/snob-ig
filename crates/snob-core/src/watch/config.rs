@@ -97,8 +97,16 @@ pub struct ConsentConfig {
 
 impl AccountConfig {
     /// Whether this line names the account the session belongs to.
+    ///
+    /// The at sign comes off first, because everywhere else in the tool it does:
+    /// `@self` is what somebody writes who has just written `@friend` on the
+    /// line above. Without it that line is read as a stranger named `self`, and
+    /// a scheduled run refuses to start asking for confirmation to read an
+    /// account it owns.
     pub fn is_own(&self) -> bool {
-        self.target.eq_ignore_ascii_case("self")
+        self.target
+            .trim_start_matches('@')
+            .eq_ignore_ascii_case("self")
     }
 }
 
