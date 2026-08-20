@@ -461,7 +461,22 @@ async fn run_accounts(
                 // nothing has put a row there yet. That is the account a new
                 // user would most want a probe to fail for, and it is written
                 // down here rather than left to be rediscovered.
-                record_failed_run(app, account, &e, charged);
+                //
+                // The moment is read once and given to both, so the row in the
+                // run log and the line in the stream name the same second and a
+                // reader can put them side by side.
+                let at = snob_core::store::now();
+                record_failed_run(app, account, &e, charged, at);
+                if printing.json {
+                    // The stream gets a line for this interval too. Written
+                    // after the `?` in `tick_one`, there was none: the failure
+                    // went to standard error as prose and `events.ndjson` had
+                    // nothing at all for that run.
+                    println!(
+                        "{}",
+                        json_line(&failed_tick_json(account, &e, at, charged), printing)
+                    );
+                }
                 failures.push(e);
             }
         }
@@ -514,6 +529,7 @@ fn record_failed_run(
     watched: &Watched,
     error: &anyhow::Error,
     requests: u32,
+    at: i64,
 ) {
     let pk = match watched.name() {
         Some(name) => snob_core::store::accounts::find_pk_by_username(
@@ -528,7 +544,6 @@ fn record_failed_run(
         return;
     };
 
-    let at = snob_core::store::now();
     let outcome = ExitCode::from_chain(error).unwrap_or(ExitCode::Error);
     let record = snob_core::store::watch::record_run(
         app.db().conn(),
@@ -577,15 +592,7 @@ async fn tick_one(
     let tick = tick?;
 
     if printing.json {
-        let json = tick_json(&tick);
-        println!(
-            "{}",
-            if printing.watching {
-                serde_json::to_string_pretty(&json)?
-            } else {
-                serde_json::to_string(&json)?
-            }
-        );
+        println!("{}", json_line(&tick_json(&tick), printing));
     } else if printing.watching || !tick.report.changes().is_empty() {
         for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             println!("{line}");
@@ -1815,14 +1822,95 @@ fn as_json(report: &WatchReport) -> serde_json::Value {
 fn tick_json(tick: &TickReport) -> serde_json::Value {
     let mut out = as_json(&tick.report);
     out["run"] = serde_json::json!({
+        "at": tick.at(),
         "looked": tick.looked(),
         "requests": tick.requests,
-        "lists": tick.lists.iter().map(|l| serde_json::json!({
-            "kind": l.kind.as_str(),
-            "skipped": l.skipped.map(skipped_token),
-        })).collect::<Vec<_>>(),
+        "lists": run_lists_json(tick),
     });
     out
+}
+
+/// Which lists this run read, and which it refused.
+///
+/// One builder for both streams. The webhook body used to say nothing about
+/// this at all: a list served during a cooldown, after a failed poll or cut
+/// short is dropped before the comparison, so it reaches [`payload`] as `None`
+/// and serializes to `null` — the same `null` an account with no capture of
+/// that list produces, with `counts.following_lost` at `0` either way. A run
+/// where the following walk met the truncation wall and a run where nothing
+/// happened were byte-identical, so `{{ $json.counts.following_lost > 0 }}`
+/// routed to "quiet" for as long as the wall lasted. The refusal was said out
+/// loud on standard error, where no receiver hears it.
+fn run_lists_json(tick: &TickReport) -> serde_json::Value {
+    tick.lists
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "kind": l.kind.as_str(),
+                "skipped": l.skipped.map(skipped_token),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// The line a tick that failed leaves in the stream.
+///
+/// Written after the `?` in `tick_one`, the JSON line was not written at all: a
+/// tick that could not resolve an account, or met a mid-walk cooldown, or could
+/// not read `history_head`, put its whole account on standard error as an
+/// English paragraph and left the file with no line for that interval. On a
+/// recipe the README offers as a complete way to use the tool.
+///
+/// It carries the same `run` object a successful line carries, so one reader
+/// can take `run.at` off every line without asking which kind it is, and
+/// `error` is what tells the two apart. `error.code` is the vocabulary of the
+/// README's exit table and of `watch_runs.outcome`, which is the field worth
+/// branching on; `error.message` is the chain, for a person reading the file.
+///
+/// The name and the message are the true values, unfiltered, for the reason
+/// `as_json` gives about a username: `printable` is for terminals, a machine
+/// format has to carry what identifies the account, and `serde_json` escapes
+/// what it emits. Everything drawn at a person still goes through
+/// `report::print_error`.
+fn failed_tick_json(
+    watched: &Watched,
+    error: &anyhow::Error,
+    at: i64,
+    requests: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "account": {
+            "username": watched.name(),
+            "is_self": watched.name().is_none(),
+        },
+        "run": {
+            "at": at,
+            "looked": false,
+            "requests": requests,
+            "lists": [],
+        },
+        "error": {
+            "code": ExitCode::from_chain(error).unwrap_or(ExitCode::Error).as_str(),
+            "message": format!("{error:#}"),
+        },
+    })
+}
+
+/// One JSON line, laid out the way this mode lays them out.
+///
+/// `once` is looked at while it runs and lays its object out to be read; the
+/// scheduled mode writes one line down a pipe. That was decided in two places,
+/// and the second of them is reached from the arm that is already handling a
+/// failure — which is why the fallback is `Value::to_string` rather than a `?`:
+/// a serializer error on a `Value` built here is not a second failure worth
+/// returning instead of the first.
+fn json_line(value: &serde_json::Value, printing: Printing) -> String {
+    if printing.watching {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        value.to_string()
+    }
 }
 
 /// What goes on the wire.
@@ -1832,7 +1920,7 @@ fn tick_json(tick: &TickReport) -> serde_json::Value {
 /// automation branches on, and a field renamed by accident breaks a workflow
 /// somebody built months ago.
 ///
-/// Three decisions worth knowing about, all of them about what an n8n node
+/// Four decisions worth knowing about, all of them about what an n8n node
 /// actually needs:
 ///
 /// - **`counts` is separate from `changes`**, and redundant with the array
@@ -1845,6 +1933,15 @@ fn tick_json(tick: &TickReport) -> serde_json::Value {
 /// - **`looked` is not derivable from the arrays.** Empty changes mean "nothing
 ///   happened" when the run could see and "I could not look" when it could not,
 ///   and something watching for silence reads those as the same thing.
+/// - **`run.lists` is `looked` at the granularity a receiver needs.** `looked`
+///   is true when *either* list was read, so a run that walked followers and
+///   was refused following says `true` while `lists.following` is `null` and
+///   `counts.following_lost` is `0` — indistinguishable from a quiet run, and
+///   from an account with no following capture at all. The token is per list
+///   and additive, so `schema` stays 1. `lists.<kind>` deliberately stays
+///   `null` rather than becoming an object: a receiver testing it against
+///   `null` is the shape this shipped with, and there is no version to warn
+///   them by.
 fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
     let report = &tick.report;
     let changes = report.changes();
@@ -1854,9 +1951,13 @@ fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
         "event": event,
         "run": {
             "id": run_id,
-            "at": snob_core::store::now(),
+            // The tick's own moment, not a third reading of the clock. It is
+            // what `commit_report` files the mark at and what the `--json` line
+            // carries, so one event has one time in all three places.
+            "at": tick.at(),
             "looked": tick.looked(),
             "requests": tick.requests,
+            "lists": run_lists_json(tick),
             "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
         },
         "account": {
@@ -2104,6 +2205,7 @@ fn earliest_since(report: &WatchReport) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::watch::TickList;
 
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
@@ -3342,6 +3444,172 @@ consent = { agreed_at = 1700 }
         }
     }
 
+    /// A refused list is not a quiet one, and the body has to say which it was.
+    ///
+    /// `tick` drops a list it could not verify before the comparison, so it
+    /// reaches `payload` as `None` and `list_json` turns it into `null` — the
+    /// same `null` an account with no capture of that list produces, with
+    /// `counts.following_lost` at `0` in both. The two bodies were byte
+    /// identical, so `{{ $json.counts.following_lost > 0 }}` routed a run that
+    /// could not see to "nothing happened" for as long as the wall lasted, and
+    /// the only place the refusal was said out loud was standard error.
+    ///
+    /// `run.looked` cannot resolve it, and it is asserted equal here to say so:
+    /// it is `any`, not `all`, so a run that read followers and was refused
+    /// following reports `true`. Which list is the question.
+    #[test]
+    fn a_refused_list_is_not_reported_as_a_quiet_one() {
+        let body = |skipped| {
+            let mut tick = TickReport::for_test(
+                report_with(
+                    Some(list(
+                        Basis::Compare {
+                            before: 1,
+                            after: 2,
+                        },
+                        ListDiff {
+                            gained: vec![user(1, "arrived")],
+                            lost: vec![],
+                        },
+                        Some(1_000),
+                    )),
+                    vec![],
+                ),
+                7,
+                1_700_000_000,
+            );
+            tick.lists = vec![
+                TickList {
+                    kind: ListKind::Followers,
+                    skipped: None,
+                },
+                TickList {
+                    kind: ListKind::Following,
+                    skipped,
+                },
+            ];
+            payload(&tick, "run-1", "watch.changes")
+        };
+
+        let refused = body(Some(Skipped::NobodyLooked(Provenance::PollFailed)));
+        let read = body(None);
+
+        // Everything a receiver had to go on before, and it is the same in
+        // both: the arrays cannot tell them apart and neither can the counts.
+        assert_eq!(refused["lists"], read["lists"]);
+        assert_eq!(refused["counts"], read["counts"]);
+        assert_eq!(
+            refused["run"]["looked"], read["run"]["looked"],
+            "`looked` is `any`, so it says `true` for both"
+        );
+
+        assert_ne!(
+            refused["run"]["lists"], read["run"]["lists"],
+            "a receiver has no field to read the refusal from"
+        );
+        assert_eq!(refused["run"]["lists"][1]["kind"], "following");
+        assert_eq!(refused["run"]["lists"][1]["skipped"], "not_verified");
+        assert_eq!(
+            read["run"]["lists"][1]["skipped"],
+            serde_json::Value::Null,
+            "a list that was read carries no refusal"
+        );
+    }
+
+    /// An event line says when it happened.
+    ///
+    /// The README puts `snob watch --json >> events.ndjson` forward as a
+    /// complete way to use the tool, and the line carried no time of its own.
+    /// The only epoch fields belonged to the lists — the mark's moment and the
+    /// capture's — and they go away with the list when it is refused. One 429
+    /// opens a cooldown, both lists are served from storage for the next half
+    /// hour, and every line in that window is byte-identical while the wire
+    /// bodies for the same ticks differ at `run.at`. A file like that cannot be
+    /// queried by time, windowed or deduplicated.
+    #[test]
+    fn an_event_line_says_when_it_happened() {
+        let quiet_run_at = |at| {
+            let mut tick = TickReport::for_test(report_with(None, vec![]), 0, at);
+            tick.lists = vec![TickList {
+                kind: ListKind::Followers,
+                skipped: Some(Skipped::NobodyLooked(Provenance::Cooldown)),
+            }];
+            tick_json(&tick)
+        };
+
+        let first = quiet_run_at(1_700_000_000);
+        let second = quiet_run_at(1_700_021_600);
+
+        assert_eq!(first["run"]["at"], 1_700_000_000);
+        assert_ne!(
+            first, second,
+            "six hours apart and the same bytes: nothing in the file can date a run"
+        );
+
+        // The moment is the tick's own, so the file and whatever the webhook
+        // delivered can be joined on it.
+        let tick = TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000);
+        assert_eq!(
+            tick_json(&tick)["run"]["at"],
+            payload(&tick, "run-1", "watch.changes")["run"]["at"],
+            "one event, one moment"
+        );
+    }
+
+    /// A failed tick leaves a line in the stream.
+    ///
+    /// The JSON line is written after the `?` in `tick_one`, so a tick that
+    /// failed printed nothing on standard output at all — @friend goes private,
+    /// or DNS goes away for a named target, and `events.ndjson` simply has no
+    /// line for that interval. The failure went to standard error as an English
+    /// `error:` / `caused by:` / `hint:` paragraph, which is the one shape a
+    /// consumer of the file is not reading.
+    ///
+    /// The line has to be readable by the same reader the successful lines
+    /// have, which is why `run` is the same object. `error` is what tells them
+    /// apart, and a successful line must not have one.
+    #[test]
+    fn a_failed_tick_leaves_a_line_in_the_stream() {
+        let error = anyhow::anyhow!("@friend's account is private");
+        let line = failed_tick_json(
+            &Watched::consented(
+                "friend".into(),
+                crate::engine::watch::Consent { given_at: 1 },
+            ),
+            &error,
+            1_700_000_000,
+            1,
+        );
+
+        assert_eq!(
+            line["run"]["at"], 1_700_000_000,
+            "the gap in the file has to be datable, which is the whole of it"
+        );
+        assert_eq!(line["run"]["looked"], false);
+        assert_eq!(line["run"]["requests"], 1, "the poll was charged");
+        assert_eq!(line["account"]["username"], "friend");
+        assert_eq!(
+            line["error"]["code"], "error",
+            "the vocabulary of the exit table, not free text"
+        );
+
+        // And the two kinds of line are told apart by the field itself, not by
+        // what is missing from the rest of the object.
+        let ok = tick_json(&TickReport::for_test(
+            report_with(None, vec![]),
+            0,
+            1_700_000_000,
+        ));
+        assert!(
+            ok.get("error").is_none(),
+            "a run that worked must not look like one that failed"
+        );
+
+        // Both modes lay a line out the way they lay the successful ones out.
+        assert!(!json_line(&line, Printing::unattended(true)).contains('\n'));
+        assert!(json_line(&line, Printing::watched(true)).contains('\n'));
+    }
+
     /// The shape a stranger's automation branches on, pinned to a literal.
     ///
     /// This is the one output of the tool that somebody else's workflow reads,
@@ -3349,8 +3617,9 @@ consent = { agreed_at = 1700 }
     /// error anywhere. Comparing against a literal means a change to the
     /// contract has to be a change somebody made on purpose.
     ///
-    /// The two moving fields are left out of the comparison: `run.at` is the
-    /// clock and `run.id` is random, which is what they are for.
+    /// Both of the fields that move in production are arguments here: `run.id`
+    /// is random and `run.at` is the tick's own moment, so the literal can
+    /// carry them rather than the comparison having to skip them.
     #[test]
     fn the_payload_has_the_shape_a_receiver_was_promised() {
         let tick = TickReport::for_test(
@@ -3375,10 +3644,10 @@ consent = { agreed_at = 1700 }
                 }],
             ),
             14,
+            1_700_000_000,
         );
 
-        let mut payload = payload(&tick, "run-1", "watch.changes");
-        payload["run"]["at"] = serde_json::Value::Null;
+        let payload = payload(&tick, "run-1", "watch.changes");
 
         assert_eq!(
             payload,
@@ -3387,9 +3656,10 @@ consent = { agreed_at = 1700 }
                 "event": "watch.changes",
                 "run": {
                     "id": "run-1",
-                    "at": null,
+                    "at": 1_700_000_000,
                     "looked": false,
                     "requests": 14,
+                    "lists": [],
                     "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
                 },
                 "account": { "pk": 42, "username": "me", "is_self": true },
