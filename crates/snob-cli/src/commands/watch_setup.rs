@@ -746,7 +746,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         .as_ref()
         .and_then(|c| c.webhook.as_ref())
         .and_then(|w| url::Url::parse(&w.url).ok())
-        .map(|url| super::watch::destination_of(&url));
+        .map(|url| super::watch::delivery::destination_of(&url));
     let owed = deliveries::owed(db.conn(), destination.as_deref())?;
     let marks = watch_store::all_marks(db.conn())?;
     // Per account, and reported per account: a run covers every configured one,
