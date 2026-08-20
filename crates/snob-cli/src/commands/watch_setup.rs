@@ -1308,7 +1308,13 @@ every = \"6h\"
             "schema = 1\nevery = \"5m\"\n",
             "schema = 1\ncron = \"0 9 * *\"\n",
             "schema = 1\nat = [\"25:00\"]\n",
-            "schema = 1\nevery = \"2w\"\non = [\"mon\"]\n",
+            // `every = "2w"` beside `on = ["mon"]` was in this list, and it was
+            // the defect rather than the guard: days with no time of day went to
+            // `Schedule::calendar`, which is a set of minutes and refuses one
+            // naming none, so the shape the README leads with killed every run
+            // of a service over a file the parser had accepted. It builds now,
+            // and `one_monday_in_every_two_is_what_the_readme_says_it_is` is
+            // where it is held down.
         ] {
             let configured = config(refused);
             let ok = ran("ok");

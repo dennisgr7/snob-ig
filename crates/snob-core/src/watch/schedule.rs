@@ -363,6 +363,61 @@ impl Schedule {
         .validated()
     }
 
+    /// On these weekdays, as often as the interval allows.
+    ///
+    /// The shape `--every 2w --on mon` asks for, and the one thing cron cannot
+    /// express — which README.md, CHANGELOG.md and AGENTS.md all print as an
+    /// example and the tool refused. Days with no time of day went to
+    /// [`Schedule::calendar`], which is a set of minutes and so answers "a
+    /// calendar needs a time of day" to one that names none; the interval was
+    /// never looked at. Through `watch.toml` that is worse than a typo at a
+    /// prompt, because `config::parse` accepts `every` beside `on`: an installed
+    /// service refused at startup on every run, over a file it had accepted.
+    ///
+    /// So every minute of an allowed day is allowed, and the interval is what
+    /// keeps two runs apart. **The interval is not optional here**, which is why
+    /// it is an argument rather than something [`Schedule::and_every`] adds
+    /// afterwards: on its own this grid names 1440 moments a day, and
+    /// [`Schedule::validated`] refuses that and is right to — "on Mondays", with
+    /// nothing else said, is not a schedule.
+    ///
+    /// The jitter this comes out with is zero, and that is the arithmetic
+    /// working rather than failing. [`Schedule::room_for_jitter`] takes the
+    /// interval as the step, and a grid whose tightest gap is one minute has
+    /// nothing left over. What keeps a fortnightly run off the same second is
+    /// the length of the walk in front of it, which the floor already measures
+    /// from.
+    ///
+    /// Empty days are refused rather than read as every day, which is what
+    /// [`Schedule::calendar`] does with them. There they still leave a time of
+    /// day behind; here they would leave a calendar allowing every minute of
+    /// every day — [`Schedule::every`] wearing a calendar, whereupon
+    /// `is_on_a_calendar` answers `true` and a fresh install stops inventing the
+    /// last run it needs.
+    pub fn days(days: &[Weekday], interval: Duration) -> Result<Self, ScheduleError> {
+        if days.is_empty() {
+            return Err(ScheduleError::Unreadable(
+                "which days? try --on mon,thu, or --every 6h for no particular day".to_string(),
+            ));
+        }
+
+        Self {
+            calendar: Some(Calendar {
+                times: Times::Crossed {
+                    minutes: FieldSet::all(0..=59),
+                    hours: FieldSet::all(0..=23),
+                },
+                days_of_month: FieldSet::all(1..=31),
+                months: FieldSet::all(1..=12),
+                days_of_week: FieldSet(days.iter().fold(0u64, |bits, d| bits | (1 << d.number()))),
+            }),
+            every: Some(interval),
+            jitter: default_jitter(Some(interval)),
+        }
+        .fitted()
+        .validated()
+    }
+
     /// A five-field cron expression.
     pub fn cron(expression: &str) -> Result<Self, ScheduleError> {
         Self {
