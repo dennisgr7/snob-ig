@@ -9,7 +9,7 @@
 //! module is about reports, this one is about a file and a keyring entry.
 
 use anyhow::{Context, Result, bail};
-use snob_core::model::printable;
+use snob_core::model::{ListKind, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secret::Secret;
 use snob_core::secrets::{Kind, SecretStore};
@@ -451,7 +451,32 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         });
     }
 
-    let health = health(config.as_ref(), &runs_of, owed, snob_core::store::now());
+    // Which accounts have had exactly one of their two lists reported on. Built
+    // here for the same reason `runs_of` is: the store is open here.
+    let mut seen: std::collections::BTreeMap<snob_core::Pk, Vec<ListKind>> = Default::default();
+    for mark in &marks {
+        seen.entry(mark.account_pk).or_default().push(mark.kind);
+    }
+    let mut reported = Vec::new();
+    for (pk, kinds) in seen {
+        let name = snob_core::store::users::name(db.conn(), pk)?;
+        reported.push(HalfRead {
+            who: crate::app::label(pk, name.as_deref()),
+            reported: kinds[0],
+            missing: (kinds.len() == 1).then(|| match kinds[0] {
+                ListKind::Followers => ListKind::Following,
+                ListKind::Following => ListKind::Followers,
+            }),
+        });
+    }
+
+    let health = health(
+        config.as_ref(),
+        &runs_of,
+        &reported,
+        owed,
+        snob_core::store::now(),
+    );
 
     if args.json {
         println!(
@@ -669,7 +694,25 @@ fn expected_gap(config: &WatchConfig, now: i64) -> Option<i64> {
     (second > first).then_some(second - first)
 }
 
-fn health(config: Option<&WatchConfig>, runs: &[RunOf<'_>], owed: usize, now: i64) -> Health {
+/// An account with exactly one of its two lists ever reported on.
+///
+/// Built by `status` from the marks it already reads. A mark moves only when a
+/// list was actually compared, so a list with none while its sibling has one has
+/// never been read — which nothing else in the tool can say.
+struct HalfRead {
+    who: String,
+    reported: ListKind,
+    /// The one that never has been, or `None` when both have.
+    missing: Option<ListKind>,
+}
+
+fn health(
+    config: Option<&WatchConfig>,
+    runs: &[RunOf<'_>],
+    reported: &[HalfRead],
+    owed: usize,
+    now: i64,
+) -> Health {
     let mut notes = Vec::new();
     let mut verdict = Verdict::Ok;
     let mut at_least = |level: Verdict| verdict = verdict.max(level);
@@ -684,6 +727,32 @@ fn health(config: Option<&WatchConfig>, runs: &[RunOf<'_>], owed: usize, now: i6
     if runs.is_empty() {
         at_least(Verdict::Warned);
         notes.push("it has not run yet".to_string());
+    }
+
+    // **One list being read while the other never is.**
+    //
+    // `watch_runs.outcome` is one column for a tick that covers two lists, and
+    // `TickReport::looked()` asks `any`, not `all` — so a run where followers
+    // completed and following was refused records `ok`, `status` takes the
+    // "found nothing" branch, and the exit code is 0. Every run, forever, on
+    // the account AGENTS.md files under "Known walls": `following` meets the
+    // truncation wall on every walk while `followers` completes. There was no
+    // probe anywhere that could tell that from a quiet account.
+    //
+    // Asked of the marks rather than of the run log, because the marks are
+    // where the durable answer already is: a mark moves only when a list was
+    // actually compared, so a list with none while its sibling has one has
+    // never once been read. That needs no new column and no threshold, and it
+    // catches the permanent case, which is the one that matters. A single
+    // half-blind run is the payload's question, not this one.
+    for half in reported.iter().filter(|r| r.missing.is_some()) {
+        let (read, never) = (half.reported, half.missing.expect("filtered"));
+        at_least(Verdict::Warned);
+        notes.push(format!(
+            "{}: {read} has been reported on and {never} never has, so one of the two \
+             lists is not being read",
+            half.who
+        ));
     }
 
     // A schedule the scheduler refuses is a monitor that cannot start.
@@ -1017,7 +1086,7 @@ url = \"https://n8n.internal/hook\"
 
         let ok = ran("ok");
         assert_eq!(
-            health(Some(&configured), &[of(&ok)], 0, NOW).verdict,
+            health(Some(&configured), &[of(&ok)], &[], 0, NOW).verdict,
             Verdict::Ok,
             "configured, ran just now, nothing owed"
         );
@@ -1027,7 +1096,7 @@ url = \"https://n8n.internal/hook\"
         for lifts in ["rate_limited", "interrupted"] {
             let run = ran(lifts);
             assert_eq!(
-                health(Some(&configured), &[of(&run)], 0, NOW).verdict,
+                health(Some(&configured), &[of(&run)], &[], 0, NOW).verdict,
                 Verdict::Warned,
                 "{lifts} passes on its own"
             );
@@ -1037,7 +1106,7 @@ url = \"https://n8n.internal/hook\"
         // in, and every run until then does nothing at all.
         let dead = ran("no_session");
         assert_eq!(
-            health(Some(&configured), &[of(&dead)], 0, NOW).verdict,
+            health(Some(&configured), &[of(&dead)], &[], 0, NOW).verdict,
             Verdict::Failed
         );
 
@@ -1045,7 +1114,7 @@ url = \"https://n8n.internal/hook\"
         // they expire -- and the changes in them are already marked as
         // reported, so they are the only copy.
         assert_eq!(
-            health(Some(&configured), &[of(&ok)], 2, NOW).verdict,
+            health(Some(&configured), &[of(&ok)], &[], 2, NOW).verdict,
             Verdict::Warned
         );
         let no_webhook = config(
@@ -1054,13 +1123,13 @@ every = \"6h\"
 ",
         );
         assert_eq!(
-            health(Some(&no_webhook), &[of(&ok)], 2, NOW).verdict,
+            health(Some(&no_webhook), &[of(&ok)], &[], 2, NOW).verdict,
             Verdict::Failed
         );
 
         // And a machine with nothing configured is not broken, but a bare
         // `snob watch` there has no schedule to run on.
-        let nothing = health(None, &[], 0, NOW);
+        let nothing = health(None, &[], &[], 0, NOW);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
     }
@@ -1087,7 +1156,7 @@ every = \"6h\"
         ] {
             let configured = config(refused);
             let ok = ran("ok");
-            let health = health(Some(&configured), &[of(&ok)], 0, NOW);
+            let health = health(Some(&configured), &[of(&ok)], &[], 0, NOW);
             assert_eq!(
                 health.verdict,
                 Verdict::Failed,
@@ -1099,7 +1168,54 @@ every = \"6h\"
         // And one that builds is still fine.
         let good = config("schema = 1\nevery = \"6h\"\n");
         let ok = ran("ok");
-        assert_eq!(health(Some(&good), &[of(&ok)], 0, NOW).verdict, Verdict::Ok);
+        assert_eq!(
+            health(Some(&good), &[of(&ok)], &[], 0, NOW).verdict,
+            Verdict::Ok
+        );
+    }
+
+    /// One list being read while the other never is.
+    ///
+    /// `watch_runs.outcome` is one column for a tick covering two lists, and
+    /// `TickReport::looked()` asks `any` rather than `all` — so a run where
+    /// followers completed and following was refused records `ok`, `status`
+    /// takes the "found nothing" branch, and the exit code is 0. Every run,
+    /// forever, on the account AGENTS.md files under "Known walls". There was
+    /// no probe anywhere that could tell that from a quiet account.
+    ///
+    /// Asked of the marks, because that is where the durable answer already
+    /// is: a mark moves only when a list was actually compared.
+    #[test]
+    fn one_list_never_being_read_is_not_a_healthy_monitor() {
+        let configured = config("schema = 1\nevery = \"6h\"\n");
+        let ok = ran("ok");
+
+        let half = HalfRead {
+            who: "@me".to_string(),
+            reported: ListKind::Followers,
+            missing: Some(ListKind::Following),
+        };
+        let blind = health(Some(&configured), &[of(&ok)], &[half], 0, NOW);
+        assert_eq!(blind.verdict, Verdict::Warned, "{:?}", blind.notes);
+        assert!(
+            blind
+                .notes
+                .iter()
+                .any(|n| n.contains("following") && n.contains("@me")),
+            "the line has to name the list and the account: {:?}",
+            blind.notes
+        );
+
+        // Both read is the ordinary case and says nothing.
+        let whole = HalfRead {
+            who: "@me".to_string(),
+            reported: ListKind::Followers,
+            missing: None,
+        };
+        assert_eq!(
+            health(Some(&configured), &[of(&ok)], &[whole], 0, NOW).verdict,
+            Verdict::Ok
+        );
     }
 
     /// A monitor that stopped is not a healthy monitor.
@@ -1117,7 +1233,7 @@ every = \"6h\"
 
         let recent = ran("ok");
         assert_eq!(
-            health(Some(&configured), &[of(&recent)], 0, NOW).verdict,
+            health(Some(&configured), &[of(&recent)], &[], 0, NOW).verdict,
             Verdict::Ok
         );
 
@@ -1126,7 +1242,7 @@ every = \"6h\"
             started_at: NOW - 7 * 3_600,
             ..ran("ok")
         };
-        let one = health(Some(&configured), &[of(&late)], 0, NOW);
+        let one = health(Some(&configured), &[of(&late)], &[], 0, NOW);
         assert_eq!(one.verdict, Verdict::Warned, "{:?}", one.notes);
 
         // Three weeks is nobody coming back.
@@ -1134,7 +1250,7 @@ every = \"6h\"
             started_at: NOW - 21 * 86_400,
             ..ran("ok")
         };
-        let stopped = health(Some(&configured), &[of(&gone)], 0, NOW);
+        let stopped = health(Some(&configured), &[of(&gone)], &[], 0, NOW);
         assert_eq!(stopped.verdict, Verdict::Failed, "{:?}", stopped.notes);
         assert!(
             stopped
@@ -1157,14 +1273,14 @@ every = \"6h\"
 
         let weekly = config("schema = 1\non = [\"mon\"]\nat = [\"09:00\"]\n");
         assert_eq!(
-            health(Some(&weekly), &[of(&two_days_ago)], 0, NOW).verdict,
+            health(Some(&weekly), &[of(&two_days_ago)], &[], 0, NOW).verdict,
             Verdict::Ok,
             "two days is not late for a weekly schedule"
         );
 
         let six_hourly = config("schema = 1\nevery = \"6h\"\n");
         assert_ne!(
-            health(Some(&six_hourly), &[of(&two_days_ago)], 0, NOW).verdict,
+            health(Some(&six_hourly), &[of(&two_days_ago)], &[], 0, NOW).verdict,
             Verdict::Ok,
             "and it very much is for a six-hourly one"
         );
@@ -1189,7 +1305,7 @@ every = \"6h\"
             who: "@stranger".to_string(),
             watched: false,
         };
-        let health = health(Some(&configured), &[orphan], 0, NOW);
+        let health = health(Some(&configured), &[orphan], &[], 0, NOW);
 
         assert_eq!(health.verdict, Verdict::Ok, "{:?}", health.notes);
         assert!(
