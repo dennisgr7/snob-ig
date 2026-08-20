@@ -177,11 +177,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
 
         if now >= wake_at {
             if missed > 0 {
-                ui::warn(&format!(
-                    "{missed} scheduled runs were missed while this was not running. They are \
-                     reported as one: there is only one present state, so there is nothing to \
-                     catch up on"
-                ));
+                ui::warn(&missed_warning(missed));
             }
             // Recorded before the work, so a run that fails cannot turn into a
             // tight loop retrying it.
@@ -232,6 +228,31 @@ fn refuse_unattended(name: &str) -> anyhow::Error {
         ),
     )
     .into()
+}
+
+/// What the monitor says about the runs it was not running for.
+///
+/// **One is the ordinary case, and it was the ungrammatical one.** This was a
+/// single format string with `1` an ordinary value in it: "1 scheduled runs were
+/// missed while this was not running. They are reported as one" — which
+/// contradicts itself in the case it prints most often. A machine off for a day
+/// on a daily schedule misses exactly one, and `missed_since` takes one off the
+/// end because the moment being served is itself in the past, so one is what a
+/// laptop that was shut overnight produces.
+///
+/// Its own function so a test can read it, like [`refuse_unattended`]. The
+/// sentence is only ever printed from inside the loop, which no test can drive.
+fn missed_warning(missed: u32) -> String {
+    if missed == 1 {
+        "1 scheduled run was missed while this was not running. It is not replayed: there is \
+         only one present state, so there is nothing to catch up on"
+            .to_string()
+    } else {
+        format!(
+            "{missed} scheduled runs were missed while this was not running. They are reported \
+             as one: there is only one present state, so there is nothing to catch up on"
+        )
+    }
 }
 
 /// How far the clock may move between two turns of the loop and still be
@@ -1097,9 +1118,16 @@ pub(super) async fn preflight(
         }),
     }
 
-    if let Some(delivery) = delivery.as_ref()
-        && !args.no_webhook
-    {
+    if let Some(line) = not_posted(
+        delivery
+            .as_ref()
+            .map(|d| (d.destination.as_str(), d.signed)),
+        args.no_webhook,
+    ) {
+        // Not posted is not the same as nowhere to post, and with no line at
+        // all the two were the same report.
+        report.checked.push(line);
+    } else if let Some(delivery) = delivery.as_ref() {
         let id = run_id(now, 0);
         let body = serde_json::to_string(&preflight_body(&id, now))?;
         report.checked.push(
@@ -1115,6 +1143,46 @@ pub(super) async fn preflight(
     }
 
     Ok(report)
+}
+
+/// The webhook line for a run that is deliberately not posting one.
+///
+/// `None` when there is nothing to say — no webhook configured at all, or a run
+/// that is about to post and will report what came back.
+///
+/// With `--no-webhook` nothing was pushed at all, so `check --json` had no
+/// webhook object and the terminal no webhook line: byte for byte the report a
+/// machine with no `[webhook]` produces. That is the one flag somebody reaches
+/// for to check everything else without disturbing a receiver, and it made "is a
+/// receiver configured?" unanswerable from the probe's own output. The
+/// validation that did happen went with it — by the time this is reached
+/// `delivery_from` has parsed the address and put every configured header
+/// through `webhook::check`, and a failure there is already its own `Failed`
+/// line, so what is left is a check that passed and was thrown away.
+///
+/// The flag is an argument rather than a condition at the call site, because the
+/// defect is the decision not to push a line: a helper that only built one would
+/// leave the revert green.
+fn not_posted(
+    webhook: Option<(&str, bool)>,
+    no_webhook: bool,
+) -> Option<crate::engine::check::Checked> {
+    use crate::engine::check::{Checked, Verdict, What};
+
+    let (destination, signed) = webhook.filter(|_| no_webhook)?;
+    Some(Checked {
+        what: What::Webhook {
+            destination: destination.to_string(),
+            status: None,
+            signed,
+        },
+        verdict: Verdict::Ok,
+        problem: Some(
+            "--no-webhook, so nothing was posted; the address and the headers were still \
+             checked"
+                .to_string(),
+        ),
+    })
 }
 
 /// Walks the configured accounts once, so there is something to compare
@@ -2275,9 +2343,14 @@ fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
     }
 
     if !changes.renamed.is_empty() {
+        // The verb agrees, because one rename is the common case: it is what
+        // `once`, `diff` and the loop print most often, and the line above the
+        // names read "1 now go by another name". The baseline sentence a screen
+        // up already branches this way for the same reason.
+        let renamed = changes.renamed.len();
         lines.push(format!(
-            "  {} now go by another name",
-            changes.renamed.len()
+            "  {renamed} now {} by another name",
+            if renamed == 1 { "goes" } else { "go" }
         ));
         for r in &changes.renamed {
             lines.push(format!(
@@ -3090,6 +3163,57 @@ consent = { agreed_at = 1700 }
         assert_eq!(event_of("not json at all"), "watch.changes");
     }
 
+    /// Not posting is not the same as having nowhere to post.
+    ///
+    /// With `--no-webhook` no entry was pushed at all, so `check --json` had no
+    /// webhook object and the terminal no webhook line -- indistinguishable from
+    /// a machine with no `[webhook]` in its file. That is the flag somebody uses
+    /// to check everything else without disturbing a receiver, so it is exactly
+    /// when the question "is a receiver configured?" is being asked. The address
+    /// and every configured header have been through `webhook::check` by then,
+    /// so there is a validation that passed to report rather than nothing.
+    #[test]
+    fn not_posting_is_not_the_same_as_having_nowhere_to_post() {
+        use crate::engine::check::{CheckReport, Verdict, What};
+
+        const WHERE_TO: &str = "https://n8n.local/webhook/snob";
+
+        let checked =
+            not_posted(Some((WHERE_TO, true)), true).expect("the address was checked and not used");
+        assert!(
+            matches!(&checked.what, What::Webhook { destination, status: None, signed: true }
+                if destination == WHERE_TO),
+            "the address it did not post to is the answer: {:?}",
+            checked.what
+        );
+        assert_eq!(checked.verdict, Verdict::Ok);
+        assert!(
+            checked
+                .problem
+                .as_deref()
+                .is_some_and(|p| p.contains("--no-webhook")),
+            "and the line has to say why nothing was posted: {:?}",
+            checked.problem
+        );
+
+        // A run that is going to post reports what came back instead, and an
+        // address nobody configured has nothing to say either way.
+        assert!(not_posted(Some((WHERE_TO, true)), false).is_none());
+        assert!(not_posted(None, true).is_none());
+
+        // The whole point is that it reaches both readers.
+        let report = CheckReport {
+            checked: vec![checked],
+        };
+        assert!(
+            describe_check(&report)
+                .iter()
+                .any(|l| l.contains("webhook")),
+            "a probe cannot tell a receiver that was not posted to from no receiver"
+        );
+        assert_eq!(check_json(&report)["checks"][0]["what"], "webhook");
+    }
+
     /// A `[webhook]` section as `watch.toml` would parse it.
     fn configured(url: &str, headers: &[(&str, &str)]) -> WebhookConfig {
         WebhookConfig {
@@ -3843,6 +3967,78 @@ consent = { agreed_at = 1700 }
         let text = lines.join("\n");
         assert!(text.contains("@before is now @after"), "{text}");
         assert!(!text.contains("Nothing has changed"), "{text}");
+    }
+
+    /// And one rename is counted as one.
+    ///
+    /// The test above builds exactly one `Rename` and asserts only the line
+    /// *below* the count, so it passes with that line deleted and passed with it
+    /// reading "1 now go by another name". One is the common case here: it is
+    /// what `once`, `diff` and the loop print most often.
+    #[test]
+    fn one_rename_is_counted_as_one() {
+        let renamed = |names: &[(&str, &str)]| {
+            describe(
+                &report_with(
+                    Some(list(
+                        Basis::Compare {
+                            before: 1,
+                            after: 2,
+                        },
+                        ListDiff::default(),
+                        Some(1_000),
+                    )),
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(n, (from, to))| Rename {
+                            pk: n as Pk,
+                            history_id: n as i64,
+                            from: (*from).into(),
+                            to: (*to).into(),
+                            at: 1_500,
+                        })
+                        .collect(),
+                ),
+                false,
+            )
+            .join("\n")
+        };
+
+        let one = renamed(&[("before", "after")]);
+        assert!(one.contains("1 now goes by another name"), "{one}");
+
+        let two = renamed(&[("before", "after"), ("other", "later")]);
+        assert!(two.contains("2 now go by another name"), "{two}");
+    }
+
+    /// The monitor's own sentence about its gaps reads as a sentence for one.
+    ///
+    /// One format string with no branch and `1` an ordinary value in it: "1
+    /// scheduled runs were missed while this was not running. They are reported
+    /// as one." Ungrammatical, and self-contradictory in the case it prints most
+    /// often -- a laptop shut overnight on a daily schedule misses exactly one,
+    /// and `missed_since` takes one off the end because the moment being served
+    /// is itself in the past.
+    #[test]
+    fn the_missed_warning_reads_as_a_sentence_for_one() {
+        let one = missed_warning(1);
+        assert!(one.contains("1 scheduled run was missed"), "{one}");
+        assert!(!one.contains("runs were"), "{one}");
+        assert!(!one.contains("They are"), "{one}");
+
+        let several = missed_warning(4);
+        assert!(
+            several.contains("4 scheduled runs were missed"),
+            "{several}"
+        );
+
+        // Both have to say the part that matters, which is that they are not
+        // replayed: firing twelve to catch up is the burst the pacing exists to
+        // prevent, and they would all report the same present state anyway.
+        for text in [one, several] {
+            assert!(text.contains("nothing to catch up on"), "{text}");
+        }
     }
 
     /// The tokens are what a caller branches on, so they are asserted rather
