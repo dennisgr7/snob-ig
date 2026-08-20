@@ -152,6 +152,33 @@ pub fn begin(
     })
 }
 
+/// What makes a partial capture resumable, in one place.
+///
+/// [`resumable`] takes it and [`is_resumable`] asks about it, and the promise
+/// that binds them is that a walk the advice on screen says can be continued is
+/// one the next invocation really will continue. Two hand-typed `WHERE` clauses
+/// were what kept it: identical but for one term, over five conditions, in two
+/// statements forty lines apart. Their disagreement is the defect this file's
+/// header describes, and it came back once already when the claim was added.
+///
+/// **The one term that differs is a bound value rather than a difference in the
+/// text.** `?5` is the process a claim may already belong to and still count as
+/// available: `Some(this_process())` when the caller is about to take the row,
+/// because resuming your own work after a restart is the point; `None` when the
+/// caller is only asking, because `claimed_by = NULL` is NULL and the clause
+/// goes inert — and the run that continues the walk is never the one asking.
+/// That asymmetry is real and load-bearing, and now it is one parameter instead
+/// of one clause somebody has to notice.
+///
+/// The parameters, in both statements: `?1` the account, `?2` the list, `?3` the
+/// oldest `started_at` still inside the resume window, `?4` the newest
+/// `claimed_at` that counts as abandoned, `?5` the process whose own claim does
+/// not disqualify a row.
+const RESUMABLE: &str = "account_pk = ?1 AND kind = ?2 AND complete = 0
+     AND next_cursor IS NOT NULL AND started_at >= ?3
+     AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ?4
+          OR claimed_by = ?5)";
+
 /// Looks for an interrupted walk this process may continue, and takes it.
 ///
 /// **The claim is taken in the same statement that finds the row**, which is
@@ -187,13 +214,10 @@ pub fn resumable(
         .query_row(
             &format!(
                 "UPDATE snapshots
-                 SET claimed_by = ?4, claimed_at = ?5
+                 SET claimed_by = ?5, claimed_at = ?6
                  WHERE id = (
                    SELECT id FROM snapshots
-                   WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-                     AND next_cursor IS NOT NULL AND started_at >= ?3
-                     AND (claimed_by IS NULL OR claimed_by = ?4
-                          OR claimed_at IS NULL OR claimed_at < ?6)
+                   WHERE {RESUMABLE}
                    ORDER BY started_at DESC LIMIT 1
                  )
                  RETURNING {SNAPSHOT_COLUMNS}"
@@ -202,9 +226,13 @@ pub fn resumable(
                 pk_to_sql(account_pk),
                 kind.as_str(),
                 now - RESUME_WINDOW_SECS,
+                now - CLAIM_TTL_SECS,
+                // This process's own claim does not disqualify a row here: the
+                // caller is about to take it, and resuming its own work after a
+                // restart is what the window is for. `is_resumable` binds `None`
+                // to the same parameter and the clause goes inert.
                 this_process(),
                 now,
-                now - CLAIM_TTL_SECS,
             ],
             row_to_snapshot,
         )
@@ -232,16 +260,18 @@ pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result
     let now = now();
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM snapshots
-             WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-               AND next_cursor IS NOT NULL AND started_at >= ?3
-               AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ?4)
-             LIMIT 1",
+            &format!("SELECT 1 FROM snapshots WHERE {RESUMABLE} LIMIT 1"),
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
                 now - RESUME_WINDOW_SECS,
                 now - CLAIM_TTL_SECS,
+                // Nobody's claim is excused here, including this process's own:
+                // `claimed_by = NULL` is NULL, so the last term of the shared
+                // predicate goes inert. The run that continues the walk is never
+                // this one, so availability is judged the way the next process
+                // will judge it.
+                None::<&str>,
             ],
             |row| row.get(0),
         )
@@ -572,6 +602,54 @@ mod tests {
     ///
     /// Written out, the way `the_default_pace_is_the_documented_one` writes out
     /// the pacing: changing one has to be deliberate and has to say so here.
+    /// The one term the two resume questions do not share, pinned from both
+    /// sides.
+    ///
+    /// They ask the same five conditions, and they were two hand-typed `WHERE`
+    /// clauses forty lines apart. Now they are one string with one bound value
+    /// between them, which makes the asymmetry easy to read and easy to
+    /// "simplify" away -- so it is written down here as behaviour rather than as
+    /// a comment.
+    ///
+    /// `resumable` counts this process's own claim as available, because
+    /// resuming its own work after a restart inside the window is the point.
+    /// `is_resumable` does not, because the run that continues a walk is never
+    /// the one asking: bind `this_process()` there and the advice on screen
+    /// promises a continuation the next invocation will refuse, which is
+    /// verbatim the defect that made every interrupted walk begin again at page
+    /// one.
+    #[test]
+    fn asking_whether_a_walk_can_be_continued_answers_for_the_next_process() {
+        let mut db = base();
+        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        save_page(&mut db, id, &[user(10)], Some("next")).unwrap();
+
+        // Claimed by this process, which is what `begin` and `save_page` leave
+        // behind.
+        let held: Option<String> = db
+            .conn()
+            .query_row("SELECT claimed_by FROM snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            held.as_deref(),
+            Some(this_process()),
+            "the fixture depends on this process holding the claim"
+        );
+
+        assert!(
+            !is_resumable(db.conn(), 1, ListKind::Followers).unwrap(),
+            "the next process will find this claim fresh and refuse it, so the advice \
+             must not promise a continuation"
+        );
+        assert_eq!(
+            resumable(db.conn(), 1, ListKind::Followers)
+                .unwrap()
+                .map(|s| s.id),
+            Some(id),
+            "and this process picks up its own work, which is what the window is for"
+        );
+    }
+
     /// A capture whose kind this version cannot read is an error, not a
     /// following capture.
     ///
