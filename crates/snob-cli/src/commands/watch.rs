@@ -381,14 +381,54 @@ async fn run_accounts(
         if app.cancel().is_canceled() {
             break;
         }
-        match tick_one(app, account, delivery, printing).await {
+        // Read around the tick rather than out of the report it returns.
+        //
+        // `TickReport.requests` is worked out at the *end* of `tick`, so any
+        // `?` on the way out throws away a measurement the pacer has already
+        // been charged for — and `tick_one` also `?`s on serializing the body
+        // and on `deliver`, both of them after a whole successful two-list
+        // walk. `snob watch once friend` where @friend has gone private spends
+        // one `web_profile_info` and then prints "0 requests", under a comment
+        // saying a run that stopped halfway still spent some. What was really
+        // spent has its own row in AGENTS.md.
+        let before = app.client().pacer().spent();
+        let outcome = tick_one(app, account, delivery, printing).await;
+        let charged = app.client().pacer().spent().saturating_sub(before);
+        spent += charged;
+
+        match outcome {
             Ok(tick) => {
-                spent += tick.requests;
                 if code == ExitCode::Ok {
                     code = tick.outcome();
                 }
             }
-            Err(e) => failures.push(e),
+            Err(e) => {
+                // A tick that failed is still a tick that happened.
+                //
+                // `record_run` is reached only through `commit`, which is the
+                // last statement of a *successful* `tick_one`, so **any** `Err`
+                // out of `tick` wrote no row at all — not only an unresolvable
+                // name, but a mid-walk cooldown, a failed `history_head` read,
+                // a `compare` that could not run. @friend goes private and
+                // `target::resolve` bails; the same for a rename, a delete, and
+                // for any named account a DNS outage, which fails in `resolve`
+                // before the poll-failure handler that saves the own-account
+                // case.
+                //
+                // So `status` went on printing "@friend last ran on <the last
+                // good date> and found nothing", `health` saw a stale `ok`, and
+                // `prune` keeps that newest row for ever so it never aged into
+                // "it has not run yet". The schema comment says "One row per
+                // tick, including the ticks that found nothing".
+                //
+                // An account whose *first* tick fails still records nothing:
+                // `watch_runs.account_pk` references `accounts(pk)`, and
+                // nothing has put a row there yet. That is the account a new
+                // user would most want a probe to fail for, and it is written
+                // down here rather than left to be rediscovered.
+                record_failed_run(app, account, &e, charged);
+                failures.push(e);
+            }
         }
     }
 
@@ -421,6 +461,53 @@ async fn run_accounts(
         spent,
         code,
         failed,
+    }
+}
+
+/// Writes the row a failed tick owes the run log.
+///
+/// Best-effort, like `commit`'s own recording: a run log that cannot be written
+/// is worth a line in the journal and is not a reason to turn a failure into a
+/// different failure.
+///
+/// The account has to be resolved locally, because a tick that failed at
+/// `target::resolve` never learned an id. An account that has never been seen
+/// has no `accounts` row for the foreign key to point at, so nothing is written
+/// — which is exactly the case the comment at the call site names.
+fn record_failed_run(
+    app: &crate::app::App,
+    watched: &Watched,
+    error: &anyhow::Error,
+    requests: u32,
+) {
+    let pk = match watched.name() {
+        Some(name) => snob_core::store::accounts::find_pk_by_username(
+            app.db().conn(),
+            snob_core::model::printable(name).trim(),
+        )
+        .ok()
+        .flatten(),
+        None => Some(app.viewer().pk),
+    };
+    let Some(account_pk) = pk else {
+        return;
+    };
+
+    let at = snob_core::store::now();
+    let outcome = ExitCode::from_chain(error).unwrap_or(ExitCode::Error);
+    let record = snob_core::store::watch::record_run(
+        app.db().conn(),
+        &snob_core::store::watch::Run {
+            account_pk,
+            started_at: at,
+            finished_at: Some(at),
+            requests,
+            outcome: Some(outcome.as_str().to_string()),
+            changes: 0,
+        },
+    );
+    if let Err(e) = record {
+        tracing::warn!(error = %e, "the failed run could not be recorded");
     }
 }
 
@@ -1993,6 +2080,68 @@ mod tests {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "42%3AAbCdEfGh%3A20";
+
+    /// A tick that failed is still a tick that happened, and it still spent.
+    ///
+    /// `record_run` is reached only through `commit`, the last statement of a
+    /// *successful* `tick_one`, so any `Err` out of `tick` wrote no row at all.
+    /// `status` went on printing "@friend last ran on <the last good date> and
+    /// found nothing", `health` saw a stale `ok`, and `prune` keeps the newest
+    /// row per account for ever so it never aged into "it has not run yet".
+    ///
+    /// The count comes from the pacer around the tick rather than out of the
+    /// report, because `TickReport.requests` is worked out at the end of `tick`
+    /// and any `?` on the way out throws it away — after the pacer has already
+    /// been charged.
+    #[tokio::test]
+    async fn a_run_that_failed_is_recorded_and_counts_what_it_spent() {
+        let server = wiremock::MockServer::start().await;
+        // The profile poll is refused, so `target::resolve` fails and the `?`
+        // carries out of `tick` — one request spent, no report, no commit.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (mut app, _delivery) = app_posting_to(&server);
+        // The account has to be known locally, or the foreign key has nothing
+        // to point at — which is its own gap, written down at the call site.
+        snob_core::store::users::upsert(app.db().conn(), &user(99, "friend")).unwrap();
+        snob_core::store::accounts::upsert(app.db().conn(), 99, false).unwrap();
+
+        let watched = [Watched::consented(
+            "friend".into(),
+            crate::engine::watch::Consent { given_at: 1 },
+        )];
+        // Driven through `run_accounts` rather than `run_one`, because the
+        // count `once` prints is what it returns and `run_one` discards it.
+        let outcome = run_accounts(&mut app, &watched, None, Printing::unattended(false)).await;
+
+        assert!(
+            outcome.failed.is_some(),
+            "the account could not be resolved"
+        );
+        assert!(
+            outcome.spent >= 1,
+            "the poll was charged, so the run has to say it spent it: {}",
+            outcome.spent
+        );
+
+        let runs = snob_core::store::watch::last_runs(app.db().conn()).unwrap();
+        let recorded = runs
+            .iter()
+            .find(|r| r.account_pk == 99)
+            .expect("a tick that failed is a tick that happened");
+        assert_ne!(
+            recorded.outcome.as_deref(),
+            Some("ok"),
+            "and it must not read as a run that worked"
+        );
+        assert!(
+            recorded.requests >= 1,
+            "the poll was spent and charged, so it has to be counted: {recorded:?}"
+        );
+    }
 
     /// Two workflows on one host are two addresses.
     ///
