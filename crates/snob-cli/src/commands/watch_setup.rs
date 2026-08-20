@@ -58,7 +58,10 @@ pub async fn setup(
 
     let schedule_line = ask_schedule()?;
     let (webhook, heartbeat, headers, signing_key, token) = ask_webhook()?;
-    let accounts = ask_accounts()?;
+    // The address goes down with it. What somebody agrees to when they answer
+    // for a stranger is read later as the authority for two different acts, and
+    // the wizard is holding the second one at the moment it asks.
+    let accounts = ask_accounts(webhook.as_deref())?;
 
     let text = config::template(
         &schedule_line,
@@ -500,7 +503,7 @@ fn last_of_each(typed: Vec<(String, String)>) -> Vec<(String, String)> {
     headers.into_iter().collect()
 }
 
-fn ask_accounts() -> Result<Vec<(String, Option<i64>)>> {
+fn ask_accounts(webhook: Option<&str>) -> Result<Vec<(String, Option<i64>)>> {
     let mut accounts = vec![("self".to_string(), None)];
 
     if ui::confirm("Also watch somebody else's account?", false)? {
@@ -515,19 +518,52 @@ fn ask_accounts() -> Result<Vec<(String, Option<i64>)>> {
             if name.is_empty() {
                 break;
             }
-            if !ui::confirm(
-                &format!(
-                    "Record that you agreed to read @{}'s lists?",
-                    printable(name)
-                ),
-                false,
-            )? {
+            if !ui::confirm(&consent_question(name, webhook), false)? {
                 continue;
             }
             accounts.push((name.to_string(), Some(snob_core::store::now())));
         }
     }
     Ok(accounts)
+}
+
+/// The question the recorded consent is an answer to.
+///
+/// **It names the webhook, because the answer is used for two things.** What
+/// goes into `[account.consent]` is consent to *read* somebody else's lists, and
+/// `Watched::may_run_unattended` then reads it, unchanged, as the authority for
+/// posting that person's arrivals and departures — `username`, `full_name` and
+/// `profile_url`, out of `account_json` — to a third-party server on every run.
+/// Both prompts framed the question entirely as risk to the *user's own*
+/// account: heavier request, readier refusal. Neither mentioned the other
+/// person. The wizard makes it sharpest, because `ask_webhook` runs one line
+/// above `ask_accounts` and the address is already in hand while the question is
+/// being asked — and `describe_config` then printed "Reports to https://…" and
+/// "Watches your account and 1 other" as two unrelated lines.
+///
+/// Split from the prompting so it can be read. Everything around it is behind
+/// `dialoguer`, which answers nothing without a terminal.
+///
+/// The residue, written down rather than left to be found: an attended
+/// `snob watch once <stranger> --webhook …` still asks a question that says
+/// nothing about forwarding. That one belongs in `commands::watch::once` and not
+/// in `engine::ask_consent_with`, which has no access to the delivery
+/// configuration and must not be given one — `ListArgs` carries none, and
+/// putting a `WatchConfig` inside `engine::list` is the layer AGENTS.md keeps
+/// free of how anything is delivered.
+fn consent_question(name: &str, webhook: Option<&str>) -> String {
+    match webhook {
+        Some(url) => format!(
+            "Record that you agreed to read @{}'s lists, and to have what changes in them sent \
+             to {}?",
+            printable(name),
+            printable(url)
+        ),
+        None => format!(
+            "Record that you agreed to read @{}'s lists?",
+            printable(name)
+        ),
+    }
 }
 
 fn quoted_list(values: &[&str]) -> String {
@@ -1293,6 +1329,49 @@ evry = \"6h\"
 
         assert!(!text.contains("your account"), "{text}");
         assert!(text.contains("1 account, and not your own"), "{text}");
+    }
+
+    /// Consent recorded about one act is read as authority for another, so the
+    /// question has to name both.
+    ///
+    /// `[account.consent] agreed_at` is an answer to "may this read @friend's
+    /// lists?", and `Watched::may_run_unattended` then reads it as the authority
+    /// for POSTing @friend's arrivals and departures -- username, full name and
+    /// profile URL -- to a third-party server on every run. Both prompts framed
+    /// the question as risk to the user's own account and neither mentioned the
+    /// other person; the wizard already holds the address when it asks, because
+    /// `ask_webhook` runs one line above `ask_accounts`.
+    #[test]
+    fn the_consent_question_names_where_the_names_are_sent() {
+        let asked = consent_question("friend", Some("https://n8n.local/webhook/snob"));
+        assert!(asked.contains("@friend"), "{asked}");
+        assert!(asked.contains("https://n8n.local/webhook/snob"), "{asked}");
+
+        // With nowhere to send it, there is nothing extra to agree to and the
+        // question stays the short one.
+        let plain = consent_question("friend", None);
+        assert!(plain.contains("@friend"), "{plain}");
+        assert!(!plain.contains("sent to"), "{plain}");
+
+        // And the file reads back as one fact rather than two unrelated lines.
+        let both = describe_config(&config(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://n8n.local/hook\"\n\n\
+             [[account]]\ntarget = \"self\"\n\n[[account]]\ntarget = \"friend\"\n\
+             [account.consent]\nagreed_at = 1\n",
+        ))
+        .join("\n");
+        assert!(
+            both.contains("go to https://n8n.local/hook"),
+            "watching somebody else and sending it somewhere is one fact: {both}"
+        );
+
+        // Your own account alone has nobody else's names in it, so there is
+        // nothing to join.
+        let alone = describe_config(&config(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://n8n.local/hook\"\n",
+        ))
+        .join("\n");
+        assert!(!alone.contains("Their usernames"), "{alone}");
     }
 
     /// A file with no `[[account]]` at all means the obvious thing, and this is
