@@ -113,16 +113,13 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
     // no-session branch of `once`, which records no run of its own, so the
     // table can go a month without gaining a row.
     conn.execute(
+        // Through the view, which is the same question `last_runs` asks. The
+        // window function was written out here and again there, and the
+        // `id DESC` tie-break added to one alone would have prune keep one of
+        // two runs recorded in the same second while `status` reads the other.
         "DELETE FROM watch_runs
          WHERE started_at < ?1
-           AND id NOT IN (
-             SELECT id FROM (
-               SELECT id, row_number() OVER (
-                 PARTITION BY account_pk ORDER BY started_at DESC, id DESC
-               ) AS rank
-               FROM watch_runs
-             ) WHERE rank = 1
-           )",
+           AND id NOT IN (SELECT id FROM newest_run)",
         params![now - KEEP_RUNS_FOR_SECS],
     )?;
 
@@ -188,12 +185,11 @@ pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
 /// `(account_pk, started_at DESC)` was added for.
 pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT account_pk, started_at, finished_at, requests, outcome, changes FROM (
-           SELECT *, row_number() OVER (
-             PARTITION BY account_pk ORDER BY started_at DESC, id DESC
-           ) AS rank
-           FROM watch_runs
-         ) WHERE rank = 1
+        // The view rather than the window function again: `prune` exempts
+        // exactly these rows from the thirty-day sweep, and a tie-break that
+        // means one thing here and another there deletes the row this displays.
+        "SELECT account_pk, started_at, finished_at, requests, outcome, changes
+         FROM newest_run
          ORDER BY account_pk",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -734,6 +730,79 @@ mod tests {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
             })
+        );
+    }
+
+    /// The run retention keeps is the run `status` shows.
+    ///
+    /// "The newest run of each account" was spelled twice, forty lines apart:
+    /// `prune` exempts it from the thirty-day sweep so `status` never says "it
+    /// has not run yet" about a monitor that has been failing for weeks, and
+    /// `last_runs` reads it to say what happened.
+    ///
+    /// `started_at` is whole seconds, so two runs of one account inside the same
+    /// second are a tie -- reachable through `snob watch once` beside a
+    /// scheduled tick, which consults no schedule and no gap. The `id DESC`
+    /// tie-break is what breaks it, and added to one site and not the other,
+    /// prune keeps one of the two rows while `last_runs` reads the other: the
+    /// run a person is shown is deleted on the next settle and the survivor is
+    /// one nothing displays. Nothing fails and the suite stays green.
+    ///
+    /// Both rows are older than the window, so the only thing keeping either of
+    /// them is the exemption -- which is what makes this a test of the exemption
+    /// and not of the sweep. And it is asked by id rather than by count: prune
+    /// keeping *a* row while the reader reads *the other* leaves one row either
+    /// way, which is exactly why the disagreement was invisible.
+    #[test]
+    fn the_run_retention_keeps_is_the_run_status_shows() {
+        let db = Store::in_memory().unwrap();
+        users::upsert(db.conn(), &user(7, "me")).unwrap();
+        accounts::upsert(db.conn(), 7, true).unwrap();
+        let now = 2_000_000_000;
+        let long_ago = now - KEEP_RUNS_FOR_SECS - 1;
+
+        // Two runs of one account in the same second, which `started_at` cannot
+        // tell apart.
+        for _ in 0..2 {
+            record_run(
+                db.conn(),
+                &Run {
+                    account_pk: 7,
+                    started_at: long_ago,
+                    finished_at: Some(long_ago),
+                    requests: 1,
+                    outcome: Some("ok".to_string()),
+                    changes: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        // The row `status` would show, before anything is swept.
+        let shown: i64 = db
+            .conn()
+            .query_row("SELECT id FROM newest_run", [], |row| row.get(0))
+            .unwrap();
+
+        prune(db.conn(), now).unwrap();
+
+        let kept: Vec<i64> = db
+            .conn()
+            .prepare("SELECT id FROM watch_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            kept,
+            vec![shown],
+            "retention keeps exactly the row the reader reads, and nothing else"
+        );
+        assert_eq!(
+            last_runs(db.conn()).unwrap().len(),
+            1,
+            "and the reader still finds it"
         );
     }
 
