@@ -1665,8 +1665,10 @@ mod tests {
             let schedule = Schedule::cron(expression).unwrap();
             let start = at(hours(9));
 
-            // The worst case: pushed by the whole jitter, every time.
-            let mut last = with_jitter(start, schedule.jitter(), 0.999_999);
+            // The worst case: pushed by the whole jitter, every time. Through
+            // `wake_at`, which is what the loop calls — `with_jitter` alone is
+            // half the bound, and this test is here to walk the real path.
+            let mut last = wake_at(&schedule, start, 0.999_999, &Utc);
             for step in 1..=4 {
                 let expected = start + step * grid;
                 match due(&schedule, Some(last), expected, &Utc) {
@@ -1676,7 +1678,7 @@ mod tests {
                          after a run at {last}: {other:?}"
                     ),
                 }
-                last = with_jitter(expected, schedule.jitter(), 0.999_999);
+                last = wake_at(&schedule, expected, 0.999_999, &Utc);
             }
         }
     }
