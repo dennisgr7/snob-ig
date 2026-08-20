@@ -248,6 +248,10 @@ pub struct TickReport {
     /// How far along the rename history this report has covered, when it read a
     /// window at all. `None` means the cursor must not move.
     rename_cursor: Option<i64>,
+    /// The `username_history` rows this tick is announcing, so no later one
+    /// repeats them. A different question from the cursor, for the reason
+    /// `007_renames_sent.sql` sets out.
+    renames_sent: Vec<i64>,
 }
 
 /// A report on its way to somewhere, ready to be made durable.
@@ -284,6 +288,7 @@ pub fn commit(
         &tick.committable,
         at,
         tick.rename_cursor,
+        &tick.renames_sent,
         delivery.map(|d| store::Queued {
             run_id: d.run_id,
             body: d.body,
@@ -364,6 +369,7 @@ impl TickReport {
             committable: Vec::new(),
             at: 0,
             rename_cursor: None,
+            renames_sent: Vec::new(),
         }
     }
 
@@ -469,6 +475,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         committable: compared.marks,
         at,
         rename_cursor: compared.rename_cursor,
+        renames_sent: compared.renames_sent,
     })
 }
 
@@ -524,6 +531,7 @@ pub fn record_from_store(app: &mut App, typed: Option<&str>) -> Result<WatchRepo
         &compared.marks,
         snob_core::store::now(),
         compared.rename_cursor,
+        &compared.renames_sent,
         None,
     )?;
 
@@ -607,15 +615,32 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
         .filter(|report| report.verified())
         .collect();
 
+    // What this run announces, and the history rows behind them.
+    //
+    // **Already-sent is asked per row, not per watermark**, and that is the
+    // whole of the fix `007_renames_sent` exists for. Whether a rename is
+    // reported and whether the cursor may move are independent conditions, and
+    // they come apart both ways: a tick with one list refused announces what it
+    // can see and must not move the cursor, so the next tick re-reads the same
+    // window and would announce the same rename again under a fresh `run_id`;
+    // and a rename of somebody only in the refused list sits inside that same
+    // window and is not found at all, so any watermark that suppresses the
+    // first also buries the second for ever.
     let mut renamed: Vec<Rename> = Vec::new();
+    let mut announcing: Vec<i64> = Vec::new();
     if !verified.is_empty() {
         let since = store::rename_cursor(app.db().conn(), pk)?;
+        let already = store::renames_already_sent(app.db().conn(), pk)?;
         let mut seen = std::collections::HashSet::new();
         for report in &verified {
             for rename in
                 store::renames_since(app.db().conn(), report.basis.mark_to(), since, head)?
             {
+                if already.contains(&rename.history_id) {
+                    continue;
+                }
                 if seen.insert(rename.pk) {
+                    announcing.push(rename.history_id);
                     renamed.push(rename);
                 }
             }
@@ -649,20 +674,58 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
     // reported on no list at all read no window, so there is nothing to file as
     // covered — an account nothing has ever walked does not even have a row for
     // the cursor to hang off.
+    //
+    // **Two corrections to that, both about what a capture is.**
+    //
+    // It asked `latest_complete`, which is true of members and false of
+    // `username_history`. A walk that ends `Truncated` is not a capture
+    // anything may be compared against — but it ran `save_page`, and
+    // `save_page` runs `users::upsert`, so it filed history rows for the people
+    // it did see, who are members of that list. On the account whose second
+    // list meets the truncation wall every time, `latest_complete` answers
+    // `None` for ever while that list goes on filing renames every run, and the
+    // cursor closed over every one of them.
+    //
+    // And a baseline accounts for its list only on the account's **first**
+    // report, which is the case the seeding rule above was written for: the
+    // monitor starts now, and history from before it is not news. A baseline
+    // later on is a different animal — it is a walled list finally completing —
+    // and counting it there is what shut the recovery route, because the one
+    // run that could see the owed renames is the run *after* it, and this run
+    // had already closed the window.
+    //
+    // Asked of the marks rather than of the captures: `delete_partials` clears
+    // a list's partials whenever a new walk starts, so counting captures says
+    // "one" on the walled list's fifth attempt as readily as on its first. A
+    // mark is what says something was ever reported.
+    //
+    // The cost is that a permanently walled list holds the window open, so it
+    // grows. That is the honest direction — the alternative is losing what is in
+    // it — and it is only affordable because announcing is no longer decided by
+    // where the cursor is: `007_renames_sent` records what actually went out, so
+    // a window read twice does not send anything twice.
+    let verified_kinds: Vec<ListKind> = verified.iter().map(|report| report.kind).collect();
     let reported_on: Vec<ListKind> = [followers.as_ref(), following.as_ref()]
         .into_iter()
         .flatten()
         .map(|report| report.kind)
         .collect();
 
+    let first_report = store::mark(app.db().conn(), pk, ListKind::Followers)?.is_none()
+        && store::mark(app.db().conn(), pk, ListKind::Following)?.is_none();
+
     let mut every_list_accounted_for = true;
     for kind in [ListKind::Followers, ListKind::Following] {
-        if reported_on.contains(&kind) {
+        if verified_kinds.contains(&kind) {
             continue;
         }
-        if snapshots::latest_complete(app.db().conn(), pk, kind)?.is_some() {
-            every_list_accounted_for = false;
+        if !snapshots::any_capture(app.db().conn(), pk, kind)? {
+            continue; // nothing was ever captured, so nothing was missed
         }
+        if first_report && reported_on.contains(&kind) {
+            continue; // the seeding baseline
+        }
+        every_list_accounted_for = false;
     }
 
     // Nothing filed after `head` is inside the window — enforced by
@@ -696,6 +759,7 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
         },
         marks,
         rename_cursor: covered,
+        renames_sent: announcing,
     })
 }
 
@@ -709,6 +773,7 @@ struct Compared {
     report: WatchReport,
     marks: Vec<(ListKind, i64)>,
     rename_cursor: Option<i64>,
+    renames_sent: Vec<i64>,
 }
 
 fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Option<ListReport>> {
@@ -873,6 +938,7 @@ mod tests {
             committable: Vec::new(),
             at: 0,
             rename_cursor: None,
+            renames_sent: Vec::new(),
         };
 
         assert!(!tick.looked());

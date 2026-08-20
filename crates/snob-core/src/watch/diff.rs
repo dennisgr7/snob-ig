@@ -60,6 +60,14 @@ impl ListDiff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rename {
     pub pk: Pk,
+    /// The `username_history` row this came from.
+    ///
+    /// Carried so a report can say which renames it announced, rather than
+    /// leaving a watermark to stand in for the answer. Whether a rename is
+    /// reported and whether the scan window may close are independent
+    /// conditions — `007_renames_sent` sets out how they come apart in both
+    /// directions — and only the row itself can settle the first.
+    pub history_id: i64,
     /// What they used to be called.
     pub from: String,
     /// What they are called now.

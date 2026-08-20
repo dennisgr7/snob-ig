@@ -3245,6 +3245,7 @@ consent = { agreed_at = 1700 }
                 )),
                 vec![Rename {
                     pk: 7,
+                    history_id: 7,
                     from: "before".into(),
                     to: "after".into(),
                     at: 1_500,
@@ -3303,6 +3304,7 @@ consent = { agreed_at = 1700 }
                 )),
                 vec![Rename {
                     pk: 7,
+                    history_id: 7,
                     from: "before".into(),
                     to: "after".into(),
                     at: 1_500,
