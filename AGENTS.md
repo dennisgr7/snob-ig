@@ -379,6 +379,18 @@ Two judgement calls worth understanding before touching them:
   local, and reaching it means depending on `keyring-core` directly and keeping
   its version in lockstep or the shared default store breaks at run time. The
   reasoning, and what would have to change, is in `secrets.rs::entry_for`.
+- **There is no lease over `watch_marks`, and the upsert is unconditional.**
+  `snapshots` has a whole lease because the database is shared between
+  processes; the marks have none, while `compare` reads the mark minutes before
+  `commit_report` writes it back. Two overlapping runs therefore report one
+  arrival twice under two `run_id`s. It costs duplicates and never loses a
+  window, and by the time the mark regresses both reports have already been
+  delivered — so an ordering clause on the upsert suppresses only the third copy
+  while introducing a write that declines without saying so, on the one
+  statement that retires a report. What would prevent the first two is a
+  per-account run lease, and half of one is worth nothing. The two clauses that
+  look like they would work, and why neither does, are written out at
+  `store::watch::set_mark`, with a test for each.
 
 ## State
 

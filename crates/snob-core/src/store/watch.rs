@@ -331,6 +331,50 @@ pub fn history_head(conn: &Connection) -> Result<i64, StoreError> {
 /// report carries the same moment. Read inside, two lists marked a moment apart
 /// would leave a sliver between them in which a rename is filed and then belongs
 /// to neither report.
+///
+/// **The upsert is unconditional, and there is no lease over it. Both of those
+/// are known, and neither is an oversight.** `snapshots` has a whole one —
+/// `claimed_by`, `CLAIM_TTL_SECS`, guards on `save_page` and `close` — because
+/// the database is shared between processes; `watch_marks` and `watch_renames`
+/// have nothing, while `engine::watch::compare` reads the mark, the cursor and
+/// `history_head` minutes before `commit_report` writes them back. Two runs
+/// overlap whenever a walk outlasts the interval, or when somebody types
+/// `snob watch once` while the loop is mid-tick — `once` consults no schedule
+/// and no gap. The later run commits first, the earlier one commits after and
+/// puts the mark back on the older capture, and one arrival is reported twice
+/// under two `run_id`s, which is the value receivers deduplicate on. No ordering
+/// here can *lose* a window; what it costs is duplicates.
+///
+/// Two one-line clauses look like they would close it and neither does, which is
+/// why this paragraph is here instead of one of them:
+///
+/// - `WHERE excluded.compared_at > watch_marks.compared_at` orders nothing. `at`
+///   is stamped by `tick` **before** the comparison, so it says when a run
+///   finished looking rather than when it wrote: a long walk that started first
+///   stamps a later moment than a short run that started later and committed
+///   first, and the clause waves the older capture through. It also drops a
+///   legitimate re-mark inside the same whole second, silently, since
+///   `store::now()` counts seconds.
+/// - `WHERE excluded.snapshot_id >= watch_marks.snapshot_id` really is
+///   monotone — a new capture always takes `max(rowid) + 1` and the marked row
+///   is still there to keep the maximum up — but `snapshot_id` is **nullable**,
+///   by `ON DELETE SET NULL`, which is the state `prune` documents and
+///   `pruning_the_marked_capture_leaves_the_receipt_behind` pins. A comparison
+///   against NULL is NULL, so the update is declined and that account's list can
+///   never be marked again: every later run reads no baseline, reports nothing,
+///   and files nothing. A monitor gone permanently quiet, closed by the guard
+///   meant to protect it. `watch_marks.snapshot_id IS NULL OR …` is the spelling
+///   that is actually safe.
+///
+/// It is still not taken. By the time the mark regresses both runs have already
+/// queued and drained a report, so a guard here suppresses only the *third*
+/// copy; and a `DO UPDATE … WHERE` that declines is a write that fails without
+/// saying so, on the one statement that retires a report. What would prevent the
+/// first two copies is a per-account run lease shaped like `snapshots.claimed_by`,
+/// and there is no point building half of one.
+/// [`tests::a_quiet_run_moves_the_moment_without_moving_the_capture`] and
+/// [`tests::a_receipt_whose_capture_was_pruned_can_be_marked_again`] are the two
+/// tripwires for whoever tries.
 pub fn set_mark(
     conn: &Connection,
     account_pk: Pk,
@@ -703,6 +747,73 @@ mod tests {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
             })
+        );
+    }
+
+    /// The quiet run: the same capture, a later moment.
+    ///
+    /// This is `Basis::Unchanged`, whose `mark_to()` is the id already in the
+    /// row, and it is the common case -- two unmoved counters, one request. It
+    /// is a tripwire for the guard somebody will reach for: an upsert
+    /// conditioned on `excluded.snapshot_id > watch_marks.snapshot_id` declines
+    /// this write, and `compared_at` -- what `snob watch status` prints as "last
+    /// reported on" -- stops moving on a monitor that is working perfectly.
+    #[test]
+    fn a_quiet_run_moves_the_moment_without_moving_the_capture() {
+        let mut db = Store::in_memory().unwrap();
+        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
+        set_mark(db.conn(), 7, ListKind::Followers, id, 1_800).unwrap();
+
+        assert_eq!(
+            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            Some(Mark {
+                snapshot_id: Some(id),
+                compared_at: 1_800,
+            }),
+            "a run that found nothing still reported, and status says when"
+        );
+    }
+
+    /// And a receipt whose capture retention took can be marked again.
+    ///
+    /// The other tripwire, and the sharper one. `snapshot_id` is nullable by
+    /// `ON DELETE SET NULL` -- the neighbouring test pins that state -- so an
+    /// ordering guard written as `excluded.snapshot_id >= watch_marks.snapshot_id`
+    /// compares against NULL, which is NULL, which `DO UPDATE ... WHERE` reads as
+    /// false. The write is declined with no error, the account never gets a new
+    /// baseline, and every run from then on is a `Basis::Baseline` that reports
+    /// nothing. A monitor gone silent for good, closed by the guard meant to
+    /// protect it.
+    #[test]
+    fn a_receipt_whose_capture_was_pruned_can_be_marked_again() {
+        let mut db = Store::in_memory().unwrap();
+        let first = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        set_mark(db.conn(), 7, ListKind::Followers, first, 1_700).unwrap();
+
+        db.conn()
+            .execute("DELETE FROM snapshots WHERE id = ?1", params![first])
+            .unwrap();
+        assert_eq!(
+            mark(db.conn(), 7, ListKind::Followers)
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            None,
+            "the fixture depends on the receipt outliving its capture"
+        );
+
+        let second = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        set_mark(db.conn(), 7, ListKind::Followers, second, 1_800).unwrap();
+
+        assert_eq!(
+            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            Some(Mark {
+                snapshot_id: Some(second),
+                compared_at: 1_800,
+            }),
+            "the next run lays a new baseline, and this is where it is recorded"
         );
     }
 
