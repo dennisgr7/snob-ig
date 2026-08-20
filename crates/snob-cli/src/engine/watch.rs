@@ -353,6 +353,35 @@ pub fn settle(db: &snob_core::store::Store, at: i64) {
     }
 }
 
+/// The same, for a run that never got as far as opening an `App`.
+///
+/// [`settle`] is the only caller of `store::prune`, and both of its call sites
+/// were behind doors this kind of run returns from first. `run_accounts` needs
+/// an `App`, and every mode checks the webhook address before it opens
+/// anything — deliberately, so an address that could never work costs nothing
+/// to find out about. So `snob watch` under a unit whose session was logged out
+/// settled nothing at all, and neither did either mode over a `watch.toml`
+/// whose `[webhook.headers]` names a header this tool sends, which is an easy
+/// thing to write when every header it sends starts `X-Snob-`. The scheduled
+/// mode dies one line earlier still, at `schedule_from`, on any of the
+/// schedules a hand-edit can put in a file the parser accepts.
+///
+/// Nothing is delivered wrongly by that and nothing is lost — `due`'s age bound
+/// means an over-age report cannot go out late. What stops is the bookkeeping:
+/// the queue goes on counting reports `due` will never return, `status` goes on
+/// promising the next run will try them, and old captures, settled deliveries
+/// and the run log all stop being expired for as long as it lasts.
+///
+/// Best-effort, like the rest of settling. A database that cannot be opened is
+/// the run's own problem a moment later, and it is not worth turning a refusal
+/// about a webhook into a different failure.
+pub fn settle_without_a_session(paths: &snob_core::paths::AppPaths, at: i64) {
+    match snob_core::store::Store::open(paths) {
+        Ok(db) => settle(&db, at),
+        Err(e) => tracing::warn!(error = %e, "the database could not be opened to settle it"),
+    }
+}
+
 impl TickReport {
     /// A report that never ran, for a test that only cares what it looks like.
     ///
