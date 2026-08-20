@@ -55,6 +55,12 @@ const MAX_ATTEMPTS: i64 = 32;
 pub const MAX_AGE_SECS: i64 = 24 * 3_600;
 
 /// A report waiting to be sent.
+///
+/// **`created_at` is a column and not a field.** It was read by nothing, and
+/// that is not an omission: a caller holding it would compute a report's age and
+/// decide something from it, which is [`MAX_AGE_SECS`]'s job and is decided in
+/// one place. The mapper below reads by position, so a field nothing needs is
+/// also one more position to keep in step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub id: i64,
@@ -62,7 +68,6 @@ pub struct Delivery {
     /// The exact bytes to send, and the ones the signature covers.
     pub body: String,
     pub attempts: i64,
-    pub created_at: i64,
 }
 
 /// Queues a report.
@@ -88,6 +93,68 @@ pub fn enqueue(
         params![run_id, pk_to_sql(account_pk), at, body, destination],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// The moment a report has to be newer than to still be news.
+///
+/// One function because the bound was three hand-written comparisons and they
+/// disagreed at exactly a day: [`due`] handed the report out as news, [`failed`]
+/// gave up on it, and `store::watch::prune` left it `pending` for ever. A report
+/// either is news or is not, and one of the three readings had to be it.
+///
+/// `failed`'s is the one kept, because
+/// `a_report_too_old_to_be_news_is_given_up_on` pins it: a report is too old the
+/// moment it *reaches* [`MAX_AGE_SECS`], and everything strictly newer is still
+/// news.
+fn still_news_after(now: i64) -> i64 {
+    now - MAX_AGE_SECS
+}
+
+/// Gives up on reports that have grown too old to be news.
+///
+/// **[`MAX_AGE_SECS`] cannot be left to [`failed`] alone**, which is only
+/// reached by a run that *tries* the report — so a report nothing ever retried
+/// aged without limit. Three ways that showed: a year-old row was still `due`
+/// and went out as news on the next run; removing `[webhook]` from the
+/// configuration left rows owed forever with `status` promising the next run
+/// would try them; and a walk that failed before the delivery step stopped the
+/// queue draining even when the webhook was fine.
+///
+/// Marked rather than deleted, so `status` can still say what became of it.
+///
+/// Here rather than written out in `store::watch::prune`, which is where it was.
+/// The outbox's rules live in this file — the header says so — and that
+/// statement out there is how the age bound came to be spelled a third time, in
+/// a third direction, with nothing to compare the three against.
+pub(super) fn expire_stale(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+    let expired = conn.execute(
+        "UPDATE watch_deliveries
+         SET state = 'expired', settled_at = ?1,
+             next_try_at = NULL,
+             last_error = coalesce(last_error, 'it grew too old to be news')
+         WHERE state = 'pending' AND created_at <= ?2",
+        params![now, still_news_after(now)],
+    )?;
+    Ok(expired)
+}
+
+/// How long a settled delivery is kept, for `status` and for anybody wondering
+/// where a report went. **Seven days**; older ones are only a record that
+/// something arrived.
+pub const KEEP_SETTLED_FOR_SECS: i64 = 7 * 24 * 3_600;
+
+/// Forgets deliveries settled long enough ago to be history rather than work.
+///
+/// **A pending row is never deleted here.** [`failed`] and [`expire_stale`] are
+/// what decide when a report stops being owed, and removing one from under them
+/// would lose a report that was still going to be tried.
+pub(super) fn forget_settled(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+    let removed = conn.execute(
+        "DELETE FROM watch_deliveries
+         WHERE state != 'pending' AND settled_at IS NOT NULL AND settled_at < ?1",
+        params![now - KEEP_SETTLED_FOR_SECS],
+    )?;
+    Ok(removed)
 }
 
 /// Reports that may be tried now, oldest first.
@@ -128,23 +195,22 @@ pub fn due(
     destination: &str,
 ) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, run_id, body, attempts, created_at
+        "SELECT id, run_id, body, attempts
          FROM watch_deliveries
          WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
-           AND created_at >= ?3
+           AND created_at > ?3
            AND (destination IS NULL OR destination = ?4)
          ORDER BY created_at, id
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(
-        params![now, limit as i64, now - MAX_AGE_SECS, destination],
+        params![now, limit as i64, still_news_after(now), destination],
         |row| {
             Ok(Delivery {
                 id: row.get(0)?,
                 run_id: row.get(1)?,
                 body: row.get(2)?,
                 attempts: row.get(3)?,
-                created_at: row.get(4)?,
             })
         },
     )?;
@@ -216,7 +282,7 @@ pub fn failed(
         Some(GaveUp::Refused)
     } else if attempts >= MAX_ATTEMPTS {
         Some(GaveUp::OutOfAttempts)
-    } else if now - created_at >= MAX_AGE_SECS {
+    } else if created_at <= still_news_after(now) {
         Some(GaveUp::TooOld)
     } else {
         None
@@ -431,7 +497,9 @@ mod tests {
         let id = queued(&db, "run-1", 1_000);
 
         assert_eq!(
-            failed(db.conn(), id, Some(0), "not a header", true, 1_000).unwrap(),
+            // `None`, not `Some(0)`: `Attempt::Refused` carries no status
+            // because no server answered, and 0 is not a code one can send.
+            failed(db.conn(), id, None, "not a header", true, 1_000).unwrap(),
             Outcome::GaveUp(GaveUp::Refused)
         );
         assert!(due(db.conn(), 999_999, 10, HERE).unwrap().is_empty());
@@ -685,6 +753,50 @@ mod tests {
 
         // However it is split, nothing falls out of the total.
         assert_eq!(here.waiting + here.elsewhere, pending(db.conn()).unwrap());
+    }
+
+    /// A day old is one answer, not three.
+    ///
+    /// The bound was written out three times -- here, in `failed`, and in
+    /// `store::watch::prune` -- and at exactly `MAX_AGE_SECS` the three
+    /// disagreed: `due` handed the report out as news, `failed` gave up on it,
+    /// and `prune` left it pending for ever, where nothing could reach it again.
+    /// Whichever reading is right, one of them has to be it.
+    #[test]
+    fn a_report_exactly_a_day_old_is_the_same_answer_to_everyone() {
+        let queued_at = 1_000;
+        let now = queued_at + MAX_AGE_SECS;
+
+        let db = store();
+        let id = queued(&db, "run-1", queued_at);
+        assert!(
+            due(db.conn(), now, 10, HERE).unwrap().is_empty(),
+            "a report the age bound has caught must not go out as news"
+        );
+        assert_eq!(
+            failed(db.conn(), id, None, "connection refused", false, now).unwrap(),
+            Outcome::GaveUp(GaveUp::TooOld),
+            "and the run that tries it gives up on it"
+        );
+
+        // And the sweep that runs whether or not anything tried it agrees, which
+        // is the reading that was the odd one out.
+        let db = store();
+        let swept = queued(&db, "run-2", queued_at);
+        expire_stale(db.conn(), now).unwrap();
+        assert_eq!(
+            state(db.conn(), swept).unwrap().as_deref(),
+            Some("expired"),
+            "a report nothing ever retried is expired at the same age"
+        );
+    }
+
+    /// And how long the record of a delivered one is kept, for the same reason
+    /// the age bound is written down: `prune`'s fixture ages a row by a multiple
+    /// of this, so it agreed with anything.
+    #[test]
+    fn how_long_a_settled_report_is_kept_is_the_documented_one() {
+        assert_eq!(KEEP_SETTLED_FOR_SECS, 7 * 24 * 3_600);
     }
 
     /// The id the receiver deduplicates on has to be unique, or two runs could

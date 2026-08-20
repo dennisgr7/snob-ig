@@ -172,7 +172,6 @@ mod tests {
             taken_at: Some(taken_at),
             member_count: 0,
             declared_count: None,
-            pages: 0,
             next_cursor: None,
         }
     }

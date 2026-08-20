@@ -642,12 +642,28 @@ impl Schedule {
 }
 
 /// Whether a run is owed, and when the next one is.
+///
+/// **"It names no moment" is a variant, not an instant.** It used to be
+/// `At(i64::MAX)`, and the loop told the two apart by matching that literal in
+/// an arm written above the general one — so the whole guard was an arm order
+/// and a number, both of which anything else in either file was free to move.
+/// Let the sentinel through and every reader downstream treats it as a moment:
+/// `with_jitter` adds to it and saturates, `wake_at` hands back `i64::MAX`, and
+/// the loop naps sixty seconds at a time until the end of time. No error, no
+/// exit code, and a process that looks perfectly healthy to whatever is watching
+/// it. That is the worst failure this loop has available and it was one
+/// reordering away. As a variant, the compiler asks for the arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
     /// Nothing yet. Sleep until this instant, an epoch in seconds.
     At(i64),
     /// Run now. `missed` counts the scheduled runs being folded into this one.
     Now { missed: u32 },
+    /// The schedule names no moment at all — `0 0 31 2 *`, and nothing else this
+    /// parser accepts. There is nothing to sleep until, so the caller has to say
+    /// so rather than wait. The same fact [`next_moment`] answers `None` with,
+    /// which is where the two readings came apart.
+    Never,
 }
 
 /// How far ahead a calendar is searched before it is called impossible.
@@ -935,7 +951,7 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
     let Some(next) = next_after(schedule, last_run, now, zone) else {
         // An impossible calendar. Never due, and the caller says so rather than
         // sleeping on a moment that will not come.
-        return Due::At(i64::MAX);
+        return Due::Never;
     };
 
     if next > now {
@@ -2204,13 +2220,52 @@ mod tests {
         }
     }
 
+    /// "It never fires" is an answer, and it must not be an instant.
+    ///
+    /// The sentinel was `Due::At(i64::MAX)` and the loop matched that literal in
+    /// an arm above the general one. Everything downstream of `At` treats the
+    /// payload as a moment -- `with_jitter` adds to it and saturates, `wake_at`
+    /// hands back `i64::MAX` -- so a schedule that names nothing put the monitor
+    /// to sleep a minute at a time for ever, with nothing failing and nothing to
+    /// read. Two things are pinned: that the impossible calendar answers its own
+    /// variant, and that nothing this module accepts ever hands the loop an
+    /// instant anywhere near the end of time, which is what made the sentinel
+    /// look safe.
+    #[test]
+    fn a_schedule_that_names_nothing_is_never_due_rather_than_due_at_the_end_of_time() {
+        // A century out, which is past anything expressible here:
+        // `MAX_INTERVAL_SECS` is a year and the search horizon is four minutes.
+        let a_century = at(0) + 100 * 366 * 24 * 3_600;
+        for schedule in [
+            Schedule::every(Duration::from_secs(hours(6) as u64)).unwrap(),
+            Schedule::every(Duration::from_secs(MAX_INTERVAL_SECS as u64)).unwrap(),
+            Schedule::cron("*/15 * * * *").unwrap(),
+            // A leap day: rare enough to look impossible, and it is not.
+            Schedule::cron("0 9 29 2 *").unwrap(),
+            Schedule::days(&[Weekday::Mon], Duration::from_secs(14 * 24 * 3_600)).unwrap(),
+        ] {
+            match due(&schedule, Some(at(0)), at(hours(1)), &Utc) {
+                Due::At(next) => assert!(
+                    next < a_century,
+                    "{schedule:?} handed the loop {next} to sleep until"
+                ),
+                Due::Now { .. } => {}
+                Due::Never => panic!("{schedule:?} names moments and one of them is next"),
+            }
+        }
+    }
+
     /// An expression that matches nothing must answer rather than search
     /// forever. There is no 31st of February.
     #[test]
     fn an_impossible_calendar_answers_none_instead_of_spinning() {
         let schedule = Schedule::cron("0 0 31 2 *").unwrap();
         assert_eq!(next_after(&schedule, None, at(0), &Utc), None);
-        assert_eq!(due(&schedule, None, at(0), &Utc), Due::At(i64::MAX));
+        assert_eq!(
+            due(&schedule, None, at(0), &Utc),
+            Due::Never,
+            "there is no 31st of February, and that is not a moment to sleep until"
+        );
     }
 
     /// The search matches against local wall-clock time, which is what decides

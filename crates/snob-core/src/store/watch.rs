@@ -53,10 +53,6 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
 /// somebody wants to look back. Thirty days is enough to look back over.
 const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
 
-/// How many settled deliveries to keep, for `status` and for anybody wondering
-/// where a report went. Older ones are only a record that something arrived.
-const KEEP_DELIVERIES_FOR_SECS: i64 = 7 * 24 * 3_600;
-
 /// Removes captures nothing needs any more.
 ///
 /// Three things are kept whatever their age, and each is load-bearing:
@@ -94,35 +90,13 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
         params![cutoff],
     )?;
 
-    // A report too old to be news stops being owed.
-    //
-    // `MAX_AGE_SECS` used to be applied only inside `deliveries::failed`, which
-    // is only reached by a run that tries the report — so a report nothing ever
-    // retried aged without limit. Three ways that showed: a year-old row was
-    // still `due` and went out as news on the next run; removing `[webhook]`
-    // from the configuration left rows owed forever with `status` promising the
-    // next run would try them; and a walk that failed before the delivery step
-    // stopped the queue draining even when the webhook was fine.
-    //
-    // Marked rather than deleted, so `status` can still say what became of it.
-    conn.execute(
-        "UPDATE watch_deliveries
-         SET state = 'expired', settled_at = ?1,
-             next_try_at = NULL,
-             last_error = coalesce(last_error, 'it grew too old to be news')
-         WHERE state = 'pending' AND created_at < ?2",
-        params![now, now - super::deliveries::MAX_AGE_SECS],
-    )?;
-
-    // Settled deliveries are a record, not work. Pending ones are never deleted
-    // here: `deliveries::failed` is what decides when one stops being owed, and
-    // removing one from under it would lose a report that was still going to be
-    // tried.
-    conn.execute(
-        "DELETE FROM watch_deliveries
-         WHERE state != 'pending' AND settled_at IS NOT NULL AND settled_at < ?1",
-        params![now - KEEP_DELIVERIES_FOR_SECS],
-    )?;
+    // The outbox expires its own. A report too old to be news stops being owed,
+    // and a settled one stops being kept — both are the outbox's rules, and they
+    // are written where the rest of them are. Written out here as well, the age
+    // bound ended up spelled three times and disagreeing at exactly a day: `due`
+    // handed the report out, `failed` gave up on it, and this left it pending.
+    super::deliveries::expire_stale(conn, now)?;
+    super::deliveries::forget_settled(conn, now)?;
 
     // Runs are a log, and `--every 30m` over three accounts writes some fifty
     // thousand rows a year; the table postdates the rest of retention, which is
@@ -155,9 +129,9 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
     Ok(removed)
 }
 
-/// How long the run log is kept. Long enough for `status` to describe a bad
-/// week, short enough that a monitor on a half-hourly schedule does not
-/// accumulate rows forever.
+/// How long the run log is kept. **Thirty days**: long enough for `status` to
+/// describe a bad week, short enough that a monitor on a half-hourly schedule
+/// does not accumulate rows forever.
 const KEEP_RUNS_FOR_SECS: i64 = 30 * 24 * 3_600;
 
 /// What one run of the monitor did.
@@ -517,6 +491,27 @@ fn record_renames_sent(
     Ok(())
 }
 
+/// A report on its way to somewhere, ready to be made durable.
+///
+/// The bytes rather than the events, because the signature covers bytes and a
+/// retry has to send the same string.
+pub struct Queued<'a> {
+    pub run_id: &'a str,
+    pub body: &'a str,
+    /// Where it is addressed, and what [`super::deliveries::due`] filters on, so
+    /// a later run cannot drain it through a client pointed somewhere else.
+    ///
+    /// **Not an `Option`.** It was one, under a doc offering "`None` when this
+    /// run has no webhook" as a state to write — and no caller can produce that
+    /// state, because a report with nowhere to go is never queued at all. What
+    /// made the offer dangerous is the other end: `due` reads a NULL destination
+    /// as "matches whatever is asked", which is the rule for rows queued before
+    /// `005_destination.sql` added the column. So the first caller to believe
+    /// the doc would have written a row any client drains — the leak that
+    /// migration closed, reopened through a field whose doc said to do it.
+    pub destination: &'a str,
+}
+
 /// Commits a report: queues it, and moves the marks it makes stale.
 ///
 /// **One transaction, and the order inside it is the point.** A change that has
@@ -532,14 +527,6 @@ fn record_renames_sent(
 ///
 /// `marks` names only the lists this report actually spoke about. A list that
 /// was refused is left out by the caller and its mark stays where it was.
-pub struct Queued<'a> {
-    pub run_id: &'a str,
-    pub body: &'a str,
-    /// Where it is addressed. `None` when this run has no webhook, so the report
-    /// is only printed.
-    pub destination: Option<&'a str>,
-}
-
 pub fn commit_report(
     store: &mut super::Store,
     account_pk: Pk,
@@ -558,7 +545,7 @@ pub fn commit_report(
             account_pk,
             queued.body,
             at,
-            queued.destination,
+            Some(queued.destination),
         )?),
         None => None,
     };
@@ -747,6 +734,68 @@ mod tests {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
             })
+        );
+    }
+
+    /// The two retention windows this file owns, written out.
+    ///
+    /// Every fixture below is expressed as a multiple of the constant it
+    /// exercises -- `KEEP_FOR_SECS * 5`, `KEEP_RUNS_FOR_SECS + 1` -- so all of
+    /// them agree with any value at all: set the capture window to an hour and
+    /// the whole suite still passes while a month of history disappears
+    /// overnight, or set it to a decade and the database grows without end. A
+    /// relative fixture tests the arithmetic. This tests the decision.
+    #[test]
+    fn how_long_a_capture_and_a_run_are_kept_are_the_documented_ones() {
+        assert_eq!(KEEP_FOR_SECS, 30 * 24 * 3_600, "thirty days of captures");
+        assert_eq!(KEEP_RUNS_FOR_SECS, 30 * 24 * 3_600, "thirty days of runs");
+    }
+
+    /// A report this store queues is always addressed, and the type is what
+    /// says so.
+    ///
+    /// `Queued::destination` was an `Option` under a doc offering "`None` when
+    /// this run has no webhook" as a state to write. No caller could produce it
+    /// -- a report with nowhere to go is never queued -- but `due` reads a NULL
+    /// destination as "matches whatever is asked", which is the rule for rows
+    /// queued before `005_destination.sql` existed. So the first caller to
+    /// believe the doc would have written a row any client drains, which is
+    /// verbatim the leak that migration closed.
+    #[test]
+    fn a_queued_report_carries_the_address_it_was_made_for() {
+        const HERE: &str = "https://n8n.local/webhook/snob";
+        const THE_TEST_RUN: &str = "https://n8n.local/webhook-test/snob";
+
+        let mut db = Store::in_memory().unwrap();
+        let capture = account_with_capture(&mut db, 7, &[user(1, "one")]);
+
+        commit_report(
+            &mut db,
+            7,
+            &[(ListKind::Followers, capture)],
+            1_700,
+            None,
+            &[],
+            Some(Queued {
+                run_id: "run-1",
+                body: "{}",
+                destination: HERE,
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            crate::store::deliveries::due(db.conn(), 1_700, 10, THE_TEST_RUN)
+                .unwrap()
+                .is_empty(),
+            "a report committed for {HERE} was drained to {THE_TEST_RUN}"
+        );
+        assert_eq!(
+            crate::store::deliveries::due(db.conn(), 1_700, 10, HERE)
+                .unwrap()
+                .len(),
+            1,
+            "and it is still owed where it was addressed"
         );
     }
 
@@ -1092,7 +1141,11 @@ mod tests {
         account_with_capture(&mut db, 7, &[user(1, "one")]);
 
         let now = crate::store::now();
-        let long_ago = now - KEEP_DELIVERIES_FOR_SECS * 10;
+        // A year, written out rather than taken from the constant it is meant
+        // to exercise. `deliveries` owns that number now, and
+        // `how_long_a_settled_report_is_kept_is_the_documented_one` is what pins
+        // it; a fixture expressed as a multiple of it agrees with anything.
+        let long_ago = now - 365 * 24 * 3_600;
         // Owed, and young enough to still be news — the other half of the rule
         // is the test below.
         let owed =

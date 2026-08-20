@@ -73,7 +73,12 @@ pub fn this_process() -> &'static str {
 /// safety check while deciding nothing at all. The check is the view, and it is
 /// held there rather than by whoever remembers to ask.
 ///
-/// The columns stay: `pages` and `requests` are what a walk cost, and the next
+/// `pages` went the same way and for a second reason as well: [`row_to_snapshot`]
+/// reads by position, so a field nothing needs is one more position that has to
+/// stay in step with [`SNAPSHOT_COLUMNS`], and a miss there is an
+/// `InvalidColumnIndex` at run time rather than a compile error.
+///
+/// The columns stay. `pages` and `requests` are what a walk cost, and the next
 /// thing that wants to say so should find them written down rather than lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -84,7 +89,6 @@ pub struct Snapshot {
     pub taken_at: Option<i64>,
     pub member_count: u64,
     pub declared_count: Option<u64>,
-    pub pages: u32,
     pub next_cursor: Option<String>,
 }
 
@@ -97,7 +101,7 @@ pub struct Snapshot {
 /// is not a compile error but an `InvalidColumnIndex` at runtime, on whichever
 /// of the three paths was missed. Two of the three are ordinary lookups and the
 /// third is the resume path, which only a walk that was interrupted ever takes.
-const SNAPSHOT_COLUMNS: &str = "id, account_pk, kind, started_at, taken_at, member_count,                                 declared_count, pages, next_cursor";
+const SNAPSHOT_COLUMNS: &str = "id, account_pk, kind, started_at, taken_at, member_count,                                 declared_count, next_cursor";
 
 /// What changed when a page was saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -513,22 +517,34 @@ pub fn delete_partials(
     Ok(deleted)
 }
 
+/// Reads one capture, by position, from [`SNAPSHOT_COLUMNS`].
+///
+/// **The `kind` is parsed and not defaulted.** Anything that was not
+/// `"followers"` used to be mapped to `Following`, which is a default wearing a
+/// match's clothes: `FromStr for ListKind` exists for exactly this read and its
+/// own doc says it fails rather than guessing, and `watch::all_marks` obeys it.
+/// The CHECK on the column keeps the state unreachable only until somebody edits
+/// the schema, and what the default buys on the day that happens is a followers
+/// capture handed back as a following one — the wrong list, silently, on the
+/// path every comparison reads.
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     let kind: String = row.get(2)?;
+    let kind = kind.parse::<ListKind>().map_err(|()| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            format!("\"{kind}\" is not a list this version knows").into(),
+        )
+    })?;
     Ok(Snapshot {
         id: row.get(0)?,
         account_pk: pk_from_sql(row.get(1)?),
-        kind: if kind == "followers" {
-            ListKind::Followers
-        } else {
-            ListKind::Following
-        },
+        kind,
         started_at: row.get(3)?,
         taken_at: row.get(4)?,
         member_count: row.get::<_, i64>(5)? as u64,
         declared_count: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-        pages: row.get::<_, i64>(7)? as u32,
-        next_cursor: row.get(8)?,
+        next_cursor: row.get(7)?,
     })
 }
 
@@ -556,6 +572,35 @@ mod tests {
     ///
     /// Written out, the way `the_default_pace_is_the_documented_one` writes out
     /// the pacing: changing one has to be deliberate and has to say so here.
+    /// A capture whose kind this version cannot read is an error, not a
+    /// following capture.
+    ///
+    /// The mapper answered `Following` for anything that was not `"followers"`,
+    /// which is a default dressed as a match. The CHECK on the column makes it
+    /// unreachable today and a one-line schema edit is all it takes; what it
+    /// buys then is a followers capture handed back as a following one, on the
+    /// path `latest_complete`, `find_usable` and the resume all read.
+    ///
+    /// Asked of the projection directly, because a row like this is precisely
+    /// what the table will not hold -- the guard has to hold for a database this
+    /// program did not write.
+    #[test]
+    fn a_capture_whose_kind_is_unreadable_is_refused_rather_than_guessed_at() {
+        let db = base();
+        let read = db.conn().query_row(
+            "SELECT 1, 1, 'sideways', 0, NULL, 0, NULL, NULL",
+            [],
+            row_to_snapshot,
+        );
+        assert!(
+            matches!(
+                &read,
+                Err(rusqlite::Error::FromSqlConversionFailure(2, _, _))
+            ),
+            "a kind this version cannot read answered {read:?}"
+        );
+    }
+
     #[test]
     fn the_two_windows_are_the_documented_ones() {
         assert_eq!(RESUME_WINDOW_SECS, 15 * 60);
@@ -1021,7 +1066,16 @@ mod tests {
             .unwrap();
         assert_eq!(pending.id, id);
         assert_eq!(pending.next_cursor.as_deref(), Some("next"));
-        assert_eq!(pending.pages, 1);
+
+        // `pages` is a column and not a field, so this asks the column. It was
+        // the only reader of either, and dropping the field without moving the
+        // question down would leave `pages = pages + 1` in `save_page` with
+        // nothing asserting it ever ran.
+        let pages: i64 = db
+            .conn()
+            .query_row("SELECT pages FROM snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pages, 1, "a saved page is a page the capture has paid for");
     }
 
     #[test]

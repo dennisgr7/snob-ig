@@ -69,8 +69,13 @@ pub enum Attempt {
     /// Not "the server said no": a configuration that never went through
     /// [`check`] and produces a header this cannot build. Retrying it sends the
     /// identical unbuildable request.
+    ///
+    /// **No status, rather than a zero.** It carried `status: 0`, and that zero
+    /// was written into `watch_deliveries.last_status`, whose comment reads "the
+    /// HTTP code, when there was one" — NULL already says that, and 0 is not a
+    /// code any server can answer with. Every reader had to know the convention
+    /// to avoid reporting it as one, and one of them stored it.
     Refused {
-        status: u16,
         error: String,
     },
 }
@@ -78,9 +83,10 @@ pub enum Attempt {
 impl Attempt {
     /// The HTTP code the far end answered with, when it answered at all.
     ///
-    /// `Refused` is deliberately `None` even though it carries a `status: 0`:
-    /// that zero means the request was never built, and reporting it as an HTTP
-    /// code would say the server sent something it never sent.
+    /// `Refused` has none to give: the request was never built, so no server
+    /// answered anything. It used to carry `status: 0` and this arm dropped it
+    /// on the floor — a convention that only held while every reader remembered
+    /// it.
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Delivered { status } => Some(*status),
@@ -175,7 +181,6 @@ impl WebhookClient {
                 }
                 _ => {
                     return Attempt::Refused {
-                        status: 0,
                         error: format!("\"{name}\" is not a header this can send"),
                     };
                 }
