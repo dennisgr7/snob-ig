@@ -45,12 +45,6 @@ pub struct ListReport {
 }
 
 impl ListReport {
-    /// Whether this is a comparison that actually happened, as opposed to a
-    /// baseline being laid down or a list nothing has touched.
-    pub fn compared(&self) -> bool {
-        matches!(self.basis, Basis::Compare { .. })
-    }
-
     /// Whether this run established that the list is still true, which is what
     /// makes a rename among its members worth reporting.
     ///
@@ -128,14 +122,23 @@ pub struct Watched {
 
 /// A recorded answer to "may this walk somebody else's lists?".
 ///
-/// Deliberately not a `bool`. A bool can be set to `true` by whatever needs it
-/// to be true; this carries when it was given, so what reaches the walk is a
-/// record of an answer rather than a decision made at the point of use.
+/// Deliberately not a `bool`. A bool is set to `true` by whatever needs it to be
+/// true, and the whole rule is about where the `true` came from — so what
+/// reaches the walk is a named type, and `grep Consent` is the complete list of
+/// the places one can be produced. Today that list is one:
+/// [`Watched::consented`], called only where an `[account.consent]` table was
+/// read out of `watch.toml`.
+///
+/// It carried the moment consent was given and nothing ever read it. A number
+/// nothing validates and nothing surfaces is an invitation to build a staleness
+/// rule on it — "consent older than a year is stale" — and there is no such rule
+/// here, nor anything checking that `agreed_at` is a moment rather than whatever
+/// a hand-edit put in the file. The record of *when* stays in `watch.toml`,
+/// where `AccountConfig::consent`'s own doc explains why it is a table and not a
+/// bool; what this type stands for is that an answer was given, which is what
+/// [`Watched::may_run_unattended`] asks and what `check` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Consent {
-    /// When it was given, in epoch seconds.
-    pub given_at: i64,
-}
+pub struct Consent;
 
 impl Watched {
     /// The account the session belongs to.
@@ -762,10 +765,31 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
     // where the cursor is: `007_renames_sent` records what actually went out, so
     // a window read twice does not send anything twice.
     let verified_kinds: Vec<ListKind> = verified.iter().map(|report| report.kind).collect();
-    let reported_on: Vec<ListKind> = [followers.as_ref(), following.as_ref()]
+    // The lists this report actually spoke about: what the marks name, and the
+    // one answer to "which lists did this run report on" that the cursor below
+    // reads too.
+    //
+    // Built here rather than by the caller, and that is the fix: the caller
+    // handed everything that had not been refused, and `list_report` can still
+    // answer with nothing — for a capture that turns out not to be usable, or a
+    // baseline another process pruned between the mark being read and the
+    // capture being looked up. The mark then advanced over a list nothing was
+    // said about, which loses that window for good. The two callers also
+    // disagreed about it, one marking a list the other left alone on identical
+    // state.
+    //
+    // **The cursor hangs off this list and not off a second copy of it.** It was
+    // worked out twice, fifty lines apart, from the same two `Option`s — and the
+    // paragraph above is an invitation to narrow *this* one the next time
+    // `list_report` answers `None` for something. Narrowing one copy alone
+    // leaves the cursor closing a window over a list no mark was written for,
+    // which is the permanent-loss failure `006_rename_cursor.sql` exists for and
+    // which nothing in the suite would have failed on. Narrowed here, the cursor
+    // simply declines to move and the next run says what this one did not.
+    let marks: Vec<(ListKind, i64)> = [followers.as_ref(), following.as_ref()]
         .into_iter()
         .flatten()
-        .map(|report| report.kind)
+        .map(|report| (report.kind, report.basis.mark_to()))
         .collect();
 
     let first_report = store::mark(app.db().conn(), pk, ListKind::Followers)?.is_none()
@@ -779,7 +803,7 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
         if !snapshots::any_capture(app.db().conn(), pk, kind)? {
             continue; // nothing was ever captured, so nothing was missed
         }
-        if first_report && reported_on.contains(&kind) {
+        if first_report && marks.iter().any(|&(marked, _)| marked == kind) {
             continue; // the seeding baseline
         }
         every_list_accounted_for = false;
@@ -788,22 +812,7 @@ fn compare(app: &App, pk: Pk, usable: &[(ListKind, i64)], head: i64) -> Result<C
     // Nothing filed after `head` is inside the window — enforced by
     // `renames_since` rather than asserted here, which is what the comment used
     // to do.
-    let covered = (!reported_on.is_empty() && every_list_accounted_for).then_some(head);
-
-    // The lists this report actually spoke about, for whoever commits it.
-    //
-    // Built here rather than by the caller, and that is the fix: the caller
-    // handed everything that had not been refused, and `list_report` can still
-    // answer with nothing — for a capture that turns out not to be usable, or a
-    // baseline another process pruned between the mark being read and the capture
-    // being looked up. The mark then advanced over a list nothing was said about,
-    // which loses that window for good. The two callers also disagreed about it,
-    // one marking a list the other left alone on identical state.
-    let marks = [followers.as_ref(), following.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|report| (report.kind, report.basis.mark_to()))
-        .collect();
+    let covered = (!marks.is_empty() && every_list_accounted_for).then_some(head);
 
     Ok(Compared {
         report: WatchReport {

@@ -750,14 +750,14 @@ fn with_recorded_consent(name: &str, configured: Option<&WatchConfig>) -> Watche
         })
         .and_then(|account| account.consent);
 
-    match recorded {
-        Some(consent) => Watched::consented(
-            name.to_string(),
-            crate::engine::watch::Consent {
-                given_at: consent.agreed_at,
-            },
-        ),
-        None => Watched::asking(name.to_string()),
+    if recorded.is_some() {
+        // The table is what matters, not what is in it. `[account.consent]`
+        // exists because somebody was asked; its `agreed_at` is the record of
+        // when, kept in the file, and nothing downstream of here reads it or
+        // could tell a real moment from whatever a hand-edit wrote.
+        Watched::consented(name.to_string(), crate::engine::watch::Consent)
+    } else {
+        Watched::asking(name.to_string())
     }
 }
 
@@ -2527,7 +2527,7 @@ mod tests {
 
         let watched = [Watched::consented(
             "friend".into(),
-            crate::engine::watch::Consent { given_at: 1 },
+            crate::engine::watch::Consent,
         )];
         // Driven through `run_accounts` rather than `run_one`, because the
         // count `once` prints is what it returns and `run_one` discards it.
@@ -4423,10 +4423,7 @@ consent = { agreed_at = 1700 }
     fn a_failed_tick_leaves_a_line_in_the_stream() {
         let error = anyhow::anyhow!("@friend's account is private");
         let line = failed_tick_json(
-            &Watched::consented(
-                "friend".into(),
-                crate::engine::watch::Consent { given_at: 1 },
-            ),
+            &Watched::consented("friend".into(), crate::engine::watch::Consent),
             &error,
             1_700_000_000,
             1,

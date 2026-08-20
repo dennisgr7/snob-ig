@@ -419,7 +419,7 @@ async fn a_second_watched_account_is_walked_as_itself() {
     let mut seen = Vec::new();
     for watched in [
         Watched::own(),
-        Watched::consented("other".into(), watch::Consent { given_at: 1 }),
+        Watched::consented("other".into(), watch::Consent),
     ] {
         seen.push(run(&mut app, &watched).await.report.account_pk);
     }
@@ -449,10 +449,7 @@ async fn a_second_watched_account_is_walked_as_itself() {
 async fn only_a_recorded_answer_lets_an_unattended_run_read_a_stranger() {
     assert!(Watched::own().may_run_unattended());
     assert!(!Watched::asking("someone".into()).may_run_unattended());
-    assert!(
-        Watched::consented("someone".into(), watch::Consent { given_at: 1_700 })
-            .may_run_unattended()
-    );
+    assert!(Watched::consented("someone".into(), watch::Consent).may_run_unattended());
 }
 
 /// A report too old to be news settles even when no tick got as far as
@@ -1107,18 +1104,9 @@ async fn check_stops_asking_once_an_account_earns_a_cooldown() {
         .with_service(&format!("snob-ig-test-throttle-{}", std::process::id()));
 
     let watched = [
-        Watched::consented(
-            "one".into(),
-            snob_cli::engine::watch::Consent { given_at: 1 },
-        ),
-        Watched::consented(
-            "two".into(),
-            snob_cli::engine::watch::Consent { given_at: 1 },
-        ),
-        Watched::consented(
-            "three".into(),
-            snob_cli::engine::watch::Consent { given_at: 1 },
-        ),
+        Watched::consented("one".into(), snob_cli::engine::watch::Consent),
+        Watched::consented("two".into(), snob_cli::engine::watch::Consent),
+        Watched::consented("three".into(), snob_cli::engine::watch::Consent),
     ];
 
     let mut report = CheckReport::default();

@@ -260,18 +260,20 @@ async fn offer_the_baseline(
     secrets: &SecretStore,
     paths: &AppPaths,
 ) -> Result<()> {
-    use crate::engine::check::What;
-
-    // Nothing to offer if a run could not happen anyway, or if there is
-    // already something to compare against.
+    // Nothing to offer if a run could not happen anyway, or if there is already
+    // something to compare against.
+    //
+    // Asked of the report rather than derived here out of the same `Vec` length.
+    // The check's line and this offer answer one question between them — the
+    // line explains why a first run says nothing, the offer is what stops it
+    // happening — and while they were two tests in two layers, the change that
+    // made a baseline mean "reported on" rather than "captured" had to be made
+    // in both. Made in one, the wizard goes silent about exactly the state the
+    // check has just started warning about.
     if report.verdict() == Verdict::Failed {
         return Ok(());
     }
-    let missing = report
-        .checked
-        .iter()
-        .any(|c| matches!(&c.what, What::Baseline { taken_at } if taken_at.len() < 2));
-    if !missing || !ui::can_show_a_menu() {
+    if !report.wants_a_baseline() || !ui::can_show_a_menu() {
         return Ok(());
     }
 
@@ -919,9 +921,7 @@ fn health(
 
     if config.is_none() {
         at_least(Verdict::Warned);
-        notes.push(
-            "nothing is configured, so a bare \"snob watch\" has no schedule to run on".to_string(),
-        );
+        notes.push(crate::report::NOTHING_CONFIGURED.to_string());
     }
 
     if runs.is_empty() {
@@ -1641,6 +1641,37 @@ every = \"6h\"
         let nothing = health(None, &[], &[], deliveries::Owed::default(), NOW);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
+    }
+
+    /// The two probes say the same thing about a machine with no `watch.toml`.
+    ///
+    /// `snob watch check` decides that sentence in `engine::check` and
+    /// `snob watch status` decides it here. They used to spell it out
+    /// separately, character for character -- and it is the advice a newly
+    /// installed tool gives, so it is the one somebody edits. Two probes run one
+    /// after the other, disagreeing about the same machine, each with a test
+    /// asserting it is right, is the state this stops.
+    ///
+    /// One run is given so `status` has nothing else to say: the only note left
+    /// is the one under test, which is what makes this an equality rather than a
+    /// search for a substring.
+    #[test]
+    fn both_probes_say_the_same_thing_about_an_unconfigured_machine() {
+        let ok = ran("ok");
+        let status = health(None, &[of(&ok)], &[], deliveries::Owed::default(), NOW);
+        assert_eq!(status.notes.len(), 1, "{:?}", status.notes);
+
+        let check = crate::engine::check::without_a_session(None, None, NOW);
+        assert_eq!(check.checked.len(), 1, "{:?}", check.checked);
+
+        assert_eq!(
+            status.notes[0],
+            check.checked[0]
+                .problem
+                .clone()
+                .expect("the check has to say why nothing is configured"),
+            "two probes somebody runs one after the other, disagreeing about one machine"
+        );
     }
 
     /// A queue for an address the file does not name is not a monitor with

@@ -138,6 +138,22 @@ impl CheckReport {
             .unwrap_or(Verdict::Ok)
     }
 
+    /// Whether anything in here says the first scheduled run would have nothing
+    /// to compare against.
+    ///
+    /// Two readers, one derivation. [`baseline_of`] gives the line its warning
+    /// and the sentence explaining why a first run says nothing, and `setup`'s
+    /// offer to take the first capture decides whether the offer is made at all
+    /// — and both tested the length of the same `Vec`, in two layers. They
+    /// answer one question between them: the line explains the state, and the
+    /// offer is what stops it. Narrow one of them and the check goes on
+    /// explaining a first run nobody was offered a way out of, which is exactly
+    /// what happened when a baseline came to mean "reported on" rather than
+    /// "captured" and only the verdict was changed.
+    pub fn wants_a_baseline(&self) -> bool {
+        self.checked.iter().any(|c| wants_a_baseline(&c.what))
+    }
+
     fn push(&mut self, what: What, verdict: Verdict, problem: Option<String>) {
         self.checked.push(Checked {
             what,
@@ -203,10 +219,7 @@ pub fn without_a_session(
         report.push(
             What::NotConfigured,
             Verdict::Warned,
-            Some(
-                "nothing is configured, so a bare \"snob watch\" has no schedule to run on"
-                    .to_string(),
-            ),
+            Some(crate::report::NOTHING_CONFIGURED.to_string()),
         );
     }
 
@@ -315,13 +328,18 @@ pub async fn with_a_session(
             return;
         }
 
-        let checked = account_of(app, account, session_works).await;
         // The baseline is asked about with the id this check just resolved, so
         // it is the same account the scheduled run would compare.
-        let pk = match &checked.what {
-            What::Account { pk, .. } => *pk,
-            _ => None,
-        };
+        //
+        // Handed back beside the line rather than taken out of it. Reading it
+        // back meant a `match` on `What` with a catch-all arm that cannot fire,
+        // three lines under the `What::Account` that had just been built — so a
+        // variant added to `What`, or an arm over there that came to answer with
+        // something else, would silently stop pushing the baseline check, and
+        // take its first-run warning and `setup`'s offer to lay a baseline down
+        // with it. No compile error, and no failing test: the report would
+        // simply be one line shorter.
+        let (checked, pk) = account_of(app, account, session_works).await;
         report.checked.push(checked);
         if let Some(pk) = pk {
             report.checked.push(baseline_of(app, pk));
@@ -370,17 +388,26 @@ fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
     Checked {
         what,
         verdict: Verdict::Failed,
-        problem: Some(
-            "no recorded consent, so an unattended run will refuse to read it \
-             (and it is in cooldown, so nothing else was checked)"
-                .to_string(),
-        ),
+        problem: Some(format!(
+            "{} (and it is in cooldown, so nothing else was checked)",
+            crate::report::NO_RECORDED_CONSENT
+        )),
     }
 }
 
 /// One configured account: does it resolve, may an unattended run read it, and
 /// what do its counters say.
-async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Checked {
+///
+/// The id comes back beside the line rather than only inside it.
+/// `with_a_session` needs it to ask about the baseline, and it read it back out
+/// of the `What::Account` this function had just built — through a catch-all
+/// that cannot fire, which is the shape that stops being true quietly. Handed
+/// back, the compiler is what keeps the two in step.
+async fn account_of(
+    app: &App,
+    watched: &super::watch::Watched,
+    ask: bool,
+) -> (Checked, Option<Pk>) {
     let target = watched.name().map(str::to_string);
     let may_run_unattended = watched.may_run_unattended();
 
@@ -395,11 +422,14 @@ async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Ch
     // A session that does not work cannot answer about anybody, and asking
     // would spend a request to learn what the line above already said.
     if !ask {
-        return Checked {
-            what,
-            verdict: Verdict::Warned,
-            problem: Some("not checked: the session is not responding".to_string()),
-        };
+        return (
+            Checked {
+                what,
+                verdict: Verdict::Warned,
+                problem: Some("not checked: the session is not responding".to_string()),
+            },
+            None,
+        );
     }
 
     let name = match &target {
@@ -435,22 +465,28 @@ async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Ch
                 // be asked, and a run is not stopped by it — a run resolves its
                 // own target — so this is the warning it is, not a failure.
                 Ok(None) => {
-                    return Checked {
-                        what,
-                        verdict: Verdict::Warned,
-                        problem: Some(
-                            "not checked: the session carries no username, and Instagram \
-                             did not name the account either"
-                                .to_string(),
-                        ),
-                    };
+                    return (
+                        Checked {
+                            what,
+                            verdict: Verdict::Warned,
+                            problem: Some(
+                                "not checked: the session carries no username, and Instagram \
+                                 did not name the account either"
+                                    .to_string(),
+                            ),
+                        },
+                        None,
+                    );
                 }
                 Err(e) => {
-                    return Checked {
-                        what,
-                        verdict: Verdict::Failed,
-                        problem: Some(e.to_string()),
-                    };
+                    return (
+                        Checked {
+                            what,
+                            verdict: Verdict::Failed,
+                            problem: Some(e.to_string()),
+                        },
+                        None,
+                    );
                 }
             },
         },
@@ -470,20 +506,25 @@ async fn account_of(app: &App, watched: &super::watch::Watched, ask: bool) -> Ch
             } else {
                 Verdict::Failed
             };
-            let problem = (!may_run_unattended).then(|| {
-                "no recorded consent, so an unattended run will refuse to read it".to_string()
-            });
+            let problem =
+                (!may_run_unattended).then(|| crate::report::NO_RECORDED_CONSENT.to_string());
+            (
+                Checked {
+                    what,
+                    verdict,
+                    problem,
+                },
+                Some(profile.id),
+            )
+        }
+        Err(e) => (
             Checked {
                 what,
-                verdict,
-                problem,
-            }
-        }
-        Err(e) => Checked {
-            what,
-            verdict: Verdict::Failed,
-            problem: Some(e.to_string()),
-        },
+                verdict: Verdict::Failed,
+                problem: Some(e.to_string()),
+            },
+            None,
+        ),
     }
 }
 
@@ -519,25 +560,19 @@ pub async fn webhook_of(
 ) -> Checked {
     use crate::watch::webhook::Attempt;
 
-    let what = What::Webhook {
-        destination,
-        status: None,
-        signed,
-    };
-
+    // Built inside each arm rather than once above and taken apart again. It was
+    // one `What::Webhook`, destructured and rebuilt in both arms behind a
+    // catch-all that cannot fire — and the only reason to rebuild it is the
+    // status, so `destination` is the field that goes along for the ride and the
+    // one an edit here drops. Nothing would have failed: neither preflight test
+    // asserted the address survives, and `describe_check` builds its whole
+    // "{destination} answered {code}" sentence out of it.
     match client.post(body, PREFLIGHT_EVENT, run_id, 1).await {
         Attempt::Delivered { status } => Checked {
-            what: match what {
-                What::Webhook {
-                    destination,
-                    signed,
-                    ..
-                } => What::Webhook {
-                    destination,
-                    status: Some(status),
-                    signed,
-                },
-                other => other,
+            what: What::Webhook {
+                destination,
+                status: Some(status),
+                signed,
             },
             verdict: Verdict::Ok,
             problem: None,
@@ -555,22 +590,24 @@ pub async fn webhook_of(
         // syntax put in front of the person at the terminal by the command
         // whose whole job is to explain what is wrong.
         other => Checked {
-            what: match what {
-                What::Webhook {
-                    destination,
-                    signed,
-                    ..
-                } => What::Webhook {
-                    destination,
-                    status: other.status(),
-                    signed,
-                },
-                other => other,
+            what: What::Webhook {
+                destination,
+                status: other.status(),
+                signed,
             },
             verdict: Verdict::Failed,
             problem: Some(other.error().to_string()),
         },
     }
+}
+
+/// The one test of "there is nothing to compare against yet".
+///
+/// A list counts only once a mark says it was reported on, which is what
+/// [`reported_baseline`] puts into `taken_at` — so two captures nobody has ever
+/// reported on are still no baseline, whichever of the two readers is asking.
+fn wants_a_baseline(what: &What) -> bool {
+    matches!(what, What::Baseline { taken_at } if taken_at.len() < 2)
 }
 
 /// When the capture a run would compare against was taken, if there is one.
@@ -628,15 +665,12 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
         }
     }
 
-    let complete = taken_at.len() == 2;
+    let what = What::Baseline { taken_at };
+    let wants = wants_a_baseline(&what);
     Checked {
-        what: What::Baseline { taken_at },
-        verdict: if complete {
-            Verdict::Ok
-        } else {
-            Verdict::Warned
-        },
-        problem: (!complete).then(|| {
+        what,
+        verdict: if wants { Verdict::Warned } else { Verdict::Ok },
+        problem: wants.then(|| {
             "the first scheduled run lays the baseline down and reports no changes; \
              the second one onwards reports them"
                 .to_string()
