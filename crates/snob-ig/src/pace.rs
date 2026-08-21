@@ -223,15 +223,31 @@ impl Pacer {
     /// contention it sits on the five-second busy timeout. That is a long time
     /// to hold a runtime worker, and this runs before every single request.
     async fn reserve(&self) -> Result<Duration, crate::error::IgError> {
+        self.charge(false).await
+    }
+
+    /// The same, for a follow or an unfollow. See
+    /// [`snob_core::store::rate_budget::RateBudget::reserve_write`].
+    async fn reserve_write(&self) -> Result<Duration, crate::error::IgError> {
+        self.charge(true).await
+    }
+
+    async fn charge(&self, write: bool) -> Result<Duration, crate::error::IgError> {
         let budget = Arc::clone(&self.budget);
         // `spawn_blocking` rather than `block_in_place`, which would be simpler
         // and needs no clone: `block_in_place` panics on a current-thread
         // runtime, and that is what `#[tokio::test]` builds by default. A tool
         // whose tests cannot run it is not a tool this code can use.
-        tokio::task::spawn_blocking(move || budget.reserve())
-            .await
-            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
-            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            if write {
+                budget.reserve_write()
+            } else {
+                budget.reserve()
+            }
+        })
+        .await
+        .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+        .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
     /// Takes a slot and waits for it. Every request goes through here.
@@ -248,11 +264,29 @@ impl Pacer {
     /// Before the reservation, not after: refusing to send and charging for it
     /// anyway is the one combination that helps nobody.
     pub(crate) async fn clear_to_send(&self) -> Result<(), crate::error::IgError> {
+        self.clear(false).await
+    }
+
+    /// The same for a write, which pays the read budgets and the write bucket.
+    ///
+    /// A separate method rather than a boolean on the one above, so that the
+    /// choice is made by which of `IgClient::get` and `IgClient::post` is
+    /// calling and not by an argument somebody could pass wrongly. There is no
+    /// way to send a follow or an unfollow that goes through the cheaper one.
+    pub(crate) async fn clear_to_send_write(&self) -> Result<(), crate::error::IgError> {
+        self.clear(true).await
+    }
+
+    async fn clear(&self, write: bool) -> Result<(), crate::error::IgError> {
         if self.cancel.is_canceled() {
             return Err(crate::error::IgError::Canceled);
         }
 
-        let owed = self.reserve().await?;
+        let owed = if write {
+            self.reserve_write().await?
+        } else {
+            self.reserve().await?
+        };
         // Counted at the reservation rather than at the answer: the budget has
         // been charged by now whatever the server goes on to say.
         self.spent.fetch_add(1, Ordering::Relaxed);

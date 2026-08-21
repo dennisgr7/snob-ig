@@ -117,6 +117,10 @@ impl RateBudget for LateCooldown {
         Ok(std::time::Duration::ZERO)
     }
 
+    fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+        self.reserve()
+    }
+
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
         let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok((seen >= self.calls_before).then(|| snob_core::store::now_ms() + 3_600_000))

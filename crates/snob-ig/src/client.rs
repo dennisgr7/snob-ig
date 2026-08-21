@@ -15,7 +15,8 @@ use url::Url;
 use crate::client_hints::{self, ClientHints};
 use crate::error::{IgError, classify, declares_failure};
 use crate::model::{
-    FriendshipsPage, Identity, UserInfo, UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
+    FriendshipResult, FriendshipStatus, FriendshipsPage, Identity, Reel, ReelsMedia, UserInfo,
+    UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
 };
 use crate::pace::Pacer;
 use crate::{BASE_URL, IG_APP_ID};
@@ -206,6 +207,19 @@ pub struct IgClient {
     /// platform trust store is read to assemble one — and every other command
     /// paid for that on the startup path to never send a request through it.
     cdn: OnceLock<reqwest::Client>,
+    /// Sends the two writes, and follows nothing.
+    ///
+    /// A third client, for a third rule. [`api_policy`] allows up to three
+    /// same-origin hops, which is right for a read and wrong for a write:
+    /// following a redirect on a POST means asking Instagram to do the thing
+    /// again, and "again" is a follow or an unfollow that nobody confirmed.
+    /// reqwest converts a 307 or 308 into a repeat of the same method and body,
+    /// so this is not theoretical — it is what would happen.
+    ///
+    /// Built on first use like [`Self::cdn`], and for the same reason: every
+    /// command that never writes would otherwise assemble a TLS configuration
+    /// it has no use for.
+    writer: OnceLock<reqwest::Client>,
     base: Url,
     session: Session,
     /// Reserving budget lives here rather than in each caller, so a request
@@ -218,6 +232,15 @@ pub struct IgClient {
 
 /// What a browser sends before the server has told it anything.
 const INITIAL_CLAIM: &str = "0";
+
+/// The route through the site that a follow button was reached by.
+///
+/// Sent because the web client sends it and its absence is the anomaly, not
+/// because anything here depends on it. It says: profile page, arrived at cold.
+/// It is a constant rather than assembled per request — assembling it would be
+/// inventing a browsing history we did not have, which is disguise, and this
+/// project does coherence instead.
+const NAV_CHAIN: &str = "PolarisProfilePostsTabRoot:profilePage:1:via_cold_start";
 
 /// Where every client built after this call points, in a testing build.
 ///
@@ -276,6 +299,7 @@ impl IgClient {
             hints: ClientHints::from_user_agent(&session.user_agent),
             api: build_client(&session.user_agent, api_policy(base.clone()))?,
             cdn: OnceLock::new(),
+            writer: OnceLock::new(),
             base,
             session,
             pacer,
@@ -294,6 +318,17 @@ impl IgClient {
         }
         let built = build_client(&self.session.user_agent, cdn_policy(self.base.clone()))?;
         Ok(self.cdn.get_or_init(|| built))
+    }
+
+    /// The write client, built the first time a follow or an unfollow is sent.
+    ///
+    /// See [`Self::writer`] for why it does not share the read client.
+    fn writer(&self) -> Result<&reqwest::Client, IgError> {
+        if let Some(writer) = self.writer.get() {
+            return Ok(writer);
+        }
+        let built = build_client(&self.session.user_agent, reqwest::redirect::Policy::none())?;
+        Ok(self.writer.get_or_init(|| built))
     }
 
     /// The current `X-IG-WWW-Claim`.
@@ -491,6 +526,76 @@ impl IgClient {
         .await
     }
 
+    /// The stories an account has up right now. One request.
+    ///
+    /// **This does not tell anybody you looked.** Instagram registers a view
+    /// through a separate call, which this project does not implement and which
+    /// `crates/snob-core/tests/no_seen.rs` checks has not appeared. Fetching the
+    /// reel is a read like any other.
+    ///
+    /// An account with nothing up answers 200 with an empty envelope rather
+    /// than 404, so `None` means there are no stories and not that the account
+    /// is missing — the caller resolved it before getting here.
+    pub async fn stories(&self, pk: Pk, username: &str) -> Result<Option<Reel>, IgError> {
+        let ids = pk.to_string();
+        let envelope: ReelsMedia = self
+            .get(
+                "/api/v1/feed/reels_media/",
+                &[("reel_ids", ids.as_str())],
+                // In a browser this call comes from the story viewer, which
+                // opens over the account's own page.
+                &if username.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", snob_core::model::in_a_path(username))
+                },
+            )
+            .await?;
+        Ok(envelope.reel())
+    }
+
+    /// Follows an account. **A write.** See [`IgClient::post`].
+    pub async fn follow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
+        self.friendship("create", pk, username).await
+    }
+
+    /// Unfollows an account. **A write.** See [`IgClient::post`].
+    pub async fn unfollow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
+        self.friendship("destroy", pk, username).await
+    }
+
+    /// The body of both, because the two differ by one word in the path.
+    ///
+    /// The form fields are the ones the web client sends. `container_module`
+    /// and `nav_chain` say which screen the button was on, and they are sent
+    /// because a browser sends them: this project's whole header and body
+    /// posture is coherence rather than disguise, and a POST that carries only
+    /// the account id is not a shape the site produces.
+    async fn friendship(
+        &self,
+        verb: &str,
+        pk: Pk,
+        username: &str,
+    ) -> Result<FriendshipStatus, IgError> {
+        let id = pk.to_string();
+        let result: FriendshipResult = self
+            .post(
+                &format!("/api/v1/friendships/{verb}/{pk}/"),
+                &[
+                    ("container_module", "profile"),
+                    ("nav_chain", NAV_CHAIN),
+                    ("user_id", id.as_str()),
+                ],
+                &if username.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", snob_core::model::in_a_path(username))
+                },
+            )
+            .await?;
+        Ok(result.friendship_status.unwrap_or_default())
+    }
+
     /// Downloads a public asset, such as a profile picture.
     ///
     /// These live on the CDN, a different host from the API, so the URL arrives
@@ -582,10 +687,48 @@ impl IgClient {
         // Paid for before it is sent, and there is no way in that skips this.
         self.pacer.clear_to_send().await?;
 
-        let mut request = self
-            .api
-            .get(url)
-            .query(query)
+        let request = self.browser_headers(self.api.get(url).query(query), referer);
+
+        let response = request.send().await?;
+        self.remember_claim(&response);
+
+        let status = response.status();
+
+        // The status is already in hand, and a body that will not read must not
+        // take it away. With `?` here, a 429 whose body died mid-stream became
+        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
+        // three more requests into an endpoint that had just said no, and
+        // `classify_and_record`, the only caller of `cooldown_for` there is,
+        // never ran: nothing was written down and the next run knocked again.
+        // What Instagram said is the status; the body only refines it.
+        let body = match read_capped(response, MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(_) if !status.is_success() => {
+                return Err(self.classify_and_record(status.as_u16(), ""));
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.decode(status, &body)
+    }
+
+    /// The headers every request to Instagram carries, in one place.
+    ///
+    /// Factored out when the write path arrived. Two copies of this list is how
+    /// the coherence `client_hints.rs` exists to maintain gets lost: a header
+    /// added for a good reason on the read path and forgotten on the write path
+    /// makes the two requests look like they came from different clients, on
+    /// one session, which is the anomaly and not the fix.
+    ///
+    /// What is deliberately **not** here is `Origin` and `Content-Type`. Both
+    /// belong to the write path only, and both are added there — see
+    /// [`IgClient::post`].
+    fn browser_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        referer: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut request = request
             // Without this header Instagram answers 403 even with a good session.
             .header("X-IG-App-ID", IG_APP_ID)
             .header("X-ASBD-ID", client_hints::ASBD_ID)
@@ -625,10 +768,16 @@ impl IgClient {
             )
             .header("Cookie", self.session.cookie_header().as_str());
 
-        // Deliberately no `Origin`: the Fetch standard omits it on same-origin
-        // GETs, so sending one next to `Sec-Fetch-Site: same-origin` would be
-        // two headers contradicting each other. Easy to add by reflex, which is
-        // why it is called out here rather than left to be noticed.
+        // Deliberately no `Origin` **here**: the Fetch standard omits it on
+        // same-origin GETs, so sending one next to `Sec-Fetch-Site:
+        // same-origin` would be two headers contradicting each other. Easy to
+        // add by reflex, which is why it is called out rather than left to be
+        // noticed.
+        //
+        // The other half of the same rule, and the reason this comment now says
+        // "here": the standard requires `Origin` on a POST even when it is
+        // same-origin. Omitting it there would be the identical incoherence the
+        // other way round, so `post` adds it, and only `post`.
 
         if let Some(csrf) = &self.session.csrftoken {
             request = request.header("X-CSRFToken", csrf.expose());
@@ -648,18 +797,104 @@ impl IgClient {
             request = request.header("Priority", priority);
         }
 
+        request
+    }
+
+    /// Turns what Instagram said into either the value asked for or an error,
+    /// recording a cooldown on the way if the answer earned one.
+    ///
+    /// Shared by the read and the write path so that "a 200 can still be a
+    /// failure" is one rule rather than two. It was inline in `get` when `get`
+    /// was the only caller.
+    fn decode<T: DeserializeOwned>(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> Result<T, IgError> {
+        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
+        // with a 200 in some cases.
+        if !status.is_success() || declares_failure(body) {
+            return Err(self.classify_and_record(status.as_u16(), body));
+        }
+
+        serde_json::from_str(body).map_err(|e| {
+            // The same excerpt every other error gets. This one had a copy of
+            // its own that took 200 raw characters: unfiltered, though it is
+            // printed to a terminal, and with no idea that a body starting with
+            // `<` is a captive portal rather than the API — which is exactly
+            // what a body that will not parse usually is.
+            IgError::Decode(format!(
+                "{e} - response: {}",
+                crate::error::body_excerpt(body)
+            ))
+        })
+    }
+
+    /// **The only function in this workspace that sends anything other than a
+    /// GET to Instagram.** Everything the write rule in `AGENTS.md` promises is
+    /// enforced on the way through here.
+    ///
+    /// Four things it does that [`IgClient::get`] does not, each of them there
+    /// because a write is not a read:
+    ///
+    /// - **It pays the write budget**, not the read one, and like `get` it pays
+    ///   before it sends. There is no argument that selects between the two:
+    ///   `get` calls `clear_to_send` and this calls `clear_to_send_write`, so
+    ///   the choice is made by which function the caller reached rather than by
+    ///   a value it passed.
+    /// - **It refuses without a CSRF token instead of finding out.** Instagram
+    ///   would answer 403, and that 403 would cost a request, a slot of write
+    ///   budget and — because `classify` reads a 403 as a dead session — a
+    ///   message telling the user to log in again when their session is fine.
+    ///   A `snob login --paste` session has no `csrftoken` unless one was given,
+    ///   so this is the common case rather than the odd one.
+    /// - **It sends `Origin`**, which the Fetch standard requires on a POST even
+    ///   when the request is same-origin. See the comment in
+    ///   [`IgClient::browser_headers`] for the half of that rule which lives on
+    ///   the read side.
+    /// - **It follows no redirect at all**, through [`IgClient::writer`].
+    ///
+    /// `referer` is the profile page the button would have been clicked on, in
+    /// the same spelling `get` wants: a path with no leading slash.
+    async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        referer: &str,
+    ) -> Result<T, IgError> {
+        // Before the budget is charged, so that a session which cannot write
+        // does not spend a slot discovering it. The token itself is put on the
+        // request by `browser_headers`, which adds it whenever the session has
+        // one; this guard is what makes "whenever" mean "always" on this path.
+        if self.session.csrftoken.is_none() {
+            return Err(IgError::NoCsrfToken);
+        }
+
+        let url = self.base.join(path)?;
+        tracing::debug!(%url, "POST");
+
+        self.pacer.clear_to_send_write().await?;
+
+        let request = self
+            .browser_headers(self.writer()?.post(url), referer)
+            .header("Origin", self.base.as_str().trim_end_matches('/'))
+            .form(form);
+
         let response = request.send().await?;
         self.remember_claim(&response);
 
         let status = response.status();
 
-        // The status is already in hand, and a body that will not read must not
-        // take it away. With `?` here, a 429 whose body died mid-stream became
-        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
-        // three more requests into an endpoint that had just said no, and
-        // `classify_and_record`, the only caller of `cooldown_for` there is,
-        // never ran: nothing was written down and the next run knocked again.
-        // What Instagram said is the status; the body only refines it.
+        // A redirect reaches here as a status rather than as a new request,
+        // because the policy is `none()`. It is not success and it is not
+        // something to replay, so it is reported as what it is.
+        if status.is_redirection() {
+            return Err(IgError::Unexpected {
+                status: status.as_u16(),
+                body: "Instagram redirected a write, which is never followed".into(),
+            });
+        }
+
         let body = match read_capped(response, MAX_BODY_BYTES).await {
             Ok(body) => body,
             Err(_) if !status.is_success() => {
@@ -668,23 +903,7 @@ impl IgClient {
             Err(e) => return Err(e),
         };
 
-        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
-        // with a 200 in some cases.
-        if !status.is_success() || declares_failure(&body) {
-            return Err(self.classify_and_record(status.as_u16(), &body));
-        }
-
-        serde_json::from_str(&body).map_err(|e| {
-            // The same excerpt every other error gets. This one had a copy of
-            // its own that took 200 raw characters: unfiltered, though it is
-            // printed to a terminal, and with no idea that a body starting with
-            // `<` is a captive portal rather than the API — which is exactly
-            // what a body that will not parse usually is.
-            IgError::Decode(format!(
-                "{e} - response: {}",
-                crate::error::body_excerpt(&body)
-            ))
-        })
+        self.decode(status, &body)
     }
 }
 
@@ -733,6 +952,9 @@ mod tests {
         fn reserve(&self) -> Result<std::time::Duration, RateBudgetError> {
             Ok(std::time::Duration::ZERO)
         }
+        fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+            self.reserve()
+        }
         fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
             Ok(None)
         }
@@ -751,8 +973,18 @@ mod tests {
 
     /// A client whose budget can be asked afterwards what it was told.
     fn watching(base: &str) -> (IgClient, Arc<Recording>) {
+        watching_as(base, false)
+    }
+
+    /// The same, with the option of a session that can write. Kept as one
+    /// helper so the two paths are driven through identical wiring and any
+    /// difference in what gets recorded is the code's rather than the test's.
+    fn watching_as(base: &str, can_write: bool) -> (IgClient, Arc<Recording>) {
         let budget = Arc::new(Recording::default());
-        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let mut session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        if can_write {
+            session.csrftoken = Some("TOKEN".into());
+        }
         let client = IgClient::new(
             session,
             crate::pace::Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>),
@@ -1421,5 +1653,205 @@ mod tests {
 
         let error = client(&server).await.validate().await.unwrap_err();
         assert!(matches!(error, IgError::Decode(_)));
+    }
+
+    /// A session with a CSRF token, which is what `login --browser` produces
+    /// and what the write path requires.
+    async fn writer(server: &MockServer) -> IgClient {
+        let mut session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        session.csrftoken = Some("TOKEN".into());
+        IgClient::new(session, crate::pace::Pacer::unlimited())
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap())
+    }
+
+    const FOLLOWED: &str = r#"{"status":"ok","friendship_status":{"following":true,"outgoing_request":false,"followed_by":false,"is_private":false}}"#;
+
+    #[tokio::test]
+    async fn a_follow_posts_the_form_the_web_client_sends() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/friendships/create/7/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
+            .mount(&server)
+            .await;
+
+        let status = writer(&server).await.follow(7, "someone").await.unwrap();
+        assert!(status.following);
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = &requests[0];
+        let body = String::from_utf8_lossy(&sent.body);
+        assert!(body.contains("user_id=7"), "{body}");
+        assert!(body.contains("container_module=profile"), "{body}");
+        assert!(body.contains("nav_chain="), "{body}");
+    }
+
+    /// The three headers a POST carries that a GET does not, plus the CSRF
+    /// token, which a GET carries too but a write cannot go without.
+    #[tokio::test]
+    async fn a_write_carries_origin_a_content_type_and_the_csrf_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
+            .mount(&server)
+            .await;
+
+        writer(&server).await.follow(7, "someone").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let headers = &requests[0].headers;
+        assert_eq!(
+            headers.get("origin").unwrap(),
+            server.uri().trim_end_matches('/'),
+            "a same-origin POST carries Origin, unlike a same-origin GET"
+        );
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+        assert_eq!(headers.get("x-csrftoken").unwrap(), "TOKEN");
+        // And it is still recognizably the same client as the read path.
+        assert!(headers.contains_key("x-ig-app-id"));
+        assert!(headers.contains_key("x-ig-www-claim"));
+        assert!(headers.contains_key("cookie"));
+    }
+
+    /// **Nothing is sent at all** when the session cannot sign the request.
+    /// Discovering it from Instagram's 403 would cost a request, a slot of the
+    /// write budget, and a message telling the user their session had expired
+    /// when it had not.
+    #[tokio::test]
+    async fn a_session_without_a_csrf_token_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
+            .mount(&server)
+            .await;
+
+        // `client` builds a pasted session, which has no token.
+        let error = client(&server)
+            .await
+            .follow(7, "someone")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IgError::NoCsrfToken), "{error:?}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the refusal must happen before anything goes out"
+        );
+    }
+
+    /// A redirect on a write is refused rather than followed. Following one
+    /// would mean asking Instagram to do the thing a second time, and reqwest
+    /// repeats the method and the body on a 307 or a 308.
+    #[tokio::test]
+    async fn a_redirected_write_is_not_replayed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/friendships/destroy/7/"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", "/api/v1/friendships/destroy/7/"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = writer(&server)
+            .await
+            .unfollow(7, "someone")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, IgError::Unexpected { status: 307, .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the write must have been sent exactly once"
+        );
+    }
+
+    /// An action block on a write earns a cooldown, and the budget is asked to
+    /// remember it. Driven through `Recording`, which does remember, rather
+    /// than through `Pacer::unlimited`, which answers `Ok(0)` and forgets.
+    #[tokio::test]
+    async fn an_action_block_on_a_write_is_recorded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            // No `spam` field: that one short-circuits to `RateLimited` before
+            // the message is read, and what is under test here is the action
+            // block, which carries the longer cooldown.
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"message":"feedback_required","status":"fail"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, budget) = watching_as(&server.uri(), true);
+
+        let error = client.follow(7, "someone").await.unwrap_err();
+        assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
+        assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
+    }
+
+    /// Both envelope shapes carry the same reel, and the caller cannot tell
+    /// which arrived. Reading only the one seen during development is how this
+    /// breaks quietly when Instagram switches.
+    #[tokio::test]
+    async fn stories_are_read_out_of_either_envelope() {
+        let item = r#"{"pk":"1","media_type":1,"taken_at":100,"expiring_at":200,
+            "image_versions2":{"candidates":[{"url":"https://x/s.jpg","width":640,"height":1136},
+            {"url":"https://x/b.jpg","width":1080,"height":1920}]}}"#;
+
+        for envelope in [
+            format!(r#"{{"reels_media":[{{"items":[{item}]}}]}}"#),
+            format!(r#"{{"reels":{{"42":{{"items":[{item}]}}}}}}"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/feed/reels_media/"))
+                .and(query_param("reel_ids", "42"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(&envelope))
+                .mount(&server)
+                .await;
+
+            let reel = client(&server)
+                .await
+                .stories(42, "someone")
+                .await
+                .unwrap()
+                .expect("a reel");
+            assert_eq!(reel.items.len(), 1);
+            assert_eq!(
+                crate::model::largest(&reel.items[0].image_versions2.clone().unwrap().candidates)
+                    .unwrap()
+                    .url,
+                "https://x/b.jpg",
+                "the biggest candidate wins, not the first"
+            );
+        }
+    }
+
+    /// An account with nothing up is not a missing account.
+    #[tokio::test]
+    async fn an_account_with_no_stories_is_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/feed/reels_media/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"reels_media":[]}"#))
+            .mount(&server)
+            .await;
+
+        assert!(
+            client(&server)
+                .await
+                .stories(42, "someone")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

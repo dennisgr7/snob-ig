@@ -45,6 +45,20 @@ pub enum IgError {
     #[error("could not consult the request budget: {0}")]
     Budget(String),
 
+    /// The stored session carries no `csrftoken`, so it cannot write.
+    ///
+    /// Reads do not need one, which is why a session that cannot write is a
+    /// perfectly good session and this is not `SessionExpired`. It arrives on
+    /// every session created by `snob login --paste` without `--csrftoken`,
+    /// because the sessionid is all that is pasted; `snob login --browser`
+    /// captures the token along with the cookie.
+    #[error(
+        "this session has no CSRF token, so it can read but not follow or unfollow; \
+         run \"snob login --browser\", or pass the token with \
+         \"snob login --paste --csrftoken\""
+    )]
+    NoCsrfToken,
+
     #[error("canceled")]
     Canceled,
 

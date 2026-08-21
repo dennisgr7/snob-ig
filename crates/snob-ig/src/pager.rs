@@ -1179,6 +1179,9 @@ mod tests {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 Ok(Duration::ZERO)
             }
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
+            }
             fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
                 Ok(Some(snob_core::store::now_ms() + 3_600_000))
             }
@@ -1226,6 +1229,9 @@ mod tests {
         impl RateBudget for CooldownAfterTwo {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 Ok(Duration::ZERO)
+            }
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
             }
             fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
                 let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1281,6 +1287,9 @@ mod tests {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(Duration::ZERO)
+            }
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
             }
             fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
                 Ok(None)

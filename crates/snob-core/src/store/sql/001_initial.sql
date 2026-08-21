@@ -94,7 +94,7 @@ CREATE VIEW usable_snapshots AS
 -- and the v2 service so two invocations do not spend without noticing each
 -- other.
 CREATE TABLE rate_budget (
-  bucket        TEXT PRIMARY KEY,   -- 'pace' | 'daily'
+  bucket        TEXT PRIMARY KEY,   -- 'pace' | 'daily' | 'writes'
   tat_ms        INTEGER NOT NULL,   -- theoretical arrival time allowed
   emission_ms   INTEGER NOT NULL,   -- what one request costs in time
   burst_ms      INTEGER NOT NULL,   -- burst tolerance

@@ -40,7 +40,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 # to read the answer is worse than not announcing it. `deflate` was the one
 # missing, so the header did not match the comment that asked for it.
 
-reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "gzip", "deflate", "brotli", "zstd"] }
+# `form` is what the two writes send their body as, and it costs nothing: it
+# pulls `serde_urlencoded`, which `query` already put in the tree. Encoding the
+# body by hand would have been the same crate graph and one more place to get
+# percent-encoding wrong.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "form", "gzip", "deflate", "brotli", "zstd"] }
 # Depended on only to turn one feature back on. reqwest declares rustls with
 # `default-features = false`, which drops `prefer-post-quantum` — and without it
 # the client advertises the hybrid group X25519MLKEM768 in `supported_groups`

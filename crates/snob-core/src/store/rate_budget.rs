@@ -23,6 +23,7 @@ use crate::paths::AppPaths;
 /// strings in five places, and missing one of them silently restarts the budget.
 const PACE_BUCKET: &str = "pace";
 const DAILY_BUCKET: &str = "daily";
+const WRITE_BUCKET: &str = "writes";
 /// The only value of `cooldowns.scope`. A cooldown covers the whole session.
 const SESSION_SCOPE: &str = "session";
 
@@ -59,6 +60,49 @@ const PACE_BURST_MS: i64 = PACE_EMISSION_MS * 20;
 /// Daily ceiling of roughly two thousand requests.
 const DAILY_EMISSION_MS: i64 = 43_200;
 const DAILY_BURST_MS: i64 = 86_400_000;
+
+/// Sustained pace of **writes**: one follow or unfollow every fifteen minutes,
+/// which is ninety-six a day if somebody keeps it up around the clock.
+///
+/// This is a third bucket rather than a smaller emission on the existing two,
+/// because a write is a request *and* something else. It pays the pace bucket
+/// and the daily bucket like every other request — it costs Instagram the same
+/// — and then it pays this one on top, which is the constraint that has nothing
+/// to do with volume.
+///
+/// Where the number comes from, since `pace.rs`'s numbers come from a reference
+/// implementation and this one has none. The public field reports for 2026 put
+/// an established account at 100 to 150 follow actions a day and a new account
+/// at 10 to 30, and they agree on something more useful than either figure:
+/// **what gets actioned is the burst, not the daily total.** A hundred
+/// unfollows inside half an hour is blocked on an account whose day's count
+/// would have passed without comment. So the design target is not a daily
+/// ceiling at all — it is a floor under the gap between two writes, and ninety-
+/// six a day is what falls out of it rather than what was aimed at.
+///
+/// Fifteen minutes is also below the rate a person clicking the button would
+/// produce, which is the point: the ceiling that matters is not the one snob
+/// enforces on itself but the one the account has already used up elsewhere.
+/// This bucket knows nothing about the follows made in the app on the same
+/// account today, so it has to leave room for them.
+const WRITE_EMISSION_MS: i64 = 900_000;
+
+/// Burst tolerance of the write bucket: **three** writes back to back, and then
+/// the fifteen minutes apply.
+///
+/// Two emissions, not three. A GCRA tolerance of *n* intervals lets *n + 1*
+/// through before it throttles — the *n* that fit ahead plus the one emitted on
+/// pace, which is the arithmetic `FIT_IN_A_ROW` in the tests below spells out
+/// for the pace bucket. Written as three it would have allowed four, and the
+/// sentence above would have been wrong about the constant underneath it.
+///
+/// Deliberately tight, and the reason is the shape of the risk rather than the
+/// size of it. Twenty was right for reads, where a burst is a walk going
+/// through pages of one list and looks like somebody scrolling. Three writes in
+/// a row is the most that looks like somebody changing their mind; the fourth
+/// starts to look like a script, which is the only thing being defended
+/// against here.
+const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 
 /// Slack before deciding the system clock has gone backwards.
 const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
@@ -113,6 +157,17 @@ pub trait RateBudget: Send + Sync {
     /// The reservation is committed even if the request is never made:
     /// overcharging is the safe direction to be wrong in.
     fn reserve(&self) -> Result<Duration, RateBudgetError>;
+
+    /// Reserves a **write** — a follow or an unfollow — and returns how long to
+    /// wait before sending it.
+    ///
+    /// A write pays everything a read pays and then the write bucket on top, so
+    /// this can never come back with a shorter wait than [`Self::reserve`]
+    /// would have. That ordering is the whole point of it being a separate
+    /// method: a caller cannot reach the cheaper one by mistake, because
+    /// `IgClient::post` calls this one and `IgClient::get` calls the other, and
+    /// neither takes an argument that could pick the wrong one.
+    fn reserve_write(&self) -> Result<Duration, RateBudgetError>;
 
     /// Until when the account is in cooldown, as an epoch in milliseconds.
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError>;
@@ -255,8 +310,20 @@ impl SqliteRateBudget {
     }
 }
 
-impl RateBudget for SqliteRateBudget {
-    fn reserve(&self) -> Result<Duration, RateBudgetError> {
+impl SqliteRateBudget {
+    /// The body of both reservations, so that the two cannot come apart.
+    ///
+    /// Every reservation charges the pace bucket and the daily one; a write
+    /// charges the write bucket as well. The answer is the longest of the waits
+    /// they hand back, and **all of the buckets are charged whichever wait
+    /// wins** — a request held back by one budget still spends the others,
+    /// because it is still going to be sent.
+    ///
+    /// One transaction for all of them, and it is `IMMEDIATE` for the reason
+    /// spelled out below. Charging the write bucket in a second transaction
+    /// would let two processes interleave between the two, which is exactly the
+    /// case a shared budget exists for.
+    fn reserve_buckets(&self, write: bool) -> Result<Duration, RateBudgetError> {
         let now = now_ms();
 
         // BEGIN IMMEDIATE rather than the default deferred one: with deferred,
@@ -271,12 +338,27 @@ impl RateBudget for SqliteRateBudget {
             Self::reserve_bucket(&tx, PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS, now)?;
         let daily_wait =
             Self::reserve_bucket(&tx, DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS, now)?;
+        let write_wait = if write {
+            Self::reserve_bucket(&tx, WRITE_BUCKET, WRITE_EMISSION_MS, WRITE_BURST_MS, now)?
+        } else {
+            0
+        };
 
         tx.commit()?;
 
         Ok(Duration::from_millis(
-            pace_wait.max(daily_wait).max(0) as u64
+            pace_wait.max(daily_wait).max(write_wait).max(0) as u64,
         ))
+    }
+}
+
+impl RateBudget for SqliteRateBudget {
+    fn reserve(&self) -> Result<Duration, RateBudgetError> {
+        self.reserve_buckets(false)
+    }
+
+    fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+        self.reserve_buckets(true)
     }
 
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
@@ -366,6 +448,9 @@ pub struct UnlimitedRateBudget;
 
 impl RateBudget for UnlimitedRateBudget {
     fn reserve(&self) -> Result<Duration, RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+    fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
         Ok(Duration::ZERO)
     }
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
@@ -476,6 +561,67 @@ mod tests {
         assert!(
             b.reserve().unwrap() > Duration::ZERO,
             "past the burst it should throttle"
+        );
+    }
+
+    /// Three writes fit, and the fourth waits. The tolerance is what decides
+    /// that, and it is deliberately much tighter than the one reads get.
+    #[test]
+    fn three_writes_fit_in_a_row_and_the_fourth_waits() {
+        let (_tmp, b) = temp_budget();
+        for i in 0..3 {
+            assert_eq!(
+                b.reserve_write().unwrap(),
+                Duration::ZERO,
+                "write {i} should not have waited"
+            );
+        }
+        assert!(
+            b.reserve_write().unwrap() > Duration::from_secs(60),
+            "the fourth write should be held back by minutes, not milliseconds"
+        );
+    }
+
+    /// **The buckets do not leak into each other.** A write spends the read
+    /// budgets too — it is a request — but an exhausted write bucket must not
+    /// stop a walk, which is the failure this would have if the write cost were
+    /// expressed as a smaller emission on the pace bucket instead of as a
+    /// bucket of its own.
+    #[test]
+    fn a_spent_write_budget_does_not_hold_up_a_read() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..4 {
+            b.reserve_write().unwrap();
+        }
+        assert!(
+            b.reserve_write().unwrap() > Duration::ZERO,
+            "the write bucket should be spent by now"
+        );
+        assert_eq!(
+            b.reserve().unwrap(),
+            Duration::ZERO,
+            "a read must not pay for the writes"
+        );
+    }
+
+    /// A write is a request, so the pace bucket sees it. Without this the write
+    /// path would be a way of reaching Instagram that the request count does not
+    /// know about, and `Pacer::spent` would stop meaning what it says.
+    #[test]
+    fn a_write_spends_the_read_budget_as_well() {
+        let (_tmp, b) = temp_budget();
+        // Three writes are all the write bucket allows in a row, so the rest of
+        // the pace bucket has to be spent by reads for the assertion to be
+        // about the writes having spent theirs.
+        for _ in 0..3 {
+            b.reserve_write().unwrap();
+        }
+        for _ in 0..27 {
+            b.reserve().unwrap();
+        }
+        assert!(
+            b.reserve().unwrap() > Duration::ZERO,
+            "thirty requests, three of which were writes, should have spent the pace burst"
         );
     }
 

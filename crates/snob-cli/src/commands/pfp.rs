@@ -243,6 +243,9 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(std::time::Duration::ZERO)
         }
+        fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+            self.reserve()
+        }
         fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
             Ok(None)
         }

@@ -182,6 +182,120 @@ where
     }
 }
 
+/// What Instagram answers to `friendships/create` and `friendships/destroy`.
+///
+/// The interesting field is `outgoing_request`. Following a private account does
+/// not follow it — it asks — and the difference is the whole answer to "did that
+/// work?". Reporting a request as a follow would be the command lying about the
+/// one thing it was run to do.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FriendshipResult {
+    #[serde(default)]
+    pub friendship_status: Option<FriendshipStatus>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FriendshipStatus {
+    #[serde(default)]
+    pub following: bool,
+    #[serde(default)]
+    pub outgoing_request: bool,
+    #[serde(default)]
+    pub followed_by: bool,
+    /// Whether the other account is private, which is what decides whether a
+    /// follow became a follow or a request.
+    #[serde(default)]
+    pub is_private: bool,
+}
+
+/// Response of `/api/v1/feed/reels_media/?reel_ids={pk}`.
+///
+/// Two shapes are accepted because Instagram serves both, and which one arrives
+/// has moved between versions: `reels_media` is a list of reels and `reels` is a
+/// map keyed by the account id. They carry the same reel. Reading only the one
+/// that happened to arrive during development is how this breaks silently six
+/// months later, so both are read and [`Self::reel`] is the only way in.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReelsMedia {
+    #[serde(default)]
+    pub reels_media: Vec<Reel>,
+    #[serde(default)]
+    pub reels: std::collections::HashMap<String, Reel>,
+}
+
+impl ReelsMedia {
+    /// The one reel that was asked for, whichever shape it came back in.
+    ///
+    /// An account with nothing up answers with both collections empty rather
+    /// than with a 404, so `None` here means "no stories", not "no such
+    /// account". The caller has already resolved the account by then.
+    pub fn reel(self) -> Option<Reel> {
+        self.reels_media
+            .into_iter()
+            .next()
+            .or_else(|| self.reels.into_values().next())
+    }
+}
+
+/// One account's stories: the tray entry plus the items themselves.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Reel {
+    #[serde(default)]
+    pub items: Vec<ReelItem>,
+    #[serde(default)]
+    pub user: Option<UserSummary>,
+}
+
+/// One story.
+///
+/// `media_type` is Instagram's integer — 1 for a photo, 2 for a video — and it
+/// is kept as the wire integer here and turned into something meaningful at the
+/// boundary, like every other field in this module. Nothing downstream compares
+/// it to a literal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReelItem {
+    pub pk: String,
+    #[serde(default)]
+    pub media_type: u8,
+    #[serde(default)]
+    pub taken_at: i64,
+    /// When it disappears. Absent on some items, which is why it is optional
+    /// rather than defaulted to zero: "expires at the epoch" would print as an
+    /// expired story rather than as an unknown one.
+    #[serde(default)]
+    pub expiring_at: Option<i64>,
+    #[serde(default)]
+    pub image_versions2: Option<Candidates>,
+    #[serde(default)]
+    pub video_versions: Vec<PictureVersion>,
+    #[serde(default)]
+    pub reel_mentions: Vec<ReelMention>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Candidates {
+    #[serde(default)]
+    pub candidates: Vec<PictureVersion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReelMention {
+    #[serde(default)]
+    pub user: Option<UserSummary>,
+}
+
+/// Picks the largest of the versions Instagram offers.
+///
+/// The web client picks the one that fits the viewport; nothing here draws in a
+/// terminal, so what is wanted is simply the biggest. Missing dimensions sort
+/// last rather than first: an entry that does not say how large it is must not
+/// win by default over one that does.
+pub fn largest(versions: &[PictureVersion]) -> Option<&PictureVersion> {
+    versions
+        .iter()
+        .max_by_key(|v| (v.width.unwrap_or(0) as u64) * (v.height.unwrap_or(0) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

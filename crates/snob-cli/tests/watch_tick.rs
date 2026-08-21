@@ -734,6 +734,9 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(std::time::Duration::ZERO)
         }
+        fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+            self.reserve()
+        }
         fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
             let spent = self.0.load(std::sync::atomic::Ordering::Relaxed);
             Ok((spent >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
