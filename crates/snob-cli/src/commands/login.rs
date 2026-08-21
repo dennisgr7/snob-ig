@@ -7,7 +7,7 @@
 //! that there was nowhere to put the result.
 
 use anyhow::{Result, bail};
-use snob_core::paths::AppPaths;
+use snob_core::paths::{self, AppPaths};
 use snob_core::secrets::{Backend, SecretStore};
 use snob_core::session::Session;
 use snob_ig::login::{self, ValidationOutcome};
@@ -217,10 +217,63 @@ async fn by_browser(
     }
     let (cookies, user_agent) = captured?;
 
+    if !args.keep_profile {
+        discard_profile(&profile);
+    }
+
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
     session.browser = Some(found.name.to_string());
     finish(session, store, pacer, LoginMethod::Browser).await
+}
+
+/// Removes the profile the browser was driven in, once its cookies are ours.
+///
+/// **87.2 MB and 886 files, holding a live Instagram session at rest.** More
+/// than the binary and a year of the database put together, and a second copy
+/// of the credential — protected by whatever the data directory's permissions
+/// happen to be, which on Windows is not something this tool sets. The profile
+/// exists so that logging in does not happen in the user's everyday browser;
+/// nothing about that purpose needs it to survive the login. `--keep-profile`
+/// is for whoever wants the next login to skip the Instagram form.
+///
+/// Guarded by `is_safe_to_remove` like every other recursive delete here, and
+/// retried briefly: the browser has just been told to close and Windows holds
+/// a directory until the last handle in it goes. A failure is a warning rather
+/// than an error, because the session has already been captured and losing the
+/// login over housekeeping would be the worse outcome — and the sentence names
+/// the path, so it can be removed by hand.
+fn discard_profile(profile: &std::path::Path) {
+    if !profile.exists() {
+        return;
+    }
+    if !paths::is_safe_to_remove(profile) {
+        ui::warn(&format!(
+            "{} is too close to the root to remove; delete it by hand",
+            profile.display()
+        ));
+        return;
+    }
+
+    let mut last = None;
+    for attempt in 0..10 {
+        match std::fs::remove_dir_all(profile) {
+            Ok(()) => return,
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+            }
+        }
+    }
+
+    if let Some(e) = last {
+        ui::warn(&format!(
+            "the browser profile at {} could not be removed ({e}). It holds a \
+             logged-in session; delete it by hand, or run \
+             \"snob logout --purge-profile\" later.",
+            profile.display()
+        ));
+    }
 }
 
 /// Drives the browser from launch to captured session, and always closes it.
