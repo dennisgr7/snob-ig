@@ -132,7 +132,17 @@ fn signing_secret(value: &str) -> Result<String, String> {
     let length = value.chars().count();
     if length < FLOOR {
         return Err(format!(
-            "a signing secret has to be at least {FLOOR} characters and this one is              {length}. A short one can be guessed offline by anybody who has been sent              one signed report. Generate one instead --              \"openssl rand -hex 32\", or \"python -c \\\"import secrets;              print(secrets.token_hex(32))\\\"\"."
+            concat!(
+                "a signing secret has to be at least {FLOOR} characters and this one is ",
+                "{length}. A short one can be guessed offline by anybody who has been ",
+                "sent one signed report. Generate one instead -- ",
+                "\"openssl rand -hex 32\", or ",
+                "\"python -c \\\"import secrets; print(secrets.token_hex(32))\\\"\"." // Named rather than captured: a `format!` cannot reach an identifier
+                                                                                      // through a `concat!`, and `concat!` is what keeps `cargo fmt` from
+                                                                                      // rejoining these lines and leaving the indentation inside the string.
+            ),
+            FLOOR = FLOOR,
+            length = length
         ));
     }
     Ok(value.to_string())

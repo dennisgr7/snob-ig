@@ -375,13 +375,21 @@ Two judgment calls worth understanding before touching them:
   weight:
   - The 52-to-14 was an estimate, and the August 2026 capture makes it look
     like the wrong way round. **The real client batches twelve or thirteen ids
-    per call, never more** — 41 calls in one session, median 12, and it makes
-    about 1.5 of them per page of 12 followers, because the list payload
-    carries `pk`, `username` and `full_name` and no friendship status at all.
-    At that batch size a thousand accounts is roughly eighty calls, which is
-    worse than walking the second list, not better. Whether the limit is the
-    endpoint's or just what the page asks for is still unverified — but the
-    saving the estimate rested on is no longer the obvious part.
+    per call, never more** — 41 calls in one session, thirty of them exactly
+    twelve, tracking the rendered page one for one. At that batch size a
+    thousand accounts is roughly eighty calls, which is worse than walking the
+    second list rather than better. Whether twelve is the endpoint's limit or
+    only what the page asks for is unverified, so this does not settle the
+    saving; it removes the reason to assume there is one.
+
+    And a fourth ground, which is the one that closes it. Across 461 statuses
+    in that session the fields returned were `following`, `is_bestie`,
+    `is_feed_favorite`, `is_private`, `is_restricted`,
+    `text_post_app_pre_following`, `incoming_request` and `outgoing_request`.
+    **`followed_by` is not among them, not once.** So `show_many` cannot answer
+    "does this account follow me" — it could only ever have replaced the
+    *following* half of a crossing, and the followers half is the expensive
+    one.
   - It is a POST, and **in this codebase POST means write**. `IgClient::post` is
     the one function that sends anything other than a GET, and it is where the
     write budget is paid, the CSRF token is required and the redirect policy

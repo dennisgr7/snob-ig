@@ -621,9 +621,10 @@ fn ask_webhook() -> Result<WebhookAnswers> {
             // The same floor `--sign-with` applies, for the same reason, and
             // said in the same place a person is standing. A short secret is
             // guessable offline by anybody holding one signed report.
-            bail!(
-                "a signing secret has to be at least 32 characters. Generate one --                  \"openssl rand -hex 32\" -- rather than choosing one"
-            );
+            bail!(concat!(
+                "a signing secret has to be at least 32 characters. Generate one -- ",
+                "\"openssl rand -hex 32\" -- rather than choosing one"
+            ));
         }
         Some(Secret::new(value.to_string()))
     } else {

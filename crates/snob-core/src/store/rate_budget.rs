@@ -465,6 +465,60 @@ impl RateBudget for UnlimitedRateBudget {
 mod tests {
     use super::*;
 
+    /// **The numbers that decide how fast this program talks to Instagram.**
+    ///
+    /// Written out rather than derived, because a test written in terms of the
+    /// constant it is checking passes whatever that constant becomes — which is
+    /// how these came to be unguarded in the first place. Five sibling families
+    /// in this tree already have a test of this exact shape and these did not,
+    /// though `AGENTS.md` calls them the reason for most of the rules in it.
+    ///
+    /// It was not a theoretical gap. Setting `PACE_EMISSION_MS` to 100 — ten
+    /// requests a second, thirty-eight times the documented rate — left all 274
+    /// tests in this crate green, and so did cutting `WRITE_EMISSION_MS` from
+    /// fifteen minutes to seventy seconds. Every database test here is relative:
+    /// it counts reservations against a burst expressed in emissions, and
+    /// because `PACE_BURST_MS` is `PACE_EMISSION_MS * 20` the whole suite is
+    /// scale-invariant. Nothing else in the workspace looks at these values.
+    ///
+    /// The arithmetic behind the first one is in the module header and is worth
+    /// restating here, because it is the pair that drifts: 1250 + 1150 +
+    /// 10000/7 = 3829, from `pace::Pace::default`. If that pace changes, this
+    /// fails and says so — which is the point, since the two are one decision
+    /// written in two files.
+    #[test]
+    fn the_budget_numbers_are_the_documented_ones() {
+        assert_eq!(PACE_EMISSION_MS, 3_830, "one request every 3.83 s");
+        assert_eq!(PACE_BURST_MS, 76_600, "twenty requests of tolerance");
+        assert_eq!(DAILY_EMISSION_MS, 43_200, "2000 requests a day");
+        assert_eq!(DAILY_BURST_MS, 86_400_000, "a day of them");
+        assert_eq!(
+            WRITE_EMISSION_MS, 900_000,
+            "one write every fifteen minutes"
+        );
+        assert_eq!(
+            WRITE_BURST_MS, 1_800_000,
+            "two emissions of tolerance, which lets three writes through and not four"
+        );
+    }
+
+    /// And the three cooldowns, for the same reason.
+    ///
+    /// `AGENTS.md` promises that an action block earns twelve hours rather than
+    /// the throttle's two. Both constants were referenced only by name, so both
+    /// could have become one second with the suite green and the promise would
+    /// have read exactly the same.
+    #[test]
+    fn the_cooldowns_are_the_documented_ones() {
+        assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(2 * 3600));
+        assert_eq!(ACTION_BLOCK_COOLDOWN, Duration::from_secs(12 * 3600));
+        assert_eq!(CHALLENGE_COOLDOWN, Duration::from_secs(30 * 60));
+        assert!(
+            ACTION_BLOCK_COOLDOWN > RATE_LIMIT_COOLDOWN,
+            "an action block is not a throttle and must not be treated as the lighter one"
+        );
+    }
+
     const T: i64 = 2_400;
     const TAU: i64 = 48_000; // twenty requests
 

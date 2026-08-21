@@ -101,7 +101,10 @@ pub struct Snapshot {
 /// is not a compile error but an `InvalidColumnIndex` at runtime, on whichever
 /// of the three paths was missed. Two of the three are ordinary lookups and the
 /// third is the resume path, which only a walk that was interrupted ever takes.
-const SNAPSHOT_COLUMNS: &str = "id, account_pk, kind, started_at, taken_at, member_count,                                 declared_count, next_cursor";
+const SNAPSHOT_COLUMNS: &str = concat!(
+    "id, account_pk, kind, started_at, taken_at, member_count, ",
+    "declared_count, next_cursor"
+);
 
 /// What changed when a page was saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

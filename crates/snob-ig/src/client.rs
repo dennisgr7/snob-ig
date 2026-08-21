@@ -362,14 +362,37 @@ impl Surface<'_> {
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
             Self::App | Self::Relay { .. } => "*/*",
-            Self::Document => {
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,                 image/webp,image/apng,*/*;q=0.8"
-            }
+            // **Byte for byte what Chrome 151 sent on all six navigations in
+            // the August 2026 capture**, `application/signed-exchange` and all.
+            // It had been carrying a seventeen-space run in the middle of the
+            // value, from a line continuation lost in an edit, and it went out
+            // that way on the token-harvest request before every write. No
+            // browser sends that, and the test nearest to it asserted only
+            // `starts_with("text/html")` -- a fixture that could not see the
+            // defect it was standing next to.
+            // **`concat!`, and that is not a style choice.** This value was
+            // carrying a seventeen-space run in the middle of it, and it went
+            // out that way on the token-harvest request before every write.
+            // The cause is `cargo fmt`: given a `\`-continued string literal
+            // it joins the lines back together and materializes the
+            // indentation as spaces inside the value. So the continuation form
+            // cannot be used for a header, and neither can a single long line
+            // without going past the width. Separate literals are the form
+            // that survives formatting.
+            //
+            // Byte for byte what Chrome 151 sent on all six navigations in the
+            // August 2026 capture, `application/signed-exchange` and all.
+            Self::Document => concat!(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,",
+                "image/avif,image/webp,image/apng,*/*;q=0.8,",
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
         }
     }
 
     /// The `Sec-Fetch-Mode` and `Sec-Fetch-Dest` pair, which Instagram answers
-    /// `Vary` on and which therefore decides what comes back.
+    /// what a browser sends -- see the note on `Vary` in `dressed`, which the
+    /// capture measured and which does not name these.
     fn fetch_mode(self) -> (&'static str, &'static str) {
         match self {
             Self::App | Self::Relay { .. } => ("cors", "empty"),
@@ -1920,7 +1943,9 @@ mod tests {
         );
         assert_eq!(read("x-requested-with"), "XMLHttpRequest");
 
-        // Instagram answers `Vary` on these two, so they change its reply.
+        // A browser sends these, so a request without them is the anomaly.
+        // (It used to say Instagram answers `Vary` on them. It does not; see
+        // `client_hints`'s header for the count.)
         assert_eq!(read("sec-fetch-site"), "same-origin");
         assert_eq!(read("sec-fetch-mode"), "cors");
         assert_eq!(read("sec-fetch-dest"), "empty");
@@ -3224,14 +3249,19 @@ mod tests {
         }
         assert_eq!(page.headers.get("sec-fetch-mode").unwrap(), "navigate");
         assert_eq!(page.headers.get("sec-fetch-dest").unwrap(), "document");
-        assert!(
-            page.headers
-                .get("accept")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("text/html"),
-            "a navigation asks for HTML"
+        // **The whole value, not its first word.** Asserting `starts_with` is
+        // what let a seventeen-space run sit in the middle of this header and
+        // go out on the wire before every write: the test was standing next to
+        // the defect and could not see it. The App surface's `Accept` was
+        // already pinned to the byte; this one was not.
+        assert_eq!(
+            page.headers.get("accept").unwrap(),
+            concat!(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,",
+                "image/avif,image/webp,image/apng,*/*;q=0.8,",
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+            "a navigation asks for what Chrome asks for"
         );
         assert_eq!(
             page.headers.get("priority").unwrap(),

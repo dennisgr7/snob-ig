@@ -385,11 +385,79 @@ fn stray_spaces_in(line: &str) -> Option<String> {
         }
         let before = chars[start - 1];
         let after = chars[i];
-        if before.is_ascii_lowercase() && (after.is_ascii_lowercase() || after == '{') {
+        // **A comment and a string literal are judged differently, because
+        // only one of them can be wrong in a way that reaches anybody.**
+        //
+        // In prose, two lowercase letters either side of a run is the whole
+        // signal: a doc comment is full of deliberate indentation — bullet
+        // lists, tables, aligned continuations — and widening the rule there
+        // reports dozens of them.
+        //
+        // In a string literal there is no deliberate indentation, so any two
+        // non-space characters count. The narrow rule let three real ones
+        // through, all between `-` and a quote: two signing-secret messages a
+        // user reads, and a seventeen-space run inside the `Accept` header for
+        // a navigation, which went out on the wire before every write.
+        //
+        // The mechanism behind all four was the same and is worth knowing:
+        // `cargo fmt` rejoins a `\`-continued string literal onto one line and
+        // materializes the indentation as spaces inside the value. `concat!`
+        // of separate literals is the form that survives it.
+        //
+        // The second clause is what the first one missed. All four real cases
+        // sat between a comma or a dash and the next word or quote, which is
+        // where a sentence continues and where a column never begins: SQL
+        // alignment runs into an uppercase keyword, and a fixture's run sits
+        // inside its own quotes.
+        let mid_sentence =
+            before.is_ascii_lowercase() && (after.is_ascii_lowercase() || after == '{');
+        // The length is what separates the two. Deliberate alignment inside a
+        // SQL string is three to five spaces wide; a run left by a rejoined
+        // continuation is thirteen to thirty-three, because it is the source
+        // file's indentation. Eight is comfortably between them.
+        let after_a_break = i - start >= 8
+            && matches!(before, ',' | '-')
+            // The backslash is not decoration: in the two messages this was
+            // written for, the run runs into an escaped quote, so what follows
+            // it in the source is `\` and not `"`.
+            && (after.is_ascii_lowercase() || after == '"' || after == '\\');
+        if mid_sentence || after_a_break {
             return Some(format!("{} spaces mid-sentence", i - start));
         }
     }
     None
+}
+
+/// The four shapes the widened rule was written for, and the three it must
+/// keep ignoring.
+///
+/// All four real ones came from the same mechanism: `cargo fmt` rejoins a
+/// `\`-continued string literal onto one line and materializes the source
+/// file's indentation as spaces inside the value. One of them was the `Accept`
+/// header for a navigation, so it went out on the wire.
+#[test]
+fn a_rejoined_continuation_is_caught_and_deliberate_alignment_is_not() {
+    for caught in [
+        r#"    "text/html,application/xml;q=0.9,                 image/webp,*/*""#,
+        r#"    "at least 32 characters. Generate one --              \"openssl rand -hex 32\"""#,
+        r#"    "id, account_pk, kind,                                 declared_count""#,
+        r#"    "a secret has to be at least {FLOOR} and this one is              {length}.""#,
+    ] {
+        assert!(
+            stray_spaces_in(caught).is_some(),
+            "missed a rejoined continuation: {caught}"
+        );
+    }
+    for left_alone in [
+        r#"             is_private  = coalesce(excluded.is_private,  users.is_private),"#,
+        r#"        for input in ["", "   ", "noseparator"] {"#,
+        "///   - a bullet in a doc comment, indented on purpose",
+    ] {
+        assert!(
+            stray_spaces_in(left_alone).is_none(),
+            "reported deliberate alignment: {left_alone}"
+        );
+    }
 }
 
 /// Files exempt from the space check.

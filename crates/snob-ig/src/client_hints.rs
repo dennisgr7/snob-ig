@@ -3,10 +3,27 @@
 //!
 //! These are ordinary HTTP request headers with a written specification:
 //! `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, `Priority` and
-//! `Accept-Language`. Instagram's own edge answers
-//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, which is the server saying out loud
-//! that headers of this kind change its reply — so getting them right is a
-//! correctness requirement, not a nicety.
+//! `Accept-Language`.
+//!
+//! **This used to open by saying Instagram's edge answers
+//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, and that getting these right was
+//! therefore a correctness requirement rather than a nicety. It does not.**
+//! Two browser captures in August 2026 recorded 4210 `Vary` headers across
+//! every route this tool touches: `Origin` 3130 times, `Origin` with
+//! `Accept-Encoding` 950, `Accept-Language, Cookie, Accept-Encoding` 126,
+//! `Accept-Encoding` alone 107, `Accept-Language, Cookie` 6. No `Sec-Fetch-*`,
+//! anywhere, including on all forty responses from the list endpoint this tool
+//! spends nearly every request on.
+//!
+//! The correction is worth having in full because it is the founding argument
+//! of this module and it was borrowed. What the same measurement *did* confirm
+//! is `Accept-Language`, which appears in `Vary` 132 times — so the value
+//! [`accept_language`] computes really does change Instagram's reply, which
+//! until then was an assumption.
+//!
+//! The headers stay regardless, on the reason below, which never needed the
+//! borrowed one: a browser sends them, and a request without them is the
+//! anomaly.
 //!
 //! **The rule is that the set has to agree with itself.** A request that
 //! declares Chrome 151 in its User-Agent and then sends no client hints at all
