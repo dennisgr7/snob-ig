@@ -122,15 +122,31 @@ pub fn kill_launched() {
     }
 
     // No tokio here: this runs from a signal handler on its way to exit.
+    //
+    // **Both helpers are named by absolute path.** A bare name is resolved by
+    // search, and on Windows the first place searched is the *calling
+    // executable's own directory* -- not the working directory, not `PATH`.
+    // That was checked: a planted `taskkill.exe` beside `snob.exe` wins. This
+    // function runs from the panic hook and from the second Ctrl+C, which is
+    // exactly the moment a browser is up with a live session behind an open
+    // debugging port, and it is reachable by anybody who can write next to the
+    // binary -- a `snob.exe` run out of a downloads folder, a share, a USB
+    // stick.
     #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    {
+        let mut taskkill = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        );
+        taskkill.push(r"System32\taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 
     #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
+    let _ = std::process::Command::new("/bin/kill")
         .args(["-9", &pid.to_string()])
         .status();
 }

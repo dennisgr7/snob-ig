@@ -79,6 +79,29 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// A shared secret long enough to be worth having.
+///
+/// `--sign-with a` was accepted and produced a well-formed signature that
+/// anybody could reproduce. The reason that matters is already written down at
+/// `delivery.rs`: handing a third party a body and its MAC gives them
+/// everything they need to guess a human-chosen secret offline, at whatever
+/// rate their hardware allows. HMAC-SHA256 accepts a key of any length, so
+/// nothing below this would have complained.
+///
+/// Thirty-two characters is the shortest that is not a guessing target. It is
+/// counted in characters rather than bytes because the person typing it is
+/// counting characters.
+fn signing_secret(value: &str) -> Result<String, String> {
+    const FLOOR: usize = 32;
+    let length = value.chars().count();
+    if length < FLOOR {
+        return Err(format!(
+            "a signing secret has to be at least {FLOOR} characters and this one is              {length}. A short one can be guessed offline by anybody who has been sent              one signed report. Generate one instead --              \"openssl rand -hex 32\", or \"python -c \\\"import secrets;              print(secrets.token_hex(32))\\\"\"."
+        ));
+    }
+    Ok(value.to_string())
+}
+
 /// Shown under the option list.
 ///
 /// The note about quoting is not decoration. On PowerShell `@` is the splatting
@@ -361,8 +384,13 @@ pub struct WebhookArgs {
     pub header: Vec<String>,
 
     /// Sign the body with this secret, so the receiver can check it came from
-    /// here. Sent as an X-Snob-Signature header.
-    #[arg(long, value_name = "SECRET")]
+    /// here. Sent as an X-Snob-Signature header. At least 32 characters.
+    ///
+    /// The floor is checked here rather than at the point of sending, and that
+    /// is deliberate: a report is queued before it is delivered, so refusing a
+    /// weak key at send time would strand one that had already been made.
+    /// Here, nothing has been queued yet.
+    #[arg(long, value_name = "SECRET", value_parser = signing_secret)]
     pub sign_with: Option<String>,
 
     /// Send a report even when nothing changed, so something watching for
