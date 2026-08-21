@@ -36,7 +36,7 @@ target() {
     # that building from source is right there.
     Darwin/x86_64)
       die "snob has no build for Intel Macs. Build it from source instead:
-    cargo install --git https://github.com/$REPO snob-cli"
+    cargo install --locked --git https://github.com/$REPO snob-cli"
       ;;
     *) die "no build for $os on $arch" ;;
   esac

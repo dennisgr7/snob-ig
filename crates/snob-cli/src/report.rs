@@ -365,8 +365,8 @@ pub fn requests(n: u32) -> String {
 /// this module guessing from the reason. `Truncated` used to be treated as
 /// proof that nothing was left to continue from, and that is true of exactly
 /// one of the five ways it arrives: the reclassification `verify_completion`
-/// makes
-/// once pagination has already ended, where there is no cursor to save. The
+/// makes once pagination has already ended, where there is no cursor to save.
+/// The
 /// other four — the hard page cap, a cursor that came back unchanged, two empty
 /// pages, and several pages with nothing new — stop in the **middle** of the
 /// pagination with a cursor stored, and a run within the resume window

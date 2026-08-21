@@ -35,6 +35,9 @@ brew install snob
 [releases page][releases] and:
 
 ```bash
+# Check it against the published sums first, as every other channel here does.
+curl -fsSLO https://github.com/dennisgr7/snob-ig/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
 sudo apt install ./snob-v<version>-x86_64-unknown-linux-musl.deb
 ```
 
@@ -60,7 +63,7 @@ both are short, and reading them first is the right instinct.
 **From source**, with Rust installed:
 
 ```bash
-cargo install --git https://github.com/dennisgr7/snob-ig snob-cli
+cargo install --locked --git https://github.com/dennisgr7/snob-ig snob-cli
 ```
 
 **By hand** — every release has an archive per platform on the [releases
@@ -112,9 +115,9 @@ snob unfollowers
 
 ```
 Username     Full name        Attributes
-mattfrs      Matt Frears
-kellyjrd     Kelly J.         private
-rosanieves   Rosa Nieves      verified
+someone      Some One
+a.private    Private Account  private
+a.verified   Verified Account verified
 ...
 33 accounts you follow that do not follow you back - 33 of 139 - 12 requests
 ```
@@ -252,6 +255,13 @@ it without digging through arrays:
 }
 ```
 
+Each account in `events` is abbreviated above. What is actually sent is
+everything snob knows about them — `pk`, `username`, `full_name`,
+`is_private`, `is_verified` and `pfp_url` — plus the `profile_url` snob builds.
+Worth knowing before you point this at a third-party automation service: the
+report names real people, and `pfp_url` is a signed CDN address that anything
+holding it can fetch until it expires.
+
 `schema` is the version of this shape. It moves when a field is removed or
 changes meaning and never when one is added, so a workflow written against 1
 keeps working; every message carries it, including the one `snob watch check`
@@ -283,12 +293,17 @@ without parsing the body at all:
 | Header | What it is |
 |---|---|
 | `X-Snob-Event` | `watch.changes` or `watch.preflight` — the same value as `event` in the body. |
-| `X-Snob-Delivery` | The delivery id, and the same value as `run.id`. **The one to deduplicate on**: it stays the same across every retry of one report, so a receiver that has already acted on it can drop the second copy. |
+| `X-Snob-Delivery` | The delivery id: the same across every retry of one report. Convenient for dropping a duplicate before you parse anything — but **deduplicate on `run.id` in the body**, which is the same value and is the one the signature covers. A header is not signed and anything on the path can set it. |
 | `X-Snob-Attempt` | Which try this is, counting from 1. |
 
 Because those four are the protocol, snob refuses to send a `[webhook.headers]`
 entry or a `--header` that sets any name beginning `X-Snob-`: a configured copy
 would make the value ambiguous, and most frameworks join duplicates with `, `.
+
+Two more things a receiver should do, both using values already inside the
+signature: reject a report whose `run.at` is more than a day old, since nothing
+older than that is ever sent, and treat `event` in the body rather than
+`X-Snob-Event` as the authority on what arrived.
 
 Nothing is sent when nothing changed, so every message that arrives means
 something; `--heartbeat` sends one anyway, for when silence is the signal you

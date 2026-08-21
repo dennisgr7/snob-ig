@@ -421,7 +421,7 @@ mod tests {
         let error = usernames_from_json(json, Which::Followers).unwrap_err();
         assert!(error.to_string().contains("no usernames"), "{error}");
 
-        // An genuinely empty list is still fine: some accounts follow nobody.
+        // A genuinely empty list is still fine: some accounts follow nobody.
         assert!(
             usernames_from_json("[]", Which::Followers)
                 .unwrap()
