@@ -285,6 +285,55 @@ struct ErrorBody {
     /// cookie returns exactly that.
     #[serde(default)]
     require_login: Option<bool>,
+    /// A GraphQL refusal, which is the shape the write path gets.
+    #[serde(default)]
+    errors: Option<Vec<GraphqlError>>,
+}
+
+impl ErrorBody {
+    /// Every piece of text a refusal might have put its reason in, joined and
+    /// lowercased, ready for the word matching below.
+    ///
+    /// Joined rather than picked. The two endpoint families disagree about
+    /// where the reason goes and neither of them is wrong, so searching one
+    /// field and falling back to the other in some priority order would be a
+    /// third opinion invented here. Every branch below asks `contains`, so a
+    /// longer haystack costs nothing and cannot pick the wrong field.
+    fn searchable(&self) -> String {
+        let mut text = self.message.clone().unwrap_or_default();
+        for error in self.errors.iter().flatten() {
+            for part in [&error.message, &error.summary, &error.description]
+                .into_iter()
+                .flatten()
+            {
+                text.push(' ');
+                text.push_str(part);
+            }
+        }
+        text.to_ascii_lowercase()
+    }
+}
+
+/// One entry from a GraphQL `errors` array.
+///
+/// **A refusal from `/api/graphql` looks nothing like a refusal from
+/// `/api/v1/`.** There is no `message` at the top level, no `status`, and the
+/// HTTP status is 200. What arrives is `{"errors":[{...}],"data":null}`, and
+/// the words this file decides on -- `feedback_required`, `checkpoint_required`
+/// -- are inside there.
+///
+/// Three fields because the same refusal is spelled differently depending on
+/// which layer answered: `message` is the machine-readable one, `summary` and
+/// `description` are what the interface would have shown the person. All three
+/// are read, because which one carries the word is not ours to decide.
+#[derive(Debug, Deserialize)]
+struct GraphqlError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +371,21 @@ pub fn declares_failure(body: &str) -> bool {
         spam: Option<bool>,
         #[serde(default)]
         require_login: Option<bool>,
+        /// **The one that made this a bug rather than a gap.** A GraphQL
+        /// refusal arrives under a 200 with `data: null` and the reason in
+        /// here. Without it the write path read an action block as a
+        /// successful no-op: `FriendshipResult` is optional in every field, so
+        /// the body deserialized cleanly with all of them absent and `status()`
+        /// fell to its default arm -- not following, nothing outstanding --
+        /// which is exactly what a successful unfollow looks like. The budget
+        /// was spent, no cooldown was written down, and the user was told
+        /// nothing had happened.
+        ///
+        /// Untyped on purpose: this gate only has to know that Instagram
+        /// objected. What it objected about is [`classify`]'s question, and
+        /// [`GraphqlError`] is where that is spelled out.
+        #[serde(default)]
+        errors: Option<Vec<serde_json::Value>>,
     }
 
     let Ok(envelope) = serde_json::from_str::<Envelope>(body) else {
@@ -330,6 +394,7 @@ pub fn declares_failure(body: &str) -> bool {
     envelope.status.as_deref() == Some("fail")
         || envelope.spam == Some(true)
         || envelope.require_login == Some(true)
+        || envelope.errors.is_some_and(|errors| !errors.is_empty())
 }
 
 /// Translates an Instagram error response into the matching error.
@@ -339,7 +404,11 @@ pub fn declares_failure(body: &str) -> bool {
 /// matters.
 pub fn classify(status: u16, body: &str) -> IgError {
     let parsed: ErrorBody = serde_json::from_str(body).unwrap_or_default();
-    let message = parsed.message.as_deref().unwrap_or("").to_ascii_lowercase();
+    // Every place a reason might be, not just the REST one. See
+    // [`ErrorBody::searchable`]; the branches below are unchanged and now serve
+    // both endpoint families, which is the point -- a `feedback_required` is
+    // the same event whichever route reported it.
+    let message = parsed.searchable();
 
     // Checked before the message: Instagram returns "Please wait a few minutes"
     // with `require_login: true` when the cookie is no good. Without this

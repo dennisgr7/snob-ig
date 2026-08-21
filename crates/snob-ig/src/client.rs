@@ -744,17 +744,24 @@ impl IgClient {
     /// recording a cooldown on the way if the answer earned one.
     ///
     /// Shared by the read and the write path so that "a 200 can still be a
-    /// failure" is one rule rather than two. It was inline in `get` when `get`
+    /// failure" is one rule rather than two. It says so because it is now true:
+    /// this comment was written when `post` was split out and `get` was left
+    /// re-implementing every line of it, so for a while the rule was two
+    /// copies and the doc was the only place they looked like one. It was inline in `get` when `get`
     /// was the only caller.
-    fn decode<T: DeserializeOwned>(
-        &self,
-        status: reqwest::StatusCode,
-        body: &str,
-    ) -> Result<T, IgError> {
+    fn decode<T: DeserializeOwned>(&self, answer: &Answer) -> Result<T, IgError> {
+        let body = answer.body.as_str();
         // A 200 can still be an error: Instagram returns `{"status":"fail"}`
-        // with a 200 in some cases.
-        if !status.is_success() || declares_failure(body) {
-            return Err(self.classify_and_record(status.as_u16(), body));
+        // with a 200 in some cases, and a GraphQL refusal is *always* a 200
+        // with the reason in an `errors` array.
+        if !(200..300).contains(&answer.status) || declares_failure(body) {
+            // Here rather than in each caller. It used to be in `get` only,
+            // which meant the write path -- the one that earns the twelve-hour
+            // cooldown, and the one where a push-back is most worth seeing --
+            // was the single class of request never measured, while
+            // `AGENTS.md` promised every one of them was.
+            self.note_push_back(answer);
+            return Err(self.classify_and_record(answer.status, body));
         }
 
         serde_json::from_str(body).map_err(|e| {
@@ -825,6 +832,10 @@ impl IgClient {
         self.remember_claim(&response);
 
         let status = response.status();
+        // Read before the body, for the same reason `get_body` reads it there:
+        // the header is on the response, and a body that will not read must not
+        // take the one measurement worth having away with it.
+        let retry_after = retry_after(&response);
 
         // A redirect reaches here as a status rather than as a new request,
         // because the policy is `none()`. It is not success and it is not
@@ -838,13 +849,15 @@ impl IgClient {
 
         let body = match read_capped(response, MAX_BODY_BYTES).await {
             Ok(body) => body,
-            Err(_) if !status.is_success() => {
-                return Err(self.classify_and_record(status.as_u16(), ""));
-            }
+            Err(_) if !status.is_success() => String::new(),
             Err(e) => return Err(e),
         };
 
-        self.decode(status, &body)
+        self.decode(&Answer {
+            status: status.as_u16(),
+            body,
+            retry_after,
+        })
     }
     /// The stories an account has up right now. One request.
     ///
@@ -1151,26 +1164,7 @@ impl IgClient {
         referer: &str,
     ) -> Result<T, IgError> {
         let answer = self.get_body(path, query, referer, Surface::App).await?;
-
-        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
-        // with a 200 in some cases.
-        if !(200..300).contains(&answer.status) || declares_failure(&answer.body) {
-            self.note_push_back(&answer);
-            return Err(self.classify_and_record(answer.status, &answer.body));
-        }
-
-        let body = answer.body;
-        serde_json::from_str(&body).map_err(|e| {
-            // The same excerpt every other error gets. This one had a copy of
-            // its own that took 200 raw characters: unfiltered, though it is
-            // printed to a terminal, and with no idea that a body starting with
-            // `<` is a captive portal rather than the API — which is exactly
-            // what a body that will not parse usually is.
-            IgError::Decode(format!(
-                "{e} - response: {}",
-                crate::error::body_excerpt(&body)
-            ))
-        })
+        self.decode(&answer)
     }
 
     /// Sends the request and follows any redirect itself, **paying for every
@@ -3206,6 +3200,95 @@ mod tests {
         let error = client.follow(7, "someone", &Known).await.unwrap_err();
         assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
         assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
+    }
+
+    /// **The refusal that was being read as success.**
+    ///
+    /// This is the shape a real block arrives in, and it is the one the earlier
+    /// test above could not have caught: HTTP 200, no `status`, no `message`,
+    /// the reason inside an `errors` array. Every field of `FriendshipResult`
+    /// is optional, so before `declares_failure` learned this envelope the body
+    /// deserialized cleanly with all of them absent, `status()` fell to its
+    /// default arm, and the command reported "Instagram accepted it, but
+    /// nothing changed" -- while the write budget had been spent and no
+    /// cooldown had been written down.
+    #[tokio::test]
+    async fn a_graphql_refusal_under_a_200_is_an_action_block_and_not_a_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":null,"errors":[{"message":"feedback_required",
+                    "summary":"Try Again Later",
+                    "description":"We restrict certain activity to protect our community."}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGGED_IN_PAGE))
+            .mount(&server)
+            .await;
+
+        let (client, budget) = watching_as(&server.uri(), true);
+
+        let error = client.follow(7, "someone", &Known).await.unwrap_err();
+        assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
+        assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
+    }
+
+    /// The reason may be in any of the three fields, and which one is not ours
+    /// to choose. `summary` alone is enough.
+    #[tokio::test]
+    async fn a_graphql_reason_is_found_wherever_instagram_put_it() {
+        for body in [
+            r#"{"errors":[{"message":"checkpoint_required"}]}"#,
+            r#"{"errors":[{"summary":"checkpoint_required"}]}"#,
+            r#"{"errors":[{"description":"checkpoint_required"}]}"#,
+        ] {
+            assert!(declares_failure(body), "not seen as a failure: {body}");
+            assert!(
+                matches!(
+                    crate::error::classify(200, body),
+                    IgError::Checkpoint { .. }
+                ),
+                "not classified from: {body}"
+            );
+        }
+    }
+
+    /// An empty `errors` array is what a *successful* GraphQL answer may carry.
+    /// Reading it as a refusal would fail every write that worked.
+    #[tokio::test]
+    async fn an_empty_errors_array_is_not_a_refusal() {
+        assert!(!declares_failure(r#"{"data":{"x":1},"errors":[]}"#));
+    }
+
+    /// **The write path measures its own push-backs now.**
+    ///
+    /// It was the one class of request that never did: `note_push_back` was
+    /// called from `get` and from `get_body`, never from `post`, and `post` did
+    /// not so much as read the header. So the endpoint most likely to say
+    /// something worth hearing was the one nobody was listening to.
+    #[tokio::test]
+    async fn a_write_keeps_the_retry_after_it_was_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "30")
+                    .set_body_string(r#"{"message":"please wait a few minutes"}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGGED_IN_PAGE))
+            .mount(&server)
+            .await;
+
+        let (client, _) = watching_as(&server.uri(), true);
+        let error = client.follow(7, "someone", &Known).await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
     }
 
     /// Both envelope shapes carry the same reel, and the caller cannot tell
