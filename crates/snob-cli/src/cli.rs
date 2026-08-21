@@ -200,6 +200,17 @@ pub struct LoginArgs {
     /// installed browser. It has to match or Instagram will reject the session.
     #[arg(long, value_name = "STRING")]
     pub user_agent: Option<String>,
+
+    /// Keep the browser profile "--browser" creates, so a later login skips
+    /// the Instagram form
+    ///
+    /// Off by default, and the default is the point. That profile is 87 MB and
+    /// holds a second copy of the live session, at rest, indefinitely — more
+    /// than the binary and a year of the database together. It exists so the
+    /// login does not happen in the user's everyday browser, not so it
+    /// survives the login.
+    #[arg(long, requires = "browser")]
+    pub keep_profile: bool,
 }
 
 #[derive(Args, Debug)]
