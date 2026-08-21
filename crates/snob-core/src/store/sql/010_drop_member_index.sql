@@ -1,0 +1,24 @@
+-- Drops an index that answers no question anybody asks, and costs 42% of the
+-- database to keep.
+--
+-- `snapshot_members` is `WITHOUT ROWID` with `PRIMARY KEY (snapshot_id,
+-- user_pk)`, so an index on `user_pk` alone is very nearly a second copy of the
+-- largest table in the file: 34.9 bytes per member row against 20.0 without it.
+-- On a modelled year of a thousand followers that is 7.71 MB against 4.50 MB.
+--
+-- **It was checked before it was dropped, rather than reasoned about.** The
+-- only two statements in the workspace that read `snapshot_members` are
+-- `members()` and `renames_since`, and `EXPLAIN QUERY PLAN` for both is
+-- byte-identical with the index and without it: both seek the primary key on
+-- `snapshot_id`, which is this index's own column in the wrong order. The one
+-- other job it could have had -- the `ON DELETE CASCADE` from `users` -- never
+-- runs, because nothing in the tree deletes from `users`; `purge` removes the
+-- file whole.
+--
+-- If some later query does want "which snapshots was this person in", it can
+-- come back in a migration of its own, with a plan showing it is used.
+--
+-- Dropping an index moves its pages to the freelist rather than shrinking the
+-- file. `VACUUM` is what returns the space and cannot run inside a transaction,
+-- so it does not belong here; `store::migrate` runs it once afterwards.
+DROP INDEX IF EXISTS snapshot_members_user;

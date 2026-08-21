@@ -26,10 +26,34 @@ const DAILY_BUCKET: &str = "daily";
 /// The only value of `cooldowns.scope`. A cooldown covers the whole session.
 const SESSION_SCOPE: &str = "session";
 
-/// Sustained pace: one request every 2.4 seconds, the average of the project
-/// ours is modeled on.
-const PACE_EMISSION_MS: i64 = 2_400;
+/// Sustained pace: one request every 3.83 seconds, which is what the project
+/// ours is modeled on actually averages.
+///
+/// **It said 2.4 seconds, and that was the average of two of the three waits.**
+/// The reference project pauses 1,250 ms before a request and 1,150 ms after a
+/// page, and then a long 10,000 ms pause every seventh page — so its mean per
+/// page is 1250 + 1150 + 10000/7 = 3,829 ms. Leaving the long pause out of the
+/// average is how 2,400 was arrived at. `pace.rs` has all five of those numbers
+/// right; only this summary of them was wrong, and it is the one the budget
+/// enforces.
+///
+/// What it cost: the ceiling was 295 requests per eleven minutes where a single
+/// walker uses 172, so the 123-request gap was headroom for nobody — except in
+/// the case the project explicitly supports, two processes sharing this budget,
+/// where the budget is the only thing holding the combined rate down and it was
+/// holding it at 26.8 a minute instead of the designed 15.7. Checked against
+/// `pace.rs`'s constants in August 2026.
+const PACE_EMISSION_MS: i64 = 3_830;
 /// Burst tolerance of the pace bucket: twenty requests.
+///
+/// Kept at twenty rather than raised with the emission, deliberately. With the
+/// emission now equal to a single walker's own mean, the GCRA is a zero-drift
+/// random walk around it, and a wider tolerance would not change what a walker
+/// experiences — but a narrower ratio would: at seven emissions the per-block
+/// jitter of the reference cadence exceeds the tolerance often enough that over
+/// a long walk the budget would start pacing the walker, which is a design
+/// change nobody asked for. Twenty preserves the "twenty requests of slack"
+/// this has always meant.
 const PACE_BURST_MS: i64 = PACE_EMISSION_MS * 20;
 
 /// Daily ceiling of roughly two thousand requests.

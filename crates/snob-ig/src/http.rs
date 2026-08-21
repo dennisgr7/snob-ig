@@ -58,6 +58,20 @@ pub fn builder(
         .redirect(redirect)
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        // reqwest drops an idle connection at 90 s, and this tool deliberately
+        // waits between requests: the long pause every seventh page is up to 15
+        // s on its own, and the request budget is shared between processes, so
+        // a second snob can push a wait arbitrarily far out. Measured on the
+        // boundary: 89 s reuses the connection, 95 s opens a new one — a fresh
+        // TCP and TLS handshake for a request that was only being polite. Five
+        // minutes is Chromium's own idle-socket timeout.
+        //
+        // The keepalive is the other half. A connection held open for minutes
+        // is one a NAT or a firewall may drop silently, and without this the
+        // first thing that notices is a failed request; with it, the kernel
+        // does.
+        .pool_idle_timeout(Duration::from_secs(300))
+        .tcp_keepalive(Duration::from_secs(60))
 }
 
 /// A client that carries no credential.
