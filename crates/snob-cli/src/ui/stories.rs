@@ -47,9 +47,11 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
         );
     }
 
-    // Removed on the way out, and whatever a viewer is still holding is caught
-    // by `snob purge`. See `AppPaths::story_scratch` for why that is the
-    // promise being made rather than a stronger one.
+    // Before this session's own directory is made, so that a run which never
+    // gets that far still tidies up after the ones before it. See
+    // `ABANDONED_AFTER`, and `AppPaths::story_scratch` for where these live.
+    snob_core::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
+
     let scratch = Scratch::new(paths.story_scratch())?;
 
     let mut selected = 0usize;
@@ -219,13 +221,35 @@ async fn keep(
     Ok(path)
 }
 
+/// How long a scratch directory has to be untouched before a later run treats
+/// it as abandoned.
+///
+/// A browsing session is minutes. Six hours is far past anything that could
+/// still be live, and being generous costs nothing: the only thing waiting
+/// buys is that a run started this morning and left open over lunch does not
+/// have its files pulled out from under it by a run started after it.
+const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// The scratch directory, removed when the browsing session ends.
 ///
 /// A type rather than two calls, so that leaving through an error removes it
-/// too. What it cannot promise is that the removal succeeds: on Windows a file
-/// an image viewer still has open cannot be deleted, and there is no moment at
-/// which this program knows the viewer was closed. What survives is caught by
-/// `snob purge`, which takes the whole data directory.
+/// too.
+///
+/// **What it can and cannot promise, measured on Windows 11 in August 2026
+/// rather than assumed.** This used to say that an image viewer holds the file
+/// open so Windows will not delete it, and that turned out to be false for the
+/// viewers people actually have: Photos with the picture on screen and Media
+/// Player with the video playing hold no handle at all — Restart Manager
+/// reports nobody, and the delete succeeds with the window still up. So on the
+/// ordinary path the file really is gone when the session ends, on all three
+/// platforms. On Unix it was never in doubt: `unlink` succeeds regardless and
+/// a viewer that already has it open keeps working.
+///
+/// The case that cannot be fixed is a viewer that opens the file without
+/// `FILE_SHARE_DELETE`. Nothing deletes underneath that, not `DeleteFileW` and
+/// not the POSIX-semantics disposition — only waiting. That is what
+/// [`sweep`] is for, and it is the only mechanism here that does not depend on
+/// something having gone right.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -242,10 +266,14 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // Best effort by design, and silent by design: a file the viewer is
-        // still holding is the expected case, not an error the user can do
-        // anything about, and a warning printed every time somebody looked at
-        // a story would train them to ignore warnings.
+        // Silent by design: a file a greedy viewer is still holding is not an
+        // error the user can do anything about, and a warning printed every
+        // time somebody looked at a story would train them to ignore warnings.
+        // The sweep at the start of the next run is what actually answers it.
+        //
+        // **This does not run on a panic.** The release profile is
+        // `panic = "abort"`, so no destructor does. That is another reason the
+        // sweep exists rather than being a belt-and-braces extra.
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

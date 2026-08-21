@@ -233,15 +233,33 @@ pub struct IgClient {
 /// What a browser sends before the server has told it anything.
 const INITIAL_CLAIM: &str = "0";
 
-/// The route through the site that a follow button was reached by.
+/// Which of the two things a browser does on instagram.com a request is.
 ///
-/// Sent because the web client is reported to send it, not because anything
-/// here depends on it. It says: profile page, arrived at cold. A constant
-/// rather than assembled per request — assembling it would be inventing a
-/// browsing history we did not have, which is disguise, and this project does
-/// coherence instead. See [`IgClient::friendship`] for what is unsettled about
-/// the request it goes in.
-const NAV_CHAIN: &str = "PolarisProfilePostsTabRoot:profilePage:1:via_cold_start";
+/// **They do not carry the same headers, and sending the wrong set is not a
+/// cosmetic mismatch — it changes which handler answers.** This was found the
+/// hard way: `POST /web/friendships/{pk}/follow/` with the app's headers
+/// answers 404, and the same route is what the browser really uses.
+///
+/// - [`Surface::App`] is the single-page application talking to `/api/v1/`.
+///   It announces itself with `X-IG-App-ID`, `X-ASBD-ID`, `X-IG-WWW-Claim` and
+///   `X-Requested-With`, and without the first of those those routes answer 403
+///   even with a good session. Every read this tool makes is one of these.
+/// - [`Surface::Page`] is an ordinary `fetch()` from the page, to the older
+///   `/web/` routes. It sends **none** of those four: the browser adds only
+///   what it always adds, plus whatever the call asked for. Reference:
+///   `davidarroyo1234/InstagramUnfollowers`, which is the project this tool's
+///   pacing is copied from and which does this every day —
+///   `fetch(url, { headers: { "content-type": ..., "x-csrftoken": ... } })`
+///   and nothing else.
+///
+/// So "coherence" here means per request rather than per client. Sending one
+/// superset of headers everywhere would be a shape no browser produces on
+/// either route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    App,
+    Page,
+}
 
 /// Where every client built after this call points, in a testing build.
 ///
@@ -557,65 +575,58 @@ impl IgClient {
 
     /// Follows an account. **A write.** See [`IgClient::post`].
     pub async fn follow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
-        self.friendship("create", pk, username).await
+        self.friendship("follow", pk, username).await
     }
 
     /// Unfollows an account. **A write.** See [`IgClient::post`].
     pub async fn unfollow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
-        self.friendship("destroy", pk, username).await
+        self.friendship("unfollow", pk, username).await
     }
 
     /// The body of both, because the two differ by one word in the path.
     ///
-    /// # This route is not settled, and neither candidate worked
+    /// # Which route, and why it took three attempts to find out
     ///
-    /// **Do not read the path below as verified.** Two spellings were sent live
-    /// against a real session in August 2026, and both failed. The relationship
-    /// was read back after each, and neither had changed anything — so what
-    /// follows is a record of two eliminated answers, not one accepted one.
+    /// `POST /web/friendships/{pk}/{follow|unfollow}/`, with **no body** and
+    /// with [`Surface::Page`] headers. Both halves of that were established by
+    /// sending the alternatives live in August 2026 and reading the
+    /// relationship back afterwards:
     ///
-    /// - `POST /api/v1/friendships/create/{pk}/`, with the form body below, is
-    ///   the spelling every write-up of this API gives and is what the current
-    ///   web client is reported to send. It answers **200 carrying the web
-    ///   app's HTML shell**: no status to classify, no message to read, and a
-    ///   parse failure as the only symptom. That is what `www.instagram.com`
-    ///   serves for a path its API router did not accept, so something about
-    ///   the request is being refused before it is a friendship request at all.
-    /// - `POST /web/friendships/{pk}/follow/`, the older web route that the
-    ///   Python web clients use, answers **404**. That one is simply gone.
+    /// - `POST /api/v1/friendships/create/{pk}/` — the spelling every write-up
+    ///   of this API gives — answers **200 carrying the web app's HTML shell**.
+    ///   No status to classify, no message to read, and a parse failure as the
+    ///   only symptom. That is the mobile app's route; `www.instagram.com` does
+    ///   not serve it.
+    /// - The same `/web/` route below, sent with [`Surface::App`] headers,
+    ///   answers **404**. The route was right and the headers were wrong, which
+    ///   is the failure that looks most like the route being gone — and is why
+    ///   the first reading of that 404 was that it had been removed.
     ///
-    /// The unexamined difference between what was sent and what a browser sends
-    /// is `x-web-session-id`, which the write-up lists and this client does not
-    /// send. It is not added on a guess: inventing a header a browser derives
-    /// from its own session is the disguise this module's header rules exist to
-    /// avoid, and one more failed write is a request to Instagram that looks
-    /// like probing. **The next step is a capture of the real request**, not
-    /// another attempt.
+    /// What settled it is `davidarroyo1234/InstagramUnfollowers`, the project
+    /// this tool's pacing is copied from, which unfollows from inside the page
+    /// with `content-type` and `x-csrftoken` and **nothing else**. No
+    /// `X-IG-App-ID`. That is what [`Surface`] exists to express.
     ///
-    /// Until then `snob follow` and `snob unfollow` reach Instagram and fail,
-    /// which is why `AGENTS.md` lists them as written and not working. The
-    /// budget, the confirmation, the refusal without a token and the refusal to
-    /// follow a redirect are all exercised by that failure and are not in doubt.
+    /// The body is empty, which is what that project sends and what the route
+    /// takes. The `container_module`/`nav_chain`/`user_id` triple belongs to
+    /// the `/api/v1/` request and is not sent here: it would be inventing a
+    /// shape no browser produces.
     async fn friendship(
         &self,
         verb: &str,
         pk: Pk,
         username: &str,
     ) -> Result<FriendshipStatus, IgError> {
-        let id = pk.to_string();
         let answer: FriendshipResult = self
             .post(
-                &format!("/api/v1/friendships/{verb}/{pk}/"),
-                &[
-                    ("container_module", "profile"),
-                    ("nav_chain", NAV_CHAIN),
-                    ("user_id", id.as_str()),
-                ],
+                &format!("/web/friendships/{pk}/{verb}/"),
+                &[],
                 &if username.is_empty() {
                     String::new()
                 } else {
                     format!("{}/", snob_core::model::in_a_path(username))
                 },
+                Surface::Page,
             )
             .await?;
         Ok(answer.status())
@@ -727,7 +738,7 @@ impl IgClient {
         // Paid for before it is sent, and there is no way in that skips this.
         self.pacer.clear_to_send().await?;
 
-        let request = self.browser_headers(self.api.get(url).query(query), referer);
+        let request = self.browser_headers(self.api.get(url).query(query), referer, Surface::App);
 
         let response = request.send().await?;
         self.remember_claim(&response);
@@ -763,17 +774,29 @@ impl IgClient {
     /// What is deliberately **not** here is `Origin` and `Content-Type`. Both
     /// belong to the write path only, and both are added there — see
     /// [`IgClient::post`].
+    ///
+    /// `style` picks which of the two things a browser is doing on
+    /// instagram.com this request is. See [`Surface`].
     fn browser_headers(
         &self,
         request: reqwest::RequestBuilder,
         referer: &str,
+        style: Surface,
     ) -> reqwest::RequestBuilder {
+        let mut request = request;
+
+        if style == Surface::App {
+            request = request
+                // Without this header Instagram answers 403 even with a good
+                // session — on the `/api/v1/` routes. On the `/web/` ones it is
+                // the header that makes the request fail.
+                .header("X-IG-App-ID", IG_APP_ID)
+                .header("X-ASBD-ID", client_hints::ASBD_ID)
+                .header("X-IG-WWW-Claim", self.claim())
+                .header("X-Requested-With", "XMLHttpRequest");
+        }
+
         let mut request = request
-            // Without this header Instagram answers 403 even with a good session.
-            .header("X-IG-App-ID", IG_APP_ID)
-            .header("X-ASBD-ID", client_hints::ASBD_ID)
-            .header("X-IG-WWW-Claim", self.claim())
-            .header("X-Requested-With", "XMLHttpRequest")
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
             .header("Accept", "*/*")
@@ -901,6 +924,7 @@ impl IgClient {
         path: &str,
         form: &[(&str, &str)],
         referer: &str,
+        style: Surface,
     ) -> Result<T, IgError> {
         // Before the budget is charged, so that a session which cannot write
         // does not spend a slot discovering it. The token itself is put on the
@@ -916,7 +940,7 @@ impl IgClient {
         self.pacer.clear_to_send_write().await?;
 
         let request = self
-            .browser_headers(self.writer()?.post(url), referer)
+            .browser_headers(self.writer()?.post(url), referer, style)
             .header("Origin", self.base.as_str().trim_end_matches('/'))
             .form(form);
 
@@ -1718,15 +1742,13 @@ mod tests {
     /// **The route is `/web/friendships/`, and that was settled by trying it.**
     /// `/api/v1/friendships/create/` is what every write-up gives and is the
     /// The request this client sends, asserted against what it is *meant* to
-    /// send rather than against what Instagram accepts — see
-    /// [`IgClient::friendship`], which records that neither candidate route has
-    /// worked live and why the next step is a capture rather than a guess. When
-    /// that capture lands, this test is the thing to correct first.
+    /// The route and the shape, which took three live attempts to settle — see
+    /// [`IgClient::friendship`] for what the other two were.
     #[tokio::test]
-    async fn a_follow_posts_the_form_this_client_is_built_to_send() {
+    async fn a_follow_goes_to_the_page_route_with_no_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/v1/friendships/create/7/"))
+            .and(path("/web/friendships/7/follow/"))
             .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
             .mount(&server)
             .await;
@@ -1736,10 +1758,10 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        let body = String::from_utf8_lossy(&requests[0].body);
-        assert!(body.contains("user_id=7"), "{body}");
-        assert!(body.contains("container_module=profile"), "{body}");
-        assert!(body.contains("nav_chain="), "{body}");
+        assert!(
+            requests[0].body.is_empty(),
+            "this route takes no body; the /api/v1/ form fields belong to that one"
+        );
     }
 
     /// Either answer shape means the same thing to the caller.
@@ -1755,6 +1777,60 @@ mod tests {
             assert!(status.following, "{body}");
             assert!(!status.outgoing_request, "{body}");
         }
+    }
+
+    /// **The four headers that say "I am the app" are not sent to the page's
+    /// own routes**, and that is not a style preference: sent with them, this
+    /// exact route answers 404, which reads as the route having been removed
+    /// and cost two live attempts to tell apart. The read path must keep them,
+    /// so both halves are asserted here together.
+    #[tokio::test]
+    async fn a_page_route_does_not_claim_to_be_the_app() {
+        const APP_ONLY: [&str; 4] = [
+            "x-ig-app-id",
+            "x-asbd-id",
+            "x-ig-www-claim",
+            "x-requested-with",
+        ];
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"users":[]}"#))
+            .mount(&server)
+            .await;
+
+        let client = writer(&server).await;
+        client.follow(7, "someone").await.unwrap();
+        client.validate().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let write = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("the write");
+        let read = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("the read");
+
+        for header in APP_ONLY {
+            assert!(
+                !write.headers.contains_key(header),
+                "a /web/ route was told {header}, which makes it answer 404"
+            );
+            assert!(
+                read.headers.contains_key(header),
+                "an /api/v1/ route needs {header} and did not get it"
+            );
+        }
+        // What the page's own fetch does send, and all it sends.
+        assert!(write.headers.contains_key("x-csrftoken"));
+        assert!(write.headers.contains_key("content-type"));
+        assert!(write.headers.contains_key("cookie"));
     }
 
     /// A private account answers `requested`, and that is not a follow.
@@ -1798,10 +1874,12 @@ mod tests {
             "application/x-www-form-urlencoded"
         );
         assert_eq!(headers.get("x-csrftoken").unwrap(), "TOKEN");
-        // And it is still recognizably the same client as the read path.
-        assert!(headers.contains_key("x-ig-app-id"));
-        assert!(headers.contains_key("x-ig-www-claim"));
         assert!(headers.contains_key("cookie"));
+        // What it does **not** carry is asserted next door, in
+        // `a_page_route_does_not_claim_to_be_the_app`, together with the read
+        // path that must carry it.
+        assert!(headers.contains_key("user-agent"));
+        assert!(headers.contains_key("accept-language"));
     }
 
     /// **Nothing is sent at all** when the session cannot sign the request.
@@ -1836,10 +1914,10 @@ mod tests {
     async fn a_redirected_write_is_not_replayed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/v1/friendships/destroy/7/"))
+            .and(path("/web/friendships/7/unfollow/"))
             .respond_with(
                 ResponseTemplate::new(307)
-                    .insert_header("location", "/api/v1/friendships/destroy/7/"),
+                    .insert_header("location", "/web/friendships/7/unfollow/"),
             )
             .mount(&server)
             .await;

@@ -886,7 +886,7 @@ async fn a_confirmed_unfollow_sends_one_post() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     Mock::given(method("POST"))
-        .and(path_regex(r"^/api/v1/friendships/destroy/\d+/$"))
+        .and(path_regex(r"^/web/friendships/\d+/unfollow/$"))
         .respond_with(
             ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
         )
@@ -917,12 +917,14 @@ async fn a_confirmed_unfollow_sends_one_post() {
         .filter(|r| r.method == wiremock::http::Method::POST)
         .collect();
     assert_eq!(writes.len(), 1, "one account, one write");
-    assert_eq!(writes[0].url.path(), "/api/v1/friendships/destroy/9001/");
+    assert_eq!(writes[0].url.path(), "/web/friendships/9001/unfollow/");
     assert_eq!(
         writes[0].headers.get("x-csrftoken").unwrap(),
         "SANDBOXTOKEN"
     );
-    assert!(String::from_utf8_lossy(&writes[0].body).contains("user_id=9001"));
+    // The account is named by the path. This route takes no body, and the
+    // fields the /api/v1/ one wants belong to the /api/v1/ one.
+    assert!(writes[0].body.is_empty());
 }
 
 /// A relationship that already holds costs no request at all, which matters

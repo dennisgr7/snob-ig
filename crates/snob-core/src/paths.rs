@@ -45,6 +45,17 @@ pub struct AppPaths {
     /// it pointed at Roaming. It is read to rescue whatever is there, never
     /// written to.
     legacy_data: Option<PathBuf>,
+    /// Set by [`Self::rooted_at`], and the reason [`Self::stories_root`] is not
+    /// simply the system temporary directory.
+    ///
+    /// Every other location this type hands out is already under the root a
+    /// test or `--sandbox-root` gave it. The scratch directory is the one that
+    /// would otherwise escape, because it is the one that comes from the
+    /// environment rather than from `directories`. "Every file this run
+    /// touches is under one directory" is a promise the sandbox seam makes in
+    /// `AGENTS.md`, and a hole in it is a test writing into the real
+    /// `%TEMP%`.
+    sandbox: Option<PathBuf>,
 }
 
 impl AppPaths {
@@ -59,6 +70,7 @@ impl AppPaths {
             config: dirs.config_dir().to_path_buf(),
             legacy_data: (previous != data).then_some(previous),
             data,
+            sandbox: None,
         })
     }
 
@@ -71,6 +83,7 @@ impl AppPaths {
             // Always defined so the rescue path can be tested on any platform,
             // not just Windows.
             legacy_data: Some(root.join("legacy-data")),
+            sandbox: Some(root.to_path_buf()),
         }
     }
 
@@ -124,23 +137,56 @@ impl AppPaths {
     /// Where `snob stories --interactive` puts a story it is about to hand to
     /// the system viewer.
     ///
-    /// **Under the data directory rather than under the operating system's
-    /// temporary one, and the reason is that this cannot be cleaned up
-    /// reliably.** The viewer is a separate process; `start` on Windows returns
-    /// as soon as it has launched one, so there is no moment at which this
-    /// program knows the window was closed — and while an image viewer holds
-    /// the file open, Windows refuses to delete it. The browser sits here for
-    /// the same reason, and the same answer applies: the session deletes what
-    /// it can on the way out, and whatever a viewer is still holding is caught
-    /// by `snob purge`, which takes this whole directory.
+    /// **Under the operating system's temporary directory, one directory per
+    /// process, and this was measured rather than reasoned.** The first version
+    /// of this put it under the data directory and gave three reasons, all of
+    /// which turned out to be wrong on Windows 11 in August 2026:
     ///
-    /// The operating system's temporary directory would have been cleaned by
-    /// somebody eventually, and it is world-readable on some systems. This one
-    /// is created 0700 on Unix by `create_private_dir` along with the rest of
-    /// the data directory, which is the better default for somebody else's
-    /// photograph.
+    /// - *"An image viewer holds the file open and Windows refuses to delete
+    ///   it."* Photos with the picture on screen and Media Player with the
+    ///   video playing both hold **no** handle: Restart Manager reports nobody,
+    ///   and `DeleteFileW` succeeds while the window is still up. A viewer that
+    ///   opens without `FILE_SHARE_DELETE` does exist and nothing can delete
+    ///   underneath it — but it is not the default, and it is not the case the
+    ///   design should have been built around.
+    /// - *"The temporary directory is world-readable."* True of `/tmp` on
+    ///   Linux, and false on Windows: `%TEMP%` and `%LOCALAPPDATA%` carry
+    ///   **identical** ACLs — SYSTEM, Administrators, the user — both inherited.
+    ///   On Linux the honest answer is better than either: `$XDG_RUNTIME_DIR`
+    ///   is 0700 *by specification*, on tmpfs, and dies with the session.
+    /// - *"The data directory is the more private default."* Windows Search
+    ///   **indexes `%LOCALAPPDATA%\snob-ig` today** — a query against the live
+    ///   index returns files out of the browser profile. It buys no privacy.
+    ///
+    /// So the file goes where a temporary file goes. `std::env::temp_dir()`
+    /// already does the right thing on all three platforms, and on Linux
+    /// [`runtime_dir`] prefers `$XDG_RUNTIME_DIR` when there is one.
+    ///
+    /// **The process id is in the name on purpose**, twice over: two `snob`
+    /// runs must not share a directory one of them will delete, and a
+    /// fixed-name directory in a shared temporary space is a name anybody can
+    /// predict and create first.
+    ///
+    /// [`Self::owned_dirs`] carries the parent, so `snob purge` still reaches
+    /// whatever a run left behind — which is the case that matters, because the
+    /// system's own cleaner is not something to lean on: the oldest thing in
+    /// this machine's `%TEMP%` had been there forty-nine days.
     pub fn story_scratch(&self) -> PathBuf {
-        self.data.join("stories")
+        self.stories_root()
+            .join(format!("run-{}", std::process::id()))
+    }
+
+    /// The parent of every [`Self::story_scratch`], which is what `purge`
+    /// removes and what the age sweep walks.
+    pub fn stories_root(&self) -> PathBuf {
+        // A sandbox root replaces every other location a run touches, and this
+        // is one of them: a test must not be able to reach into the real
+        // temporary directory, and `--sandbox-root` promising "every file this
+        // run touches" has to keep being true.
+        match &self.sandbox {
+            Some(root) => root.join("stories"),
+            None => runtime_dir().join("snob-ig-stories"),
+        }
     }
 
     /// Every directory this tool may have created, for `snob purge` to remove.
@@ -155,10 +201,17 @@ impl AppPaths {
     /// directory the first one had already taken and be reported as a problem.
     pub fn owned_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
+        let stories = self.stories_root();
         for dir in [
             Some(&self.data),
             Some(&self.config),
             self.legacy_data.as_ref(),
+            // The one location outside the data directory this tool writes to.
+            // It is here rather than left to the system's temporary-file
+            // cleaner because that cleaner is not a mechanism: the oldest thing
+            // in this machine's `%TEMP%` had been sitting there for forty-nine
+            // days. See [`Self::story_scratch`].
+            Some(&stories),
         ]
         .into_iter()
         .flatten()
@@ -217,6 +270,63 @@ pub fn is_safe_to_remove(dir: &Path) -> bool {
 
 /// Creates the directory and, on Unix, restricts it to its owner. On Windows
 /// the ACL inherited from `%LOCALAPPDATA%` already limits access to the user.
+/// Where a file that should not outlive the session goes.
+///
+/// `$XDG_RUNTIME_DIR` when there is one, and [`std::env::temp_dir`] otherwise.
+/// The preference is Linux's alone in practice, and it is worth the three
+/// lines: the XDG base directory specification requires that directory to be
+/// owned by the user, `0700`, on a filesystem that is not shared, and **removed
+/// when the session ends** — which is every property wanted here and none of
+/// which `/tmp` promises. `std::env::temp_dir` reads `GetTempPath2W` on
+/// Windows and `$TMPDIR` on macOS, both of which are already per-user.
+///
+/// The variable is checked for being an absolute path that exists, because it
+/// arrives from the environment and a relative one would put somebody else's
+/// photograph in the working directory.
+fn runtime_dir() -> PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let path = PathBuf::from(runtime);
+        if path.is_absolute() && path.is_dir() {
+            return path;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Removes what earlier runs left in the scratch directory.
+///
+/// **The one mechanism here that does not depend on anything having gone
+/// right.** Everything else — the viewer releasing the file, the session
+/// reaching its own cleanup — is a thing that usually happens. A process killed
+/// mid-view, a viewer that opened the file without sharing delete, a machine
+/// restarted: none of those clean up after themselves, and on Windows the
+/// temporary directory is not emptied on boot.
+///
+/// It walks by age rather than by process id, because a process id is reused
+/// and a directory named after a run that ended last week may be named after a
+/// run in progress today. `older_than` is deliberately generous: a browsing
+/// session is minutes, so hours is far past anything live.
+///
+/// Every failure is ignored on purpose. This is housekeeping, and a run that
+/// cannot tidy up after an earlier one still has a story to show.
+pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return; // nothing has ever run, which is the common case
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > older_than)
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
     std::fs::create_dir_all(dir).map_err(|source| PathError::Create {
         path: dir.to_path_buf(),
@@ -233,12 +343,126 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
         })?;
     }
 
+    #[cfg(windows)]
+    keep_out_of_the_search_index(dir);
+
     Ok(())
+}
+
+/// Marks a directory so that Windows Search does not index what is inside it.
+///
+/// **This closes a leak that was measured rather than imagined.** A query
+/// against the live index in August 2026 returned files out of
+/// `%LOCALAPPDATA%\snob-ig\data\browser-profile` — the profile that holds a
+/// second copy of the session while a login is in progress. The crawl scope
+/// includes `AppData\Local`, so everything this tool writes was being read by
+/// the indexer and copied into its database, where deleting the original does
+/// not remove it.
+///
+/// `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` is inherited by files created inside
+/// afterwards, which was checked: a file created in a marked directory carries
+/// the attribute without anything setting it. So this is set once, on the
+/// directory, at creation.
+///
+/// Failure is ignored deliberately. The attribute is a defense in depth on top
+/// of the ACL, not the thing keeping anybody out, and a tool that refuses to
+/// run because an attribute would not set is worse than one that is indexed.
+#[cfg(windows)]
+fn keep_out_of_the_search_index(dir: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    // SAFETY: `SetFileAttributesW` reads a null-terminated wide string and
+    // returns a boolean. The buffer above is null-terminated and outlives the
+    // call, and the attribute value is a documented constant. Microsoft
+    // documents that it does not clear other attributes when the value is
+    // combined, so the directory bit is preserved by reading first.
+    unsafe {
+        let existing = windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(wide.as_ptr());
+        if existing == windows_sys::Win32::Storage::FileSystem::INVALID_FILE_ATTRIBUTES {
+            return;
+        }
+        windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+            wide.as_ptr(),
+            existing | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A sandboxed run must not reach the real temporary directory.**
+    /// The scratch directory is the one location that comes from the
+    /// environment rather than from `directories`, so it is the one that would
+    /// escape a root — and "every file this run touches is under one
+    /// directory" is what `--sandbox-root` promises in `AGENTS.md`.
+    #[test]
+    fn a_rooted_run_keeps_its_scratch_under_the_root() {
+        let paths = AppPaths::rooted_at("/tmp/test");
+        assert!(paths.stories_root().starts_with("/tmp/test"));
+        assert!(paths.story_scratch().starts_with(paths.stories_root()));
+    }
+
+    /// Two runs at once must not share a directory one of them will delete.
+    #[test]
+    fn each_run_gets_a_scratch_directory_of_its_own() {
+        let paths = AppPaths::rooted_at("/tmp/test");
+        let mine = paths.story_scratch();
+        assert!(
+            mine.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&std::process::id().to_string())),
+            "the run has to be named in the path: {}",
+            mine.display()
+        );
+    }
+
+    /// The scratch root is on the list `purge` reads. It is the only thing this
+    /// tool writes outside the data directory, so it is the only one that could
+    /// be forgotten there.
+    #[test]
+    fn the_scratch_root_is_something_purge_removes() {
+        let paths = AppPaths::rooted_at("/tmp/test");
+        assert!(paths.owned_dirs().contains(&paths.stories_root()));
+    }
+
+    /// The sweep takes what is old and leaves what is not. Both halves matter:
+    /// deleting a live run's directory takes the file out from under the viewer
+    /// it was just handed to.
+    #[test]
+    fn the_sweep_takes_the_abandoned_and_leaves_the_living() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("run-old");
+        let fresh = tmp.path().join("run-fresh");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(old.join("story.jpg"), b"x").unwrap();
+
+        // Zero, so everything already on disk counts as abandoned; then a
+        // generous one, so nothing does. Testing it this way rather than by
+        // waiting keeps the suite off the wall clock, which is a rule this
+        // repository has broken before.
+        sweep_old_scratch(tmp.path(), std::time::Duration::ZERO);
+        assert!(!old.exists(), "an abandoned directory should have gone");
+
+        std::fs::create_dir_all(&fresh).unwrap();
+        sweep_old_scratch(tmp.path(), std::time::Duration::from_secs(3600));
+        assert!(fresh.exists(), "a live directory must be left alone");
+    }
+
+    /// A root that does not exist is not an error. It is the common case: the
+    /// first run of `snob stories` on a machine.
+    #[test]
+    fn sweeping_a_root_nothing_has_created_is_quiet() {
+        sweep_old_scratch(
+            Path::new("/nonexistent-snob-scratch"),
+            std::time::Duration::ZERO,
+        );
+    }
 
     #[test]
     fn files_hang_off_their_directories() {

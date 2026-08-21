@@ -116,7 +116,7 @@ percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 
 # Test-only
 wiremock = "0.6"
