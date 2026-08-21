@@ -635,6 +635,92 @@ The three Unix targets have never been measured — nothing here cross-links
 them. Note that musl carries the Secret Service stack, some thirty crates a
 Windows build does not, so it is not comparable.
 
+## Measured, decided, and not done yet
+
+Found by an audit in August 2026, with numbers. Written down here rather than
+left in a report nobody can find, and in the order they are worth doing.
+
+- **`login --browser` leaves an unauthenticated debugging port open**, on
+  loopback, for up to `LOGIN_TIMEOUT`. Demonstrated end to end: a second local
+  process read the port from `DevToolsActivePort`, called `/json/version` with
+  no credential, and got the session cookie back from `Storage.getCookies`
+  despite `httpOnly`. Loopback sockets have no per-user access control, so this
+  is every account on the machine. `--remote-debugging-pipe` is the fix and it
+  was demonstrated working on Windows — the platform is not the obstacle;
+  `std::process::Command` is, because it does not expose the `lpReserved2`
+  handle-inheritance blob. Roughly 250 lines of unsafe plus a Unix path, and it
+  retires `tokio-tungstenite` and `futures-util`. Pair it with a job object
+  carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which also covers the case no
+  handler can catch: snob killed from outside, browser and port left running.
+- **`keyring-core` and the platform stores.** The keyring project split in
+  2026 and `keyring 4.x` now calls itself sample code, pointing applications at
+  `keyring-core` plus a store. Two things arrive together:
+  `windows-native-keyring-store` with `default-features = false` drops `regex`
+  and `aho-corasick` — 863,744 bytes, 11.4% of both Windows binaries, for a
+  search API nothing calls — and its `persistence` modifier gives
+  `CRED_PERSIST_LOCAL_MACHINE` through a supported interface, retiring the
+  roaming-credential exposure below. **One thing must be answered against a
+  real Credential Manager before shipping it**: an entry written as Enterprise
+  has to still be found by a lookup under Local on the same target name, or the
+  first save after an upgrade silently logs every existing user out. That is
+  why this did not go into 0.2.0.
+- **Redirect hops are followed without being paced or charged.** Fixed: a
+  *refused* redirect no longer retries. Still owed: the hops that are followed
+  go out unpaid, against the standing rule that every request is paid for. The
+  shape is `Policy::none()` plus a bounded loop in `IgClient::get` charging
+  `clear_to_send()` per hop.
+- **The Windows data directory has no DACL of its own.** `create_private_dir`
+  chmods 0700 on Unix and does nothing on Windows, on the assumption that
+  `%LOCALAPPDATA%` already limits access. On a machine with a non-default
+  profile ACL it does not, and the database — the whole follower history, in
+  the clear — is readable by other local accounts. `session.json` is
+  DPAPI-sealed, so this is about the database and the browser profile.
+  `SetNamedSecurityInfoW` with `PROTECTED_DACL_SECURITY_INFORMATION` was
+  verified working unprivileged. The defect is that the code asserts a property
+  it does not enforce.
+- **Ctrl+C during an in-flight request waits for the server.** Measured: a
+  stop during a budget wait takes 1.13 s, and about nine interrupts in ten land
+  there — but during a request the exit tracks the server's hold, up to
+  `REQUEST_TIMEOUT`, or 254 s on a black-holed connection because `Network`
+  retries. It matters most under a service manager, where a stalled request can
+  outlast the stop grace period and the process is killed before it closes its
+  snapshot. Ten lines of `tokio::select!` in `get`, and the cancel branch must
+  return `Canceled` rather than falling into `Network`.
+- **`Retry-After` is never read.** `classify` receives no headers. Reading it
+  would make snob the only tool of its class that does — but nobody has
+  established whether these endpoints send it. Log the header at `debug` on
+  every push-back first, so a real run answers the question. When implemented
+  it is a floor and never a ceiling: a server-named 30 s must not shorten the
+  local cooldown.
+- **The pacing rate has no reference behind it.** The best public figure for
+  this endpoint family is instaloader's field-report guess of 75 requests per
+  660 s for non-GraphQL; snob walks at 172, because the cadence was copied from
+  a project that walks GraphQL. Not a proposal — at 8.8 s per request a
+  235-page walk takes 34 minutes against a 900-second resume window, and one
+  list describing one moment is worth more than the rate. It is recorded
+  because it is the one number in the design with nothing behind it. The
+  ubiquitous "200 calls per user per hour" is Meta's Graph API platform limit
+  for graph.facebook.com and has nothing to do with these endpoints.
+- **`friendships/show_many`** would take a 1000/500 crossing from 52 requests
+  to 14. It is a POST, which this project has never sent, and its page limit,
+  response shape and throttle weighting are all unverified. Settle whether a
+  non-mutating POST is inside the no-write rule before designing anything.
+- **Reproducibility is 24 bytes away.** Two release builds differed only in the
+  PE TimeDateStamp and the CodeView GUID; `-Clink-arg=/Brepro` plus
+  `--remap-path-prefix` made them identical and took 46,080 bytes off. The gap
+  is the archives: `tar -czf` and `Compress-Archive` both embed mtimes, while
+  the `.deb` is already reproducible. Pin `rust-toolchain.toml` to an exact
+  version first — it says `stable`, so a rebuild months later cannot match by
+  construction. Remember that `RUSTFLAGS` replaces `.cargo/config.toml`.
+- **Narrowing the trust store** is available and should be opt-in, not default.
+  reqwest 0.13 made `rustls-platform-verifier` the default, so the four rustls
+  targets now honor enterprise roots and a managed laptop with an inspection
+  root can read the session in transit. `tls_certs_only(webpki_root_certs)`
+  behind `--strict-roots`, with `--tls-extra-root` as the way out, and never on
+  the webhook client, where a private CA is legitimate. Certificate **pinning**
+  is separately rejected: Meta rotates leaves across issuers and there is no
+  fast update channel behind this binary.
+
 ## Known walls
 
 - **A list of tens of thousands does not come back.** On an account declaring
