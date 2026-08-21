@@ -14,7 +14,7 @@ use snob_core::store::{accounts, now, snapshots};
 use crate::app::App;
 use crate::cli::ListArgs;
 use crate::engine::target::{Counters, Target};
-use crate::engine::{ListOutcome, walk};
+use crate::engine::{ListOutcome, Provenance, walk};
 
 /// Polls, compares, and either serves what is stored or walks.
 pub async fn decide_and_fetch(
@@ -29,11 +29,26 @@ pub async fn decide_and_fetch(
         Err(e) => {
             // Walking the whole list right when Instagram is already having
             // trouble is the worst possible reaction, so anything stored wins.
-            if let Some(snapshot) = &stored {
+            //
+            // Except under `--refresh`, whose whole help text is "walk the list
+            // again". This arm answered it with whatever was stored — a capture
+            // from any month, printed with exit 0 and nothing on screen saying
+            // which — because the flag was not consulted until two statements
+            // below, and this one returns first. Falling through puts the flag
+            // exactly where a first-ever run already is: no counter to compare
+            // against, so walk. It costs one request against an endpoint that
+            // just failed, which is the price of the flag meaning what it says;
+            // the pager does not retry a push-back, so it is one and not four.
+            if let Some(snapshot) = &stored
+                && !args.refresh
+            {
                 app.warn(&format!(
                     "could not check for changes ({e}); using the stored list"
                 ));
-                return serve(app, target, snapshot);
+                // Served, but with nothing said about whether it is still
+                // true. It is fine to print; it is not fine to cross against
+                // another list, and only the provenance can carry that.
+                return serve(app, snapshot, Provenance::PollFailed);
             }
             app.warn(&format!("could not read the profile ({e})"));
             None
@@ -42,9 +57,21 @@ pub async fn decide_and_fetch(
 
     if !args.refresh
         && let Some(snapshot) = &stored
-        && is_still_good(snapshot, declared, args.max_age.as_secs() as i64)
+        // Saturating rather than casting. `duration::parse` refuses anything
+        // this could not hold, so nothing reaches here that would wrap — but
+        // "it is checked somewhere else" is how the wrap got written in the
+        // first place, and the next reader of a `Duration` inherits an answer
+        // this way rather than a hole. Same shape as `schedule.rs`.
+        && is_still_good(
+            snapshot,
+            declared,
+            i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX),
+        )
     {
-        return serve(app, target, snapshot);
+        // The counter was polled just now and had not moved, so this describes
+        // the account as it is however old the snapshot is. That is what makes
+        // it safe to cross.
+        return serve(app, snapshot, Provenance::CounterVerified);
     }
 
     walk::fetch(app, args, kind, target, declared).await
@@ -66,12 +93,12 @@ fn is_still_good(snapshot: &snapshots::Snapshot, declared: Option<u64>, max_age_
 
 fn serve(
     app: &App,
-    target: &Target,
     snapshot: &snapshots::Snapshot,
+    provenance: Provenance,
 ) -> Result<(Vec<User>, ListOutcome)> {
     Ok((
         snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(target.pk, snapshot.taken_at.unwrap_or_default(), false),
+        ListOutcome::cached(snapshot, provenance),
     ))
 }
 
@@ -83,14 +110,24 @@ fn serve(
 /// hand and asking twice would only spend the request that the whole cache
 /// policy exists to save.
 async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u64>> {
-    let counters = match target.counters {
-        Some(counters) => counters,
-        None => {
-            let profile = app.client().web_profile_info(&target.username).await?;
-            Counters {
+    let counters = match (target.counters, target.username.as_deref()) {
+        (Some(counters), _) => counters,
+        // The profile endpoint takes a name, so without one there is nothing to
+        // ask with. Saying the counter is unknown costs nothing; asking about a
+        // numeric id would spend a request on a guaranteed 404 every run.
+        (None, None) => return Ok(None),
+        (None, Some(username)) => {
+            let profile = app.client().web_profile_info(username).await?;
+            let counters = Counters {
                 followers: profile.follower_count(),
                 following: profile.following_count(),
-            }
+            };
+            // One answer carries both counters, so the other list of a crossing
+            // does not have to ask again. Without this the memo held the
+            // identity and the second list still spent a request on the numbers
+            // it already had in hand.
+            app.remember_counters(counters);
+            counters
         }
     };
 
@@ -115,13 +152,9 @@ mod tests {
             kind: ListKind::Followers,
             started_at: taken_at,
             taken_at: Some(taken_at),
-            complete: true,
             member_count: 10,
             declared_count: declared,
-            pages: 1,
-            requests: 1,
             next_cursor: None,
-            resumes: 0,
         }
     }
 
@@ -143,6 +176,25 @@ mod tests {
     fn an_old_list_is_walked_however_still_the_counter_is() {
         let old = snapshot(now() - SIX_HOURS - 1, Some(300));
         assert!(!is_still_good(&old, Some(300), SIX_HOURS));
+    }
+
+    /// The longest maximum age anyone can write must not mean the shortest.
+    ///
+    /// `duration::parse` now refuses what will not fit in an `i64`, so this is
+    /// the second lock on the same door: a `Duration` built any other way still
+    /// saturates instead of wrapping, and a saturated bound reuses everything
+    /// rather than walking everything.
+    #[test]
+    fn an_absurd_maximum_age_reuses_rather_than_walks() {
+        let ancient = snapshot(0, Some(300));
+        let forever =
+            i64::try_from(std::time::Duration::from_secs(u64::MAX).as_secs()).unwrap_or(i64::MAX);
+
+        assert_eq!(forever, i64::MAX);
+        assert!(
+            is_still_good(&ancient, Some(300), forever),
+            "the longest age anyone can write is the one that expires nothing"
+        );
     }
 
     /// Not knowing the counter is not the same as knowing it stayed put. If an

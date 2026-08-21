@@ -1,0 +1,23 @@
+# Keeps the pinned actions and the dependency graph from rotting.
+#
+# Since July 2026 Dependabot applies a three-day release cooldown by default,
+# with nothing to configure — which is what makes this safe to switch on. The
+# hazard it used to carry was becoming a fast follower of every fresh publish,
+# and a freshly published malicious version is exactly what `--locked` and the
+# advisory job exist to keep out of a build.
+#
+# Weekly rather than daily: this is a small tool with five targets, and a pull
+# request per dependency per day is how an update feed gets muted.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    # The lockfile is what ships, so an update has to be a reviewed change to
+    # it rather than a manifest range widening under everybody.
+    versioning-strategy: lockfile-only

@@ -8,10 +8,10 @@
 //! requests, not lists.
 
 use anyhow::{Result, anyhow};
+use snob_core::model::printable;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
-use snob_ig::error::{IgError, cooldown_for};
 
 use crate::app::App;
 use crate::cli::PfpArgs;
@@ -19,12 +19,13 @@ use crate::engine::target;
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Rendered};
 use crate::report;
+use crate::ui;
 
 pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // No bar: three requests do not need one, and the picture goes to standard
     // output when there is no `-o`.
     let Some(app) = App::open(&secrets, paths, false)? else {
-        eprintln!("No session stored. Run \"snob login\".");
+        ui::no_session();
         return Ok(ExitCode::NoSession);
     };
 
@@ -41,22 +42,21 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
         .into());
     }
 
-    let picture = match fetch(app.client(), &args.target).await {
-        Ok(picture) => picture,
-        Err(e) => {
-            // Throttling has to leave a mark, or the next run walks straight
-            // into it again. Same table the walker uses, so a picture and a
-            // list earn the same wait.
-            if let Some((reason, minimum)) = e.downcast_ref::<IgError>().and_then(cooldown_for) {
-                let _ = app.client().pacer().start_cooldown(reason, minimum);
-            }
-            return Err(e);
-        }
-    };
+    // Nothing here records a cooldown. `IgClient::classify_and_record` already
+    // did, on the request that earned it, which is the one place that sees
+    // every request. Doing it again here wrote a second row within
+    // milliseconds, and `start_cooldown` reads a row it finds inside the last
+    // day as a repeat offense: one 429 during `snob pfp` became two strikes
+    // and four hours instead of one strike and two.
+    let picture = fetch(app.client(), &args.target).await?;
 
     if app.cancel().is_canceled() {
         return Ok(ExitCode::Interrupted);
     }
+
+    // Said before the file is written, so a smaller picture is not a caveat
+    // tacked onto "Written to ...".
+    picture.source.announce();
 
     // Worked out before the bytes are moved into the payload: the name comes
     // from what actually arrived, not from the URL.
@@ -73,7 +73,7 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
         // it goes to standard output, which is what
         // `snob pfp someone > face.jpg` is asking for.
         None if output::Presentation::detect(None).interactive => {
-            let path = output::default_path(&username, extension)?;
+            let path = output::default_path(std::path::Path::new("."), &username, extension)?;
             output::write_new(&rendered, &path)?;
         }
         None => output::write_rendered(&rendered, None)?,
@@ -86,6 +86,8 @@ struct Picture {
     username: String,
     url: String,
     bytes: Vec<u8>,
+    /// Which of the two pictures arrived. The command exists for one of them.
+    source: Source,
 }
 
 impl Picture {
@@ -117,6 +119,7 @@ impl std::fmt::Debug for Picture {
             .field("username", &self.username)
             .field("url", &self.url)
             .field("bytes", &self.bytes.len())
+            .field("source", &self.source)
             .finish()
     }
 }
@@ -135,25 +138,37 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
     // `profile_pic_url_hd`, but what it hands back is a URL carrying an
     // instruction to the CDN to downscale to 320x320 — and that instruction is
     // covered by the URL's signature, so it cannot simply be stripped off.
+    //
     // A failure here is not worth losing the picture over: the smaller one
-    // below still works, so "did not answer" and "answered without one" are
-    // deliberately the same case.
-    let full_size = client
-        .user_info(profile.id)
-        .await
-        .inspect_err(|e| tracing::debug!(error = %e, "the by-id endpoint did not answer"))
-        .ok()
-        .flatten()
-        .and_then(|info| info.hd_profile_pic_url_info)
-        .inspect(|p| tracing::debug!(width = ?p.width, height = ?p.height, "full-size picture"));
+    // below still works. But the reason is kept rather than logged away. It
+    // used to go to `debug!`, which nobody passes `--verbose` to see on a
+    // command that appeared to
+    // work — and it can be the 429 that has just put the account in cooldown,
+    // so the next command refusing came with no explanation anywhere.
+    let (full_size, why_not) = match client.user_info(profile.id).await {
+        Ok(info) => (info.and_then(|i| i.hd_profile_pic_url_info), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     // Accounts that never set a picture have none of these, and the default
     // avatar is not worth downloading.
-    let url = full_size
-        .map(|p| p.url)
-        .or(profile.profile_pic_url_hd)
-        .or(profile.profile_pic_url)
-        .ok_or_else(|| anyhow!("@{} has no profile picture", profile.username))?;
+    let (url, source) = match full_size {
+        Some(p) => (
+            p.url,
+            Source::FullSize {
+                size: p.width.zip(p.height),
+            },
+        ),
+        None => match profile.profile_pic_url_hd.or(profile.profile_pic_url) {
+            Some(url) => (url, Source::Smaller { why: why_not }),
+            None => {
+                return Err(anyhow!(
+                    "@{} has no profile picture",
+                    printable(&profile.username)
+                ));
+            }
+        },
+    };
 
     // The CDN is not Instagram's API and does not count against its budget.
     let bytes = client.download(&url).await?;
@@ -161,7 +176,46 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
         username: profile.username,
         url,
         bytes,
+        source,
     })
+}
+
+/// Which of the two pictures this is.
+///
+/// Not `Option<(u32, u32)>`: the by-id endpoint can answer with a picture and
+/// no dimensions, which would collapse into the same `None` as not having
+/// answered at all — and those are the two cases the whole command turns on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// The by-id endpoint answered. The size is what it declared, not what was
+    /// measured: nothing here decodes the image.
+    FullSize { size: Option<(u32, u32)> },
+    /// What the profile page offers, which is the one thing this command exists
+    /// not to hand back. `why` is what the by-id endpoint said, when it said
+    /// anything.
+    Smaller { why: Option<String> },
+}
+
+impl Source {
+    /// What to tell the user before the file is written, if anything.
+    ///
+    /// Said **before** the write, so it does not read as a caveat attached to
+    /// "Written to picture.jpg" after the fact.
+    fn announce(&self) {
+        match self {
+            Self::FullSize { size: Some((w, h)) } => ui::info(&format!("Full size: {w}x{h}.")),
+            Self::FullSize { size: None } => {}
+            Self::Smaller { why } => {
+                let mut line = "the full-size lookup did not answer, so this is the smaller \
+                                picture the profile page serves"
+                    .to_string();
+                if let Some(why) = why {
+                    line.push_str(&format!(" ({why})"));
+                }
+                ui::warn(&line);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +343,10 @@ mod tests {
 
         let picture = fetch_with(&server, "someone").await.0.unwrap();
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
+        assert!(
+            matches!(picture.source, Source::Smaller { .. }),
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
+        );
     }
 
     /// A by-id endpoint that errors outright must not lose the picture either.
@@ -304,6 +362,10 @@ mod tests {
 
         let picture = fetch_with(&server, "someone").await.0.unwrap();
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
+        assert!(
+            matches!(picture.source, Source::Smaller { .. }),
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
+        );
     }
 
     #[tokio::test]
@@ -370,6 +432,7 @@ mod tests {
             // Deliberately disagreeing with the bytes: the URL must not decide.
             url: "https://cdn.example/x/abc.webp?stp=dst-jpg".into(),
             bytes: bytes.to_vec(),
+            source: Source::FullSize { size: None },
         }
     }
 

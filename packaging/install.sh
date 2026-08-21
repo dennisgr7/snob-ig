@@ -36,7 +36,7 @@ target() {
     # that building from source is right there.
     Darwin/x86_64)
       die "snob has no build for Intel Macs. Build it from source instead:
-    cargo install --git https://github.com/$REPO snob-cli"
+    cargo install --locked --git https://github.com/$REPO snob-cli"
       ;;
     *) die "no build for $os on $arch" ;;
   esac
@@ -101,18 +101,34 @@ main() {
 
   echo "Installed $("$INSTALL_DIR/snob" --version) to $INSTALL_DIR"
 
+  # Which profile file to write is a question only the user's shell can
+  # answer, so this prints the line rather than guessing at one. What it must
+  # not do is then tell them to run a command that will not resolve.
+  on_path=yes
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)
+      on_path=no
       echo
       echo "$INSTALL_DIR is not on your PATH. Add this to your shell profile:"
       echo "    export PATH=\"\$PATH:$INSTALL_DIR\""
       ;;
   esac
 
+  # Both lines, not just the first. The flag was added so this script would not
+  # "tell them to run a command that will not resolve", and the purge reminder
+  # was left saying a bare `snob` — the one command here it matters most that
+  # somebody can actually type, because skipping it leaves a live session cookie
+  # on a machine whose owner has just uninstalled the tool.
+  if [ "$on_path" = yes ]; then
+    snob=snob
+  else
+    snob="$INSTALL_DIR/snob"
+  fi
+
   echo
-  echo "Start with: snob login"
-  echo "Before uninstalling, run \"snob purge\": the session and the database"
+  echo "Start with: $snob login"
+  echo "Before uninstalling, run \"$snob purge\": the session and the database"
   echo "live outside this directory and deleting the binary will not reach them."
 }
 

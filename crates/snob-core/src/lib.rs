@@ -4,6 +4,7 @@
 //! its username. Usernames change, and detecting that change is itself an event
 //! the tool reports.
 
+pub mod duration;
 pub mod filters;
 pub mod model;
 pub mod paths;
@@ -12,6 +13,7 @@ pub mod secrets;
 pub mod session;
 pub mod sets;
 pub mod store;
+pub mod watch;
 
 /// Stable numeric identifier of an Instagram account.
 pub type Pk = u64;

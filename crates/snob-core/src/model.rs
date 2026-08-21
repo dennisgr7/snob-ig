@@ -25,9 +25,49 @@ pub struct User {
     pub pfp_url: Option<String>,
 }
 
+/// What may sit in a path segment unescaped: RFC 3986's unreserved set, which
+/// contains every character Instagram lets a username be made of.
+const IN_A_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// A name, ready to be one segment of a URL path.
+///
+/// Public for the same reason [`printable`] is: a username reaches an address
+/// from more than one place, and [`User::profile_url`] is not all of them. The
+/// `Referer` header the Instagram client sends names the page a browser would
+/// have called from, which is built out of the username as typed — and a
+/// header value cannot hold a byte below 0x20 at all, so an unencoded name
+/// there does not produce a wrong address, it produces no request.
+///
+/// Encoded rather than filtered, for the reason [`User::profile_url`] gives at
+/// length: removing a character from a name yields the address of a different
+/// account.
+pub fn in_a_path(name: &str) -> String {
+    percent_encoding::utf8_percent_encode(name, IN_A_PATH).to_string()
+}
+
 impl User {
+    /// The address of this account, with the name encoded into it.
+    ///
+    /// **Encoded rather than filtered, and the reason is not the terminal.**
+    /// This string lands in the URL slot of an OSC 8 sequence, in a markdown
+    /// link destination and in a spreadsheet hyperlink, and [`printable`] would
+    /// keep all three safe — but it *removes* characters, and a name with one
+    /// removed is the address of a **different account**, which may well exist.
+    /// A link that quietly points at somebody else is worse than one that does
+    /// not work, because nothing on screen says anything happened.
+    ///
+    /// Percent-encoding cannot do that. It is the identity on the alphabet
+    /// Instagram allows, so ordinary names come out byte for byte as they did
+    /// before, and anything else round-trips instead of resolving elsewhere.
+    /// It also closes the hole this had: an `ESC` in a username ended the OSC 8
+    /// sequence early and let the rest of the name open one of its own, so the
+    /// cell showed a filtered name and pointed wherever the name said.
     pub fn profile_url(&self) -> String {
-        format!("https://www.instagram.com/{}/", self.username)
+        format!("https://www.instagram.com/{}/", in_a_path(&self.username))
     }
 
     /// The full name with control characters taken out, for anything a
@@ -58,23 +98,63 @@ impl User {
 /// The one exception is whitespace that happens to be a control character —
 /// a newline or a tab. Those become a space rather than vanishing, because
 /// deleting them would join two words that were never one.
-fn printable(text: &str) -> String {
+///
+/// Public because the same filter is needed for strings that never become a
+/// [`User`]: the name a `scan` summary opens with, an account named in an
+/// error, an excerpt of a response body. A second, slightly different copy of
+/// this list is how one output path ends up covered and another does not.
+pub fn printable(text: &str) -> String {
     text.chars()
         .filter_map(|c| match c {
             c if c.is_whitespace() => Some(' '),
-            c if c.is_control() || is_reordering(c) => None,
+            c if c.is_control() || is_invisible(c) => None,
             c => Some(c),
         })
         .collect()
 }
 
-/// The invisible formatting characters that reorder what follows them.
+/// The characters that show nothing but change how their neighbors read.
 ///
-/// `char::is_control` does not cover these — they are marks, not controls — and
-/// a right-to-left override inside a name can make one account read as another
-/// entirely.
-fn is_reordering(c: char) -> bool {
-    matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+/// `char::is_control` covers general category `Cc`, which is both the C0 and
+/// the C1 ranges. It does **not** cover these: they are category `Cf`, formatting
+/// marks rather than controls, and a right-to-left override inside a name can
+/// make one account read as another entirely.
+///
+/// Four groups, and the reason each is here:
+///
+/// - **Bidirectional overrides** — U+061C, the marks and the embedding,
+///   override and isolate controls. This is the "Trojan Source" class, and
+///   reversing the visible order of a name is the whole attack.
+/// - **Zero-width characters** — ZWSP, ZWNJ, ZWJ, the word joiner, the
+///   invisible operators and the byte-order mark. They let two different
+///   accounts render as the same name, which is what makes a list of who to
+///   unfollow untrustworthy.
+/// - **The tag block**, U+E0000–U+E007F, which encodes arbitrary invisible
+///   ASCII inside a name and renders as nothing at all.
+/// - **Blank by rendering rather than by category** — the soft hyphen, the
+///   Mongolian vowel separator, the interlinear annotation marks, and the
+///   Hangul fillers, which are *letters* (`Lo`) that draw nothing. No property
+///   this function could ask about groups them: `White_Space` does not list
+///   them and `Cc` does not contain them, so each one is another way to spell
+///   a name that is already taken.
+///
+/// The word-joiner range runs to U+206F rather than stopping at the invisible
+/// operators, because the deprecated formatting characters between them are
+/// invisible on the same terms.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'
+        | '\u{061c}'
+        | '\u{115f}'..='\u{1160}'
+        | '\u{180e}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{3164}'
+        | '\u{feff}'
+        | '\u{ffa0}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Which side of the follow relationship.
@@ -94,6 +174,28 @@ impl ListKind {
         match self {
             Self::Followers => "followers",
             Self::Following => "following",
+        }
+    }
+}
+
+/// The other direction, for reading a stored row back.
+///
+/// The standard trait rather than an inherent `from_str`, which clippy warns
+/// about for a good reason: a caller reaching for `"followers".parse()` would
+/// otherwise get a different function than the one they expected, or none.
+///
+/// It fails rather than defaulting. A `kind` column holding something else
+/// means the database was written by something that is not this program, and
+/// quietly calling that "followers" would answer a question about a list nobody
+/// asked about.
+impl std::str::FromStr for ListKind {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "followers" => Ok(Self::Followers),
+            "following" => Ok(Self::Following),
+            _ => Err(()),
         }
     }
 }
@@ -165,6 +267,59 @@ impl StopReason {
 mod tests {
     use super::*;
 
+    fn named(username: &str) -> User {
+        User {
+            pk: 1,
+            username: username.to_string(),
+            full_name: None,
+            is_private: None,
+            is_verified: None,
+            pfp_url: None,
+        }
+    }
+
+    /// Encoding has to be the identity on the alphabet Instagram allows, or
+    /// every link in every export changes for no reason.
+    #[test]
+    fn an_ordinary_name_comes_out_of_the_link_unchanged() {
+        assert_eq!(
+            named("some.user_1-x").profile_url(),
+            "https://www.instagram.com/some.user_1-x/"
+        );
+    }
+
+    /// The hole this closes. The address goes into the URL slot of an OSC 8
+    /// sequence and into a markdown link destination, and an `ESC` there ended
+    /// the sequence early: the cell showed a filtered name and pointed wherever
+    /// the unfiltered one said.
+    #[test]
+    fn a_name_cannot_break_out_of_the_link_it_is_put_in() {
+        let url = named("a\x1b\\\x1b]8;;http://evil.test\x1b\\Official").profile_url();
+
+        assert!(!url.contains('\x1b'), "an escape survived: {url}");
+        assert!(!url.contains(']'), "a sequence introducer survived: {url}");
+        assert!(
+            !url.contains("evil.test/"),
+            "the second address is still a path of its own: {url}"
+        );
+    }
+
+    /// Why this encodes instead of filtering. `printable` would remove the
+    /// slashed o, and `/sren/` is somebody else's account — one that may well
+    /// exist. A link quietly pointing at the wrong person is worse than a
+    /// broken one, because nothing says it happened.
+    ///
+    /// The letter is Danish rather than Spanish so that the language guard has
+    /// nothing to say about it. Which letter it is does not matter here; that
+    /// it is not ASCII does.
+    #[test]
+    fn an_accent_still_points_at_the_same_account() {
+        assert_eq!(
+            named("søren").profile_url(),
+            "https://www.instagram.com/s%C3%B8ren/"
+        );
+    }
+
     #[test]
     fn only_a_full_walk_yields_a_complete_list() {
         assert!(StopReason::Completed.yields_complete_list());
@@ -180,6 +335,78 @@ mod tests {
                 !partial.yields_complete_list(),
                 "{partial:?} does not describe the whole list"
             );
+        }
+    }
+
+    /// The three groups the filter names, each with the character that makes
+    /// the case: a bidirectional override, a zero-width space, and a tag
+    /// character. None of them show anything, and all of them change what the
+    /// name next to them means.
+    #[test]
+    fn invisible_characters_do_not_survive() {
+        for hidden in [
+            '\u{061c}',  // Arabic letter mark
+            '\u{200b}',  // zero-width space
+            '\u{200d}',  // zero-width joiner
+            '\u{202e}',  // right-to-left override
+            '\u{2060}',  // word joiner
+            '\u{2068}',  // first strong isolate
+            '\u{feff}',  // byte-order mark
+            '\u{e0041}', // tag latin capital A
+        ] {
+            let name = format!("real{hidden}name");
+            assert_eq!(
+                printable(&name),
+                "realname",
+                "U+{:04X} survived",
+                hidden as u32
+            );
+        }
+    }
+
+    /// The rest of what shows nothing. Category `Cc` covers none of these and
+    /// the three groups above named none of them, so each one is a second way
+    /// to write a name that already exists.
+    #[test]
+    fn the_other_invisible_characters_do_not_survive_either() {
+        for hidden in [
+            '\u{00ad}', // soft hyphen
+            '\u{115f}', // Hangul choseong filler
+            '\u{1160}', // Hangul jungseong filler
+            '\u{180e}', // Mongolian vowel separator
+            '\u{206a}', // inhibit symmetric swapping
+            '\u{206f}', // nominal digit shapes
+            '\u{3164}', // Hangul filler
+            '\u{ffa0}', // halfwidth Hangul filler
+            '\u{fff9}', // interlinear annotation anchor
+            '\u{fffb}', // interlinear annotation terminator
+        ] {
+            let name = format!("real{hidden}name");
+            assert_eq!(
+                printable(&name),
+                "realname",
+                "U+{:04X} survived",
+                hidden as u32
+            );
+        }
+    }
+
+    /// Two accounts must not be able to render as the same name. This is the
+    /// point of taking the zero-width characters out, rather than only the
+    /// ones that drive the terminal.
+    #[test]
+    fn a_zero_width_character_cannot_forge_a_name() {
+        let impostor = "insta\u{200b}gram";
+        assert_ne!(impostor, "instagram");
+        assert_eq!(printable(impostor), "instagram");
+    }
+
+    /// Taking the invisible characters out must not take the visible ones with
+    /// them. Accents, other scripts and emoji are ordinary content.
+    #[test]
+    fn ordinary_text_is_untouched() {
+        for name in ["Jos\u{e9} Mu\u{f1}oz", "\u{4e2d}\u{6587}", "ana \u{1f600}"] {
+            assert_eq!(printable(name), name);
         }
     }
 

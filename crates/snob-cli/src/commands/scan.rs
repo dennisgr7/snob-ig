@@ -8,12 +8,14 @@
 //! the line you actually read first — and it costs nothing, because the answer
 //! is already in the database.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
+use snob_core::Pk;
 use snob_core::filters::Filter;
-use snob_core::model::{ListKind, User};
+use snob_core::model::{ListKind, User, printable};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
-use snob_core::sets;
 
 use crate::cli::{Format, ListArgs};
 use crate::commands::common::{self, Destination, Session};
@@ -65,9 +67,14 @@ struct Summary<'a> {
     explicit_target: bool,
     filtered: bool,
     /// The accounts you follow who also follow this one. `None` on your own
-    /// account, where the question is what `snob friends` answers, and when
-    /// nothing is stored to answer it with.
+    /// account, where the question is what `snob friends` answers, when nothing
+    /// is stored to answer it with, and when what is stored is older than
+    /// `--max-age`.
     followed_by: Option<&'a [User]>,
+    /// When the capture behind `followed_by` was taken. Carried beside it so
+    /// this answer dates itself the way every other stored figure in the same
+    /// object does.
+    followed_by_at: Option<i64>,
     followers: &'a ListOutcome,
     following: &'a ListOutcome,
 }
@@ -88,23 +95,24 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // hints can name it.
     let explicit_target = args.target.is_some();
     let viewer = app.viewer().clone();
-    let target = match &args.target {
-        Some(raw) => engine::target::clean(raw).to_string(),
-        None => viewer
-            .username
-            .clone()
-            .unwrap_or_else(|| viewer.pk.to_string()),
-    };
+    let target = summary_target(args.target.as_deref(), &viewer);
 
     // Followers first, mirroring the order `unfollowers` consumes the cache
     // in, and so an incomplete list is found out before the second walk is
     // spent.
-    let (followers, followers_outcome) = engine::list(&mut app, &args, ListKind::Followers).await?;
-    check_complete(ListKind::Followers, &followers_outcome)?;
+    let subject = engine::target::label(&app, &args);
+    let (followers, followers_outcome) =
+        common::walk_named(&mut app, &args, ListKind::Followers, &subject, |outcome| {
+            check_complete(ListKind::Followers, outcome)
+        })
+        .await?;
 
-    let (following, following_outcome) = engine::list(&mut app, &args, ListKind::Following).await?;
+    let second = common::walk_named(&mut app, &args, ListKind::Following, &subject, |outcome| {
+        check_complete(ListKind::Following, outcome)
+    })
+    .await;
     app.progress().finish();
-    check_complete(ListKind::Following, &following_outcome)?;
+    let (following, following_outcome) = second?;
     engine::cooldown::check_same_moment(&followers_outcome, &following_outcome)?;
 
     // Your own account is excluded rather than unsupported: "who you both
@@ -114,17 +122,30 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // was typed against the stored username: that name can be absent, can be
     // spelled differently, and on a fresh session is not known at all.
     let is_self = followers_outcome.is_own(&viewer);
-    let followed_by = if is_self {
+    let found = if is_self {
         None
     } else {
         people::in_common(&app, &followers)?
     };
 
+    // Held to the same age bound as every other stored answer in this object.
+    // Nothing refreshes this one — no flag walks it, and `check_same_moment`
+    // covers only the two lists that were walked — so without the bound the
+    // opening line could name accounts unfollowed months ago while reading
+    // exactly like one worked out this minute.
+    let max_age = i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX);
+    let now = snob_core::store::now();
+    let stale = found.as_ref().is_some_and(|f| !f.is_current(max_age, now));
+    let followed_by = found.filter(|_| !stale);
+
     if !is_self && followed_by.is_none() && destination.is_interactive() {
-        ui::info(
+        ui::info(if stale {
+            "Who you both follow is not shown: the stored list of your own following is older \
+             than --max-age. Run \"snob following\" to bring it up to date."
+        } else {
             "Who you both follow is not shown: nothing of your own following is stored yet. \
-             Run \"snob following\" once and it will appear from then on.",
-        );
+             Run \"snob following\" once and it will appear from then on."
+        });
     }
 
     let filtered = !filter.is_empty();
@@ -133,7 +154,8 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         target: &target,
         explicit_target,
         filtered,
-        followed_by: followed_by.as_deref(),
+        followed_by: followed_by.as_ref().map(|f| f.people.as_slice()),
+        followed_by_at: followed_by.as_ref().map(|f| f.taken_at),
         followers: &followers_outcome,
         following: &following_outcome,
     };
@@ -155,6 +177,28 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
 /// Both lists have to be complete. The set commands only need the crossed-
 /// against list whole; here every one of the five counts leans on both lists,
 /// so a single missing account would bend the summary from partial to wrong.
+/// How this summary names the account it is about.
+///
+/// Filtered on both paths, for the reason `target::label` gives about the one
+/// that came off a keyboard: it is drawn, and `clean` only strips the at sign.
+/// Where a name came from decides whether it can be *trusted*, not whether a
+/// control character in it reaches a terminal — and this value reaches four of
+/// them: the `@{target}` heading in the markdown, the closing line on the
+/// terminal, a csv field, and an xlsx cell, where a character below 0x20 is not
+/// merely ugly but illegal XML.
+///
+/// A function of its own so that can be tested. It used to be a `match` inside
+/// `run`, where the arm for the name Instagram gave was filtered and the arm
+/// for the typed one was not.
+fn summary_target(typed: Option<&str>, viewer: &crate::app::Viewer) -> String {
+    match typed {
+        Some(raw) => printable(engine::target::clean(raw)),
+        None => viewer
+            .safe_username()
+            .unwrap_or_else(|| viewer.pk.to_string()),
+    }
+}
+
 fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     if outcome.is_complete() {
         return Ok(());
@@ -164,7 +208,7 @@ fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     // them at once.
     Err(report::refuse_incomplete(
         kind,
-        outcome.reason,
+        outcome,
         "they were not there at all",
     ))
 }
@@ -174,10 +218,29 @@ fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
 /// command prints with the same flags. The displayed totals are the sums of
 /// their regions, which keeps the identity true even if an account's
 /// attributes changed between the two walks.
+///
+/// Counted rather than collected. `sets::intersection` and `sets::difference`
+/// build a `Vec<User>`, and going through them here cloned both lists three times
+/// over — twelve thousand accounts on a six-thousand-follower run — to read three
+/// lengths off the results and drop them. The rule is unchanged: cross on the pk,
+/// then ask the filter, which is what `Filter::apply` does one account at a time.
 fn summarize(followers: &[User], following: &[User], filter: &Filter) -> ScanCounts {
-    let friends = filter.apply(sets::intersection(followers, following)).len();
-    let fans = filter.apply(sets::difference(followers, following)).len();
-    let unfollowers = filter.apply(sets::difference(following, followers)).len();
+    let in_following: HashSet<Pk> = following.iter().map(|u| u.pk).collect();
+    let in_followers: HashSet<Pk> = followers.iter().map(|u| u.pk).collect();
+
+    let friends = followers
+        .iter()
+        .filter(|u| in_following.contains(&u.pk) && filter.allows(u))
+        .count();
+    let fans = followers
+        .iter()
+        .filter(|u| !in_following.contains(&u.pk) && filter.allows(u))
+        .count();
+    let unfollowers = following
+        .iter()
+        .filter(|u| !in_followers.contains(&u.pk) && filter.allows(u))
+        .count();
+
     ScanCounts {
         followers: fans + friends,
         following: unfollowers + friends,
@@ -220,6 +283,9 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
                 "followed_by": summary.followed_by.map(|people| serde_json::json!({
                     "count": people.len(),
                     "accounts": people,
+                    // The one figure in this object that used to arrive without
+                    // a date, from a capture nothing here refreshes.
+                    "taken_at": summary.followed_by_at,
                 })),
                 "lists": {
                     "followers": list_object(summary.followers),
@@ -246,7 +312,7 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
     }))
 }
 
-/// "Followed by @ana, @luis and @eva and 2 others".
+/// "Followed by @ana, @luis, @eva and 2 others, as of 07/07 at 14:12".
 ///
 /// `None` when there is nobody to name, which includes both "you follow nobody
 /// who follows them" and "we have no stored list to check against". The
@@ -254,7 +320,14 @@ fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered
 /// summary is not the place to explain what is missing from it.
 fn followed_by_line(summary: &Summary<'_>) -> Option<String> {
     let people = summary.followed_by?;
-    people::name_a_few(people, NAMES_SHOWN).map(|names| format!("Followed by {names}"))
+    let names = report::name_a_few(people, NAMES_SHOWN)?;
+    // Dated, like the two walked lists below it. This one comes entirely out of
+    // storage and no flag walks it again, so the date is the only thing that
+    // tells a line worked out this minute from one built on last month's list.
+    Some(match summary.followed_by_at {
+        Some(taken_at) => format!("Followed by {names}, as of {}", report::stored_on(taken_at)),
+        None => format!("Followed by {names}"),
+    })
 }
 
 fn text_table(summary: &Summary<'_>, hints: bool) -> String {
@@ -265,8 +338,15 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         .map(|n| n.to_string().len())
         .max()
         .unwrap_or(1);
+    // No at sign, and this is the only string in the tree that hands one over
+    // to be typed back. AGENTS.md settles what happens next: `@` is
+    // PowerShell's splatting operator, so an unquoted `@someone` is gone before
+    // `main` runs and the tool cheerfully answers about the user's own account,
+    // with exit 0 and nothing to suggest a different question was asked. A name
+    // is accepted either way, so leaving it off is a hint that works in every
+    // shell rather than one that needs quoting explained next to it.
     let suffix = if summary.explicit_target {
-        format!(" @{}", summary.target)
+        format!(" {}", summary.target)
     } else {
         String::new()
     };
@@ -293,6 +373,25 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         rows.push(row);
     }
 
+    // When the two lists came out of storage, say so and say from when. The
+    // table carried provenance into csv, xlsx and json and left the human
+    // format — the one somebody actually reads — unable to tell a scan of five
+    // minutes ago from one of last month. `lists::print_summary` says it for a
+    // single list; this is the same sentence for a crossing.
+    //
+    // The older of the two dates, because a scan is only as recent as its
+    // staler half.
+    if summary.followers.source() == ResultSource::Cached
+        || summary.following.source() == ResultSource::Cached
+    {
+        rows.push(String::new());
+        rows.push(format!(
+            "{:<14}{}",
+            "Stored on:",
+            report::stored_on(summary.followers.taken_at.min(summary.following.taken_at))
+        ));
+    }
+
     let mut s = String::new();
     for row in rows {
         s.push_str(row.trim_end());
@@ -306,7 +405,18 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
 ///
 /// `followed_by` is the count alone: a cell holding a list of names is a cell
 /// the next tool has to parse, and the JSON output is where the names live.
-const ROW_HEADER: [&str; 8] = [
+///
+/// The last four are `scan` earning an exception rather than csv being fixed.
+/// This is the one command whose entire output is derived numbers with no
+/// account list to sanity-check them against, and its rows get appended to a
+/// tracking spreadsheet over time — where two rows taken from one snapshot are
+/// indistinguishable from two taken a month apart without a date beside them.
+/// `--format json` has carried this since it existed; the row formats did not.
+///
+/// `requests` is deliberately not among them, for the same reason `followed_by`
+/// is only a count: it is a cost of the run rather than a fact about the data,
+/// and it is already on standard error.
+const ROW_HEADER: [&str; 12] = [
     "target",
     "filtered",
     "followers",
@@ -315,6 +425,10 @@ const ROW_HEADER: [&str; 8] = [
     "fans",
     "unfollowers",
     "followed_by",
+    "followers_source",
+    "followers_taken_at",
+    "following_source",
+    "following_taken_at",
 ];
 
 /// The count of people in common, or an empty cell when the question could not
@@ -332,6 +446,12 @@ fn row_fields(summary: &Summary<'_>) -> Vec<String> {
             .map(|n| n.to_string())
             .unwrap_or_default(),
     );
+    for outcome in [summary.followers, summary.following] {
+        fields.push(source_token(outcome.source()).to_string());
+        // Epoch seconds, matching the JSON — not `report::stored_on`, which is
+        // "03/08 at 14:12": a human string, and one with no year in it.
+        fields.push(outcome.taken_at.to_string());
+    }
     fields
 }
 
@@ -350,6 +470,13 @@ fn row_cells(summary: &Summary<'_>) -> Vec<Cell> {
         Some(n) => Cell::Number(n as f64),
         None => Cell::Empty,
     });
+    for outcome in [summary.followers, summary.following] {
+        cells.push(Cell::Text(source_token(outcome.source()).to_string()));
+        // A spreadsheet can hold a real date, and a column of epoch integers in
+        // one is unreadable. This is the one place the row formats diverge, and
+        // `xlsx.rs`'s claim that the two answer alike says so.
+        cells.push(Cell::DateTime(outcome.taken_at));
+    }
     cells
 }
 
@@ -368,7 +495,7 @@ fn labeled(summary: &Summary<'_>) -> Vec<(&'static str, usize)> {
 
 fn list_object(outcome: &ListOutcome) -> serde_json::Value {
     serde_json::json!({
-        "source": source_token(outcome.source),
+        "source": source_token(outcome.source()),
         "taken_at": outcome.taken_at,
         "requests": outcome.requests,
     })
@@ -386,6 +513,34 @@ mod tests {
     use super::*;
     use snob_core::filters::Attribute;
     use snob_core::model::StopReason;
+    // Only the tests go through the set helpers now: `summarize` counts instead
+    // of collecting, and one of them checks the two still agree.
+    use snob_core::sets;
+
+    /// Both halves of the heading, because only one of them used to be
+    /// filtered.
+    ///
+    /// The typed name is not trusted input just because somebody typed it:
+    /// `snob scan $'gh\e[2K\e[A'` reaches the terminal summary, the markdown
+    /// heading and — the reason this is not merely cosmetic — an xlsx cell,
+    /// where a character below 0x20 is illegal XML rather than invisible.
+    #[test]
+    fn the_heading_is_filtered_whoever_the_name_came_from() {
+        let viewer = crate::app::Viewer {
+            pk: 7,
+            username: Some("me\u{1b}[2K".into()),
+        };
+
+        assert_eq!(summary_target(Some("@gh\u{1b}[2K"), &viewer), "gh[2K");
+        assert_eq!(summary_target(None, &viewer), "me[2K");
+
+        // No name learned yet, so the id stands in for one.
+        let nameless = crate::app::Viewer {
+            pk: 7,
+            username: None,
+        };
+        assert_eq!(summary_target(None, &nameless), "7");
+    }
 
     fn user(pk: u64, name: &str) -> User {
         User {
@@ -405,14 +560,35 @@ mod tests {
         }
     }
 
+    /// The one data row of a single-row csv, parsed into fields.
+    ///
+    /// Parsed rather than matched against a literal: the row gains columns, and
+    /// a test that pins the whole line has to be rewritten every time it does —
+    /// which is how it stops testing anything and starts being edited to pass.
+    fn csv_field_at(csv: &str) -> Vec<String> {
+        csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes())
+            .records()
+            .next()
+            .expect("a data row")
+            .expect("a readable row")
+            .iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     fn outcome() -> ListOutcome {
         ListOutcome {
-            source: ResultSource::Fetched,
+            provenance: engine::Provenance::Walked,
             reason: StopReason::Completed,
             requests: 3,
+            started_at: 1_722_699_000,
             taken_at: 1_722_700_000,
-            from_cooldown: false,
             account_pk: 1,
+            snapshot_id: 1,
+            stopped_by: None,
+            resumable: false,
         }
     }
 
@@ -427,6 +603,7 @@ mod tests {
             explicit_target,
             filtered: false,
             followed_by: None,
+            followed_by_at: None,
             followers: &outcomes.0,
             following: &outcomes.1,
         }
@@ -571,7 +748,30 @@ mod tests {
     fn the_hints_repeat_an_explicit_target() {
         let outcomes = (outcome(), outcome());
         let text = rendered_text(&summary(counts(), true, &outcomes), Format::Table, true);
-        assert!(text.contains("for details, run \"snob fans @someone\""));
+        assert!(text.contains("for details, run \"snob fans someone\""));
+    }
+
+    /// A hint is written to be typed back, and this is the only one in the tree
+    /// that carries a username.
+    ///
+    /// On PowerShell `@` is the splatting operator: an unquoted `@someone` is
+    /// gone before `main` runs, so the command answers about the reader's own
+    /// account with exit 0 and no sign that a different question was asked. The
+    /// row above it still shows the at sign, because that one is a label rather
+    /// than something to copy.
+    #[test]
+    fn the_hints_never_hand_over_an_unquoted_at_name() {
+        let outcomes = (outcome(), outcome());
+        let text = rendered_text(&summary(counts(), true, &outcomes), Format::Table, true);
+
+        for line in text.lines().filter(|l| l.contains("run \"snob ")) {
+            let command = line.split("run \"snob ").nth(1).unwrap();
+            assert!(
+                !command.contains('@'),
+                "a command written to be typed back carries an at sign: {line}"
+            );
+        }
+        assert!(text.contains("Account:      @someone"), "{text}");
     }
 
     /// The summary is counts, not accounts, so its row formats are one row
@@ -583,11 +783,21 @@ mod tests {
         let csv = rendered_text(&summary(counts(), false, &outcomes), Format::Csv, false);
         let lines: Vec<_> = csv.lines().collect();
         assert_eq!(lines.len(), 2, "{csv}");
+        // The header is the contract, so it is checked whole — and the first
+        // eight columns keep their positions, which is what stops the four new
+        // ones from being a break for anything already reading this.
+        assert_eq!(lines[0], ROW_HEADER.join(","));
         assert_eq!(
-            lines[0],
+            ROW_HEADER[..8].join(","),
             "target,filtered,followers,following,friends,fans,unfollowers,followed_by"
         );
-        assert_eq!(lines[1], "someone,false,301,136,104,197,32,");
+        // Indexed rather than compared whole: the row grew four columns and a
+        // literal would have to be rewritten every time it grows again.
+        let row = csv_field_at(&csv);
+        assert_eq!(row[0], "someone");
+        assert_eq!(row[1], "false");
+        assert_eq!(&row[2..7], ["301", "136", "104", "197", "32"]);
+        assert_eq!(row[7], "", "nobody looked, so the cell is empty");
 
         let md = rendered_text(&summary(counts(), false, &outcomes), Format::Md, false);
         assert!(md.contains("@someone"), "{md}");
@@ -640,6 +850,63 @@ mod tests {
         assert!(text.contains("Account:      @someone"), "{text}");
     }
 
+    /// The opening line dates itself, like everything else in this summary.
+    ///
+    /// It is worked out entirely from storage, and no flag walks it again —
+    /// `--refresh` walks the two lists of the account being scanned, not your
+    /// own following. Undated it read exactly like a line worked out this
+    /// minute while naming accounts unfollowed months ago, in the one place
+    /// `snob scan` opens with and nobody asked for.
+    #[test]
+    fn the_opening_line_says_which_capture_it_came_from() {
+        let outcomes = (outcome(), outcome());
+        let known = vec![user(1, "ana"), user(2, "luis")];
+        let dated = Summary {
+            followed_by_at: Some(1_720_360_320),
+            ..with_people(&outcomes, &known)
+        };
+
+        let text = rendered_text(&dated, Format::Table, false);
+        assert!(
+            text.starts_with(&format!(
+                "Followed by @ana and @luis, as of {}\n",
+                report::stored_on(1_720_360_320)
+            )),
+            "{text}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered_text(&dated, Format::Json, false)).unwrap();
+        assert_eq!(
+            json["followed_by"]["taken_at"].as_i64(),
+            Some(1_720_360_320),
+            "epoch seconds, the same unit the two lists answer in"
+        );
+    }
+
+    /// The row formats say the same thing about provenance that the JSON does.
+    /// `scan` is the one command whose whole output is derived numbers, so a
+    /// row appended to a tracking spreadsheet with no date beside it cannot be
+    /// told from one taken a month earlier.
+    #[test]
+    fn the_row_formats_carry_the_same_provenance_as_the_json() {
+        let outcomes = (outcome(), outcome());
+        let summary = summary(counts(), false, &outcomes);
+
+        let row = csv_field_at(&rendered_text(&summary, Format::Csv, false));
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered_text(&summary, Format::Json, false)).unwrap();
+
+        for (i, side) in [(8, "followers"), (10, "following")] {
+            assert_eq!(row[i], json["lists"][side]["source"].as_str().unwrap());
+            // Epoch seconds in both, so the two answer in one unit.
+            assert_eq!(
+                row[i + 1].parse::<i64>().unwrap(),
+                json["lists"][side]["taken_at"].as_i64().unwrap()
+            );
+        }
+    }
+
     /// Nobody in common is an answer, and it is not the same answer as having
     /// nothing to check against. The count says so; the line says nothing.
     #[test]
@@ -653,7 +920,11 @@ mod tests {
         assert!(text.starts_with("Account:"), "{text}");
 
         let csv = rendered_text(&summary, Format::Csv, false);
-        assert!(csv.lines().nth(1).unwrap().ends_with(",0"), "{csv}");
+        assert_eq!(
+            csv_field_at(&csv)[7],
+            "0",
+            "looked and found nobody, which is not the same as not having looked"
+        );
     }
 
     /// Not having looked is an empty cell, never a zero: a script must be able
@@ -664,7 +935,11 @@ mod tests {
         let unknown = summary(counts(), true, &outcomes);
 
         let csv = rendered_text(&unknown, Format::Csv, false);
-        assert!(csv.lines().nth(1).unwrap().ends_with(",32,"), "{csv}");
+        assert_eq!(
+            csv_field_at(&csv)[7],
+            "",
+            "not having looked is an empty cell, never a zero"
+        );
 
         let json = rendered_text(&unknown, Format::Json, false);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -697,7 +972,7 @@ mod tests {
         ];
         let md = rendered_text(&with_people(&outcomes, &known), Format::Md, false);
         assert!(
-            md.contains("Followed by @ana, @luis and @eva and 1 other"),
+            md.contains("Followed by @ana, @luis, @eva and 1 other"),
             "{md}"
         );
     }

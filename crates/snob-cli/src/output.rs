@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use snob_core::model::User;
+use snob_core::model::{User, printable};
 
 use crate::cli::Format;
 use crate::ui;
@@ -140,7 +140,18 @@ pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<(
 ///
 /// An existing file is never overwritten here. With `-o` the user picked the
 /// name and replacing it is their call; with this one they did not.
-pub fn default_path(stem: &str, extension: &str) -> Result<PathBuf> {
+///
+/// `in_dir` is where that check looks, and it is a parameter because it used to
+/// be the **process's** working directory. That is shared state: the test for
+/// this walked into a temporary directory with `set_current_dir` while a
+/// sibling in the same binary called it expecting to be somewhere else, and
+/// `cargo test` runs those on threads of one process. An unreproducible red
+/// build, and worse if a panic left the whole binary rooted in a tempdir that
+/// `TempDir::drop` then could not remove on Windows.
+///
+/// What comes back is still the bare name, because that is what gets printed
+/// and what the caller writes to.
+pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
     #[rustfmt::skip]
     const RESERVED: [&str; 24] = [
         "con", "prn", "aux", "nul", "conin$", "conout$",
@@ -162,14 +173,20 @@ pub fn default_path(stem: &str, extension: &str) -> Result<PathBuf> {
         && !RESERVED.contains(&device.as_str());
 
     if !usable {
+        // Filtered where it is quoted, not where it is checked: the test above
+        // has to see the name Instagram sent, and this sentence is printed to a
+        // terminal by `report::print_error`. Every name that fails the test for
+        // carrying a control character reaches exactly this line, so it was the
+        // one refusal guaranteed to hand one straight through.
         return Err(anyhow!(
-            "\"{stem}\" cannot be used as a file name here. \
-             Use -o to say where the result should go"
+            "\"{}\" cannot be used as a file name here. \
+             Use -o to say where the result should go",
+            printable(stem)
         ));
     }
 
     let name = format!("{stem}.{extension}");
-    if Path::new(&name).exists() {
+    if in_dir.join(&name).exists() {
         return Err(anyhow!(
             "{name} already exists here. Use -o to say where the result should go"
         ));
@@ -197,9 +214,20 @@ pub fn write(
 pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
     use std::fs::OpenOptions;
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Everything else this tool writes is 0600 or 0700 -- the session, the
+    // database, the directories -- and an export is a list of real people's
+    // names. It was the one file left at whatever the umask allowed, which on
+    // a shared machine is usually world-readable. Only for the name snob
+    // chooses; an explicit `-o` is the user's own decision about where their
+    // data goes, and `write_rendered` leaves that alone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .with_context(|| format!("could not create {}", path.display()))?;
     file.write_all(rendered.as_bytes())
@@ -223,10 +251,23 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
         None => {
             let stdout = std::io::stdout();
             let mut locked = stdout.lock();
-            locked
-                .write_all(rendered.as_bytes())
-                .context("could not write the result")?;
-            locked.flush().ok();
+            // Not `.ok()` on either call. Standard output is line-buffered, so
+            // at this point the tail of the result is still in the buffer and
+            // the flush is where a full disk reports itself. Discarded, `snob
+            // pfp someone > face.jpg` on a full filesystem printed nothing,
+            // exited 0, and left a truncated JPEG behind.
+            //
+            // A closed reader is the one exception, and it is not a failure:
+            // `snob followers | head -20` is a reader that has finished, and on
+            // Windows there is no SIGPIPE to end the process the way it does on
+            // Unix. Reporting "could not write the result" and exiting non-zero
+            // there would make a normal shell idiom look like an error.
+            for step in [locked.write_all(rendered.as_bytes()), locked.flush()] {
+                match step {
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    other => other.context("could not write the result")?,
+                }
+            }
         }
     }
     Ok(())
@@ -434,6 +475,12 @@ mod tests {
     /// anything the user typed.
     #[test]
     fn a_name_that_cannot_be_a_file_is_refused_rather_than_written() {
+        // An empty directory of its own, so nothing here depends on what
+        // happens to be next to the test binary or on where the suite was
+        // started from.
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path();
+
         for bad in [
             "nul",
             "CON",
@@ -453,31 +500,52 @@ mod tests {
             &"x".repeat(200),
         ] {
             assert!(
-                default_path(bad, "jpg").is_err(),
+                default_path(here, bad, "jpg").is_err(),
                 "{bad:?} should not become a file name"
             );
         }
         for good in ["someone", "some.one", "some_one", "user123"] {
-            assert!(default_path(good, "jpg").is_ok(), "{good:?} should be fine");
+            assert!(
+                default_path(here, good, "jpg").is_ok(),
+                "{good:?} should be fine"
+            );
         }
     }
 
+    /// The refusal every unusable name arrives at must not carry the name
+    /// through unfiltered.
+    ///
+    /// A control character is one of the things that makes a name unusable
+    /// here, so this refusal is where such a name always ends up — and it is
+    /// printed to a terminal. `snob pfp` takes the stem from what Instagram
+    /// sent, which is the side of the boundary nothing on this machine chose.
+    #[test]
+    fn the_refusal_does_not_print_the_name_it_is_refusing() {
+        let error = default_path(Path::new("."), "gh\u{1b}[2K\u{1b}[A", "jpg")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains('\u{1b}'), "{error:?}");
+        assert!(error.contains("gh[2K[A"), "{error:?}");
+    }
+
+    /// Nothing here moves the process's working directory. It used to: this
+    /// walked into a tempdir with `set_current_dir` while a sibling in the same
+    /// binary resolved relative paths expecting to be elsewhere, and `cargo
+    /// test` runs those on threads of one process.
     #[test]
     fn an_existing_file_is_not_overwritten_behind_the_users_back() {
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
         assert_eq!(
-            default_path("someone", "jpg").unwrap(),
+            default_path(dir.path(), "someone", "jpg").unwrap(),
             Path::new("someone.jpg")
         );
 
-        std::fs::write("someone.jpg", b"something already here").unwrap();
-        let error = default_path("someone", "jpg").unwrap_err().to_string();
+        std::fs::write(dir.path().join("someone.jpg"), b"something already here").unwrap();
+        let error = default_path(dir.path(), "someone", "jpg")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already exists"), "{error}");
-
-        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]

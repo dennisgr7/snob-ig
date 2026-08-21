@@ -1,11 +1,19 @@
 //! As much of the Chrome DevTools Protocol as capturing a login needs.
 //!
-//! The browser is launched by us, against a profile of ours, and hands its
-//! cookies over through its own debugging protocol. That is the line the
-//! project draws: we never read, copy or decrypt the browser's own cookie
-//! store. Since Chrome 127 that store is under App-Bound Encryption on Windows,
-//! and the only ways past it are process injection and direct syscalls —
-//! infostealer technique, not ours.
+//! **Nothing here touches the user's own browser, or the cookie store that
+//! belongs to it.** What this drives is a browser *this program started*,
+//! pointed at a profile directory under snob's own data directory — empty until
+//! the user logs into Instagram themselves, in the window that opens in front
+//! of them. The cookie then comes back from that browser, through the browser's
+//! own debugging protocol, and describes a session the user created a moment
+//! earlier.
+//!
+//! That boundary is deliberate, and it is where the project stops. Reading the
+//! real browser's store instead would mean defeating the encryption the
+//! operating system put around it — on Windows, App-Bound Encryption since
+//! Chrome 127 — which is the business credential-stealing malware is in. There
+//! is no need to go anywhere near it: a profile of our own answers the same
+//! question, with the user's knowledge, and that is the route taken.
 //!
 //! `Storage.getCookies` is the method that matters, because it returns
 //! `HttpOnly` cookies too. `sessionid` is `HttpOnly`, which is also why no
@@ -39,7 +47,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for someone to finish logging in. Generous on purpose:
 /// two-factor codes arrive by SMS and people go looking for their phone.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Gap between cookie checks.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -114,15 +122,31 @@ pub fn kill_launched() {
     }
 
     // No tokio here: this runs from a signal handler on its way to exit.
+    //
+    // **Both helpers are named by absolute path.** A bare name is resolved by
+    // search, and on Windows the first place searched is the *calling
+    // executable's own directory* -- not the working directory, not `PATH`.
+    // That was checked: a planted `taskkill.exe` beside `snob.exe` wins. This
+    // function runs from the panic hook and from the second Ctrl+C, which is
+    // exactly the moment a browser is up with a live session behind an open
+    // debugging port, and it is reachable by anybody who can write next to the
+    // binary -- a `snob.exe` run out of a downloads folder, a share, a USB
+    // stick.
     #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    {
+        let mut taskkill = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        );
+        taskkill.push(r"System32\taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 
     #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
+    let _ = std::process::Command::new("/bin/kill")
         .args(["-9", &pid.to_string()])
         .status();
 }
@@ -144,7 +168,7 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     let active_port = profile.join("DevToolsActivePort");
     let _ = std::fs::remove_file(&active_port);
 
-    let child = tokio::process::Command::new(&browser.path)
+    let mut child = tokio::process::Command::new(&browser.path)
         .arg(format!("--user-data-dir={}", profile.display()))
         // Port 0 means "pick a free one and write it down", which avoids both
         // colliding with something already on 9222 and handing a fixed port to
@@ -173,7 +197,7 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     // would make a later `kill_launched` shoot at whatever has since been given
     // that number. Every way out of this function clears it except the one that
     // hands the browser over to `Launched`.
-    let endpoint = match wait_for_endpoint(&active_port, cancel).await {
+    let endpoint = match wait_for_endpoint(&active_port, &mut child, profile, cancel).await {
         Ok(endpoint) => endpoint,
         Err(e) => {
             kill_launched();
@@ -183,25 +207,47 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     Ok(Launched { child, endpoint })
 }
 
-/// Both waits below are the same shape, and all three of their endings matter:
-/// found, gave up, ran out of time. They are written out rather than shared
-/// because an async closure holding the connection across the await does not
-/// survive the borrow checker, and eight duplicated lines are a better price
-/// than the contortion that would.
+/// Both waits below are the same shape, and every one of their endings matters:
+/// found, the browser exited, gave up, ran out of time. They are written out
+/// rather than shared because an async closure holding the connection across
+/// the await does not survive the borrow checker, and eight duplicated lines
+/// are a better price than the contortion that would.
 ///
 /// Reads the endpoint the browser wrote: the port on the first line and the
 /// path to the browser-level target on the second.
-async fn wait_for_endpoint(active_port: &Path, cancel: &CancelToken) -> Result<String> {
+async fn wait_for_endpoint(
+    active_port: &Path,
+    child: &mut tokio::process::Child,
+    profile: &Path,
+    cancel: &CancelToken,
+) -> Result<String> {
     let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
 
     loop {
         if cancel.is_canceled() {
             bail!("canceled");
         }
+        // The file first, then the child: a browser that wrote its endpoint and
+        // then exited still handed us a usable one.
         if let Ok(text) = std::fs::read_to_string(active_port)
             && let Some((port, path)) = parse_endpoint(&text)
         {
             return Ok(format!("ws://127.0.0.1:{port}{path}"));
+        }
+        // Chrome's profile singleton makes this ordinary rather than exotic: a
+        // second `snob login --browser` hands its command line to the instance
+        // already holding the profile and exits within a second. Watching only
+        // the port file meant waiting the full thirty seconds and then blaming
+        // the debugging port, which is the wrong problem — and holding a dead
+        // pid the whole time, which is what the comment above `LAUNCHED_PID`
+        // warns about.
+        if let Ok(Some(status)) = child.try_wait() {
+            // `try_wait` is what reaps the child, so this is the moment the
+            // number becomes reusable. Clearing it here also makes the
+            // `kill_launched()` in the caller's error arm a deliberate no-op
+            // rather than a shot at a stranger.
+            LAUNCHED_PID.store(0, std::sync::atomic::Ordering::Relaxed);
+            bail!("{}", died_early(status.code(), profile));
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
@@ -212,6 +258,35 @@ async fn wait_for_endpoint(active_port: &Path, cancel: &CancelToken) -> Result<S
         if cancel.sleep_or_cancel(Duration::from_millis(100)).await {
             bail!("canceled");
         }
+    }
+}
+
+/// What to say when the browser started and stopped again.
+///
+/// Split out so the wording can be read and changed without a browser: nothing
+/// about the branch above is testable without launching one, and `ExitStatus`
+/// cannot be constructed portably in a test anyway, so this takes the code.
+fn died_early(code: Option<i32>, profile: &Path) -> String {
+    match code {
+        // Exiting cleanly and immediately is the singleton: the browser handed
+        // its command line to the instance that already has this profile open.
+        Some(0) => format!(
+            "the browser closed straight away, which means one is already open on snob's \
+             profile at {}.\n\
+             Close that window and try again, or use \"snob login --paste\".",
+            profile.display()
+        ),
+        // No code at all means something killed it — a signal on Unix, an
+        // external terminate on Windows. Reporting that as the singleton sent
+        // people hunting for a window that was never open, and the profile path
+        // in the message made the wrong story convincing.
+        None => "the browser was killed before it opened its debugging port.\n\
+                 Try again, or use \"snob login --paste\"."
+            .to_string(),
+        Some(code) => format!(
+            "the browser exited with code {code} instead of starting.\n\
+             Try \"snob login --paste\" instead."
+        ),
     }
 }
 
@@ -395,6 +470,31 @@ pub async fn wait_for_login(cdp: &mut Cdp, cancel: &CancelToken) -> Result<Brows
 mod tests {
     use super::*;
 
+    /// A second `snob login --browser` hands its command line to the instance
+    /// already holding the profile and exits within a second. Waiting the full
+    /// thirty seconds and then talking about the debugging port described the
+    /// wrong problem entirely.
+    #[test]
+    fn a_browser_that_exited_cleanly_names_the_profile() {
+        let profile = Path::new("C:/somewhere/browser-profile");
+        let said = died_early(Some(0), profile);
+        assert!(said.contains("already open"), "{said}");
+        assert!(said.contains("browser-profile"), "{said}");
+        assert!(said.contains("--paste"), "{said}");
+        assert!(
+            !said.contains("did not open"),
+            "that is the startup timeout, a different failure: {said}"
+        );
+    }
+
+    /// A browser that failed to start is a different thing, and says so.
+    #[test]
+    fn a_browser_that_failed_reports_its_code() {
+        let said = died_early(Some(127), Path::new("/tmp/p"));
+        assert!(said.contains("127"), "{said}");
+        assert!(!said.contains("already open"), "{said}");
+    }
+
     #[test]
     fn it_reads_the_two_line_endpoint() {
         let (port, path) = parse_endpoint("54321\n/devtools/browser/abc-123\n").unwrap();
@@ -444,7 +544,7 @@ mod tests {
     /// Everything but `sessionid` is there from the moment the login page
     /// loads, so only `sessionid` means the login actually happened.
     #[test]
-    fn before_the_login_there_is_nothing_to_take() {
+    fn before_the_login_there_is_no_session_yet() {
         let cookies = vec![
             cookie("csrftoken", "tok", ".instagram.com"),
             cookie("mid", "m", ".instagram.com"),
@@ -462,7 +562,7 @@ mod tests {
     #[test]
     fn other_sites_are_left_alone() {
         let cookies = vec![
-            cookie("sessionid", "stolen", "notinstagram.com"),
+            cookie("sessionid", "someone-elses", "notinstagram.com"),
             cookie("sessionid", "also-not", "instagram.com.example.net"),
             cookie("sessionid", "nope", "example.com"),
         ];
@@ -470,5 +570,55 @@ mod tests {
 
         let real = vec![cookie("sessionid", "mine", "www.instagram.com")];
         assert_eq!(collect(&real).unwrap().sessionid.expose(), "mine");
+    }
+
+    /// Three different things happen when a launched browser is not there any
+    /// more, and they were reported as two.
+    ///
+    /// A clean immediate exit is Chrome's profile singleton: the second launch
+    /// handed its command line to the instance already holding the profile.
+    /// **No code at all is not that** — it means something killed the process —
+    /// and it used to share the singleton's sentence, so the message named a
+    /// profile and a window to close that had never been open.
+    ///
+    /// The wording is split out precisely so it can be read without launching a
+    /// browser: `ExitStatus` cannot be built portably in a test, so this takes
+    /// the code instead.
+    #[test]
+    fn what_killed_the_browser_decides_what_is_said() {
+        let profile = std::path::Path::new("/tmp/snob-profile");
+
+        let killed = died_early(None, profile);
+        assert!(killed.contains("killed"), "{killed}");
+        assert!(
+            !killed.contains("already open"),
+            "there is no window to close: {killed}"
+        );
+
+        let failed = died_early(Some(3), profile);
+        assert!(failed.contains("code 3"), "{failed}");
+    }
+
+    /// Every line of these has to start where the terminal puts it. The two
+    /// literals carried the source's own newline and indentation inside the
+    /// string, so the message came out with a fourteen-space gap in the middle
+    /// of a sentence and a thirteen-space hanging indent -- which
+    /// `report::indented` then widened by seven more.
+    #[test]
+    fn the_browser_messages_have_no_source_indentation_in_them() {
+        let profile = std::path::Path::new("/tmp/snob-profile");
+        for message in [
+            died_early(Some(0), profile),
+            died_early(None, profile),
+            died_early(Some(3), profile),
+        ] {
+            assert!(
+                !message.contains("  "),
+                "a run of spaces survived: {message:?}"
+            );
+            for line in message.lines() {
+                assert!(!line.starts_with(' '), "a line is indented: {line:?}");
+            }
+        }
     }
 }

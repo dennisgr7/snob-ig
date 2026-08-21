@@ -9,7 +9,7 @@
 *.sqlite
 .env
 session.json
-/exports/
+exports/
 
 # Scratch notes, if any ever land here. The instruction document is AGENTS.md,
 # which is tracked.
@@ -18,8 +18,23 @@ session.json
 # Agent and editor scratch
 .claude/
 
-# Output the tool itself produces, if it lands in the repo root
+# Output the tool itself produces, if it lands in the repo root.
+#
+# All six extensions `output.rs` can write, not four. `.json` was the one
+# missing, and it is the one that matters: `snob lists -o out.json` from here
+# leaves a file full of real names, and `tests/common/mod.rs` already skips
+# `exports/` for exactly that reason. Root-anchored, so the tracked
+# `bucket/snob.json` is untouched; the negations are for the four documents
+# that live at the root and are meant to be tracked.
 /*.xlsx
 /*.csv
 /*.jpg
 /*.png
+/*.json
+/*.ndjson
+/*.jsonl
+/*.md
+!/README.md
+!/CHANGELOG.md
+!/AGENTS.md
+!/CLAUDE.md

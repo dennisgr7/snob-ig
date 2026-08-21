@@ -1,0 +1,57 @@
+# What CI checks Cargo.lock for. Run the same thing locally with
+# `cargo deny check advisories sources` — not a bare `cargo deny check`, which
+# runs all four and fails on the two the note below says are off on purpose.
+#
+# Two checks are on, and the two that are not are left off on purpose:
+#
+# - `licenses` needs an allow-list this tree does not yet have. It is not just
+#   MIT and Apache-2.0: `option-ext` is MPL-2.0, `webpki-root-certs` is
+#   CDLA-Permissive-2.0, `zlib-rs` is Zlib, and `aws-lc-sys` carries a
+#   seven-clause expression. A naive list fails on all of them at once, and a
+#   check that has to be silenced on its first run is a check nobody trusts.
+# - `bans` would flag eleven duplicate major versions that arrive through
+#   dependencies this project does not control. As a gate it would be
+#   permanently red; it belongs at `warn` first, and only after somebody has
+#   read the list.
+
+# **Audit the graph that ships, not every graph that could exist.**
+#
+# Without this, cargo-deny resolves for every target and every kind, which here
+# meant 367 crates against the 297 that ever compile on a released one: the
+# whole `openssl` stack, `ring`, `quinn`, all of `wasm-bindgen`, `jni`, and
+# `wiremock` with its tree. Two of the extras are the reason `licenses` is off
+# below — `openssl-sys`'s expression and `webpki-root-certs`'s
+# CDLA-Permissive-2.0 both leave with them — and duplicate majors drop from 22
+# to 15, so the eleven the note below mentions was already stale in the
+# direction that made the check look worse than it is.
+#
+# The five triples are the ones `release.yml` builds. A sixth target added
+# there has to be added here, or its dependencies are audited by nobody.
+[graph]
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+]
+exclude-dev = true
+
+[advisories]
+version = 2
+# `workspace` rather than the `all` that `version = 2` defaults to. An
+# unmaintained advisory against any transitive crate — something nobody here
+# chose and often nobody can change — would otherwise turn the Monday cron red
+# and keep it red, which is how an advisory gate comes to be ignored and then
+# switched off. What this project can act on is what it depends on directly.
+unmaintained = "workspace"
+yanked = "deny"
+# Every entry here needs a comment saying why and when it stops applying.
+# An ignore list without them is how this check gets switched off entirely,
+# which is the same failure the language guard is warned about.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

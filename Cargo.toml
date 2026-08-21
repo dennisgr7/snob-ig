@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/snob-ig", "crates/snob-core", "crates/snob-cli"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -18,19 +18,37 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
-# No `webpki-roots`: in reqwest 0.13 the feature only turns on an optional
-# dependency that nothing in reqwest references, so it was a crate compiled for
-# no one. Verification goes through `rustls-platform-verifier`, the operating
-# system's own trust store, which is the right answer on a desktop anyway.
+# The TLS backend is **not** listed here. It is chosen per platform, in
+# crates/snob-ig/Cargo.toml, and the reason is written out there.
 # No `cookies`: nothing here keeps a cookie jar — the session travels as an
 # explicit header, and the CDN must never receive it. Leaving the feature on
 # meant a later `.cookie_store(true)` would silently start carrying cookies
 # across redirects; without it, that becomes a compile error. It also drops ten
 # crates from the tree.
-# `brotli` and `zstd` alongside `gzip` are not about speed: Chrome advertises
-# `gzip, deflate, br, zstd`, and a client that in 2026 announces gzip alone is
-# an anomaly that costs one line to remove.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip", "brotli", "zstd"] }
+# `http2` is not optional and not a performance choice: Instagram answers 429 to
+# HTTP/1.1 on these endpoints from some hosts and networks where the same
+# request over h2 succeeds, and a browser always negotiates h2 against
+# instagram.com. Both TLS backends below advertise `h2` through ALPN.
+# No `charset`: it exists to serve `Response::text()` and `text_with_charset`,
+# and nothing here calls either — the two read paths go through `chunk()` and
+# `from_utf8_lossy` on purpose, so that a body's size is bounded before it is
+# decoded. It was compiling `encoding_rs`, most of which is character tables,
+# for no one.
+# The four decoders are not about speed. Chrome advertises
+# `gzip, deflate, br, zstd`, the client sends exactly that string, and a codec
+# may only be advertised if it can be decoded — announcing one and then failing
+# to read the answer is worse than not announcing it. `deflate` was the one
+# missing, so the header did not match the comment that asked for it.
+
+reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "gzip", "deflate", "brotli", "zstd"] }
+# Depended on only to turn one feature back on. reqwest declares rustls with
+# `default-features = false`, which drops `prefer-post-quantum` — and without it
+# the client advertises the hybrid group X25519MLKEM768 in `supported_groups`
+# and then sends a plain X25519 key share. Announcing a group you have not
+# offered a share for is what a HelloRetryRequest is for, and it is not what
+# Chrome does: Chrome puts the hybrid first and sends its share. Enabling it
+# costs about a kilobyte on the handshake.
+rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 clap = { version = "4", features = ["derive"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.
@@ -60,17 +78,51 @@ url = "2"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 base64 = "0.23"
+# Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
+# backends are optional features and stay off, which is what makes these build
+# on Windows ARM64 -- the target that has no LLVM and is the reason the TLS
+# backend is chosen per platform. `ring` and `aws-lc-rs` are the obvious
+# alternatives and are exactly the two crates that do not build there.
+# On Linux both are already in the tree, through the keyring's Secret Service
+# backend; on Windows and macOS they are a few hundred lines of new code.
+# The monitor's configuration file. Reading only: the file is written by hand
+# from a template, because a serializer cannot put the reason for a value next
+# to it and this project puts the reason next to the thing it governs.
+# `default-features = false` drops the serializing half and `toml_edit` with it.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+hmac = "0.12"
+sha2 = { version = "0.10", default-features = false }
+# Already in the tree under `url`, so this costs no extra compilation. Used to
+# put a username into the profile address. Encoding rather than filtering,
+# because filtering removes characters and a name with one removed is the
+# address of a different account; the reasoning is on `User::profile_url`.
+percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization"] }
 
 # Test-only
 wiremock = "0.6"
 tempfile = "3"
 
 [profile.release]
-opt-level = 3
+# `"s"` rather than `3`, and the numbers are from this program rather than from
+# folklore. It takes 1,790,464 bytes off the Windows ARM64 binary -- 23.7%, and
+# 847,648 off every download -- and builds faster. What it costs, measured on
+# the commands where CPU is the wall clock: csv +1.4%, json +3.4%, ndjson and
+# markdown +6.0%, xlsx +7.7%. In absolute terms the worst case is 22 ms on a
+# 285 ms export.
+#
+# Nothing on a walk is affected, because a walk is not compute: the client's own
+# CPU for a twelve-thousand-follower walk is 0.69 s against about fifteen
+# minutes of deliberate pacing. That is the ratio every optimization decision in
+# this file has to be read against.
+#
+# `"z"` is the wrong end of the curve -- 493 KB smaller again for csv +27% and
+# xlsx +42% -- and an `opt-level = 3` carve-out for `libsqlite3-sys` costs most
+# of the win back for work that is already measured in milliseconds.
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true

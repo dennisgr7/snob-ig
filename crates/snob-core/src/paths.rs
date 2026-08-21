@@ -74,10 +74,10 @@ impl AppPaths {
         }
     }
 
-    /// Where configuration **would** live. Nothing writes there yet, and the
-    /// directory is deliberately not created until something does: an empty
-    /// folder in the user's roaming profile is litter, and this tool left one
-    /// on every machine it ran on.
+    /// Where configuration lives: `watch.toml`, written by `snob watch setup`.
+    /// The directory is not created until something writes to it, because an
+    /// empty folder in the user's roaming profile is litter and this tool left
+    /// one on every machine it ran on.
     pub fn config_dir(&self) -> &Path {
         &self.config
     }
@@ -100,6 +100,22 @@ impl AppPaths {
         self.legacy_data.as_ref().map(|d| d.join("session.json"))
     }
 
+    /// Every file a session can be sitting in, for the same reason
+    /// [`Self::owned_dirs`] exists: the list is assembled here so that a
+    /// location added later cannot be forgotten by one of the callers whose
+    /// whole job is to leave no live cookie behind.
+    ///
+    /// Both `SecretStore::save` and `SecretStore::delete` walk it. `save` is on
+    /// the list because `load` checks the keyring first, so once an entry exists
+    /// the rescue path that would have found the legacy file is never reached
+    /// again and an older account's cookie stays in the roaming profile.
+    pub fn session_files(&self) -> Vec<PathBuf> {
+        [Some(self.session_file()), self.legacy_session_file()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Browser profile used by `snob login`. Never the user's real profile.
     pub fn browser_profile(&self) -> PathBuf {
         self.data.join("browser-profile")
@@ -109,8 +125,8 @@ impl AppPaths {
     ///
     /// Assembled here rather than by the command so that a directory added
     /// later cannot be forgotten by the one command whose whole job is to leave
-    /// nothing behind. The configuration directory is on the list even though
-    /// nothing writes there yet, for that same reason.
+    /// nothing behind -- the configuration directory included, which is where
+    /// `watch.toml` goes.
     ///
     /// Deduplicated, because on macOS the configuration and data directories
     /// are the same path: listed twice, the second removal would fail on a
@@ -134,13 +150,24 @@ impl AppPaths {
 
     /// Creates what the tool actually writes to.
     ///
-    /// Only the data directory: there is no configuration file, so creating a
-    /// folder for one leaves an empty directory in the roaming profile of every
-    /// machine this has ever run on. When configuration arrives, whatever
-    /// writes it creates its own directory.
+    /// Only the data directory. There **is** a configuration file --
+    /// `snob watch setup` writes one -- but that command creates the directory
+    /// itself, because creating it for everybody leaves an empty folder in the
+    /// roaming profile of every machine this has ever run on.
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         create_private_dir(&self.data)
     }
+}
+
+/// The folder name every path here is built from.
+///
+/// Exposed so that a caller recognizing one of our own directories compares
+/// against the value `ProjectDirs` was given rather than against a copy of it.
+/// `snob purge` needs exactly that, and a second spelling of this string is one
+/// that stops matching the day the application is renamed — silently, because
+/// the guard simply never fires again.
+pub fn app_dir_name() -> &'static str {
+    APPLICATION
 }
 
 /// Whether a directory is plausible as one of ours, and so may be deleted whole.
@@ -199,8 +226,14 @@ mod tests {
         assert!(paths.browser_profile().starts_with(paths.data_dir()));
     }
 
-    /// Only what gets written to. A directory for a configuration file that
-    /// does not exist is litter left on every machine the tool runs on.
+    /// Only what gets written to. A directory for a configuration file nobody
+    /// has written is litter left on every machine the tool runs on.
+    ///
+    /// There *is* a configuration file now — `snob watch setup` writes one —
+    /// and this still holds, because that command creates the directory itself
+    /// rather than `ensure_dirs` creating it for everybody. Somebody who never
+    /// runs the monitor still gets no empty folder in their roaming profile,
+    /// which is what this has always been about.
     #[test]
     fn only_the_data_directory_is_created() {
         let tmp = tempfile::tempdir().unwrap();
@@ -210,7 +243,7 @@ mod tests {
         assert!(paths.data_dir().is_dir());
         assert!(
             !paths.config_dir().exists(),
-            "nothing writes configuration yet, so nothing should create its home"
+            "the directory belongs to whatever writes configuration, not to every run"
         );
     }
 
@@ -247,6 +280,11 @@ mod tests {
             paths.session_file(),
             paths.browser_profile(),
             paths.legacy_session_file().unwrap(),
+            // The configuration file. Written since `snob watch setup` landed,
+            // and missing from this list until it was: taking `self.config` out
+            // of `owned_dirs` left `watch.toml` in the user's roaming profile
+            // after `snob purge`, and nothing here noticed.
+            crate::watch::config::path(&paths),
         ] {
             assert!(
                 owned.iter().any(|dir| path.starts_with(dir)),

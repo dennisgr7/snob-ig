@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(s.ds_user_id, 42);
         assert_eq!(s.csrftoken.as_ref().map(Secret::expose), Some("tok"));
         assert_eq!(
-            s.cookie_header(),
+            s.cookie_header().as_str(),
             "sessionid=42%3AAbCd%3A20; ds_user_id=42; csrftoken=tok; mid=mid; ig_did=did"
         );
     }

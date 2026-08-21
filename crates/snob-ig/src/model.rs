@@ -23,12 +23,6 @@ pub struct UserSummary {
     pub profile_pic_url: Option<String>,
 }
 
-impl UserSummary {
-    pub fn profile_url(&self) -> String {
-        format!("https://www.instagram.com/{}/", self.username)
-    }
-}
-
 /// From the wire format to the domain one. The conversion lives here because it
 /// is the only direction the dependencies allow: `snob-core` does not know
 /// about `snob-ig`.
@@ -62,10 +56,6 @@ pub struct FriendshipsPage {
     /// Cursor to the next page. Absent or empty means the list is done.
     #[serde(default)]
     pub next_max_id: Option<String>,
-    /// What Instagram claims the total is. Useful for estimating progress and
-    /// nothing else: there are documented cases of it lying.
-    #[serde(default)]
-    pub big_list: Option<bool>,
 }
 
 impl FriendshipsPage {

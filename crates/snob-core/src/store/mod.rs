@@ -6,15 +6,18 @@
 //! version of `rusqlite` we use.
 
 pub mod accounts;
+pub mod deliveries;
 pub mod migrations;
 pub mod rate_budget;
 pub mod snapshots;
 pub mod users;
+pub mod watch;
 
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite_migration::Migrations;
 use thiserror::Error;
 
 use crate::Pk;
@@ -33,6 +36,34 @@ pub enum StoreError {
          longer compatible.\nDelete that file and run the command again."
     )]
     OutdatedSchema { path: String },
+    /// The other direction, and the one that is reachable today.
+    ///
+    /// v0.1.1 is tagged and installed through Scoop and Homebrew with one
+    /// migration while this branch writes eight, so a downgrade -- or a
+    /// leftover `~/.cargo/bin/snob` earlier on the `PATH` -- meets a database
+    /// it cannot read. Without this the user gets
+    /// `rusqlite_migration`'s own wording, "Attempt to migrate a database with
+    /// a migration number that is too high", about a file they have no reason
+    /// to think is broken; the plausible response is deleting it, which throws
+    /// away every capture and every mark.
+    #[error(
+        "the database at {path} was written by a newer version of snob: it is at schema \
+         {found} and this build knows {known}.\nUpgrade snob, or point this one at a \
+         different data directory."
+    )]
+    SchemaFromNewerSnob {
+        path: String,
+        found: i64,
+        known: usize,
+    },
+    /// A page arrived for a walk this process no longer holds.
+    ///
+    /// Its own variant rather than a [`StoreError::Data`] string because it is
+    /// the one store error that is not a fault: another process decided this
+    /// walk had been abandoned and adopted it, and the honest response is to
+    /// stop rather than to write a second stream of pages into one capture.
+    #[error("another process took over this walk")]
+    ClaimTaken,
     #[error("{0}")]
     Data(String),
 }
@@ -79,7 +110,8 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
         reject_outdated_schema(&conn, path)?;
-        migrations::MIGRATIONS.to_latest(&mut conn)?;
+        reject_newer_schema(&conn, path)?;
+        migrate(&mut conn, &migrations::MIGRATIONS)?;
         Ok(Self { conn })
     }
 
@@ -88,7 +120,7 @@ impl Store {
     pub fn in_memory() -> Result<Self, StoreError> {
         let mut conn = Connection::open_in_memory()?;
         configure(&conn)?;
-        migrations::MIGRATIONS.to_latest(&mut conn)?;
+        migrate(&mut conn, &migrations::MIGRATIONS)?;
         Ok(Self { conn })
     }
 
@@ -103,12 +135,100 @@ impl Store {
     }
 }
 
+/// Runs the migration chain with foreign keys out of the way.
+///
+/// This is the **only** place they can be turned off for a migration.
+/// `rusqlite_migration` runs the whole chain inside one transaction, and SQLite
+/// documents `PRAGMA foreign_keys` as a no-op inside one — so a migration that
+/// writes the pragma itself, the way SQLite's own table-rebuild recipe says to,
+/// would look correct and do nothing.
+///
+/// What that costs is not a failed migration, it is silent data loss. The first
+/// migration to rebuild `snapshots` by create-copy-drop-rename would have its
+/// `DROP TABLE` fire `ON DELETE CASCADE` on `snapshot_members` and empty it.
+/// The rebuilt snapshots still read `complete = 1`, so `usable_snapshots` keeps
+/// serving them, `members()` returns nothing, and `snob unfollowers` reports
+/// everyone you follow as an unfollower.
+///
+/// It takes the migrations rather than reaching for the static so that a test
+/// can run its own chain through the very function production uses. Checking
+/// this against a hand-written copy of the wrapping would prove nothing.
+fn migrate(conn: &mut Connection, migrations: &Migrations<'_>) -> Result<(), StoreError> {
+    let before = user_version(conn).unwrap_or(0);
+
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let outcome = migrations.to_latest(conn);
+    // Back on even if the chain failed: the connection is handed back to the
+    // caller either way, and `open_at` only stops on the `?` below.
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    outcome?;
+
+    // **Once, and only when a migration actually ran.**
+    //
+    // `DROP INDEX` moves the index's pages to the freelist; the file only
+    // shrinks on `VACUUM`, and on the index 010 removes that is 42% of it.
+    // `VACUUM` cannot run inside a transaction, so it cannot live in the
+    // migration, and it rewrites the whole file, so it must not run on every
+    // open — hence the version comparison rather than a flag somebody has to
+    // remember to clear.
+    //
+    // Best-effort. A database that could not be compacted is a database that
+    // works and takes more disk, which is not worth failing an open over: the
+    // space comes back on the next migration, or never, and either way the
+    // user's command runs.
+    if user_version(conn).unwrap_or(0) > before
+        && let Err(e) = conn.execute_batch("VACUUM")
+    {
+        tracing::debug!(error = %e, "the database could not be compacted after migrating");
+    }
+
+    Ok(())
+}
+
+/// One remembered value, from the `meta` table.
+///
+/// The table has existed since the first migration and nothing had ever read
+/// or written it. It is for facts about the database itself rather than about
+/// an account -- the first of them being when retention last ran.
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// What the migration runner counts up to. `0` on a database that has none.
+fn user_version(conn: &Connection) -> Result<i64, StoreError> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
 /// Settings that have to be applied on every open.
 ///
 /// `journal_mode` is the exception: it is written into the file header and
-/// persists across opens. The rest are per connection, and `foreign_keys` in
-/// particular defaults to off, so without this the schema's foreign keys would
-/// be decorative.
+/// persists across opens. The rest are per connection.
+///
+/// `foreign_keys` is deliberately **not** here: it belongs around the migration
+/// run, which is the one thing that needs it off, and [`migrate`] leaves it on
+/// afterwards. (The bundled SQLite is compiled with
+/// `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so in this binary it is on before anyone
+/// asks — but the schema's foreign keys are load-bearing, so it is set rather
+/// than assumed.)
+///
+/// Also called by `SqliteRateBudget::open`, which opens its own connection to
+/// the same file and would otherwise miss every protection below. It overrides
+/// `synchronous` afterwards, and says there why.
 fn configure(conn: &Connection) -> Result<(), StoreError> {
     conn.busy_timeout(Duration::from_millis(5_000))?;
 
@@ -117,9 +237,35 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
     let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
 
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    // Not only a speed setting. Without it SQLite may spill a temporary
+    // b-tree into TMPDIR, which is outside every directory `purge` knows
+    // about — so a query's working copy of the follower list would outlive
+    // the command whose whole job is to leave nothing behind.
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "cache_size", -8_000)?; // 8 MiB
+
+    // Deleted rows are overwritten rather than merely unlinked from the page.
+    // This is what any pruning inside the file needs — `delete_partials` on
+    // every walk today, and whatever the monitor ends up expiring: they remove
+    // content without removing the file, and the default leaves it legible in
+    // the freed pages. A database of a few megabytes does not notice the cost.
+    // (`logout` used to be named here. It never opens the database: it takes
+    // the session and the browser profile, and `purge` deletes the file whole.)
+    conn.pragma_update(None, "secure_delete", "ON")?;
+
+    // In WAL mode the log is reused rather than truncated, so it keeps the
+    // pre-image of everything `secure_delete` just scrubbed from the database
+    // proper. Bounding it bounds how much of that history survives.
+    conn.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
+
+    // Nothing here uses a virtual table or a function inside the schema, so
+    // this costs nothing — and it is SQLite's own advice for any application
+    // that can manage without them, because the schema of a database file is
+    // executable content and this file sits at a fixed, guessable path.
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+
     Ok(())
 }
 
@@ -128,6 +274,27 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
 /// The schema version is 1 in both, so the migration runner would consider it
 /// up to date and every query would then fail with a cryptic SQL error. The
 /// missing view is the cheapest tell.
+/// Refuses a database written by a **newer** build, before the migration runner
+/// says so in its own words.
+///
+/// `rusqlite_migration` answers "Attempt to migrate a database with a migration
+/// number that is too high", wrapped in "could not apply migrations", which
+/// reads as an internal fault in a library the user has never heard of. It is
+/// reachable with no hypothetical build at all: v0.1.1 ships one migration and
+/// this branch writes eight.
+fn reject_newer_schema(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let known = migrations::COUNT;
+    if found as usize > known {
+        return Err(StoreError::SchemaFromNewerSnob {
+            path: path.display().to_string(),
+            found,
+            known,
+        });
+    }
+    Ok(())
+}
+
 fn reject_outdated_schema(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {
@@ -151,6 +318,8 @@ fn reject_outdated_schema(conn: &Connection, path: &Path) -> Result<(), StoreErr
 
 #[cfg(test)]
 mod tests {
+    use rusqlite_migration::M;
+
     use super::*;
 
     #[test]
@@ -187,8 +356,8 @@ mod tests {
         assert!(result.is_err(), "STRICT is not active");
     }
 
-    /// Proves foreign_keys=ON applied: it defaults to off, which would leave
-    /// the foreign keys decorative.
+    /// Proves the foreign keys are live once the store is open. `migrate` turns
+    /// them off for the chain and has to turn them back on.
     #[test]
     fn foreign_keys_are_enforced() {
         let db = Store::in_memory().unwrap();
@@ -197,6 +366,91 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "foreign_keys is not active");
+    }
+
+    /// A migration that rebuilds a table must not take the rows of the tables
+    /// that reference it.
+    ///
+    /// SQLite's own recipe for changing a table is create-copy-drop-rename, and
+    /// with foreign keys on, the `DROP` fires `ON DELETE CASCADE` on every
+    /// child. Here that is `snapshot_members`. The migration would succeed, the
+    /// rebuilt snapshots would still read `complete = 1`, `usable_snapshots`
+    /// would keep serving them, and `snob unfollowers` would report everyone
+    /// you follow as an unfollower.
+    ///
+    /// A migration cannot protect itself: the chain runs in one transaction and
+    /// SQLite makes `PRAGMA foreign_keys` a no-op inside one. So this drives the
+    /// real `migrate`, with a second migration shaped like the one somebody will
+    /// eventually write.
+    #[test]
+    fn a_migration_that_rebuilds_a_table_keeps_its_children() {
+        // The view has to go first and come back afterwards: SQLite checks
+        // every view when a table is renamed, and `usable_snapshots` selects
+        // from `snapshots`. Worth knowing before writing the real 002.
+        let rebuild_snapshots = "
+            DROP VIEW usable_snapshots;
+            CREATE TABLE snapshots_new (
+              id             INTEGER PRIMARY KEY,
+              account_pk     INTEGER NOT NULL REFERENCES accounts(pk) ON DELETE CASCADE,
+              kind           TEXT    NOT NULL,
+              source         TEXT    NOT NULL DEFAULT 'live',
+              started_at     INTEGER NOT NULL,
+              taken_at       INTEGER,
+              complete       INTEGER NOT NULL DEFAULT 0,
+              member_count   INTEGER NOT NULL DEFAULT 0,
+              declared_count INTEGER,
+              pages          INTEGER NOT NULL DEFAULT 0,
+              requests       INTEGER NOT NULL DEFAULT 0,
+              next_cursor    TEXT,
+              resumes        INTEGER NOT NULL DEFAULT 0,
+              stopped_by     TEXT
+            ) STRICT;
+            INSERT INTO snapshots_new SELECT
+              id, account_pk, kind, source, started_at, taken_at, complete,
+              member_count, declared_count, pages, requests, next_cursor,
+              resumes, stopped_by FROM snapshots;
+            DROP TABLE snapshots;
+            ALTER TABLE snapshots_new RENAME TO snapshots;
+            CREATE VIEW usable_snapshots AS
+              SELECT * FROM snapshots WHERE complete = 1 AND taken_at IS NOT NULL;";
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+
+        // The database as it is today, with one snapshot and one member in it.
+        let first = Migrations::new(vec![M::up(include_str!("sql/001_initial.sql"))]);
+        migrate(&mut conn, &first).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (pk, username, first_seen, last_seen) VALUES (1, 'someone', 0, 0);
+             INSERT INTO accounts (pk, is_self, added_at) VALUES (1, 1, 0);
+             INSERT INTO snapshots (id, account_pk, kind, source, started_at, taken_at, complete)
+               VALUES (1, 1, 'followers', 'live', 0, 0, 1);
+             INSERT INTO snapshot_members (snapshot_id, user_pk, ordinal) VALUES (1, 1, 0);",
+        )
+        .unwrap();
+
+        let second = Migrations::new(vec![
+            M::up(include_str!("sql/001_initial.sql")),
+            M::up(rebuild_snapshots),
+        ]);
+        migrate(&mut conn, &second).unwrap();
+
+        let members: i64 = conn
+            .query_row("SELECT count(*) FROM snapshot_members", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            members, 1,
+            "the rebuild cascaded the members away and left the snapshot claiming to be complete"
+        );
+
+        // And the keys are live again afterwards, or the next write is unguarded.
+        let orphan = conn.execute(
+            "INSERT INTO snapshot_members (snapshot_id, user_pk, ordinal) VALUES (999, 999, 0)",
+            [],
+        );
+        assert!(orphan.is_err(), "migrate left foreign_keys off");
     }
 
     #[test]
@@ -232,5 +486,46 @@ mod tests {
         };
         assert!(matches!(error, StoreError::OutdatedSchema { .. }));
         assert!(error.to_string().contains("Delete that file"));
+    }
+
+    /// A database from a newer snob says so, rather than letting the migration
+    /// runner say it in its own words.
+    ///
+    /// Reachable with no hypothetical build: v0.1.1 is tagged and installed
+    /// through Scoop and Homebrew with one migration while this branch writes
+    /// eight, so a downgrade — or a leftover `~/.cargo/bin/snob` earlier on the
+    /// `PATH` — meets a file it cannot read. What came out was "could not apply
+    /// migrations: … Attempt to migrate a database with a migration number that
+    /// is too high", which reads as an internal fault in a library the user has
+    /// never heard of, about a file they have no reason to think is broken. The
+    /// plausible response is deleting it, and that throws away every capture and
+    /// every mark.
+    #[test]
+    fn a_database_from_a_newer_snob_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ahead.db");
+
+        // A real database, then wound forward the way a newer build would leave
+        // it. The view has to be there or the *older*-schema check fires first.
+        Store::open_at(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", (migrations::COUNT + 3) as i64)
+                .unwrap();
+        }
+
+        let Err(error) = Store::open_at(&path) else {
+            panic!("a database from a newer snob should be refused");
+        };
+        assert!(
+            matches!(error, StoreError::SchemaFromNewerSnob { .. }),
+            "{error}"
+        );
+        let said = error.to_string();
+        assert!(said.contains("newer version of snob"), "{said}");
+        assert!(
+            !said.contains("Delete"),
+            "deleting it throws away every capture: {said}"
+        );
     }
 }

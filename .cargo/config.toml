@@ -1,0 +1,31 @@
+# Build settings that belong to the repository rather than to a profile.
+#
+# **A `RUSTFLAGS` environment variable replaces what is here rather than merging
+# with it.** Anything else that ever wants a rustflag -- the `--remap-path-prefix`
+# a reproducible build needs, for instance -- has to be added to these tables,
+# not exported alongside them, or it silently switches the static CRT back off.
+#
+# And note what this file does not reach: `cargo install --git`, which is the
+# from-source line in the README, does not read the repository's configuration
+# at all. The five published binaries are built here, so they get it; somebody
+# building their own does not.
+
+# Link the C runtime statically on both Windows targets.
+#
+# The README says "One binary, no runtime, nothing to install alongside it"
+# twice and AGENTS.md says "Single binary, no runtime". Without this both
+# Windows binaries import VCRUNTIME140.dll, which is not part of Windows -- it
+# comes from the Visual C++ redistributable. On a machine that has never had it,
+# snob.exe fails in the loader before `main`, with an error that names neither
+# snob nor the missing package. Scoop is the first install line in the README.
+#
+# Measured: the import table drops from 20 DLLs to 11, all of them OS-inbox, for
+# +126,976 bytes per binary (+1.68%). The cost is that a CRT security fix then
+# arrives with a snob release rather than with Windows Update, which is the
+# ordinary trade for static linking and the one this project already takes for
+# SQLite and for musl.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]

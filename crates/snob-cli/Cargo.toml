@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "snob"
 path = "src/main.rs"
 
+# A build that can be driven end to end without Instagram.
+#
+# Off by default: `cargo build --release` produces a binary with neither the
+# flags nor the code behind them. `cargo test --features testing` is what turns
+# them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
+[features]
+testing = ["snob-ig/testing"]
+
 [dependencies]
 snob-core.workspace = true
 snob-ig.workspace = true
@@ -37,11 +45,27 @@ futures-util.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used so a typed sessionid does not sit in freed memory after the prompt that
+# read it.
+zeroize.workspace = true
+# Already in the tree through snob-ig, where it jitters the pace between
+# requests. Used here for the same reason at a larger scale: `snob watch` moves
+# each scheduled run a little later, so the walks do not start on the same
+# second every day. Not a security decision, so the fast generator is the right
+# one — but the roll is made here and handed to `schedule::with_jitter`, which
+# reads no randomness of its own and can therefore be tested.
+fastrand.workspace = true
+# Was a dev-dependency, for pointing the client at a mock server. Now also a
+# real one: the monitor's webhook address is parsed and inspected before
+# anything is posted to it, and `Url::host()` is what tells an IPv6 loopback
+# from a domain -- the string form keeps the brackets the syntax requires, so
+# `[::1]` does not parse as an address.
+url.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
-url.workspace = true
 
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key
@@ -65,8 +89,9 @@ assets = [
 ]
 
 [lints.rust]
-# Linking this binary makes MSVC announce that it is creating an import
-# library, because aws-lc -- rustls's crypto provider, four levels down from
-# reqwest -- exports its jitterentropy symbols. There is nothing to act on, and
-# it is the first thing printed on every build.
+# Linking this binary has made MSVC announce that it is creating an import
+# library, because a native dependency exports symbols. There is nothing to act
+# on, and it was the first thing printed on every build. Kept even though
+# Windows no longer links aws-lc: the message belongs to the linker, not to any
+# one dependency.
 linker_messages = "allow"

@@ -23,31 +23,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
-use snob_cli::engine::{self, ListOutcome, ResultSource};
+use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 use snob_cli::exit::ExitCode;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-const SID: &str = "42%3AAbCdEfGh%3A20";
-
-fn args() -> ListArgs {
-    ListArgs {
-        target: None,
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
-        limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
-        yes: true,
-    }
-}
+mod common;
+use common::{SID, UA, args};
 
 /// A budget over a database that exists.
 ///
@@ -186,9 +166,9 @@ async fn during_a_cooldown_the_stored_list_is_served_without_requests() {
         .unwrap();
 
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(outcome.requests, 0);
-    assert!(outcome.from_cooldown);
+    assert_eq!(outcome.provenance, Provenance::Cooldown);
     assert_eq!(
         requests(&server).await,
         seeded,
@@ -232,7 +212,7 @@ async fn an_old_snapshot_is_still_served_during_the_cooldown() {
         .unwrap();
 
     assert_eq!(found.len(), 30);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(outcome.requests, 0);
 }
 
@@ -307,7 +287,7 @@ async fn a_named_target_is_resolved_locally_and_case_insensitively() {
         .unwrap();
 
     assert_eq!(found.len(), 5);
-    assert_eq!(outcome.source, ResultSource::Cached);
+    assert_eq!(outcome.source(), ResultSource::Cached);
     assert_eq!(requests(&empty).await, 0);
 }
 
@@ -416,4 +396,44 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
     assert_eq!(found.len(), 5);
     assert_eq!(outcome.requests, 0);
     assert_eq!(requests(&empty).await, 0);
+}
+
+/// A cooldown that lands while the confirmation prompt is open costs nothing.
+///
+/// The second check sat past `target::resolve`, and resolving is a request —
+/// so a named target spent exactly the counter poll `engine::cooldown` says
+/// must never be spent: "nothing may be spent, not even the counter poll". The
+/// regression test beside this one missed it because its fixture leaves
+/// `target` as `None`, which is the one shape that resolves without asking
+/// Instagram anything.
+///
+/// `after(1)`: the entry check sees nothing, and the cooldown is there by the
+/// time the second one looks. That is the window the second check exists for.
+#[tokio::test]
+async fn a_cooldown_landing_before_the_resolve_spends_nothing() {
+    let server = MockServer::start().await;
+    mount_profile(
+        &server,
+        r#"{"id":"7","username":"someone","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _schema = Store::open(&AppPaths::rooted_at(tmp.path())).unwrap();
+
+    let named = ListArgs {
+        target: Some("someone".to_string()),
+        ..args()
+    };
+    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(1));
+    let error = execute_with(&server, reopen(tmp.path()), budget, &named)
+        .await
+        .unwrap_err();
+
+    assert_rate_limited(&error);
+    assert_eq!(
+        requests(&server).await,
+        0,
+        "resolving the name is a request, and a cooldown is a cooldown"
+    );
 }
