@@ -817,6 +817,12 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 "deliveries": {
                     "waiting": owed.waiting,
                     "elsewhere": owed.elsewhere,
+                    // Not owed -- owing has ended. Deliberately outside
+                    // `pending_deliveries`, which counts work still to do:
+                    // this is work that will never be done, and a probe that
+                    // added it to the queue length would report a backlog
+                    // that no run can shorten.
+                    "given_up": owed.given_up,
                 },
                 // The verdict, so a caller reading this does not have to
                 // reimplement which combinations of the fields below mean the
@@ -919,8 +925,20 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // its pronoun, which came back when it was rewritten -- and came back
     // longer. A test walks the source for that shape now, because two rounds of
     // reading it did not.
-    if owed.waiting > 0 || owed.elsewhere > 0 {
+    if owed.waiting > 0 || owed.elsewhere > 0 || owed.given_up > 0 {
         println!();
+    }
+    if owed.given_up > 0 {
+        let (subject, what) = if owed.given_up == 1 {
+            ("report was", "What it said is")
+        } else {
+            ("reports were", "What they said is")
+        };
+        println!(
+            "{} {subject} given up on for being too old to be news. {what} not reported \
+             a second time.",
+            owed.given_up
+        );
     }
     if owed.waiting > 0 {
         let (subject, it) = if owed.waiting == 1 {
@@ -934,14 +952,19 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         );
     }
     if owed.elsewhere > 0 {
-        let (subject, they, their, it) = if owed.elsewhere == 1 {
-            ("report is", "It", "its", "it")
+        // The verb is in the tuple with everything else it has to agree with.
+        // It was not, so the singular arm read "It expire on its own." — in the
+        // output of the command the README tells people to point a monitoring
+        // system at, and reachable in the ordinary case of exactly one report
+        // left over after the webhook address moved.
+        let (subject, they, expire, their, it) = if owed.elsewhere == 1 {
+            ("report is", "It", "expires", "its", "it")
         } else {
-            ("reports are", "They", "their", "them")
+            ("reports are", "They", "expire", "their", "them")
         };
         println!(
             "{} {subject} addressed to a webhook this configuration does not send to, so \
-             nothing here will try {it}. {they} expire on {their} own.",
+             nothing here will try {it}. {they} {expire} on {their} own.",
             owed.elsewhere
         );
     }
@@ -1253,6 +1276,20 @@ fn health(
         notes.push(format!(
             "{} report(s) still waiting to be delivered",
             owed.waiting
+        ));
+    }
+
+    // A report given up on is not a failure of the monitor -- it is usually a
+    // receiver that was down for a day -- but it must not be silent, and it
+    // must not be the thing that lets the verdict go green. It used to be
+    // exactly that: `owed` counted only `pending`, so a row stopped being
+    // counted at the instant it stopped being deliverable, and the verdict went
+    // from `warning` to `ok` the moment the change was thrown away.
+    if owed.given_up > 0 {
+        at_least(Verdict::Warned);
+        notes.push(format!(
+            "{} report(s) were given up on for being too old to be news",
+            owed.given_up
         ));
     }
 
@@ -1883,7 +1920,8 @@ url = \"https://n8n.internal/hook\"
                 &[],
                 deliveries::Owed {
                     waiting: 2,
-                    elsewhere: 0
+                    elsewhere: 0,
+                    given_up: 0,
                 },
                 NOW
             )
@@ -1908,7 +1946,8 @@ every = \"6h\"
                 &[],
                 deliveries::Owed {
                     waiting: 0,
-                    elsewhere: 2
+                    elsewhere: 2,
+                    given_up: 0,
                 },
                 NOW
             )
@@ -2036,6 +2075,7 @@ every = \"6h\"
         let two_elsewhere = deliveries::Owed {
             waiting: 0,
             elsewhere: 2,
+            given_up: 0,
         };
 
         // The address moved. Those rows can never go, and the changes in them
