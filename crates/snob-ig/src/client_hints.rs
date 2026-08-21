@@ -42,6 +42,34 @@ const PRIORITY_SINCE_CHROMIUM: u32 = 123;
 /// urgency, and incremental delivery.
 pub const FETCH_PRIORITY: &str = "u=1, i";
 
+/// From which Chromium offers `zstd` in `Accept-Encoding`.
+///
+/// The same release as [`PRIORITY_SINCE_CHROMIUM`], and a constant of its own on
+/// purpose: two facts that happened to ship together, and folding them into one
+/// number would make a later divergence look like a typo. This header was a
+/// literal for a long time and was never inside this module's stated scope, so a
+/// session created with a Chrome 120 User-Agent correctly left `Priority` off
+/// and then offered a codec that browser cannot decode — the self-contradiction
+/// the rest of this module exists to prevent, on an axis the other end can check
+/// for nothing.
+const ZSTD_SINCE_CHROMIUM: u32 = 123;
+
+/// What a current browser offers to have its answers compressed with.
+///
+/// Stated here rather than left to the HTTP client, which builds its own from
+/// whichever decoders were compiled in and produces `zstd,gzip,deflate,br` — a
+/// fixed string, on every request, that no browser has ever sent. This is
+/// Chrome's, and every codec in it is one the client can actually decode.
+///
+/// There is deliberately no non-Chromium branch. Firefox has offered the same
+/// four since 126, so this is the honest value for a browser this module knows
+/// nothing else about, and inventing a different one is the thing the module
+/// refuses to do.
+pub const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
+/// What Chromium offered before it could decode `zstd`.
+pub const ACCEPT_ENCODING_BEFORE_ZSTD: &str = "gzip, deflate, br";
+
 /// Language preference, as a browser would state it.
 ///
 /// Every browser sends `Accept-Language` on every request without exception,
@@ -154,6 +182,10 @@ pub struct ClientHints {
     /// `priority`, for the browsers that send one on a fetch. `None` for the
     /// rest, and for Chromium old enough to predate it.
     pub priority: Option<&'static str>,
+    /// `accept-encoding`: the codecs this browser would offer. Never absent,
+    /// because every browser sends one — what moves with the version is which
+    /// codecs are in it.
+    pub accept_encoding: &'static str,
 }
 
 impl ClientHints {
@@ -167,6 +199,10 @@ impl ClientHints {
             priority: major
                 .filter(|major| *major >= PRIORITY_SINCE_CHROMIUM)
                 .map(|_| FETCH_PRIORITY),
+            accept_encoding: match major {
+                Some(major) if major < ZSTD_SINCE_CHROMIUM => ACCEPT_ENCODING_BEFORE_ZSTD,
+                _ => ACCEPT_ENCODING,
+            },
         }
     }
 }
@@ -421,6 +457,41 @@ mod tests {
         let firefox =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
         assert_eq!(ClientHints::from_user_agent(firefox).priority, None);
+    }
+
+    /// Chromium began offering `zstd` at 123, the release that also started
+    /// sending `Priority`. The header was a literal, so a session created with a
+    /// Chrome 120 User-Agent -- an old managed install, or one typed at
+    /// `--user-agent` -- correctly left `Priority` off and then offered a codec
+    /// that browser cannot decode. One request contradicting itself on an axis
+    /// the far end can check for free is what this module exists to prevent.
+    #[test]
+    fn the_accept_encoding_follows_the_version() {
+        assert_eq!(
+            ClientHints::from_user_agent(&desktop(151)).accept_encoding,
+            ACCEPT_ENCODING
+        );
+        assert_eq!(
+            ClientHints::from_user_agent(&desktop(123)).accept_encoding,
+            ACCEPT_ENCODING
+        );
+
+        let old = ClientHints::from_user_agent(&desktop(122));
+        assert_eq!(old.accept_encoding, ACCEPT_ENCODING_BEFORE_ZSTD);
+        assert_eq!(
+            old.priority, None,
+            "the two move together, and it is the pair that has to agree"
+        );
+
+        // Firefox has offered the same four since 126, so a browser this module
+        // knows nothing else about still gets the current string rather than an
+        // invented one.
+        let firefox =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
+        assert_eq!(
+            ClientHints::from_user_agent(firefox).accept_encoding,
+            ACCEPT_ENCODING
+        );
     }
 
     #[test]

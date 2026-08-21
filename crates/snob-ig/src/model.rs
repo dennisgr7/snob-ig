@@ -56,10 +56,6 @@ pub struct FriendshipsPage {
     /// Cursor to the next page. Absent or empty means the list is done.
     #[serde(default)]
     pub next_max_id: Option<String>,
-    /// What Instagram claims the total is. Useful for estimating progress and
-    /// nothing else: there are documented cases of it lying.
-    #[serde(default)]
-    pub big_list: Option<bool>,
 }
 
 impl FriendshipsPage {

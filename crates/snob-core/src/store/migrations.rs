@@ -26,8 +26,28 @@ use std::sync::LazyLock;
 
 use rusqlite_migration::{M, Migrations};
 
+/// Every migration, in the order they are applied.
+const CHAIN: [&str; 9] = [
+    include_str!("sql/001_initial.sql"),
+    include_str!("sql/002_watch.sql"),
+    include_str!("sql/003_deliveries.sql"),
+    include_str!("sql/004_claims.sql"),
+    include_str!("sql/005_destination.sql"),
+    include_str!("sql/006_rename_cursor.sql"),
+    include_str!("sql/007_renames_sent.sql"),
+    include_str!("sql/008_watch_state.sql"),
+    include_str!("sql/009_newest_run.sql"),
+];
+
+/// How many there are, which is what `user_version` counts up to.
+///
+/// Named so that "this database is from a newer snob" can be answered before
+/// the migration runner answers it in its own words. Derived from the chain
+/// rather than written down twice.
+pub const COUNT: usize = CHAIN.len();
+
 pub static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(include_str!("sql/001_initial.sql"))]));
+    LazyLock::new(|| Migrations::new(CHAIN.iter().map(|sql| M::up(sql)).collect()));
 
 #[cfg(test)]
 mod tests {

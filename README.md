@@ -12,9 +12,8 @@ x86_64 and ARM64, macOS on Apple Silicon.
 
 **snob only ever reads.** It never follows, unfollows, blocks or removes anyone.
 
-> **Early version.** Every command works and has been used against the real API,
-> but this is the essentials and no more. Watching an account over time and
-> reading Instagram's own data export are planned and not built yet.
+> **Early version.** Every command works and has been used against the real API.
+> Reading Instagram's own data export is planned and not built yet.
 
 ## Install
 
@@ -158,6 +157,155 @@ A username can be written with or without a leading `@`. If you write it on
 PowerShell, quote it — `"@someone"` — because an unquoted `@` is swallowed by
 the shell before snob ever sees it.
 
+## Watching over time
+
+```bash
+snob watch diff
+```
+
+What has changed since the last time the monitor looked: who started following
+you and who stopped, who you followed and unfollowed, and who now goes by a
+different name. It reads what is already stored, so it costs no requests and
+running it twice gives the same answer.
+
+The first time there is nothing to compare against, so it says so rather than
+announcing your whole follower list as new arrivals. Walk a list once and it has
+something to say from then on.
+
+```bash
+snob watch setup
+```
+
+Asks how often to look, how far each run may be pushed past its moment, and
+where to send the reports, then writes a file you can edit. It finishes by trying all of it — the schedule, the session, that each
+account resolves and can be read, and the webhook, by posting one message to it
+— so a typo or an expired token turns up while you are still there rather than
+in an unattended run at three in the morning. Then it offers to take the first
+capture, telling you what that costs, because the first scheduled run otherwise
+lays one down and reports nothing.
+
+```bash
+snob watch          # stays up and runs on the schedule
+snob watch once     # one run, for cron or a systemd timer
+snob watch check    # would a scheduled run work? exits non-zero if not
+snob watch status   # what is configured, when it last ran, and whether it is healthy
+```
+
+`check` writes nothing and walks no list, so it is safe to repeat — but poll it
+hourly rather than by the minute. It costs one request for the session, one per
+watched account, and one more until the session has learned its own account's
+name, and all of them come out of the same daily budget the walks draw on: a
+probe that drains it causes the condition it is watching for. `--no-webhook`
+leaves the receiver alone and checks everything else. Both it and `status` exit
+non-zero when something would stop the monitor doing its job, which is what
+makes them usable from a monitoring system rather than only readable.
+
+Or say it directly: `--every 6h`, `--on mon,thu --at 09:00`, or
+`--cron "0 9 * * 1,4"` if you already have one written. The two combine, so
+`--every 2w --on mon` is one Monday in every two. Times are your local ones.
+
+**A run with nothing to report costs one request.** It reads your counters and
+only walks a list if its counter moved, which is what makes running it every few
+hours reasonable. Each run is nudged a little past its due moment so the walks
+do not start on the same second every day; `--jitter` says how far and
+`--jitter 0` turns it off. A schedule whose runs are already as close together
+as the tool allows has no room to be nudged, and none is taken.
+
+### Sending it somewhere
+
+```bash
+snob watch --every 6h --webhook https://n8n.local/webhook/snob
+```
+
+Each report goes out as one JSON object — built so an automation can branch on
+it without digging through arrays:
+
+```json
+{
+  "schema": 1,
+  "event": "watch.changes",
+  "run": {
+    "id": "1755612000-9f3c1a04",
+    "at": 1755612000,
+    "looked": true,
+    "requests": 14,
+    "lists": [
+      { "kind": "followers", "skipped": null },
+      { "kind": "following", "skipped": null }
+    ],
+    "tool": { "name": "snob", "version": "0.1.1" }
+  },
+  "account": { "pk": 1234567, "username": "you", "is_self": true },
+  "counts": {
+    "followers_gained": 1,
+    "followers_lost": 2,
+    "following_gained": 0,
+    "following_lost": 0,
+    "renamed": 1,
+    "total": 4
+  },
+  "events": {
+    "followers_lost": [
+      { "pk": 7654321, "username": "someone", "profile_url": "https://www.instagram.com/someone/" }
+    ]
+  }
+}
+```
+
+`schema` is the version of this shape. It moves when a field is removed or
+changes meaning and never when one is added, so a workflow written against 1
+keeps working; every message carries it, including the one `snob watch check`
+posts and every line of the `--json` stream.
+
+`run.id` is the value to deduplicate on: delivery is at-least-once and a retry
+carries the same one. `run.at` is when the run concluded, in epoch seconds, and
+`run.lists` says which of the two lists it actually read — a `skipped` of
+`not_verified` or `incomplete` means that list was not compared, so its zeros in
+`counts` mean "not looked at" rather than "nothing happened". `events` holds one
+array per kind of change and is shown here with one of them; `lists.followers`
+and `lists.following`, left out above, carry each list's basis, how many accounts
+it holds, and two moments, or `null` for a list this run did not compare. The two
+moments are not the ends of a window and one is not always before the other:
+`since` is when this list was last *reported* on and `until` is when the capture
+being reported was *taken*. A run that walked the list has `since` before
+`until`; a run that found the counters unmoved and served the list out of storage
+has it the other way round, because the receipt was written after the capture it
+points at.
+
+`--header "Authorization: Bearer …"` for an endpoint that wants one, and
+`--sign-with` to have the body signed with HMAC-SHA256 in an `X-Snob-Signature`
+header, so the receiver can check it came from you. `snob watch setup` puts both
+in the keyring instead, which is what lets a systemd unit hold neither.
+
+Three more headers travel with every POST, and a receiver can route on them
+without parsing the body at all:
+
+| Header | What it is |
+|---|---|
+| `X-Snob-Event` | `watch.changes` or `watch.preflight` — the same value as `event` in the body. |
+| `X-Snob-Delivery` | The delivery id, and the same value as `run.id`. **The one to deduplicate on**: it stays the same across every retry of one report, so a receiver that has already acted on it can drop the second copy. |
+| `X-Snob-Attempt` | Which try this is, counting from 1. |
+
+Because those four are the protocol, snob refuses to send a `[webhook.headers]`
+entry or a `--header` that sets any name beginning `X-Snob-`: a configured copy
+would make the value ambiguous, and most frameworks join duplicates with `, `.
+
+Nothing is sent when nothing changed, so every message that arrives means
+something; `--heartbeat` sends one anyway, for when silence is the signal you
+are watching. A report that cannot be delivered is queued and retried, and it is
+queued *before* the monitor moves on — a receiver that was restarting does not
+cost you the change. It remembers the address it was made for, so pointing a run
+somewhere else with `--webhook` does not flush your backlog, or your stored
+token, to that address. Plain `http://` is refused unless the address is on your
+own network, because the report carries account names and any token travels with
+it.
+
+No webhook at all is a complete way to use this:
+
+```bash
+snob watch --every 6h --json >> events.ndjson
+```
+
 ## Where your data goes
 
 Nowhere. There is no server, no account and no telemetry: snob talks to
@@ -173,7 +321,12 @@ it from:
   with no keyring at all, like a server or a container, `snob login` notices and
   uses the file, telling you it did.
 - **A local SQLite database** of the lists it has walked, so that asking the
-  same question twice does not cost twice the requests.
+  same question twice does not cost twice the requests. The monitor expires
+  captures older than a month; the newest of each list, and whatever it last
+  reported against, are always kept.
+- **The monitor's settings**, if you ran `snob watch setup` — a `watch.toml` you
+  can read and edit. Any token or signing key it needs goes to the keyring
+  rather than into that file.
 
 **Your browser's own cookie store is never read, copied or decrypted.** The
 browser `snob login` opens is a separate one with a profile of its own. That
@@ -241,16 +394,27 @@ apart from "wait a while" without reading the message text.
 |---|---|
 | 0 | It worked. A list cut short by `--limit` or `--max-pages` is still a 0. |
 | 1 | It failed, with nothing more specific to say — including a result refused because a list came back incomplete. |
+| 2 | The command line could not be parsed. Nothing was done, and running it again unchanged will not help. |
 | 3 | No session stored, or the one there no longer works. Run `snob login`. |
 | 4 | Instagram wants the account verified. Open the address it prints. |
 | 5 | Instagram is throttling, or the account is in cooldown. Wait. |
 | 130 | Stopped by you: Ctrl+C, or a confirmation that was not given — including with no terminal to ask at, where `-y` confirms in advance. |
 
-`followers` and `following` print what they got and exit 0 even when the walk
-was cut short, because a partial list is still true as far as it goes.
-`unfollowers`, `fans`, `friends` and `scan` cross two lists, so an incomplete
-one there makes the answer wrong rather than short — those refuse, and exit
-with the code of whatever stopped them.
+`followers` and `following` print what they got even when the walk was cut
+short, because a partial list is still true as far as it goes — but they still
+exit with the code of whatever stopped them. Only a cap you asked for,
+`--limit` or `--max-pages`, is a 0; Instagram refusing to serve the rest of a
+list is a 1, and throttling is a 5. Something has to be able to tell those
+apart, and the printed names cannot.
+
+`unfollowers`, `fans` and `friends` cross two lists, and the two halves are not
+the same question. The list being crossed **against** has to be whole: an
+account missing from it shows up in the answer without deserving to, which is
+wrong rather than short, so that one refuses outright and exits with whatever
+stopped it. The list the results come **out of** is the ordinary case — the
+answer is short but every name in it is true — so it prints with a warning and
+follows the rule above, cap you asked for included. `scan` needs both lists
+whole, because each of its five numbers leans on both, and refuses either way.
 
 ## Inspiration
 

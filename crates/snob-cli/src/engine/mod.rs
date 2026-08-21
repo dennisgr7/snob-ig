@@ -8,18 +8,20 @@
 //!
 //! Every list, crossing and summary the tool prints comes out of [`list`].
 
+pub mod check;
 pub mod cooldown;
 pub mod freshness;
 pub mod people;
 pub mod target;
 pub mod walk;
+pub mod watch;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::store::{accounts, snapshots, users};
 
-use crate::app::App;
+use crate::app::{App, ConsentInAdvance};
 use crate::cli::ListArgs;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
@@ -105,6 +107,15 @@ pub struct ListOutcome {
     /// spelling Instagram uses, and — for your own account — may not be known
     /// at all until something goes and looks it up.
     pub account_pk: Pk,
+    /// The stored capture these users came out of.
+    ///
+    /// Carried rather than looked up afterwards. The monitor has to know which
+    /// row this is to compare it against the one it last reported, and asking
+    /// the store for "the newest one" after the fact is a different question:
+    /// another process sharing this database — the very thing the request
+    /// budget is built to expect — can have closed a walk in between, and the
+    /// answer would then name a capture these users did not come from.
+    pub snapshot_id: i64,
     /// What Instagram actually said, when a walk stopped because it said
     /// something.
     ///
@@ -158,6 +169,7 @@ impl ListOutcome {
             // call sites.
             taken_at: snapshot.taken_at.unwrap_or_default(),
             account_pk: snapshot.account_pk,
+            snapshot_id: snapshot.id,
             stopped_by: None,
             // A stored list is a finished one — the view this comes from cannot
             // return anything else — so there is nothing left to continue.
@@ -195,8 +207,11 @@ impl ListOutcome {
 /// request being spent that did not have to be:
 ///
 /// 1. In cooldown nothing may be spent, so only storage can answer.
-/// 2. With `--cache` the network is off, resolution included.
-/// 3. Someone else's account needs consent before it is enumerated.
+/// 2. With `--cache` the network is off, resolution included — and with it the
+///    consent question, which is about enumerating somebody rather than about
+///    reading what was already enumerated.
+/// 3. Otherwise, someone else's account needs consent before it is enumerated,
+///    and before it is resolved.
 /// 4. The cooldown is checked again, because it can land while step 3 waits.
 /// 5. One counter poll says whether the list moved at all.
 /// 6. If it did not, and what is stored is fresh enough, storage answers.
@@ -225,12 +240,45 @@ async fn decide(
         return cooldown::serve(app, args, kind, until_ms);
     }
 
-    ask_consent(app, args).await?;
+    // **`--cache` is not asked about**, because there is nothing to agree to:
+    // consent governs enumerating somebody else's lists, and this reads a list
+    // that was already walked — with permission — off this machine's own disk.
+    // Nothing is resolved over the network either, so the rule that consent
+    // comes before resolution is not in play.
+    //
+    // Asking anyway cost more than a redundant prompt. `ui::can_be_asked` is
+    // false without a terminal, so `snob unfollowers someone --cache` from cron
+    // or down a pipe exited 130 with "there is no terminal to ask at" over an
+    // answer that costs nothing and touches nobody. Interactively it warned
+    // about "a heavier request" that was never going to be made.
+    //
+    // And it disagreed with the tool's other storage path: `cooldown::serve`
+    // hands back the identical stored lists with no question at all, and says
+    // in as many words that none is asked because nothing is enumerated. The
+    // same data was gated or not depending on whether Instagram happened to be
+    // throttling.
+    if !args.cache {
+        ask_consent(app, args).await?;
+    }
+
+    // **Moved, not added.** The check at the top cannot see a cooldown that
+    // landed while the confirmation prompt was open — one written by the
+    // service sharing this database, for instance — and resolving is itself a
+    // request, so it belongs here rather than after. It used to sit past
+    // `target::resolve`, which meant a named target spent exactly the counter
+    // poll `cooldown.rs` says must never be spent: "nothing may be spent — not
+    // even the counter poll".
+    //
+    // Only the existing regression test's fixture hid it, by leaving `target`
+    // as `None` — the one shape that resolves without a request.
+    if let Some(until_ms) = app.client().pacer().cooldown()? {
+        return cooldown::serve(app, args, kind, until_ms);
+    }
 
     // A crossing asks for two lists, and resolving is a request. Reusing what
     // the first call worked out is what stops the second asking Instagram the
     // identical question about the identical account seconds later.
-    let target = match app.resolved_target() {
+    let target = match app.resolved_target(args.target.as_deref()) {
         Some(target) => target,
         None => {
             let target = if args.cache {
@@ -238,7 +286,7 @@ async fn decide(
             } else {
                 target::resolve(app, args).await?
             };
-            app.remember_target(target.clone());
+            app.remember_target(args.target.as_deref(), target.clone());
             target
         }
     };
@@ -273,7 +321,7 @@ async fn decide(
 
     if args.cache {
         let Some(snapshot) = stored else {
-            bail!("no snapshot of the {kind} list is stored; drop --cache to fetch it");
+            return Err(crate::report::refuse_nothing_stored(kind));
         };
         return Ok((
             snob_core::store::snapshots::members(app.db().conn(), snapshot.id)?,
@@ -282,14 +330,6 @@ async fn decide(
             // what makes it unsafe to cross against another one.
             ListOutcome::cached(&snapshot, Provenance::CacheFlag),
         ));
-    }
-
-    // The check at the top cannot see a cooldown that lands while the
-    // resolution or the confirmation prompt were underway — one set by the
-    // service sharing this database, for instance. Nothing may be spent once
-    // it exists, so look again before the poll.
-    if let Some(until_ms) = app.client().pacer().cooldown()? {
-        return cooldown::serve(app, args, kind, until_ms);
     }
 
     freshness::decide_and_fetch(app, args, kind, &target, stored).await
@@ -324,11 +364,15 @@ pub async fn ask_consent_with(
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
-    if args.yes || app.has_consent() {
+    // Cleaned before it is used as a key, so the answer is filed under the
+    // account rather than under a spelling of it. `clean` only strips a leading
+    // at sign and is idempotent, so this holds whether or not the name arrives
+    // already cleaned.
+    let name = target::clean(typed);
+    if args.yes || app.has_consent(name) {
         return Ok(());
     }
 
-    let name = target::clean(typed);
     // Compared raw, deliberately. A typed name with a zero-width character in
     // it is not your own account, and filtering before this comparison would
     // make it match — which skips the question for somebody else's lists.
@@ -361,11 +405,23 @@ pub async fn ask_consent_with(
     // to standard output. That stopped being true when the prompt moved to
     // standard error, and the gate did not follow it.
     if !someone_is_there {
+        // Which way to answer in advance is the *caller's* fact, not this
+        // function's. Both commands that reach here take an answer beforehand
+        // and they do not take it the same way, and one sentence named `-y` for
+        // both — so `snob watch once someone` refused with advice that then
+        // failed to parse, because `watch once` deliberately has no `-y`.
+        let in_advance = match app.consent_in_advance() {
+            ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
+            ConsentInAdvance::WatchConfig => format!(
+                "Run \"snob watch setup\" to answer it once, or ask about {shown} \
+                 while you are here."
+            ),
+        };
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
                 "reading {shown}'s lists needs confirmation, and there is no terminal to \
-                 ask at. Pass -y to confirm in advance."
+                 ask at. {in_advance}"
             ),
         )
         .into());
@@ -387,7 +443,7 @@ pub async fn ask_consent_with(
     }
     // Asked and answered. A crossing wants two lists and a summary four, and
     // asking again about the same account reads as not having listened.
-    app.record_consent();
+    app.record_consent(name);
     Ok(())
 }
 
@@ -403,13 +459,9 @@ mod tests {
             kind: ListKind::Followers,
             started_at: 0,
             taken_at: Some(0),
-            complete: true,
             member_count: 0,
             declared_count: None,
-            pages: 0,
-            requests: 0,
             next_cursor: None,
-            resumes: 0,
         };
         let outcome = ListOutcome::cached(&snapshot, Provenance::CounterVerified);
         assert!(outcome.is_complete());

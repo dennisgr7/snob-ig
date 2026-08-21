@@ -45,7 +45,6 @@ pub enum WaitKind {
     Micro,
     Cycle,
     Long,
-    Backoff,
 }
 
 /// What happens as the walk proceeds.
@@ -146,12 +145,19 @@ impl<'a> ListWalker<'a> {
     /// Rate control is not a parameter any more: it is inside the client, which
     /// cannot be built without it. Walking without it stopped being something
     /// review has to catch and became something that cannot be written.
+    ///
+    /// **The client also decides whether the waits are real**, by the server it
+    /// is pointed at. This was `without_sleeping()`, a `#[doc(hidden)]` method
+    /// any caller could reach for — so a walk against Instagram with no waits
+    /// between pages was one line away, and the rule against it lived in a
+    /// doc-comment. It is now unreachable: a mock server is not Instagram and
+    /// Instagram is not a mock server.
     pub fn new(client: &'a IgClient) -> Self {
         Self {
             client,
             pace: Pace::default(),
             cancel: CancelToken::default(),
-            sleeps: true,
+            sleeps: client.is_live(),
         }
     }
 
@@ -162,17 +168,6 @@ impl<'a> ListWalker<'a> {
 
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
-        self
-    }
-
-    /// Computes and announces the waits, but does not sleep.
-    ///
-    /// **Tests only.** It lets the real cadence be checked in milliseconds
-    /// rather than having to pause the clock, which with sockets in play makes
-    /// tests flaky. Using it against Instagram skips rate control entirely.
-    #[doc(hidden)]
-    pub fn without_sleeping(mut self) -> Self {
-        self.sleeps = false;
         self
     }
 
@@ -204,6 +199,38 @@ impl<'a> ListWalker<'a> {
             if self.cancel.is_canceled() {
                 break StopReason::Canceled;
             }
+
+            // Asked again on every page, not only before the first.
+            //
+            // `check_cooldown` above answers for the moment the walk started,
+            // and this loop is the longest unbroken run of requests the tool
+            // produces. Nothing else re-reads the table on the way through:
+            // `Pacer::clear_to_send` consults the cancel token and the budget,
+            // and `SqliteRateBudget::reserve` touches `rate_budget` alone. So a
+            // cooldown another process writes while this walk is in flight is
+            // invisible to it — `snob whoami` in a second terminal drawing a
+            // 429 stops *that* process and leaves this one paging into a door
+            // Instagram has just closed. The database is shared per user, which
+            // is what makes that an ordinary Tuesday rather than a corner case.
+            //
+            // It does not self-limit either, unless the push-back happens to
+            // cover `/api/v1/friendships/` as well: an endpoint-specific
+            // throttle leaves this walk answering normally to the end.
+            //
+            // `break` rather than `Err`, so the partial keeps its cursor and
+            // stays resumable — `verify_completion` passes a non-`Completed`
+            // reason through untouched. One local SQLite read against a wait of
+            // at least 1.5 s per page.
+            if self
+                .client
+                .pacer()
+                .cooldown()
+                .map_err(WalkError::Budget)?
+                .is_some()
+            {
+                break StopReason::RateLimit;
+            }
+
             if let Some(end) = state.cap_reached(&request) {
                 break end;
             }
@@ -328,8 +355,15 @@ impl<'a> ListWalker<'a> {
                 after,
                 error: error.to_string(),
             });
+            // `Canceled`, not the server's error. Both outcomes of the wait
+            // used to return what Instagram had said, so a 503 on page nine
+            // plus Ctrl+C during the backoff was reported as a network failure:
+            // an `error:` label, `stopped_by = 'network'` on the snapshot and
+            // exit 1 — while the same interrupt half a second later exits 130
+            // with nothing to explain. The user stopping is not the server
+            // failing, whichever of the two happened first.
             if self.sleeps && self.cancel.sleep_or_cancel(after).await {
-                return Err(error);
+                return Err(IgError::Canceled);
             }
             attempt += 1;
         }
@@ -612,6 +646,31 @@ mod tests {
         client_with(server, Pacer::unlimited())
     }
 
+    /// A walk against Instagram pays every wait; one against a test server pays
+    /// none, and neither is a choice a caller gets to make.
+    ///
+    /// This used to be `ListWalker::without_sleeping()`. It was `#[doc(hidden)]`
+    /// and its doc said not to use it against Instagram, which is the weakest
+    /// kind of guard there is: the whole of AGENTS.md's "never walk a real
+    /// account's lists without the limiter" rested on nobody writing one line.
+    /// Nothing asserted it either, so the rule could have been deleted and the
+    /// suite would have stayed green.
+    #[tokio::test]
+    async fn only_a_walk_against_a_test_server_skips_the_waits() {
+        let server = MockServer::start().await;
+        assert!(
+            !ListWalker::new(&client(&server)).sleeps,
+            "a mock server is not Instagram, so there is nothing to be polite to"
+        );
+
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let live = IgClient::new(session, Pacer::unlimited()).unwrap();
+        assert!(
+            ListWalker::new(&live).sleeps,
+            "a walk against Instagram has to pay its waits"
+        );
+    }
+
     /// A body with `n` users and, optionally, a cursor to the next page.
     fn body(from: u64, n: u64, cursor: Option<&str>) -> String {
         let users: Vec<String> = (from..from + n)
@@ -660,7 +719,7 @@ mod tests {
         request: ListRequest<'_>,
     ) -> (WalkSummary, Vec<Event>, Vec<u64>) {
         let client = client(server);
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
 
         let mut events = Vec::new();
         let mut seen: Vec<u64> = Vec::new();
@@ -759,9 +818,7 @@ mod tests {
 
         let client = client(&server);
         // PRODUCTION pace: the real policy is what is under test.
-        let walker = ListWalker::new(&client)
-            .with_pace(Pace::default())
-            .without_sleeping();
+        let walker = ListWalker::new(&client).with_pace(Pace::default());
 
         let mut waits = Vec::new();
         walker
@@ -790,7 +847,6 @@ mod tests {
                 WaitKind::Micro => (500, 2_000),
                 WaitKind::Cycle => (1_000, 1_300),
                 WaitKind::Long => (5_000, 15_000),
-                other => panic!("unexpected wait: {other:?}"),
             };
             assert!(
                 (range.0..=range.1).contains(ms),
@@ -890,6 +946,63 @@ mod tests {
         assert_eq!(summary.reason, StopReason::Network);
     }
 
+    /// Ctrl+C during a retry backoff is the user stopping, not the server
+    /// failing.
+    ///
+    /// Both outcomes of the wait used to return the server's error, so a 503 on
+    /// page nine plus an interrupt during the two-second backoff was reported as
+    /// a network failure — an `error:` label, `stopped_by = 'network'` and exit
+    /// 1 — while the same interrupt half a second later exits 130 with nothing
+    /// to explain.
+    ///
+    /// The waits have to be on for this: the backoff is where the token is
+    /// read, and a walk against a test server does not wait at all. Everything
+    /// else in the pace is set to zero so the only real wait is the one under
+    /// test, and the cancellation is fired from the `Retrying` event, which is
+    /// emitted immediately before it.
+    #[tokio::test]
+    async fn canceling_during_a_backoff_is_not_a_network_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("oops"))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let cancel = CancelToken::default();
+        let pace = Pace {
+            micro_pause_ms: (0, 0),
+            cycle_wait_ms: (0, 0),
+            long_pause_ms: (0, 0),
+            backoff_base_ms: 30_000,
+            ..Pace::default()
+        };
+        let mut walker = ListWalker::new(&client)
+            .with_pace(pace)
+            .with_cancel(cancel.clone());
+        walker.sleeps = true;
+
+        let summary = walker
+            .walk(
+                request(),
+                |p, _| Ok(p.users.len()),
+                |event| {
+                    if matches!(event, Event::Retrying { .. }) {
+                        cancel.cancel();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert!(
+            matches!(summary.error, Some(IgError::Canceled)),
+            "the server's error must not survive the user's interrupt: {:?}",
+            summary.error
+        );
+    }
+
     #[tokio::test]
     async fn the_page_cap_stops_it_and_keeps_the_cursor() {
         // Distinct cursors per page: otherwise the repeating-cursor guard would
@@ -930,9 +1043,7 @@ mod tests {
 
         let client = client(&server);
         let cancel = CancelToken::default();
-        let walker = ListWalker::new(&client)
-            .with_cancel(cancel.clone())
-            .without_sleeping();
+        let walker = ListWalker::new(&client).with_cancel(cancel.clone());
 
         let summary = walker
             .walk(
@@ -1078,7 +1189,7 @@ mod tests {
 
         let server = MockServer::start().await;
         let client = client_with(&server, Pacer::new(std::sync::Arc::new(InCooldown)));
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
 
         let error = walker
             .walk(request(), |p, _| Ok(p.users.len()), |_| {})
@@ -1090,6 +1201,71 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             0,
             "in cooldown not a single request is made"
+        );
+    }
+
+    /// A cooldown another process writes stops a walk already in flight.
+    ///
+    /// The database is shared per user, so this is the ordinary case rather
+    /// than a contrived one: `snob watch` is eight minutes into a long walk,
+    /// `snob whoami` in another terminal draws a 429, and the cooldown that
+    /// stops *that* process was invisible to this one. The walk is the longest
+    /// unbroken run of requests the tool produces and nothing on the way
+    /// through re-read the table.
+    ///
+    /// The pages carry **distinct** users on purpose: with repeats,
+    /// `MAX_PAGES_WITHOUT_NEW` would end the walk on its own and prove nothing.
+    #[tokio::test]
+    async fn a_cooldown_written_mid_walk_stops_the_walk() {
+        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+
+        /// Answers `None` until the walk is under way, then `Some` — the shape
+        /// of another process writing the row while this one pages.
+        #[derive(Default)]
+        struct CooldownAfterTwo(std::sync::atomic::AtomicUsize);
+        impl RateBudget for CooldownAfterTwo {
+            fn reserve(&self) -> Result<Duration, RateBudgetError> {
+                Ok(Duration::ZERO)
+            }
+            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+                let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok((asked >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+            }
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
+                Ok(0)
+            }
+        }
+
+        let server = server(vec![
+            ok(body(0, 50, Some("c1"))),
+            ok(body(50, 50, Some("c2"))),
+            ok(body(100, 50, Some("c3"))),
+            ok(body(150, 50, Some("c4"))),
+        ])
+        .await;
+
+        let client = client_with(
+            &server,
+            Pacer::new(std::sync::Arc::new(CooldownAfterTwo::default())),
+        );
+        let walker = ListWalker::new(&client);
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.reason,
+            StopReason::RateLimit,
+            "the walk stopped for the reason it really stopped for"
+        );
+        assert!(
+            server.received_requests().await.unwrap().len() < 4,
+            "pages kept going out after the cooldown was written"
+        );
+        assert!(
+            summary.pending_cursor.is_some(),
+            "stopping is not the same as throwing the partial away"
         );
     }
 
@@ -1123,7 +1299,7 @@ mod tests {
 
         let budget = std::sync::Arc::new(Counting::default());
         let client = client_with(&server, Pacer::new(budget.clone()));
-        let walker = ListWalker::new(&client).without_sleeping();
+        let walker = ListWalker::new(&client);
         let summary = walker
             .walk(request(), |p, _| Ok(p.users.len()), |_| {})
             .await

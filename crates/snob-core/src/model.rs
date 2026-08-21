@@ -33,6 +33,22 @@ const IN_A_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMER
     .remove(b'_')
     .remove(b'~');
 
+/// A name, ready to be one segment of a URL path.
+///
+/// Public for the same reason [`printable`] is: a username reaches an address
+/// from more than one place, and [`User::profile_url`] is not all of them. The
+/// `Referer` header the Instagram client sends names the page a browser would
+/// have called from, which is built out of the username as typed — and a
+/// header value cannot hold a byte below 0x20 at all, so an unencoded name
+/// there does not produce a wrong address, it produces no request.
+///
+/// Encoded rather than filtered, for the reason [`User::profile_url`] gives at
+/// length: removing a character from a name yields the address of a different
+/// account.
+pub fn in_a_path(name: &str) -> String {
+    percent_encoding::utf8_percent_encode(name, IN_A_PATH).to_string()
+}
+
 impl User {
     /// The address of this account, with the name encoded into it.
     ///
@@ -51,10 +67,7 @@ impl User {
     /// sequence early and let the rest of the name open one of its own, so the
     /// cell showed a filtered name and pointed wherever the name said.
     pub fn profile_url(&self) -> String {
-        format!(
-            "https://www.instagram.com/{}/",
-            percent_encoding::utf8_percent_encode(&self.username, IN_A_PATH)
-        )
+        format!("https://www.instagram.com/{}/", in_a_path(&self.username))
     }
 
     /// The full name with control characters taken out, for anything a
@@ -107,7 +120,7 @@ pub fn printable(text: &str) -> String {
 /// marks rather than controls, and a right-to-left override inside a name can
 /// make one account read as another entirely.
 ///
-/// Three groups, and the reason each is here:
+/// Four groups, and the reason each is here:
 ///
 /// - **Bidirectional overrides** — U+061C, the marks and the embedding,
 ///   override and isolate controls. This is the "Trojan Source" class, and
@@ -118,14 +131,29 @@ pub fn printable(text: &str) -> String {
 ///   unfollow untrustworthy.
 /// - **The tag block**, U+E0000–U+E007F, which encodes arbitrary invisible
 ///   ASCII inside a name and renders as nothing at all.
+/// - **Blank by rendering rather than by category** — the soft hyphen, the
+///   Mongolian vowel separator, the interlinear annotation marks, and the
+///   Hangul fillers, which are *letters* (`Lo`) that draw nothing. No property
+///   this function could ask about groups them: `White_Space` does not list
+///   them and `Cc` does not contain them, so each one is another way to spell
+///   a name that is already taken.
+///
+/// The word-joiner range runs to U+206F rather than stopping at the invisible
+/// operators, because the deprecated formatting characters between them are
+/// invisible on the same terms.
 fn is_invisible(c: char) -> bool {
     matches!(c,
-        '\u{061c}'
+        '\u{00ad}'
+        | '\u{061c}'
+        | '\u{115f}'..='\u{1160}'
+        | '\u{180e}'
         | '\u{200b}'..='\u{200f}'
         | '\u{202a}'..='\u{202e}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{2069}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{3164}'
         | '\u{feff}'
+        | '\u{ffa0}'
+        | '\u{fff9}'..='\u{fffb}'
         | '\u{e0000}'..='\u{e007f}')
 }
 
@@ -146,6 +174,28 @@ impl ListKind {
         match self {
             Self::Followers => "followers",
             Self::Following => "following",
+        }
+    }
+}
+
+/// The other direction, for reading a stored row back.
+///
+/// The standard trait rather than an inherent `from_str`, which clippy warns
+/// about for a good reason: a caller reaching for `"followers".parse()` would
+/// otherwise get a different function than the one they expected, or none.
+///
+/// It fails rather than defaulting. A `kind` column holding something else
+/// means the database was written by something that is not this program, and
+/// quietly calling that "followers" would answer a question about a list nobody
+/// asked about.
+impl std::str::FromStr for ListKind {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "followers" => Ok(Self::Followers),
+            "following" => Ok(Self::Following),
+            _ => Err(()),
         }
     }
 }
@@ -303,6 +353,33 @@ mod tests {
             '\u{2068}',  // first strong isolate
             '\u{feff}',  // byte-order mark
             '\u{e0041}', // tag latin capital A
+        ] {
+            let name = format!("real{hidden}name");
+            assert_eq!(
+                printable(&name),
+                "realname",
+                "U+{:04X} survived",
+                hidden as u32
+            );
+        }
+    }
+
+    /// The rest of what shows nothing. Category `Cc` covers none of these and
+    /// the three groups above named none of them, so each one is a second way
+    /// to write a name that already exists.
+    #[test]
+    fn the_other_invisible_characters_do_not_survive_either() {
+        for hidden in [
+            '\u{00ad}', // soft hyphen
+            '\u{115f}', // Hangul choseong filler
+            '\u{1160}', // Hangul jungseong filler
+            '\u{180e}', // Mongolian vowel separator
+            '\u{206a}', // inhibit symmetric swapping
+            '\u{206f}', // nominal digit shapes
+            '\u{3164}', // Hangul filler
+            '\u{ffa0}', // halfwidth Hangul filler
+            '\u{fff9}', // interlinear annotation anchor
+            '\u{fffb}', // interlinear annotation terminator
         ] {
             let name = format!("real{hidden}name");
             assert_eq!(

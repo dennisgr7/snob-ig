@@ -11,9 +11,25 @@
 //!
 //! - **Other users of the machine**: yes. The keyring is per account, and the
 //!   file is `0600` inside a `0700` directory.
-//! - **The file or the credential travelling to another machine**: yes. Every
-//!   backend ties the secret to this user on this computer — DPAPI on Windows,
-//!   the login keychain on macOS, the Secret Service collection on Linux.
+//! - **A bare copy of the store, read somewhere else**: yes. The keyring
+//!   database, the Windows credential and — on Windows — the file fallback are
+//!   sealed under a key that comes from the user's login: DPAPI there, the login
+//!   keychain on macOS, the Secret Service collection on Linux. The bytes on
+//!   their own are not a session.
+//! - **The secret leaving this computer**: **no**, though this file said
+//!   otherwise until it was read against the code. It is the claim somebody
+//!   checks before deciding whether backing up a profile, turning roaming on or
+//!   handing on a disk image is safe, so it is worth the three sentences. The
+//!   Windows credential is written `CRED_PERSIST_ENTERPRISE`, which Microsoft
+//!   documents as visible to this user on other computers wherever the account
+//!   has roamable state — it degrades to local storage on an account with none,
+//!   which is every ordinary machine, so the exposure is real and narrow;
+//!   `entry_for` says why it is not `CRED_PERSIST_LOCAL_MACHINE`. Outside
+//!   Windows the file fallback is `Protection::Plain` — plain JSON at `0600` —
+//!   so a copy of it is a working session anywhere, with no password and no key.
+//!   And a keychain or collection carried off together with the login password
+//!   opens wherever it is opened, because that password is the whole of what
+//!   seals it.
 //! - **Code running as the user themselves**: **no. Nowhere. By any backend.**
 //!   Windows documents no read restriction on `CRED_TYPE_GENERIC`, and any
 //!   process of the same logon can call `CredRead` or `CryptUnprotectData` and
@@ -36,12 +52,92 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::paths::{AppPaths, PathError};
+use crate::secret::Secret;
 use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
 
 const KEYRING_SERVICE: &str = "snob-ig";
 const KEYRING_USER: &str = "session";
 /// Separate keyring entry used only to check that writing works.
 const KEYRING_PROBE_USER: &str = "write-probe";
+
+/// What the credential store said when it was asked for one secret.
+///
+/// **Three answers, not two.** This used to be an `Option`, and `None` meant
+/// both "the store holds nothing under that name" and "this process cannot
+/// reach the store at all". Those are not the same fact and they do not deserve
+/// the same reaction: the first is a configuration the user chose, the second
+/// is a machine that cannot honor the one they did choose.
+///
+/// What that cost is in `commands::watch::plan`. Both of its warning arms sit
+/// inside `if let Some(...)`, so two absent secrets produced **no** warnings and
+/// a webhook client with no `Authorization` and no signing key. On a box where
+/// the session is in the file fallback and the keyring is not reachable — a
+/// `login --no-keyring`, then `setup`, then cron with no session bus — the
+/// monitor posted a document naming the user's followers unauthenticated and
+/// unsigned, and the only trace was a `debug!` line nobody sees at the default
+/// level. `WatchConfig` records nothing about what `setup` stored, so no later
+/// run could notice either.
+///
+/// An enum rather than a second predicate the caller has to remember to ask:
+/// this project has the rule that a guard living in a doc-comment is not a
+/// guard.
+#[derive(Debug)]
+pub enum Stored {
+    Found(Secret),
+    /// The store answered, and holds nothing under this name.
+    Nothing,
+    /// The store could not be opened. Whether anything is in it is unknown.
+    Unreachable,
+}
+
+impl Stored {
+    /// The secret, for callers that genuinely do not care why there is none.
+    pub fn found(self) -> Option<Secret> {
+        match self {
+            Self::Found(secret) => Some(secret),
+            Self::Nothing | Self::Unreachable => None,
+        }
+    }
+
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable)
+    }
+}
+
+/// Everything this tool may keep in the keyring.
+///
+/// An enum with an `ALL` rather than a set of loose strings, and the reason is
+/// [`SecretStore::delete`]: it walks this list, so a secret added later is
+/// deleted by `snob purge` without anybody having to remember to add it there
+/// too. A test walks the variants for the same reason.
+///
+/// The probe entry is deliberately not here. It is written and removed by the
+/// write check itself and never holds anything, so listing it would only mean
+/// `delete` reporting a failure about a value nobody stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The Instagram session. What every command needs.
+    Session,
+    /// A token the monitor sends as a header to the user's webhook.
+    WatchToken,
+    /// The key the monitor signs the webhook body with.
+    WatchSigningKey,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Session, Kind::WatchToken, Kind::WatchSigningKey];
+
+    /// The keyring entry's user name. Stable: changing one of these strands
+    /// whatever is already stored under the old one, where `purge` will no
+    /// longer find it either.
+    pub fn entry_name(self) -> &'static str {
+        match self {
+            Self::Session => KEYRING_USER,
+            Self::WatchToken => "watch-token",
+            Self::WatchSigningKey => "watch-signing-key",
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SecretsError {
@@ -134,7 +230,15 @@ impl SecretStore {
         }
     }
 
-    /// Points at a different keyring entry. **Tests only.**
+    /// Points at a different set of keyring entries. **Tests and the sandbox.**
+    ///
+    /// Two callers, and they are the same rule from two directions: a test must
+    /// not delete the session of whoever is running it, and neither must a run
+    /// under `--sandbox-root`. Forcing [`Backend::File`] does not achieve
+    /// either on its own — this store reaches the keyring on every backend, to
+    /// clear a stale entry in [`SecretStore::save`] and because the secrets in
+    /// [`Kind`] other than the session have no file form — so the service name
+    /// is what actually separates them.
     #[doc(hidden)]
     pub fn with_service(mut self, service: &str) -> Self {
         self.service = service.to_string();
@@ -225,36 +329,35 @@ impl SecretStore {
                 .map_err(|e| SecretsError::Corrupt(format!("while serializing: {e}")))?,
         );
 
-        // The Windows keyring has a size ceiling. If we go over it, store the
-        // essentials rather than failing.
-        let json = if keyring_bytes(&json) > MAX_KEYRING_SECRET_BYTES {
-            tracing::warn!(
-                bytes = keyring_bytes(&json),
-                "the session does not fit the keyring whole; storing only the essential fields"
-            );
-            Zeroizing::new(
-                serde_json::to_string(&session.minimal())
-                    .map_err(|e| SecretsError::Corrupt(format!("while serializing: {e}")))?,
-            )
-        } else {
-            json
-        };
-
         match self.backend {
             Backend::Keyring => {
+                // The Windows keyring has a size ceiling. If we go over it,
+                // store the essentials rather than failing.
+                //
+                // **Inside this arm**, because it is a property of this
+                // backend. Applied before the match, a 0600 file — which has no
+                // size limit at all — was written without `username`,
+                // `csrftoken`, `mid` and `ig_did`, and the warning named a
+                // keyring that was not the destination. `IgClient::get` then
+                // omits `X-CSRFToken`, which `session.rs` records as having
+                // already cost one debugging session.
+                let json =
+                    if keyring_bytes(&json) > MAX_KEYRING_SECRET_BYTES {
+                        tracing::warn!(
+                            bytes = keyring_bytes(&json),
+                            "the session does not fit the keyring whole; storing only the \
+                         essential fields"
+                        );
+                        Zeroizing::new(serde_json::to_string(&session.minimal()).map_err(|e| {
+                            SecretsError::Corrupt(format!("while serializing: {e}"))
+                        })?)
+                    } else {
+                        json
+                    };
+
                 self.entry()?
                     .set_password(&json)
                     .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))?;
-                // Do not leave two different sessions lying around. Every
-                // location, not just the current one: `load` checks the
-                // keyring first, so once an entry exists the rescue path that
-                // would have found and removed the legacy file is never
-                // reached again, and an older account's live cookie stays in
-                // the roaming profile — where it roams — until someone happens
-                // to run `logout` or `purge`.
-                for stale in self.paths.session_files() {
-                    let _ = std::fs::remove_file(stale);
-                }
             }
             Backend::File => {
                 self.write_file(&json)?;
@@ -275,6 +378,29 @@ impl SecretStore {
                 }
             }
         }
+
+        // Do not leave two different sessions lying around. Every location, not
+        // just the current one, and **on both backends** — `session_files`'s own
+        // doc says `save` and `delete` both walk it, and only the keyring arm
+        // did.
+        //
+        // `load` checks the keyring first, so once an entry exists the rescue
+        // path that would have found and removed a legacy file is never reached
+        // again. On the file backend nothing reached it either: a `--no-keyring`
+        // save wrote the new file, deleted the keyring entry, and left an older
+        // install's `session.json` in the **roaming** profile — where it roams,
+        // and into every backup of the home directory — until somebody happened
+        // to run `logout` or `purge`.
+        //
+        // The file just written is skipped, which is what makes this safe to run
+        // after the `Backend::File` arm.
+        let just_written = (self.backend == Backend::File).then(|| self.paths.session_file());
+        for stale in self.paths.session_files() {
+            if Some(&stale) == just_written.as_ref() {
+                continue;
+            }
+            let _ = std::fs::remove_file(stale);
+        }
         Ok(())
     }
 
@@ -291,6 +417,53 @@ impl SecretStore {
         Ok(None)
     }
 
+    /// Stores one of the monitor's secrets.
+    ///
+    /// Keyring only, unlike the session — and that is a deliberate difference
+    /// rather than an omission. The session has a fallback because without one
+    /// the tool does not work at all on a machine with no keyring, which
+    /// `paths.rs` documents as normal for a server or a container. A webhook
+    /// token is not in that position: without it the monitor still runs, still
+    /// reports, and still writes to standard output. So rather than invent a
+    /// second protected file, this says it cannot keep the secret and the user
+    /// passes `--sign-with` or `--header` on the command line, where a systemd
+    /// unit can supply it from an environment file.
+    pub fn save_secret(&self, kind: Kind, value: &Secret) -> Result<(), SecretsError> {
+        debug_assert_ne!(kind, Kind::Session, "the session is saved by `save`");
+        self.entry_for(kind.entry_name())?
+            .set_password(value.expose())
+            .map_err(|e| SecretsError::KeyringRefused(e.to_string()))
+    }
+
+    /// Reads one back, if it is there.
+    pub fn load_secret(&self, kind: Kind) -> Result<Stored, SecretsError> {
+        match self.entry_for(kind.entry_name()) {
+            Ok(entry) => match entry.get_password() {
+                Ok(value) => Ok(Stored::Found(Secret::new(value))),
+                Err(keyring::Error::NoEntry) => Ok(Stored::Nothing),
+                Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
+            },
+            // Not an error — the tool works without one — but not "nothing is
+            // stored" either, which is what this used to answer.
+            Err(e) => {
+                tracing::debug!(error = %e, "there is no keyring to read from");
+                Ok(Stored::Unreachable)
+            }
+        }
+    }
+
+    /// Removes one, for a `setup` that is being run again with no token this
+    /// time. Silent about one that was not there.
+    pub fn forget_secret(&self, kind: Kind) -> Result<(), SecretsError> {
+        match self.entry_for(kind.entry_name()) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
+            },
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Whether there is a credential on this machine at all.
     ///
     /// **Anything but a clean "nothing there" counts as one.** A stored session
@@ -305,6 +478,29 @@ impl SecretStore {
     /// wrong in the one way that matters.
     pub fn something_is_stored(&self) -> bool {
         !matches!(self.load(), Ok(None))
+    }
+
+    /// Which of the monitor's secrets are on this machine.
+    ///
+    /// The session is not among them: [`something_is_stored`] answers for that
+    /// one, and it has to, because a session too corrupt to parse still counts
+    /// and `load_secret` would call it absent.
+    ///
+    /// This exists so `purge` can **name** what it is about to remove. What it
+    /// removes is `Kind::ALL` unconditionally, so nothing depends on this
+    /// answer being complete — a keyring that refuses to be read leaves the
+    /// listing short and the deletion whole, which is the right way round.
+    ///
+    /// Walking `Kind::ALL` rather than naming the two, so a secret added later
+    /// appears here without anybody remembering to come back.
+    ///
+    /// [`something_is_stored`]: SecretStore::something_is_stored
+    pub fn monitor_secrets_stored(&self) -> Vec<Kind> {
+        Kind::ALL
+            .into_iter()
+            .filter(|kind| *kind != Kind::Session)
+            .filter(|kind| matches!(self.load_secret(*kind), Ok(Stored::Found(_))))
+            .collect()
     }
 
     /// Removes the session from everywhere it can be, and says so only if it
@@ -329,13 +525,42 @@ impl SecretStore {
     /// only decides which sentence is printed — and the file's names a path
     /// somebody can go and delete by hand.
     pub fn delete(&self) -> Result<(), SecretsError> {
+        self.remove(&[Kind::Session])
+    }
+
+    /// Removes every secret this tool has ever written, and says so only if they
+    /// all went.
+    ///
+    /// What [`SecretStore::delete`] used to be, and the split is the whole
+    /// point. `Kind::ALL` is the one list, for the same reason
+    /// `AppPaths::session_files` and `owned_dirs` are: a secret added later must
+    /// not be forgotten by the one command whose entire job is to leave nothing
+    /// behind, and a webhook token still in the keyring after `snob purge` is
+    /// exactly the failure that command exists to prevent.
+    ///
+    /// But `delete` had a second caller, and for `logout` the same list was
+    /// wrong: `snob logout` says "This removes the session and nothing else",
+    /// and it was taking the monitor's webhook token and signing key with it.
+    /// The monitor then went on running from `watch.toml`, found nothing in the
+    /// keyring, and posted reports with neither `Authorization` nor
+    /// `X-Snob-Signature` — where a receiver that requires the token answers
+    /// 401, a 401 is a refusal, and the change in that report is gone.
+    pub fn delete_all(&self) -> Result<(), SecretsError> {
+        self.remove(&Kind::ALL)
+    }
+
+    fn remove(&self, kinds: &[Kind]) -> Result<(), SecretsError> {
         let mut keyring_refused = None;
-        match self.entry() {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => keyring_refused = Some(SecretsError::KeyringRefused(e.to_string())),
-            },
-            Err(e) => tracing::debug!(error = %e, "there is no keyring to delete from"),
+        for &kind in kinds {
+            match self.entry_for(kind.entry_name()) {
+                Ok(entry) => match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(e) => {
+                        keyring_refused.get_or_insert(SecretsError::KeyringRefused(e.to_string()));
+                    }
+                },
+                Err(e) => tracing::debug!(error = %e, "there is no keyring to delete from"),
+            }
         }
 
         // The legacy copy is not housekeeping: it is a working session in the
@@ -705,26 +930,272 @@ mod tests {
         format!("snob-ig-test-{}-{n}", std::process::id())
     }
 
-    fn file_store() -> (tempfile::TempDir, SecretStore) {
+    /// Serializes the tests that reach the keyring.
+    ///
+    /// The credential store belongs to the operating system, and touching it
+    /// from several threads at once is not reliable here: an entry written by
+    /// one test came back missing to another, roughly one run in ten, in
+    /// whichever test happened to be running at the time. Not a collision
+    /// between the tests — each already has a service name of its own — so the
+    /// race is below this code and cannot be fixed from here. Running them one
+    /// at a time is the whole fix, and it costs milliseconds.
+    ///
+    /// The guard is handed back by `file_store` so a test that goes through it
+    /// cannot forget to take it. One test does not go through it --
+    /// `the_session_lands_where_the_probe_said_it_would` builds a
+    /// keyring-backed store on purpose -- and it takes the lock by hand.
+    ///
+    /// **It does not reach across test binaries**, which a `static` cannot do,
+    /// and `snob-cli` runs its own in parallel. That is why this is a reduction
+    /// in a failure rate rather than a fix: what is left is one operating
+    /// system credential store being written by two processes at once, which
+    /// nothing in this repository can serialize.
+    fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn file_store() -> (
+        tempfile::TempDir,
+        SecretStore,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let held = keyring_lock();
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path());
         (
             tmp,
             SecretStore::new(paths, true).with_service(&test_service()),
+            held,
         )
     }
 
     /// The real service name must not appear in any test.
     #[test]
     fn tests_never_point_at_the_real_keyring() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         assert_ne!(store.service, KEYRING_SERVICE);
         assert!(store.service.starts_with("snob-ig-test-"));
     }
 
+    /// Every kind has an entry name, and no two share one.
+    ///
+    /// Two kinds pointing at one entry would have the second silently overwrite
+    /// the first — the signing key landing on top of the token, with nothing
+    /// failing anywhere.
+    #[test]
+    fn every_kind_has_a_name_of_its_own() {
+        // `ALL` is the list `purge` walks, and every test of it -- including
+        // this one -- walks the same list, so shrinking `ALL` used to be
+        // invisible: drop `WatchSigningKey` from it and `snob purge` leaves the
+        // signing key in the user's keyring forever, with nothing failing.
+        //
+        // Two guards, because they catch opposite mistakes. The match is
+        // exhaustive, so a variant added later stops this compiling until
+        // somebody looks at `ALL`; the count catches a variant taken out of
+        // `ALL` while the type keeps it.
+        fn is_a_kind(kind: Kind) -> bool {
+            match kind {
+                Kind::Session | Kind::WatchToken | Kind::WatchSigningKey => true,
+            }
+        }
+        assert!(Kind::ALL.into_iter().all(is_a_kind));
+        assert_eq!(
+            Kind::ALL.len(),
+            3,
+            "a kind left `ALL`, so `purge` no longer removes it"
+        );
+
+        let names: Vec<&str> = Kind::ALL.iter().map(|k| k.entry_name()).collect();
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "two kinds share an entry: {names:?}"
+        );
+        assert!(!names.contains(&KEYRING_PROBE_USER));
+    }
+
+    /// The guard `snob purge` rests on. Its whole promise is that afterwards
+    /// there is nothing of this tool left on the machine, and a webhook token
+    /// forgotten in the keyring is precisely the failure it exists to prevent.
+    ///
+    /// Walking `Kind::ALL` rather than naming the three, so a secret added
+    /// later is covered by this test the moment it joins the list — the same
+    /// shape as the test that walks every `StopReason`.
+    #[test]
+    fn purging_takes_every_kind_of_secret_with_it() {
+        let (_tmp, store, _keyring) = file_store();
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        if !save_the_monitors_secrets(&store) {
+            return;
+        }
+
+        store.delete_all().unwrap();
+
+        assert!(
+            store.load().unwrap().is_none(),
+            "the session is still there"
+        );
+        for kind in Kind::ALL {
+            assert!(
+                store.load_secret(kind).unwrap().found().is_none(),
+                "{kind:?} survived a purge"
+            );
+        }
+    }
+
+    /// Stores one secret for every kind but the session. Returns false when
+    /// there is no keyring to store them in, which `save_secret` documents and
+    /// is not what any of these tests are about.
+    fn save_the_monitors_secrets(store: &SecretStore) -> bool {
+        for kind in Kind::ALL {
+            if kind == Kind::Session {
+                continue;
+            }
+            if store.save_secret(kind, &Secret::new("a secret")).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Saving to the file clears an earlier version's copy too.
+    ///
+    /// `AppPaths::session_files` says in its own doc that both `save` and
+    /// `delete` walk it, and only the keyring arm did. A `--no-keyring` save
+    /// wrote the new file, deleted the keyring entry, and left an older
+    /// install's `session.json` in the **roaming** profile — a live Instagram
+    /// cookie that roams, and lands in every backup of the home directory.
+    /// `load` reads the keyring first, so the rescue-and-delete path that would
+    /// have found it never ran again either.
+    #[test]
+    fn saving_to_the_file_clears_an_earlier_versions_copy() {
+        let (_tmp, store, _keyring) = file_store();
+        let store = store.using(Backend::File);
+
+        let legacy = store
+            .paths
+            .legacy_session_file()
+            .expect("the fixture has one");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"an older install's live session").unwrap();
+
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        assert!(
+            !legacy.exists(),
+            "the roaming copy is a live credential and has to go"
+        );
+        assert!(
+            store.paths.session_file().exists(),
+            "and the one just written stays"
+        );
+    }
+
+    /// The keyring's size ceiling is the keyring's, not the file's.
+    ///
+    /// The reduction to `session.minimal()` sat before the backend match, so a
+    /// 0600 file — which has no size limit — was written without `username`,
+    /// `csrftoken`, `mid` and `ig_did`, and the warning named a keyring that was
+    /// not the destination. `IgClient::get` then omits `X-CSRFToken`, the silent
+    /// state `session.rs` records as having already cost a debugging session.
+    #[test]
+    fn the_file_backend_does_not_shrink_to_fit_a_keyring() {
+        let (_tmp, store, _keyring) = file_store();
+        let store = store.using(Backend::File);
+
+        let mut session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        session.csrftoken = Some(Secret::new("a-csrf-token"));
+        // Long enough that the whole thing is past the keyring ceiling.
+        session.ig_did = Some("x".repeat(MAX_KEYRING_SECRET_BYTES));
+
+        store.save(&session).unwrap();
+
+        let back = store.load().unwrap().expect("it was just saved");
+        assert!(
+            back.csrftoken.is_some(),
+            "a file has no size ceiling, so nothing may be dropped to fit one"
+        );
+    }
+
+    /// `snob logout` takes the session and nothing else, which is what its help
+    /// says in those words.
+    ///
+    /// It shared one function with `purge`, so logging out silently took the
+    /// monitor's webhook token and signing key. The monitor kept running from
+    /// `watch.toml`, found nothing in the keyring, and posted reports with
+    /// neither `Authorization` nor `X-Snob-Signature`; a receiver that requires
+    /// the token answers 401, a 401 is a refusal, and the change in that report
+    /// is lost with no retry.
+    #[test]
+    fn logging_out_leaves_the_monitors_secrets_alone() {
+        let (_tmp, store, _keyring) = file_store();
+        store
+            .save(&Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap())
+            .unwrap();
+
+        if !save_the_monitors_secrets(&store) {
+            return;
+        }
+
+        store.delete().unwrap();
+
+        assert!(
+            store.load().unwrap().is_none(),
+            "the session should be gone"
+        );
+        for kind in Kind::ALL {
+            if kind == Kind::Session {
+                continue;
+            }
+            assert!(
+                store.load_secret(kind).unwrap().found().is_some(),
+                "logout took {kind:?} with it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_secret_reads_back_and_can_be_forgotten() {
+        let (_tmp, store, _keyring) = file_store();
+        if store
+            .save_secret(Kind::WatchToken, &Secret::new("Bearer abc"))
+            .is_err()
+        {
+            return; // no keyring on this machine; see `save_secret`
+        }
+
+        assert_eq!(
+            store
+                .load_secret(Kind::WatchToken)
+                .unwrap()
+                .found()
+                .unwrap()
+                .expose(),
+            "Bearer abc"
+        );
+        store.forget_secret(Kind::WatchToken).unwrap();
+        assert!(
+            store
+                .load_secret(Kind::WatchToken)
+                .unwrap()
+                .found()
+                .is_none()
+        );
+        // Forgetting one that is not there is not an error: `setup` run again
+        // with no token has to be able to clear whatever was there before.
+        store.forget_secret(Kind::WatchToken).unwrap();
+    }
+
     #[test]
     fn file_round_trip() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let original = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
 
         assert_eq!(store.probe_writable().unwrap(), Backend::File);
@@ -747,6 +1218,11 @@ mod tests {
     /// the destination cannot disagree.
     #[test]
     fn the_session_lands_where_the_probe_said_it_would() {
+        // The lock, taken by hand because this is the one test that builds a
+        // keyring-backed store rather than going through `file_store` -- and
+        // the only one in the workspace that *writes* to the operating
+        // system's credential store.
+        let _keyring = keyring_lock();
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(tmp.path());
         let store = SecretStore::new(paths, false).with_service(&test_service());
@@ -804,13 +1280,13 @@ mod tests {
 
     #[test]
     fn with_no_session_stored_it_returns_none() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         assert!(store.load().unwrap().is_none());
     }
 
     #[test]
     fn delete_removes_the_session() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         store.delete().unwrap();
@@ -825,13 +1301,13 @@ mod tests {
     /// it as one would make every `logout` on a clean machine exit non-zero.
     #[test]
     fn nothing_stored_is_not_a_refusal() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store.delete().unwrap();
     }
 
     #[test]
     fn a_session_in_the_legacy_location_is_rescued() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
 
         // Simulate an earlier install: the session only exists in the legacy
@@ -852,7 +1328,7 @@ mod tests {
 
     #[test]
     fn delete_also_clears_the_legacy_location() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let previous = store.paths.legacy_session_file().unwrap();
         std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
         std::fs::write(&previous, b"{}").unwrap();
@@ -878,7 +1354,7 @@ mod tests {
     /// reporting, not the reason the operating system said no.
     #[test]
     fn a_copy_that_will_not_go_is_reported_and_does_not_stop_the_others() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
 
@@ -910,7 +1386,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_file_gives_a_clear_error() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         store.paths.ensure_dirs().unwrap();
         std::fs::write(store.paths.session_file(), b"this is not json").unwrap();
         assert!(matches!(store.load(), Err(SecretsError::Corrupt(_))));
@@ -922,10 +1398,44 @@ mod tests {
         assert_eq!(Backend::File.as_str(), "file");
     }
 
+    /// The header says what the backends do, and no more than that.
+    ///
+    /// It claimed every backend "ties the secret to this user on this computer",
+    /// which two things in this same file contradict: `entry_for` records that
+    /// the Windows credential is written `CRED_PERSIST_ENTERPRISE` and roams
+    /// with the profile, and outside Windows `protect` stores
+    /// `Protection::Plain` -- plain JSON at `0600`, which is a working session
+    /// on any machine somebody copies it to. That bullet is what a person reads
+    /// before deciding whether to back up a profile or hand on a disk image, so
+    /// it gets a test rather than a proofread. `include_str!` because the claim
+    /// is the artifact under test; there is nothing else to call.
+    #[test]
+    fn the_header_does_not_promise_more_than_the_backends_do() {
+        let header = include_str!("secrets.rs")
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !header.contains("ties the secret to this user on this computer"),
+            "the header promises the secret cannot travel, and two backends let it"
+        );
+        assert!(
+            header.contains("CRED_PERSIST_ENTERPRISE"),
+            "the Windows credential roams, and the header is where that is read"
+        );
+        assert!(
+            header.contains("Protection::Plain"),
+            "the file fallback outside Windows is plain JSON, and the header is \
+             where that is read"
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn on_windows_the_file_does_not_hold_the_credential_in_the_clear() {
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         let raw = std::fs::read_to_string(store.paths.session_file()).unwrap();
@@ -939,7 +1449,7 @@ mod tests {
     #[cfg(unix)]
     fn on_unix_the_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
-        let (_tmp, store) = file_store();
+        let (_tmp, store, _keyring) = file_store();
         let s = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
         store.save(&s).unwrap();
         let mode = std::fs::metadata(store.paths.session_file())

@@ -1,0 +1,34 @@
+-- Where a queued report was addressed.
+--
+-- One column added rather than a table rebuilt, for the reason 004 gives:
+-- `ALTER TABLE ADD COLUMN` leaves the existing rows' storage alone, so this
+-- avoids the create-copy-drop-rename recipe and with it the foreign-key trap the
+-- header of `migrations.rs` warns about.
+--
+-- Why this exists. `watch_deliveries` recorded the bytes and nothing about their
+-- destination, and `due` had no destination predicate -- so the queue was drained
+-- through whichever client the current invocation happened to build. Pointing the
+-- monitor at a request bin to see what the payload looks like, which is the first
+-- thing anybody does, therefore sent the reports queued for the team's receiver
+-- to the request bin instead, with the team's bearer token on them, and marked
+-- them delivered. Not only leaked: permanently lost for the address they were
+-- made for.
+--
+-- The whole URL, and not the origin. Two questions look alike here and only one
+-- of them is about credentials. Whether a stored token may be attached is asked
+-- against the origin, in `plan`, because that is the unit a credential belongs
+-- to. Whether a queued report may be handed over is asked against the address it
+-- was addressed to -- and an origin cannot tell two workflows on one host apart,
+-- which is exactly the shape n8n ships with: `https://n8n.local/webhook/snob` in
+-- the file and `https://n8n.local/webhook-test/snob` typed to see what the
+-- payload looks like. This column answered with the origin at first, so the
+-- guard written here to close the leak reopened it one URL level lower down:
+-- `plan` rightly attaches the token, the origins match, and the production
+-- backlog goes to the test workflow with that token on it and is marked
+-- delivered. `commands::watch::destination_of` is where the two are told apart.
+--
+-- NULL for the rows already in the table when this ran. They were queued before
+-- anything recorded a destination, so nothing can say where they belong, and
+-- `due` treats them as belonging wherever it is asked -- which is exactly the old
+-- behavior, kept for those rows only rather than guessed at.
+ALTER TABLE watch_deliveries ADD COLUMN destination TEXT;

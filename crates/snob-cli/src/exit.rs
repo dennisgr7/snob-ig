@@ -21,6 +21,41 @@ pub enum ExitCode {
 }
 
 impl ExitCode {
+    /// Every code, so anything that has to walk them cannot walk a shorter
+    /// list. `secrets::Kind::ALL` is here for the same reason.
+    pub const ALL: [ExitCode; 6] = [
+        Self::Ok,
+        Self::Error,
+        Self::NoSession,
+        Self::Challenge,
+        Self::RateLimited,
+        Self::Interrupted,
+    ];
+
+    /// The code a stored token names, or `None` for a token this build does not
+    /// write.
+    ///
+    /// The other direction of [`ExitCode::as_str`], and it exists because
+    /// `watch_runs.outcome` is read back. `watch_setup::health` matched the
+    /// literals `"ok"`, `"rate_limited"` and `"interrupted"` inline — which is
+    /// precisely what `as_str`'s own doc says this vocabulary exists to stop.
+    /// Respell one there and every recorded cooldown falls through to the
+    /// failing arm, so `status` exits 1 for a monitor that will resume on its
+    /// own; and the fixture those tests build their rows from spelled the same
+    /// literals, so the suite would have moved with the defect rather than
+    /// caught it.
+    ///
+    /// Derived from [`ExitCode::as_str`] rather than written as a second match,
+    /// so the two cannot disagree at all: there is one spelling of each token in
+    /// the program.
+    ///
+    /// `None` rather than a default, because a token this build does not
+    /// recognise came from a newer one, and guessing at what it meant is how a
+    /// probe learns to lie. What to do about it is the caller's decision.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|code| code.as_str() == token)
+    }
+
     /// The stable token for this code, for machine-readable output.
     ///
     /// The same vocabulary as the table in the README, so a caller reading the
@@ -154,6 +189,31 @@ impl std::error::Error for ExitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token a code writes is the token that reads back as that code.
+    ///
+    /// `as_str` exists "so nothing has to invent tokens inline"; `from_token` is
+    /// the direction that was missing, and `watch_setup::health` had invented
+    /// three literals for want of it. Walked over `ALL` and counted, because a
+    /// variant dropped from that list quietly narrows every caller that walks it
+    /// -- and this is the caller where it is cheapest to notice.
+    #[test]
+    fn every_exit_code_reads_back_from_the_token_it_writes() {
+        assert_eq!(ExitCode::ALL.len(), 6, "a code was added or dropped");
+        for code in ExitCode::ALL {
+            assert_eq!(
+                ExitCode::from_token(code.as_str()),
+                Some(code),
+                "{code:?} writes {:?} and does not read back from it",
+                code.as_str()
+            );
+        }
+        assert_eq!(
+            ExitCode::from_token("rate-limited"),
+            None,
+            "a spelling this build does not write is not a code it knows"
+        );
+    }
 
     #[test]
     fn a_refused_result_keeps_the_documented_codes() {

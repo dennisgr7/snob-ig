@@ -1,10 +1,7 @@
 use anyhow::Result;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
-use snob_core::store::Store;
-use snob_core::store::rate_budget::SqliteRateBudget;
 use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
 
 use crate::cli::WhoamiArgs;
 use crate::exit::ExitCode;
@@ -13,6 +10,34 @@ use crate::ui;
 pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     let Some(mut session) = store.load()? else {
         ui::no_session();
+        // `--json` still gets an object. A session that has *died* already
+        // produced a full one with `alive: false` and `error.code:
+        // "no_session"`, and no session at all produced zero bytes on standard
+        // output with the same exit code — so the two states an automation most
+        // wants to tell apart were one code, and one of them handed the parser
+        // nothing to read. Every field the object always carries is here;
+        // everything that describes a session that does not exist is null.
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "pk": serde_json::Value::Null,
+                    "username": serde_json::Value::Null,
+                    "origin": serde_json::Value::Null,
+                    "storage": store.backend().as_str(),
+                    "storage_path": store.storage_path(),
+                    "created_at": serde_json::Value::Null,
+                    "validated_at": serde_json::Value::Null,
+                    "alive": false,
+                    "not_checked": "no_session",
+                    "cooldown_until": serde_json::Value::Null,
+                    "error": {
+                        "code": ExitCode::NoSession.as_str(),
+                        "message": "no session is stored on this computer",
+                    },
+                }))?
+            );
+        }
         return Ok(ExitCode::NoSession);
     };
 
@@ -34,10 +59,20 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
     let mut code = ExitCode::Ok;
 
     if !args.offline {
-        // The store goes first: it is what creates the schema the budget then
-        // opens its own connection to.
-        Store::open(paths)?;
-        let pacer = Pacer::new(std::sync::Arc::new(SqliteRateBudget::open(paths)?));
+        // Assembled by `app::pacer` rather than here, so this one is wired like
+        // every other: with the process's cancellation token, and with somebody
+        // to tell when the budget imposes a wait. It had neither, so `snob
+        // whoami` on a rationed bucket sat silent for as long as the debt
+        // lasted and Ctrl+C did not reach it.
+        let pacer = crate::app::pacer(
+            paths,
+            std::sync::Arc::new(|waited: std::time::Duration| {
+                ui::info(&format!(
+                    "The request budget is rationing; waiting {}.",
+                    snob_core::duration::format(waited)
+                ));
+            }),
+        )?;
 
         // A cooldown means nothing is spent, and checking a session is a
         // request like any other. `--offline` is the way to ask anyway, and it

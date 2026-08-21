@@ -26,11 +26,57 @@ const PROFILE_NOTE: &str = "Profiles: https://www.instagram.com/<username>";
 ///
 /// An empty list draws nothing rather than an empty frame: the summary on
 /// standard error already says the count was zero.
+///
+/// **Drawn, then checked, and drawn again without links if the check fails.**
+/// A linked username is a short name wrapped in about fifty-five characters of
+/// invisible address. comfy-table *measures* that cell with a parser that knows
+/// what OSC 8 is, and then *wraps* it with one that does not — `console`'s
+/// `AnsiCodeIterator` has a transition for `ESC [` and none for `ESC ]` — so
+/// once a column is narrow enough to wrap, the address is cut in the middle and
+/// the opener reaches the terminal with its terminator several drawn lines
+/// away. Everything in between, borders and other columns and following rows,
+/// is swallowed into the link. No error and no exit code, on a 70-column
+/// terminal with an ordinary name.
+///
+/// Predicting the arrangement here would mean reimplementing it. Asking the
+/// drawn table whether the links came out whole is exact, costs one linear
+/// scan, and keeps being true when comfy-table changes its mind. The fallback
+/// is the branch that already exists for terminals with no link support: the
+/// plain name, and the address named once underneath.
 pub(crate) fn table(users: &[User], presentation: Presentation) -> String {
     if users.is_empty() {
         return String::new();
     }
 
+    if presentation.hyperlinks {
+        let linked = draw(users, presentation);
+        if links_are_whole(&linked) {
+            return linked;
+        }
+    }
+    draw(
+        users,
+        Presentation {
+            hyperlinks: false,
+            ..presentation
+        },
+    )
+}
+
+/// Whether every hyperlink in a drawn table is still in one piece.
+///
+/// An opener is whole when its terminator is on the same drawn line. Nothing
+/// else in a cell can hold an `ESC`: both strings a row is built from go
+/// through `printable` first, which is what makes this a question about the
+/// layout rather than about the accounts.
+fn links_are_whole(drawn: &str) -> bool {
+    drawn.lines().all(|line| {
+        line.match_indices("\x1b]8;;")
+            .all(|(at, _)| line[at..].contains("\x1b\\"))
+    })
+}
+
+fn draw(users: &[User], presentation: Presentation) -> String {
     let mut table = Table::new();
     table.load_preset(presets::UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -244,6 +290,78 @@ mod tests {
         assert!(out.contains("\x1b["), "{out:?}");
     }
 
+    /// The link is either whole or absent, at every width.
+    ///
+    /// comfy-table measures an OSC 8 cell with a parser that understands it and
+    /// wraps it with one that does not, so a column narrow enough to wrap cuts
+    /// the address in half: the opener reaches the terminal and its terminator
+    /// arrives several drawn lines later, with the borders and the other
+    /// columns in between swallowed into the link. An ordinary name on a
+    /// 70-column terminal is enough.
+    #[test]
+    fn a_wrapped_column_never_cuts_a_link_in_half() {
+        let long = User {
+            username: "a_long_but_ordinary_name".into(),
+            full_name: Some("A very long name that will not fit on one line at all".into()),
+            is_verified: Some(true),
+            is_private: Some(true),
+            ..user()
+        };
+
+        let mut fell_back = 0;
+        for width in [40, 50, 60, 70, 80, 100, 120] {
+            let out = table(
+                std::slice::from_ref(&long),
+                Presentation {
+                    width: Some(width),
+                    ..looking_at_a_terminal()
+                },
+            );
+
+            for line in out.lines() {
+                for (at, _) in line.match_indices("\x1b]8;;") {
+                    assert!(
+                        line[at..].contains("\x1b\\"),
+                        "at {width} columns a link runs off the end of its line: {line:?}"
+                    );
+                }
+            }
+
+            if out.contains(PROFILE_NOTE) {
+                fell_back += 1;
+                assert!(
+                    !out.contains("\x1b]8"),
+                    "the fallback says the address once instead of linking it: {out:?}"
+                );
+                // Not a third rendering: exactly what a terminal with no link
+                // support would have been given at this width.
+                let plainly = table(
+                    std::slice::from_ref(&long),
+                    Presentation {
+                        hyperlinks: false,
+                        width: Some(width),
+                        ..looking_at_a_terminal()
+                    },
+                );
+                assert_eq!(out, plainly, "at {width} columns");
+            }
+        }
+
+        assert!(
+            fell_back > 0,
+            "the narrow widths are the ones this test is about"
+        );
+    }
+
+    /// A width the name fits in keeps the link, which is what the fallback
+    /// costs and therefore what it must not do more often than it has to.
+    #[test]
+    fn a_column_wide_enough_still_links() {
+        let out = table(&[user()], looking_at_a_terminal());
+        assert!(out.contains("\x1b]8;;"), "{out:?}");
+        assert!(!out.contains(PROFILE_NOTE), "{out}");
+    }
+
     #[test]
     fn an_empty_list_draws_nothing() {
         assert_eq!(table(&[], looking_at_a_terminal()), "");
@@ -251,6 +369,11 @@ mod tests {
 
     /// A link is invisible characters wrapped around a short name. If they
     /// were counted as width the columns would come out crooked.
+    ///
+    /// The frame is what is measured, not everything printed: `PROFILE_NOTE` is
+    /// one sentence under the table rather than a column of it, it is 45
+    /// characters whatever the terminal is, and it soft-wraps like any other
+    /// line of prose.
     #[test]
     fn a_narrow_terminal_is_respected_even_with_links() {
         let long = User {
@@ -263,7 +386,7 @@ mod tests {
             ..looking_at_a_terminal()
         };
         let out = table(&[long], presentation);
-        for line in out.lines() {
+        for line in out.lines().filter(|l| !l.starts_with("Profiles:")) {
             let visible = strip_escapes(line).chars().count();
             assert!(visible <= 40, "{visible} columns: {line:?}");
         }

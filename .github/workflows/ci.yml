@@ -36,7 +36,12 @@ jobs:
       # instead of the committed one, and the tag that follows ships versions
       # nobody reviewed. `cargo fmt` takes no such flag and resolves nothing.
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `--all-features`, so the `testing` feature is linted too. Without it
+      # `crates/snob-cli/tests/sandbox.rs` and the sandbox seam in `main.rs` are
+      # never compiled by this job at all, and the one thing that file exists to
+      # protect -- a live session cookie not reaching somebody else's server --
+      # is the last thing that should go unlinted.
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       # The release regenerates the formula and the manifests in its very last
       # job, which is the most expensive place to learn that the generator is
@@ -79,6 +84,15 @@ jobs:
       - name: Test
         if: runner.os != 'Linux'
         run: cargo test --workspace --locked
+      # The nine tests that drive the binary itself live behind the `testing`
+      # feature, so `--workspace` alone runs none of them: not `main`, not the
+      # dispatch, not the store choosing a backend, not the exit code a timer
+      # reads. No `--test` filter, deliberately -- that spelling builds only the
+      # integration target and skips the bin's own unit tests, which is where
+      # the guard on the sandbox keyring namespace lives.
+      - name: Test what only the sandbox can reach
+        if: runner.os != 'Linux'
+        run: cargo test -p snob-cli --features testing --locked
       # Against musl, which is what Linux users get. The same reasoning as the
       # keyring daemon above: a suite that passes on a build nobody receives
       # has not tested the thing that ships. This is where a musl-only problem
@@ -91,6 +105,8 @@ jobs:
           dbus-run-session -- bash -c '
             echo "" | gnome-keyring-daemon --unlock --components=secrets
             cargo test --workspace --locked --target x86_64-unknown-linux-musl
+            cargo test -p snob-cli --features testing --locked \
+              --target x86_64-unknown-linux-musl
           '
 
   build:

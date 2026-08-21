@@ -37,7 +37,14 @@ const MAX_ASTERISKS: usize = 40;
 /// that nothing will ever clear. `Zeroizing` can only wipe the buffer it still
 /// owns.
 pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
-    if !std::io::stdin().is_terminal() {
+    // Asked of the very terminal the keys are read from, so nothing sits
+    // between the question and the answer.
+    let term = console::Term::stderr();
+
+    if !can_mask(
+        std::io::stdin().is_terminal(),
+        term.features().is_attended(),
+    ) {
         let mut line = Zeroizing::new(String::with_capacity(SECRET_CAPACITY));
         std::io::stdin()
             .lock()
@@ -46,7 +53,6 @@ pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
         return Ok(line);
     }
 
-    let term = console::Term::stderr();
     let mut buffer = Zeroizing::new(String::with_capacity(SECRET_CAPACITY));
 
     term.write_str(prompt)
@@ -63,7 +69,12 @@ pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
                 term.write_line("")?;
                 bail!("input canceled");
             }
-            // Arrows, function keys and the like: ignored.
+            // Arrows, function keys and the like: ignored, `Key::Unknown`
+            // included. On Windows `console` reports every virtual key it has
+            // no name for that way — Caps Lock, the function keys, Page Up —
+            // so treating it as a failure would abort a paste because somebody
+            // brushed a key. The spin it used to cause is closed by the gate
+            // above rather than here, where it can be closed exactly.
             _ => continue,
         }
 
@@ -73,6 +84,24 @@ pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
 
     term.write_line("")?;
     Ok(buffer)
+}
+
+/// Whether the masked prompt can run, from the two facts it depends on.
+///
+/// **Both streams, not one.** It reads keys from the terminal and draws to
+/// standard error, and it was gated on standard input alone. `console` answers
+/// `read_key` with `Key::Unknown` *immediately* when the stream its `Term` was
+/// built on is not a tty — not an error, not a block — and the loop's arm for
+/// an unrecognized key is `continue`. So `snob login --paste 2> log`, which is
+/// what capturing a session looks like, pegged a core forever with nothing on
+/// screen and never read what was pasted.
+///
+/// The same stream asymmetry [`can_show_a_menu`] was written for, reaching the
+/// one prompt that never got the gate. Standard input still has to be a
+/// terminal too: without it the bytes are arriving from a pipe and there is
+/// nobody to draw asterisks for.
+fn can_mask(stdin_is_terminal: bool, stderr_is_attended: bool) -> bool {
+    stdin_is_terminal && stderr_is_attended
 }
 
 fn mask(value: &str) -> String {
@@ -320,7 +349,46 @@ pub fn looks_like_console_dump(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_be_asked, can_show_a_menu, looks_like_console_dump, mask};
+    use super::{can_be_asked, can_mask, can_show_a_menu, looks_like_console_dump, mask};
+
+    /// The masked prompt needs both streams, because it uses both.
+    ///
+    /// Gated on standard input alone, `snob login --paste 2> log` -- which is
+    /// what capturing a session looks like -- reached the loop with a `Term`
+    /// that had no terminal to read from, and the loop's arm for an
+    /// unrecognized key is `continue`.
+    #[test]
+    fn masking_needs_the_stream_it_draws_on_as_well() {
+        assert!(can_mask(true, true));
+        assert!(
+            !can_mask(true, false),
+            "stderr redirected: the case that spun"
+        );
+        assert!(!can_mask(false, true), "the value is arriving from a pipe");
+        assert!(!can_mask(false, false));
+    }
+
+    /// The library behaviour the gate exists for, asserted rather than assumed.
+    ///
+    /// `Term::read_key` on a stream that is not a tty answers `Key::Unknown` at
+    /// once: no error, no block, and forever. That is what turns `continue`
+    /// into a spin, and it is a fact about `console` rather than about this
+    /// code -- so it is checked here, where a version bump that changes it
+    /// fails a test instead of quietly making the gate pointless.
+    #[test]
+    fn reading_a_key_from_a_stream_that_is_not_a_terminal_answers_at_once() {
+        let term = console::Term::stderr();
+        if term.features().is_attended() {
+            // Run from a terminal, where the call would block. Nothing to say.
+            return;
+        }
+
+        assert!(
+            matches!(term.read_key(), Ok(console::Key::Unknown)),
+            "the arm the loop `continue`s on, answered instantly"
+        );
+        assert!(!can_mask(true, term.features().is_attended()));
+    }
 
     /// A menu is strictly more demanding than a line, and this must never
     /// invert.

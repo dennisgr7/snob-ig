@@ -16,3 +16,4 @@ pub mod output;
 pub mod progress;
 pub mod report;
 pub mod ui;
+pub mod watch;

@@ -10,7 +10,6 @@ use anyhow::{Result, bail};
 use snob_core::paths::AppPaths;
 use snob_core::secrets::{Backend, SecretStore};
 use snob_core::session::Session;
-use snob_core::store::rate_budget::SqliteRateBudget;
 use snob_ig::login::{self, ValidationOutcome};
 use snob_ig::pace::{CancelToken, Pacer};
 
@@ -97,13 +96,26 @@ fn who(session: &Session) -> String {
 /// Checking a session is a request like any other, so it is counted like any
 /// other. Before this it was free, which is how repeated logins could spend
 /// without the budget ever knowing.
+///
+/// Assembled by `app::pacer` rather than here, so this one is wired like every
+/// other: with the process's cancellation token, and with somebody to tell when
+/// the budget imposes a wait. It had neither. The interrupt handler is already
+/// installed by the time `--browser` reaches the validating request, so the
+/// first Ctrl+C printed "Stopping and saving what has been fetched…" and
+/// changed nothing — a message that was simply false, and only the second press
+/// got out.
 fn pacer(paths: &AppPaths) -> Result<Pacer> {
-    // The store goes first: it is what creates the schema the budget then
-    // opens its own connection to.
-    snob_core::store::Store::open(paths)?;
-    Ok(Pacer::new(std::sync::Arc::new(SqliteRateBudget::open(
+    crate::app::pacer(
         paths,
-    )?)))
+        // One line rather than a bar: this is a single request, so there is
+        // nothing for a bar to count.
+        std::sync::Arc::new(|waited: std::time::Duration| {
+            ui::info(&format!(
+                "The request budget is rationing; waiting {}.",
+                snob_core::duration::format(waited)
+            ));
+        }),
+    )
 }
 
 /// Works out the method: whatever the flags say, or whatever the user picks

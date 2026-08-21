@@ -73,7 +73,7 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
         // it goes to standard output, which is what
         // `snob pfp someone > face.jpg` is asking for.
         None if output::Presentation::detect(None).interactive => {
-            let path = output::default_path(&username, extension)?;
+            let path = output::default_path(std::path::Path::new("."), &username, extension)?;
             output::write_new(&rendered, &path)?;
         }
         None => output::write_rendered(&rendered, None)?,
@@ -344,7 +344,7 @@ mod tests {
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
         assert!(
             matches!(picture.source, Source::Smaller { .. }),
-            "falling back has to be recorded, or the command says nothing about              having served the one size it exists to avoid"
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
         );
     }
 
@@ -363,7 +363,7 @@ mod tests {
         assert!(picture.url.ends_with("/hd.jpg"), "{}", picture.url);
         assert!(
             matches!(picture.source, Source::Smaller { .. }),
-            "falling back has to be recorded, or the command says nothing about              having served the one size it exists to avoid"
+            "falling back has to be recorded, or the command says nothing about having served the one size it exists to avoid"
         );
     }
 
