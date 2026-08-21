@@ -84,7 +84,7 @@ cargo test the_first_run_walks_the_list    # one test by name
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p snob-cli -- login --paste     # run it; mind the double dash
 
-cargo test -p snob-cli --features testing --test sandbox   # the binary itself
+cargo test -p snob-cli --features testing            # the binary itself
 ```
 
 Without the `--`, cargo keeps the flags instead of passing them through.
@@ -121,10 +121,16 @@ walk it produced would be a real account read with no waits between pages.
 has to be repeated after every change; for iterating, `cargo run` is the one.
 
 CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
-targets. Two things there are deliberate, and both are the same idea: what is
-tested has to be what ships. The Linux job installs a keyring daemon, because
-without one the secret store falls back to a file and the backend under test is
-not the one users get. And the Linux suite runs against **musl**, which is what
+targets. Three things there are deliberate, and all three are the same idea:
+what is tested has to be what ships. The Linux job installs a keyring daemon,
+because without one the secret store falls back to a file and the backend under
+test is not the one users get. **Every platform runs the `testing` feature as
+its own step, and clippy lints with `--all-features`**: `--workspace` alone
+compiles neither `tests/sandbox.rs` nor the sandbox seam in `main.rs`, so for a
+while the only tests that drive the binary ran on no gate at all — including the
+one holding down the keyring namespace, whose absence had already destroyed a
+real session twice. The step takes no `--test` filter on purpose, because that
+spelling builds only the integration target and skips the bin's own unit tests. And the Linux suite runs against **musl**, which is what
 Linux users are given: a glibc build carries the runner's glibc version as a
 hard requirement, and built on Ubuntu 24.04 it will not install on Debian 12 or
 Ubuntu 22.04.
