@@ -663,6 +663,47 @@ deliberately unfinished:
     gives up on a report that reached a day, and `forget_settled` forgets a
     delivered one after seven.
 
+## Reproducible builds
+
+Two builds of one tag produce the same bytes, and four things had to be true at
+once for that to hold.
+
+`rust-toolchain.toml` names an **exact** version rather than `stable`, because
+a rebuild months later cannot match a release compiled by a different compiler,
+and a mismatch that proves nothing is worse than no check. Bumping it is now a
+commit somebody reviewed.
+
+`-Clink-arg=/Brepro` is in both Windows tables in `.cargo/config.toml`. Two
+release builds of one commit used to differ in exactly 24 bytes, all of them in
+the PE header: the TimeDateStamp, which is the wall clock at link time, and the
+CodeView GUID, which is random per link. `/Brepro` derives both from the input
+instead. Verified here rather than assumed -- two release builds of this tree,
+with `target/release` deleted in between, gave the same SHA-256; the same tree
+without the flag gave a different one.
+
+The absolute paths come out through a **second config file**, written by the
+release workflow into `$CARGO_HOME/config.toml`. That shape is not decoration:
+`RUSTFLAGS` *replaces* `.cargo/config.toml` rather than adding to it, so
+exporting it there would silently drop `+crt-static` and both Windows binaries
+would go back to needing the Visual C++ redistributable -- with nothing failing
+until somebody could not launch one. Cargo joins the `rustflags` arrays across
+config files, which is what makes the second file work, and
+`[target.'cfg(all())']` merges with the per-triple tables rather than replacing
+them. `CARGO_HOME` is moved inside the checkout in that workflow so a single
+`--remap-path-prefix` covers the sources and the unpacked registry together.
+
+The archives were the last of it, and an archive nobody can rebuild makes the
+binary inside it unverifiable too. Both formats embed a modification time and
+both are now given one -- the committer date of the tagged commit, derived from
+the tag like everything else there. `tar` gets `--sort=name`, `--mtime`,
+`--owner`/`--group` and `gzip -n`, that last for the timestamp gzip writes into
+its own header and everybody forgets. `Compress-Archive` has no flag at all, so
+the staged files' `LastWriteTime` is set before it runs, rounded down to an even
+second because a zip's DOS timestamp has two-second resolution. Both recipes
+were checked locally: same content on two different days, same bytes, where the
+recipes they replace gave two different archives. The `.deb` needed nothing --
+`cargo-deb` was already reproducible.
+
 ## What it costs, in bytes
 
 Measured on `aarch64-pc-windows-msvc` in August 2026, which is the odd target —
@@ -711,13 +752,6 @@ left in a report nobody can find, and in the order they are worth doing.
   to 14. It is a POST, which this project has never sent, and its page limit,
   response shape and throttle weighting are all unverified. Settle whether a
   non-mutating POST is inside the no-write rule before designing anything.
-- **Reproducibility is 24 bytes away.** Two release builds differed only in the
-  PE TimeDateStamp and the CodeView GUID; `-Clink-arg=/Brepro` plus
-  `--remap-path-prefix` made them identical and took 46,080 bytes off. The gap
-  is the archives: `tar -czf` and `Compress-Archive` both embed mtimes, while
-  the `.deb` is already reproducible. Pin `rust-toolchain.toml` to an exact
-  version first — it says `stable`, so a rebuild months later cannot match by
-  construction. Remember that `RUSTFLAGS` replaces `.cargo/config.toml`.
 - **Narrowing the trust store** is available and should be opt-in, not default.
   reqwest 0.13 made `rustls-platform-verifier` the default, so the four rustls
   targets now honor enterprise roots and a managed laptop with an inspection
