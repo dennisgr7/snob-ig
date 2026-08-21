@@ -40,14 +40,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          # **Empty, so the action reads `rust-toolchain.toml` instead.** The
-          # pin is by SHA onto the action's `stable` branch, where the default
-          # input is the literal `stable` -- so `targets` and `components` were
-          # being installed into whatever stable is today while `cargo` used the
-          # 1.97.1 this repository pins. The two builds that need a target that
-          # is not the host's failed with "can't find crate for `core`": the
-          # musl standard library was on a toolchain nothing compiled with.
-          toolchain: ""
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # `--locked` on everything that resolves dependencies, here and in the
@@ -91,11 +83,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          # See the note in the lint job: the pin is by SHA onto the action's
-          # `stable` branch, so this has to be emptied for `rust-toolchain.toml`
-          # to be what installs.
-          toolchain: ""
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The tests use their own keyring service name and never touch the real
       # one, but on Linux there is no keyring daemon at all: without this, the
@@ -171,19 +158,25 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          # **Empty, so the action reads `rust-toolchain.toml` instead.** The
-          # pin is by SHA onto the action's `stable` branch, where the default
-          # input is the literal `stable` -- so `targets` and `components` were
-          # being installed into whatever stable is today while `cargo` used the
-          # 1.97.1 this repository pins. The two builds that need a target that
-          # is not the host's failed with "can't find crate for `core`": the
-          # musl standard library was on a toolchain nothing compiled with.
-          toolchain: ""
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+      # **`rustup`, not the action's `targets:` input.** The action is pinned by
+      # SHA onto its `stable` branch, where `toolchain` is a required input
+      # defaulting to the literal `stable` -- so `targets:` installed the
+      # standard library into whatever stable is today, while every cargo
+      # invocation used the 1.97.1 that `rust-toolchain.toml` pins. On the host
+      # target nothing notices, because its standard library is already there;
+      # on a cross target the build fails with "can't find crate for `core`",
+      # which reads like a broken runner and is not.
+      #
+      # Run from the checkout, `rustup` honours the override file, so the target
+      # lands on the toolchain that will compile it. Emptying the input instead
+      # does not work on this pin -- the action refuses with "'toolchain' is a
+      # required input" -- and naming 1.97.1 here would put the pin in six
+      # places, which is the drift that caused this.
+      - name: The target, on the toolchain this repository pins
+        run: rustup target add ${{ matrix.target }}
 
       # rusqlite builds SQLite from C, so a musl target needs a musl C
       # compiler. Without this the failure is a linker error about missing
