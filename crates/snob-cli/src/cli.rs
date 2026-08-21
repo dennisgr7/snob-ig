@@ -100,6 +100,8 @@ it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.
 Exit codes:
   0   it worked; a list cut short by --limit or --max-pages is still a 0
   1   it failed, or a result was refused because a list came back incomplete
+  2   the command line could not be parsed; nothing was done, and running it
+      again unchanged will not help
   3   no session, or the stored one no longer works -- run \"snob login\"
   4   Instagram wants the account verified -- open the address it prints
   5   Instagram is throttling, or the account is in cooldown -- wait

@@ -10,6 +10,34 @@ use crate::ui;
 pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     let Some(mut session) = store.load()? else {
         ui::no_session();
+        // `--json` still gets an object. A session that has *died* already
+        // produced a full one with `alive: false` and `error.code:
+        // "no_session"`, and no session at all produced zero bytes on standard
+        // output with the same exit code — so the two states an automation most
+        // wants to tell apart were one code, and one of them handed the parser
+        // nothing to read. Every field the object always carries is here;
+        // everything that describes a session that does not exist is null.
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "pk": serde_json::Value::Null,
+                    "username": serde_json::Value::Null,
+                    "origin": serde_json::Value::Null,
+                    "storage": store.backend().as_str(),
+                    "storage_path": store.storage_path(),
+                    "created_at": serde_json::Value::Null,
+                    "validated_at": serde_json::Value::Null,
+                    "alive": false,
+                    "not_checked": "no_session",
+                    "cooldown_until": serde_json::Value::Null,
+                    "error": {
+                        "code": ExitCode::NoSession.as_str(),
+                        "message": "no session is stored on this computer",
+                    },
+                }))?
+            );
+        }
         return Ok(ExitCode::NoSession);
     };
 
