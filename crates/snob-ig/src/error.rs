@@ -151,6 +151,20 @@ impl IgError {
     /// What to do with this error during a walk.
     pub fn reaction(&self) -> Reaction {
         match self {
+            // **A refused redirect is not a network failure**, and treating it
+            // as one was expensive in the one currency this crate is careful
+            // with. `api_policy` refuses a hop that would take an API call off
+            // instagram.com by calling `attempt.error(..)`, which reqwest hands
+            // back as an ordinary `reqwest::Error` -- so it landed here as
+            // `Network`, whose reaction is `Retry`, and the pager sent the same
+            // request three more times, each one charged and each one carrying
+            // the session cookie, when retrying could not possibly help.
+            // Measured at 13 requests on the wire against 5 charged.
+            //
+            // `is_redirect()` is true exactly for a policy refusal, which is
+            // what makes this a one-line question rather than a guess about the
+            // message.
+            Self::Network(e) if e.is_redirect() => Reaction::Abort,
             Self::Network(_) => Reaction::Retry,
             // A 5xx is the server's problem, not ours.
             Self::Unexpected { status, .. } if *status >= 500 => Reaction::Retry,

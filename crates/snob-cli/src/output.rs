@@ -214,9 +214,20 @@ pub fn write(
 pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
     use std::fs::OpenOptions;
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Everything else this tool writes is 0600 or 0700 -- the session, the
+    // database, the directories -- and an export is a list of real people's
+    // names. It was the one file left at whatever the umask allowed, which on
+    // a shared machine is usually world-readable. Only for the name snob
+    // chooses; an explicit `-o` is the user's own decision about where their
+    // data goes, and `write_rendered` leaves that alone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .with_context(|| format!("could not create {}", path.display()))?;
     file.write_all(rendered.as_bytes())
