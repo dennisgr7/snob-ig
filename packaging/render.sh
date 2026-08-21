@@ -219,6 +219,13 @@ ManifestType: installer
 ManifestVersion: 1.6.0
 EOF
 
+# **The `Description` below has three other copies**, and nothing generates them
+# from one source: `crates/snob-cli/Cargo.toml` sends the same paragraph to the
+# Debian package, `crates/snob-ig/src/lib.rs` states the rule for a reader of the
+# code, and `README.md` says it in prose. All four claimed "it reads only: it
+# never follows, unfollows" for a whole version after `snob follow` shipped —
+# a store listing asserting the opposite of what the binary does. If one moves,
+# all four move.
 cat > packaging/winget/dennisgr7.snob.locale.en-US.yaml <<EOF
 # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: dennisgr7.snob
@@ -234,8 +241,10 @@ ShortDescription: "Instagram from the terminal: who does not follow you back"
 Description: |-
   Walks an Instagram account's followers and following, crosses them, and
   reports who does not follow you back, who you never followed back, and who
-  you and somebody else both know. It reads only: it never follows, unfollows,
-  blocks or removes anyone.
+  you and somebody else both know. Almost all of it reads: it changes exactly
+  two things, one account per command and after asking, which are following an
+  account and unfollowing one. It never blocks, never removes a follower, and
+  never marks a story as seen.
 Tags:
   - instagram
   - cli

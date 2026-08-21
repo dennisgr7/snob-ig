@@ -96,11 +96,20 @@ maintainer = "dennisgr7 <70021856+dennisgr7@users.noreply.github.com>"
 section = "utils"
 priority = "optional"
 depends = "$auto"
+# **This paragraph has three other copies**, and they say the same thing because
+# they are the same claim: `packaging/render.sh` renders it into the winget
+# manifest, `packaging/winget/dennisgr7.snob.locale.en-US.yaml` is that render
+# committed, and `crates/snob-ig/src/lib.rs` states the rule for a reader of the
+# code. There is no generator over the four. They said "reads only: it never
+# follows, unfollows" for a whole version after `snob follow` shipped, so if one
+# of them moves, all four move.
 extended-description = """
 Walks an Instagram account's followers and following, crosses them, and reports \
 who does not follow you back, who you never followed back, and who you and \
-somebody else both know. Reads only: it never follows, unfollows, blocks or \
-removes anyone."""
+somebody else both know. Almost all of it reads: it changes exactly two things, \
+one account per command and after asking, which are following an account and \
+unfollowing one. It never blocks, never removes a follower, and never marks a \
+story as seen."""
 assets = [
     ["target/release/snob", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/snob/README.md", "644"],
