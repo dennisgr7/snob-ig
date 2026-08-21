@@ -921,7 +921,7 @@ mod tests {
     /// And a receipt whose capture retention took can be marked again.
     ///
     /// The other tripwire, and the sharper one. `snapshot_id` is nullable by
-    /// `ON DELETE SET NULL` -- the neighbouring test pins that state -- so an
+    /// `ON DELETE SET NULL` -- the neighboring test pins that state -- so an
     /// ordering guard written as `excluded.snapshot_id >= watch_marks.snapshot_id`
     /// compares against NULL, which is NULL, which `DO UPDATE ... WHERE` reads as
     /// false. The write is declined with no error, the account never gets a new

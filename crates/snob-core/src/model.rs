@@ -113,7 +113,7 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
-/// The characters that show nothing but change how their neighbours read.
+/// The characters that show nothing but change how their neighbors read.
 ///
 /// `char::is_control` covers general category `Cc`, which is both the C0 and
 /// the C1 ranges. It does **not** cover these: they are category `Cf`, formatting

@@ -58,7 +58,7 @@ pub const NO_RECORDED_CONSENT: &str =
 /// reprimand for doing something wrong.
 ///
 /// `.for_stderr()` on every styled label is not optional. Without it `console`
-/// decides on stdout's colour state, so the labels lose their colour when only
+/// decides on stdout's color state, so the labels lose their color when only
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
 pub fn print_error(error: &anyhow::Error) {
@@ -158,9 +158,20 @@ pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
     until_ms.div_euclid(1000)
 }
 
+/// A moment, for a person to read.
+///
+/// **The month is named rather than numbered, and that is the whole of the
+/// decision.** This printed `%d/%m` — the Spanish original's convention,
+/// surviving the July 2026 translation — in a tool whose standing rule is
+/// English with US spelling, and whose audience therefore reads `03/08` as the
+/// eighth of March. It is the one formatting decision in this file that had no
+/// reasoning written at it, which is presumably why it survived. Naming the
+/// month removes the ambiguity for everybody instead of moving it from one half
+/// of the readership to the other; `%-d` rather than `%d` because "Aug 3" is
+/// how the date is said.
 fn format_epoch(seconds: i64, unknown: &str) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|t| t.format("%d/%m at %H:%M").to_string())
+        .map(|t| t.format("%b %-d at %H:%M").to_string())
         .unwrap_or_else(|| unknown.to_string())
 }
 
@@ -365,8 +376,8 @@ pub fn requests(n: u32) -> String {
 /// this module guessing from the reason. `Truncated` used to be treated as
 /// proof that nothing was left to continue from, and that is true of exactly
 /// one of the five ways it arrives: the reclassification `verify_completion`
-/// makes
-/// once pagination has already ended, where there is no cursor to save. The
+/// makes once pagination has already ended, where there is no cursor to save.
+/// The
 /// other four — the hard page cap, a cursor that came back unchanged, two empty
 /// pages, and several pages with nothing new — stop in the **middle** of the
 /// pagination with a cursor stored, and a run within the resume window
@@ -697,10 +708,10 @@ mod tests {
     fn a_date_out_of_range_still_reads_as_something() {
         assert_eq!(stored_on(i64::MAX), "earlier");
         assert_eq!(cooldown_ends_at(i64::MAX), "later");
-        assert_eq!(stored_on(1_722_700_000), "03/08 at 15:46");
+        assert_eq!(stored_on(1_722_700_000), "Aug 3 at 15:46");
         // Milliseconds, and a negative one must not round towards zero into a
         // different second than it belongs to.
-        assert_eq!(cooldown_ends_at(1_722_700_000_000), "03/08 at 15:46");
+        assert_eq!(cooldown_ends_at(1_722_700_000_000), "Aug 3 at 15:46");
     }
 
     /// The refusal has to name the mistake the caller would otherwise have

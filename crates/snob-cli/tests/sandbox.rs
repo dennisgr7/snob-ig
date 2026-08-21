@@ -26,7 +26,7 @@
 //!
 //! Every test gets its own sandbox root, its own fake Instagram and its own
 //! fake receiver, so nothing shares state and the file cannot pass by accident
-//! because a neighbour ran first.
+//! because a neighbor ran first.
 #![cfg(feature = "testing")]
 
 use std::path::Path;

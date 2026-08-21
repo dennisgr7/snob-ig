@@ -39,7 +39,7 @@ pub struct Pace {
     /// asked for — a thousand followers costs around forty requests either way
     /// — which is what the settled note in AGENTS.md already says and what this
     /// comment used to contradict. It is kept at 50 because it costs nothing,
-    /// it is honoured on the following list, and asking for less would only
+    /// it is honored on the following list, and asking for less would only
     /// ever mean more requests.
     pub per_page: u32,
     /// Short pause before each request.
@@ -421,7 +421,7 @@ mod tests {
         pacer
             .clear_to_send()
             .await
-            .expect("nothing is cancelled yet");
+            .expect("nothing is canceled yet");
         assert_eq!(pacer.spent(), 1);
 
         pacer.cancel_token().cancel();

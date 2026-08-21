@@ -117,8 +117,20 @@ impl WebhookClient {
     /// **No credential can reach this.** There is no argument for one, which is
     /// the guard rather than a rule somebody has to keep.
     pub fn new(webhook: Webhook) -> Result<Self> {
+        // A private destination is one `check` allowed to be unencrypted
+        // *because* it is private, so it must not leave the machine through a
+        // proxy named by an inherited environment variable -- which is a
+        // measured leak of the report, the `Authorization` header and the
+        // signature, in the clear, to a third party. A public receiver keeps
+        // honoring the environment, because somebody behind a mandatory proxy
+        // has no other route out.
+        let build = if is_private(&webhook.url) {
+            http::plain_direct
+        } else {
+            http::plain
+        };
         Ok(Self {
-            client: http::plain(
+            client: build(
                 &format!("snob/{}", env!("CARGO_PKG_VERSION")),
                 // Not `limited(0)`, which follows nothing but reports a 3xx as
                 // an error the same way; `none()` hands the response back so
@@ -342,7 +354,7 @@ pub fn check(webhook: &Webhook) -> Result<()> {
     // `Content-Type` is deliberately **not** here. Asking for
     // `application/json; charset=utf-8` is an ordinary thing to want, and `post`
     // now builds one map so the user's value replaces snob's rather than
-    // travelling beside it.
+    // traveling beside it.
     const FRAMING: [&str; 5] = [
         "content-length",
         "transfer-encoding",
@@ -806,7 +818,7 @@ mod tests {
         assert!(check(&hook).is_ok());
 
         // Including one snob also sends, now that `post` builds a single map and
-        // the user's value replaces snob's instead of travelling beside it.
+        // the user's value replaces snob's instead of traveling beside it.
         let mut hook = webhook("https://example.com/hook");
         hook.headers.push((
             "Content-Type".into(),

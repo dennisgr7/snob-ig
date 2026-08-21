@@ -151,7 +151,7 @@ fn existing_to_replace(paths: &AppPaths, dry_run: bool) -> Result<Option<WatchCo
 /// Instagram serves roughly this many whatever `per_page` asks for, which is
 /// the settled note in AGENTS.md. It is here to turn a follower count into a
 /// number of requests for the sentence below, and nothing depends on it being
-/// exact — it is an estimate offered to a person, labelled as one.
+/// exact — it is an estimate offered to a person, labeled as one.
 const ACCOUNTS_PER_REQUEST: u64 = 25;
 
 /// What taking the baseline now would walk, over every account it covers.
@@ -616,9 +616,14 @@ fn ask_webhook() -> Result<WebhookAnswers> {
         "Sign the body, so the receiver can check it came from here?",
         true,
     )? {
-        let value = ui::prompt_secret("A shared secret (anything long and random)")?;
-        if value.trim().is_empty() {
-            bail!("a signing secret cannot be empty");
+        let value = ui::prompt_secret("A shared secret (at least 32 characters, random)")?;
+        if value.trim().chars().count() < 32 {
+            // The same floor `--sign-with` applies, for the same reason, and
+            // said in the same place a person is standing. A short secret is
+            // guessable offline by anybody holding one signed report.
+            bail!(
+                "a signing secret has to be at least 32 characters. Generate one --                  \"openssl rand -hex 32\" -- rather than choosing one"
+            );
         }
         Some(Secret::new(value.to_string()))
     } else {

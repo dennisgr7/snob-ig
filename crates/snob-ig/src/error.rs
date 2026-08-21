@@ -151,6 +151,20 @@ impl IgError {
     /// What to do with this error during a walk.
     pub fn reaction(&self) -> Reaction {
         match self {
+            // **A refused redirect is not a network failure**, and treating it
+            // as one was expensive in the one currency this crate is careful
+            // with. `api_policy` refuses a hop that would take an API call off
+            // instagram.com by calling `attempt.error(..)`, which reqwest hands
+            // back as an ordinary `reqwest::Error` -- so it landed here as
+            // `Network`, whose reaction is `Retry`, and the pager sent the same
+            // request three more times, each one charged and each one carrying
+            // the session cookie, when retrying could not possibly help.
+            // Measured at 13 requests on the wire against 5 charged.
+            //
+            // `is_redirect()` is true exactly for a policy refusal, which is
+            // what makes this a one-line question rather than a guess about the
+            // message.
+            Self::Network(e) if e.is_redirect() => Reaction::Abort,
             Self::Network(_) => Reaction::Retry,
             // A 5xx is the server's problem, not ours.
             Self::Unexpected { status, .. } if *status >= 500 => Reaction::Retry,
@@ -427,12 +441,12 @@ mod tests {
 
     #[test]
     fn a_challenge_with_a_url() {
-        let body = r#"{"message":"challenge_required","error_type":"checkpoint_challenge_required","challenge":{"api_path":"/challenge/8166970138/kX2s7GUDNY/","url":"https://i.instagram.com/challenge/8166970138/kX2s7GUDNY/","native_flow":true,"lock":true,"logout":false},"status":"fail"}"#;
+        let body = r#"{"message":"challenge_required","error_type":"checkpoint_challenge_required","challenge":{"api_path":"/challenge/424242/Ch4LLeNGe1/","url":"https://i.instagram.com/challenge/424242/Ch4LLeNGe1/","native_flow":true,"lock":true,"logout":false},"status":"fail"}"#;
         match classify(400, body) {
             IgError::Challenge { url } => {
                 assert_eq!(
                     url.as_deref(),
-                    Some("https://i.instagram.com/challenge/8166970138/kX2s7GUDNY/")
+                    Some("https://i.instagram.com/challenge/424242/Ch4LLeNGe1/")
                 );
             }
             other => panic!("expected a challenge, got {other:?}"),
@@ -441,12 +455,12 @@ mod tests {
 
     #[test]
     fn a_checkpoint_with_a_relative_path_is_made_absolute() {
-        let body = r#"{"message":"checkpoint_required","checkpoint_url":"/challenge/35675779481/SHhJ2pZf98/","lock":false,"status":"fail"}"#;
+        let body = r#"{"message":"checkpoint_required","checkpoint_url":"/challenge/424242/Ch4LLeNGe2/","lock":false,"status":"fail"}"#;
         match classify(400, body) {
             IgError::Checkpoint { url } => {
                 assert_eq!(
                     url.as_deref(),
-                    Some("https://www.instagram.com/challenge/35675779481/SHhJ2pZf98/")
+                    Some("https://www.instagram.com/challenge/424242/Ch4LLeNGe2/")
                 );
             }
             other => panic!("expected a checkpoint, got {other:?}"),
@@ -619,7 +633,7 @@ mod tests {
             // Written as the JSON escapes they arrive as: a raw control
             // character inside a JSON string is not JSON, so a body carrying
             // one never reaches this check at all. These do.
-            "/challenge/8166970138/kX2s7GUDNY/\\u001b[2K\\u001b[A",
+            "/challenge/424242/Ch4LLeNGe1/\\u001b[2K\\u001b[A",
             "https://www.instagram.com\\u000a/challenge/x",
             "https://www.\\u0009instagram.com/challenge/x",
         ] {

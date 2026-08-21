@@ -34,7 +34,7 @@ use crate::paths::AppPaths;
 #[serde(deny_unknown_fields)]
 pub struct WatchConfig {
     /// Which shape of this file it is. Read before anything else, so a future
-    /// version can recognise an older one instead of failing at a field.
+    /// version can recognize an older one instead of failing at a field.
     #[serde(default = "one")]
     pub schema: u32,
 

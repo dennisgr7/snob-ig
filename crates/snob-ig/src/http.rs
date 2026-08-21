@@ -58,6 +58,20 @@ pub fn builder(
         .redirect(redirect)
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        // reqwest drops an idle connection at 90 s, and this tool deliberately
+        // waits between requests: the long pause every seventh page is up to 15
+        // s on its own, and the request budget is shared between processes, so
+        // a second snob can push a wait arbitrarily far out. Measured on the
+        // boundary: 89 s reuses the connection, 95 s opens a new one — a fresh
+        // TCP and TLS handshake for a request that was only being polite. Five
+        // minutes is Chromium's own idle-socket timeout.
+        //
+        // The keepalive is the other half. A connection held open for minutes
+        // is one a NAT or a firewall may drop silently, and without this the
+        // first thing that notices is a failed request; with it, the kernel
+        // does.
+        .pool_idle_timeout(Duration::from_secs(300))
+        .tcp_keepalive(Duration::from_secs(60))
 }
 
 /// A client that carries no credential.
@@ -71,6 +85,32 @@ pub fn plain(
     redirect: reqwest::redirect::Policy,
 ) -> reqwest::Result<reqwest::Client> {
     builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()
+}
+
+/// The same, for a destination that is only allowed to be plain `http://`
+/// **because it is on the user's own network** — and which therefore must not
+/// be sent through a proxy.
+///
+/// `webhook::check` permits an unencrypted address exactly when it is private,
+/// on the stated grounds that the traffic stays inside the user's own network.
+/// With `HTTP_PROXY` set in the environment that reasoning is void: hyper-util's
+/// matcher has no loopback exemption, so a POST to `http://127.0.0.1:8787/hook`
+/// goes to the proxy instead — in the clear, carrying the report, the
+/// `Authorization` header and the signature. That was reproduced against a
+/// recording proxy, not reasoned about.
+///
+/// Go's `ProxyFromEnvironment` never proxies loopback for the same reason, and
+/// this is narrower still: it is applied only where the private address is the
+/// whole justification for the request being unencrypted. A public `https://`
+/// receiver keeps honoring the environment, because somebody behind a mandatory
+/// proxy has no other route out.
+pub fn plain_direct(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+) -> reqwest::Result<reqwest::Client> {
+    builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+        .no_proxy()
+        .build()
 }
 
 /// Reads a response body, stopping at `cap`.

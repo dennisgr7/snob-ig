@@ -240,6 +240,17 @@ And the corrections worth knowing about:
   PowerShell an unquoted one is eaten before the command runs, and the answer
   comes back about your own account with exit 0.
 - "Followed by @ana, @luis and @eva and 2 others" reads as one list now.
+- **`snob login --browser` cleans up after itself.** The profile it drives the
+  browser in is 87 MB and holds a second copy of your live session, and it was
+  kept for ever. It is removed once the cookies have been captured;
+  `--keep-profile` keeps it if you would rather the next login skipped the
+  Instagram form.
+- Dates name the month — `Aug 3 at 14:12` rather than `03/08 at 14:12`, which
+  half the English-speaking world reads as the eighth of March.
+- A signing secret has to be at least 32 characters. A short one can be guessed
+  offline by anybody who has been sent one signed report.
+- On Windows the binary no longer needs the Visual C++ redistributable. It used
+  to fail in the loader, before `main`, on a machine that had never had it.
 - `snob whoami --json` answers with an object when no session is stored. It
   printed nothing at all, while a session that had *died* produced a full
   object with `alive: false` — so the two states share exit code 3 and one of

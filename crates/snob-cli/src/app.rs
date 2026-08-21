@@ -208,6 +208,10 @@ impl App {
         };
 
         let db = Store::open(paths)?;
+        // Retention, for the commands that are not the monitor. At most once a
+        // day, and here because this is the only moment every command passes
+        // through -- the same reason the User-Agent refresh above is here.
+        crate::engine::watch::settle_daily(&db);
         let progress = Progress::new(with_progress);
         let cancel = interrupt::install();
 
@@ -240,7 +244,7 @@ impl App {
     /// task per test.
     /// The one thing it does **not** skip is how the cancellation is wired.
     /// [`App::open`] hands one token to both the app and the client's pacer;
-    /// this used to build a second, unconnected one, so cancelling an `App` in
+    /// this used to build a second, unconnected one, so canceling an `App` in
     /// a test never reached a request. Every guard that stops a canceled run
     /// spending was therefore unreachable from any test — which is how two of
     /// them came to be missing.

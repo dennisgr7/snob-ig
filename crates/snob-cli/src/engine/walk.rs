@@ -33,7 +33,7 @@ pub async fn fetch(
         // Empty when the name was never learned, which the pager documents as
         // allowed and simply leaves the referer generic. It used to be the
         // numeric id, so the walk announced
-        // `Referer: https://www.instagram.com/4340136074/followers/` — a page
+        // `Referer: https://www.instagram.com/42/followers/` — a page
         // no browser would ever have been on.
         username: target.username.as_deref().unwrap_or_default(),
         direction: kind.into(),

@@ -20,11 +20,35 @@
 //! person rather than the program, so it is read from the operating system.
 //! That is still deriving it from something true rather than picking a value.
 //!
-//! Two things this module deliberately does not do. It does not touch the TLS
-//! stack: Chrome has randomized its ClientHello extension order since version
-//! 110, so there is nothing stable there to copy even in principle. And it does
-//! not invent a browser — the User-Agent comes from one actually installed on
-//! the machine (see `browser.rs`), and everything here follows from that.
+//! Two things this module deliberately does not do. It does not touch **the
+//! TLS handshake, the HTTP/2 SETTINGS or the order of the headers on the
+//! wire**, and it does not invent a browser — the User-Agent comes from one
+//! actually installed on the machine (see `browser.rs`), and everything here
+//! follows from that.
+//!
+//! The reason given for the first of those used to be that Chrome randomizes
+//! its ClientHello extension order, so there is nothing stable to copy. The
+//! premise is true and the conclusion has not held since 2023: JA4, which is
+//! what fingerprinting moved to, sorts the extension list before hashing it,
+//! precisely so that the shuffling changes nothing. There *is* something
+//! stable to copy. Three reasons that do hold, in the order they matter:
+//!
+//! - **It is detection evasion, and that is not what this tool is for.**
+//!   Matching a browser's cryptographic identity is not making a request
+//!   honestly; it is making a program harder to recognize as a program. The
+//!   goal here is to lower the risk to a real account, not to be harder to
+//!   catch, and those two come apart exactly here.
+//! - Copying a handshake means leaving `rustls`, and with it the clean static
+//!   cross-compilation to five targets that is most of what "single binary, no
+//!   runtime" costs to keep.
+//! - It would buy nothing anyway. What decides whether Instagram throttles an
+//!   account is, in order, the address the requests come from, how many there
+//!   are, and how fast.
+//!
+//! This applies to the whole wire signature and not only to TLS, which is
+//! worth saying plainly because the next version of the argument arrives as
+//! `http2_initial_stream_window_size` and the Akamai h2 fingerprint. Same
+//! answer, same three reasons.
 //!
 //! Headers are also not the lever that matters. What determines whether
 //! Instagram throttles an account is, in order, the address the requests come

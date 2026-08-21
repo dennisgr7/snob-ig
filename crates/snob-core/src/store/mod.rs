@@ -16,7 +16,7 @@ pub mod watch;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::Migrations;
 use thiserror::Error;
 
@@ -154,13 +154,64 @@ impl Store {
 /// can run its own chain through the very function production uses. Checking
 /// this against a hand-written copy of the wrapping would prove nothing.
 fn migrate(conn: &mut Connection, migrations: &Migrations<'_>) -> Result<(), StoreError> {
+    let before = user_version(conn).unwrap_or(0);
+
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     let outcome = migrations.to_latest(conn);
     // Back on even if the chain failed: the connection is handed back to the
     // caller either way, and `open_at` only stops on the `?` below.
     conn.pragma_update(None, "foreign_keys", "ON")?;
     outcome?;
+
+    // **Once, and only when a migration actually ran.**
+    //
+    // `DROP INDEX` moves the index's pages to the freelist; the file only
+    // shrinks on `VACUUM`, and on the index 010 removes that is 42% of it.
+    // `VACUUM` cannot run inside a transaction, so it cannot live in the
+    // migration, and it rewrites the whole file, so it must not run on every
+    // open — hence the version comparison rather than a flag somebody has to
+    // remember to clear.
+    //
+    // Best-effort. A database that could not be compacted is a database that
+    // works and takes more disk, which is not worth failing an open over: the
+    // space comes back on the next migration, or never, and either way the
+    // user's command runs.
+    if user_version(conn).unwrap_or(0) > before
+        && let Err(e) = conn.execute_batch("VACUUM")
+    {
+        tracing::debug!(error = %e, "the database could not be compacted after migrating");
+    }
+
     Ok(())
+}
+
+/// One remembered value, from the `meta` table.
+///
+/// The table has existed since the first migration and nothing had ever read
+/// or written it. It is for facts about the database itself rather than about
+/// an account -- the first of them being when retention last ran.
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// What the migration runner counts up to. `0` on a database that has none.
+fn user_version(conn: &Connection) -> Result<i64, StoreError> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
 /// Settings that have to be applied on every open.

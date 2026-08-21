@@ -161,7 +161,7 @@ impl AppPaths {
 
 /// The folder name every path here is built from.
 ///
-/// Exposed so that a caller recognising one of our own directories compares
+/// Exposed so that a caller recognizing one of our own directories compares
 /// against the value `ProjectDirs` was given rather than against a copy of it.
 /// `snob purge` needs exactly that, and a second spelling of this string is one
 /// that stops matching the day the application is renamed — silently, because
