@@ -32,6 +32,11 @@ anyhow.workspace = true
 serde_json.workspace = true
 dialoguer.workspace = true
 console.workspace = true
+# Keys for the story browser, and nothing else in this program. It draws with
+# `console` and reads with this: the split is deliberate and the reasoning is on
+# `ui::browser::input`. Costs no new crate here -- comfy-table already compiles
+# it; see the workspace manifest.
+crossterm.workspace = true
 opener.workspace = true
 indicatif.workspace = true
 supports-hyperlinks.workspace = true

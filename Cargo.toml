@@ -76,6 +76,27 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = { version = "0.12", default-features = false }
 console = "0.16"
+# **Already compiled into this binary before it was ever declared here**, by
+# `comfy-table`'s `tty` feature -- `cargo tree -i crossterm` shows the edge.
+# What it was built with is the `windows` feature and nothing else, so the crate
+# was in the tree with its whole reason for existing switched off.
+#
+# Turning `events` and `bracketed-paste` on is what the story browser reads keys
+# with, and it costs **zero new crates on Windows and macOS** and two on Linux
+# (`signal-hook` and `signal-hook-mio`; `mio` itself arrives with tokio). The
+# measured price of the whole browser rewrite is 18,432 bytes, against 106,496
+# for the ratatui answer to the same problem. Both numbers are in AGENTS.md.
+#
+# `default-features = false` is load-bearing and not tidiness: the defaults add
+# `derive-more`, which drags in `convert_case`, `darling`, `darling_core`,
+# `darling_macro` and `ident_case` -- five crates that weigh nothing in the
+# binary, because they are macros, and everything in build time and in what
+# `cargo deny` has to clear. Measured: the binary is byte-identical with and
+# without them.
+#
+# Read `ui/browser/input.rs` for what this buys that `console` cannot give,
+# starting with the two defects it closes.
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
 # Hands a downloaded story to whatever the user already opens pictures and
 # videos with. `default-features = false` drops the two optional Linux
 # dependencies -- `zbus` and `url` -- which exist for the "reveal in file
