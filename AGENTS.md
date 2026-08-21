@@ -350,6 +350,19 @@ Two judgment calls worth understanding before touching them:
   with no counters and a 150x150 picture whose URL is signed for that size.
   Everything needs a session; that is how Instagram has built it, not a gap
   here.
+- **The pacing rate has no published reference behind it, and it stays where it
+  is.** Looked for in August 2026 and written down at `pace.rs` rather than
+  here, because that is where somebody changing a number will be. The short of
+  it: the best public figure for this endpoint family is instaloader's
+  field-report guess of 75 requests per 660 s, snob walks at about 172, and the
+  difference is that the cadence was copied from a project that walks GraphQL.
+  It is recorded rather than acted on, because matching that guess means 8.8 s
+  a request and a 235-page walk of 34 minutes against a 900-second resume
+  window — an interrupted walk could never be continued, and a list that took
+  34 minutes to read no longer describes one moment, which is the thing every
+  comparison here rests on. The ubiquitous "200 calls per user per hour" is
+  Meta's Graph API platform limit for `graph.facebook.com` and is not evidence
+  about these endpoints at all.
 - **The wire signature is chosen for portability, and is not to be tuned to
   imitate anything** — the TLS handshake, the HTTP/2 SETTINGS and the header
   order alike. The reason written here used to be that there is nothing to
@@ -694,15 +707,6 @@ left in a report nobody can find, and in the order they are worth doing.
   how long an account is left alone after Instagram has objected. That is
   written at `note_push_back`, where somebody adding it will be looking. Two
   tests read the log back and assert the recorded cooldown is unchanged.
-- **The pacing rate has no reference behind it.** The best public figure for
-  this endpoint family is instaloader's field-report guess of 75 requests per
-  660 s for non-GraphQL; snob walks at 172, because the cadence was copied from
-  a project that walks GraphQL. Not a proposal — at 8.8 s per request a
-  235-page walk takes 34 minutes against a 900-second resume window, and one
-  list describing one moment is worth more than the rate. It is recorded
-  because it is the one number in the design with nothing behind it. The
-  ubiquitous "200 calls per user per hour" is Meta's Graph API platform limit
-  for graph.facebook.com and has nothing to do with these endpoints.
 - **`friendships/show_many`** would take a 1000/500 crossing from 52 requests
   to 14. It is a POST, which this project has never sent, and its page limit,
   response shape and throttle weighting are all unverified. Settle whether a
