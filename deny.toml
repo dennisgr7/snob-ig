@@ -14,8 +14,37 @@
 #   permanently red; it belongs at `warn` first, and only after somebody has
 #   read the list.
 
+# **Audit the graph that ships, not every graph that could exist.**
+#
+# Without this, cargo-deny resolves for every target and every kind, which here
+# meant 367 crates against the 297 that ever compile on a released one: the
+# whole `openssl` stack, `ring`, `quinn`, all of `wasm-bindgen`, `jni`, and
+# `wiremock` with its tree. Two of the extras are the reason `licenses` is off
+# below — `openssl-sys`'s expression and `webpki-root-certs`'s
+# CDLA-Permissive-2.0 both leave with them — and duplicate majors drop from 22
+# to 15, so the eleven the note below mentions was already stale in the
+# direction that made the check look worse than it is.
+#
+# The five triples are the ones `release.yml` builds. A sixth target added
+# there has to be added here, or its dependencies are audited by nobody.
+[graph]
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+]
+exclude-dev = true
+
 [advisories]
 version = 2
+# `workspace` rather than the `all` that `version = 2` defaults to. An
+# unmaintained advisory against any transitive crate — something nobody here
+# chose and often nobody can change — would otherwise turn the Monday cron red
+# and keep it red, which is how an advisory gate comes to be ignored and then
+# switched off. What this project can act on is what it depends on directly.
+unmaintained = "workspace"
 yanked = "deny"
 # Every entry here needs a comment saying why and when it stops applying.
 # An ignore list without them is how this check gets switched off entirely,
