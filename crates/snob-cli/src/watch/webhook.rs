@@ -290,6 +290,42 @@ pub fn shown(url: &Url) -> String {
     clean.to_string()
 }
 
+/// The same refusals, asked of a configuration file rather than of a built
+/// client, and without touching the keyring.
+///
+/// **`snob watch status` had no way to ask this.** It builds the schedule, so a
+/// timetable the scheduler refuses is reported — but it never built the
+/// delivery, and `delivery_from` runs before anything is opened or spent. So a
+/// hand-edited `url = "n8n.local/hook"` with no scheme killed every invocation
+/// at the parse, `record_failed_run` was never reached, `watch_runs` stayed
+/// empty, and `status` answered "it has not run yet" with exit 0 for ever while
+/// printing the address as though it were fine. `snob watch check` reported the
+/// same file as failed: the fix had been applied to one probe and not the
+/// other.
+///
+/// Config-only on purpose. A missing token is a different question and one the
+/// keyring answers; what this asks is whether the address could work at all,
+/// which is a property of the file and available to a probe that has opened
+/// nothing.
+pub fn problem_with_config(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let url = match Url::parse(url) {
+        Ok(url) => url,
+        Err(e) => return Some(format!("the configured address cannot be used: {e}")),
+    };
+    let webhook = Webhook {
+        url,
+        headers: headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        key: None,
+    };
+    check(&webhook).err().map(|e| e.to_string())
+}
+
 pub fn check(webhook: &Webhook) -> Result<()> {
     // A password in the address is a credential in a plain-text file, which is
     // the one thing `watch.toml` promises not to hold — and `reqwest` turns it

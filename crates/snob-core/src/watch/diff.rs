@@ -125,9 +125,27 @@ impl Basis {
             }),
             // Compared by id and not by date. Two captures can share a
             // timestamp, and a mark is a receipt for one particular row.
-            Some(mark) if mark == latest => Some(Self::Unchanged {
-                snapshot_id: latest,
-            }),
+            //
+            // **`>=`, not `==`, and the difference is a report that says the
+            // opposite of the truth.** Snapshot ids only go up, so a `latest`
+            // below the mark means this run's own capture is older than one
+            // already reported — which happens without anything going wrong:
+            // there is no run lock, `snob watch once` consults no schedule, and
+            // a walk that outlives the timer interval is the ordinary way two
+            // runs overlap. The slower run then finishes second holding the
+            // older id, and `Compare { before: 101, after: 100 }` reports
+            // everybody who arrived as `lost` and everybody who left as
+            // `gained`, straight into the webhook fields a receiver branches
+            // on. The test below says it in as many words and nothing enforced
+            // it.
+            //
+            // The answer is `Unchanged` **at the mark, not at `latest`**: this
+            // run has nothing to add, and moving the mark back to its own older
+            // capture would make the next run re-report a window that has
+            // already been reported. `store::watch` accepts duplicates as the
+            // cost of overlap; it does not accept inversions, and it should not
+            // have to accept a regression either.
+            Some(mark) if mark >= latest => Some(Self::Unchanged { snapshot_id: mark }),
             Some(mark) => Some(Self::Compare {
                 before: mark,
                 after: latest,
@@ -168,6 +186,33 @@ mod tests {
 
     fn pks(us: &[User]) -> Vec<Pk> {
         us.iter().map(|u| u.pk).collect()
+    }
+
+    /// **A run that finishes holding an older capture reports nothing.**
+    ///
+    /// Two runs overlapping is ordinary: no run lock, `once` consults no
+    /// schedule, and a walk longer than the timer interval is how people are
+    /// told to drive this from cron. Before the `>=` bound, the slower one
+    /// built `Compare { before: 101, after: 100 }` and every arrival came out
+    /// as a departure.
+    #[test]
+    fn a_capture_older_than_the_mark_is_not_compared_backwards() {
+        let basis = Basis::decide(Some(101), Some(100)).expect("something is stored");
+        assert_eq!(
+            basis,
+            Basis::Unchanged { snapshot_id: 101 },
+            "an older capture has nothing to add, and must not move the mark back"
+        );
+        assert_eq!(basis.mark_to(), 101, "the mark does not regress");
+
+        // The forward case is untouched.
+        assert_eq!(
+            Basis::decide(Some(100), Some(101)),
+            Some(Basis::Compare {
+                before: 100,
+                after: 101
+            })
+        );
     }
 
     #[test]

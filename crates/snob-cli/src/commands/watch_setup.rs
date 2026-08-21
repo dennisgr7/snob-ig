@@ -1066,21 +1066,57 @@ struct RunOf<'a> {
 /// cooldown that ran long. Three is nobody coming back.
 const MISSED_BEFORE_FAILED: i64 = 3;
 
-/// How long this configuration means the monitor should be silent for.
+/// How long this configuration means the monitor may be silent for.
 ///
-/// Asked of the schedule rather than guessed at, by taking the distance between
-/// the next two moments it names: six hours for `--every 6h`, and a week for
-/// `--on mon --at 09:00`, which is the point — a weekly monitor that has not run
-/// since Tuesday is not late.
+/// Asked of the schedule rather than guessed at: six hours for `--every 6h`,
+/// and a week for `--on mon --at 09:00`, which is the point — a weekly monitor
+/// that has not run since Tuesday is not late.
+///
+/// **The widest gap in a cycle, not the distance between the next two
+/// moments.** Those are the same number only on a uniform grid, and the wizard
+/// prompts for something that is not one, back to back: "Which days?
+/// (mon,thu)" and "At what times? (09:00,21:00)". Answer both with the example
+/// and the real gaps are 12h, 60h, 12h, 84h. On a Saturday the next two
+/// moments are Monday 09:00 and Monday 21:00, so the gap read as 12h, a last
+/// run on Thursday evening was 36h ago, that is three missed runs, and `status`
+/// went red — for 48 hours every week, on a monitor doing exactly what it was
+/// told. `--at 09:00,10:00` was worse: red from one in the afternoon until nine
+/// the next morning, daily. The nearby note about a probe people learn to
+/// ignore is about precisely this.
+///
+/// Bounded two ways so an `--every 5m` file does not walk a week of moments:
+/// a horizon of eight days, which covers any weekly pattern, and a hard cap on
+/// iterations. A uniform schedule reaches its widest gap on the first step, so
+/// the cap costs it nothing.
 ///
 /// `None` when the file has no schedule this can build, or names one that never
 /// fires. Both of those are their own line elsewhere and neither is a reason to
 /// call the monitor late as well.
 fn expected_gap(config: &WatchConfig, now: i64) -> Option<i64> {
+    /// Far enough to see a whole week's pattern, and one day over so a weekly
+    /// schedule is measured rather than truncated.
+    const HORIZON_SECS: i64 = 8 * 24 * 3600;
+    /// A backstop for a schedule that fires often enough to make the horizon
+    /// expensive. Two hundred steps of `--every 5m` is under a day, and a
+    /// uniform grid has already given its answer by step one.
+    const MOST_STEPS: usize = 200;
+
     let schedule = super::watch::schedule_from(&Default::default(), Some(config)).ok()?;
     let first = schedule::next_moment(&schedule, Some(now), now, &chrono::Local)?;
-    let second = schedule::next_moment(&schedule, Some(first), first, &chrono::Local)?;
-    (second > first).then_some(second - first)
+
+    let mut at = first;
+    let mut widest = 0;
+    for _ in 0..MOST_STEPS {
+        let Some(next) = schedule::next_moment(&schedule, Some(at), at, &chrono::Local) else {
+            break;
+        };
+        widest = widest.max(next - at);
+        at = next;
+        if at - first >= HORIZON_SECS {
+            break;
+        }
+    }
+    (widest > 0).then_some(widest)
 }
 
 /// An account with exactly one of its two lists ever reported on.
@@ -1152,6 +1188,23 @@ fn health(
     {
         at_least(Verdict::Failed);
         notes.push(format!("the configured schedule cannot be built: {e}"));
+    }
+
+    // And an address the delivery refuses is a monitor that cannot finish.
+    //
+    // The sibling of the schedule check above, and it was missing for the same
+    // reason it was added there: `delivery_from` runs before anything is opened
+    // or spent, so a bad address kills every run before `record_failed_run` can
+    // file one. The table stays empty and the branch above calls that "it has
+    // not run yet" -- a warning, exit 0, for ever. See
+    // `webhook::problem_with_config` for what the same file looked like to
+    // `snob watch check`, which reported it correctly all along.
+    if let Some(webhook) = config.and_then(|c| c.webhook.as_ref())
+        && let Some(problem) =
+            crate::watch::webhook::problem_with_config(&webhook.url, &webhook.headers)
+    {
+        at_least(Verdict::Failed);
+        notes.push(problem);
     }
 
     // **Whether it is still running at all**, which nothing here used to ask.
@@ -1976,6 +2029,72 @@ every = \"6h\"
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
     }
 
+    /// **An address that kills every run before it starts is a failure, not a
+    /// quiet month.**
+    ///
+    /// `delivery_from` runs before anything is opened or spent, so a bad
+    /// address means `record_failed_run` never files a row and `watch_runs`
+    /// stays empty. The empty table reads as "it has not run yet", which is a
+    /// warning and exit 0, and it stays that way for ever. `snob watch check`
+    /// reported the same file correctly all along; this is the probe that did
+    /// not.
+    #[test]
+    fn an_address_that_can_never_work_is_a_failure_and_not_a_quiet_monitor() {
+        // No scheme. Exactly what a hand-edited file looks like, and the file
+        // invites hand-editing on its first line.
+        let no_scheme = config(
+            "schema = 1
+every = \"6h\"
+
+[webhook]
+url = \"n8n.local/hook\"
+",
+        );
+        let found = health(Some(&no_scheme), &[], &[], deliveries::Owed::default(), NOW);
+        assert_eq!(
+            found.verdict,
+            Verdict::Failed,
+            "an unusable address with an empty run log: {:?}",
+            found.notes
+        );
+        assert_eq!(found.verdict.exit_code(), ExitCode::Error);
+
+        // A credential in the address is the other refusal `webhook::check`
+        // makes, and it reaches this probe by the same route.
+        let in_the_url = config(
+            "schema = 1
+every = \"6h\"
+
+[webhook]
+url = \"https://user:pw@example.com/hook\"
+",
+        );
+        assert_eq!(
+            health(
+                Some(&in_the_url),
+                &[],
+                &[],
+                deliveries::Owed::default(),
+                NOW
+            )
+            .verdict,
+            Verdict::Failed
+        );
+
+        // And an address that is merely unreachable is not this probe's
+        // question -- it cannot be answered without posting.
+        let fine = config(
+            "schema = 1
+every = \"6h\"
+
+[webhook]
+url = \"https://example.com/hook\"
+",
+        );
+        let ok = health(Some(&fine), &[], &[], deliveries::Owed::default(), NOW);
+        assert_eq!(ok.verdict, Verdict::Warned, "{:?}", ok.notes);
+    }
+
     /// What stopped the last run is read in the vocabulary exit codes are
     /// written in, not in three literals spelled again inside `health`.
     ///
@@ -2339,6 +2458,53 @@ every = \"6h\"
             Verdict::Ok,
             "and it very much is for a six-hourly one"
         );
+    }
+
+    /// **A schedule that is not a uniform grid, which is what the wizard
+    /// suggests.**
+    ///
+    /// The test above uses one weekly moment and `every = "6h"` — both
+    /// uniform, so both have one gap and could not see this. Answer the two
+    /// prompts with the examples they print and the gaps are 12h, 60h, 12h and
+    /// 84h; reading the first one made `status` call a working monitor three
+    /// runs late for two days out of every seven.
+    #[test]
+    fn an_uneven_schedule_is_measured_by_its_widest_gap_and_not_its_narrowest() {
+        let uneven = config(
+            "schema = 1
+on = [\"mon\", \"thu\"]
+at = [\"09:00\", \"21:00\"]
+",
+        );
+        let gap = expected_gap(&uneven, NOW).expect("the schedule builds and fires");
+        assert!(
+            gap >= 80 * 3600,
+            "the widest gap in this week is 84h; got {}h",
+            gap / 3600
+        );
+
+        // Twice a day is still twice a day: the widest gap is the overnight
+        // one, not the twelve hours between the two the wizard prints.
+        let daily_pair = config(
+            "schema = 1
+at = [\"09:00\", \"10:00\"]
+",
+        );
+        let gap = expected_gap(&daily_pair, NOW).expect("fires");
+        assert!(
+            gap >= 22 * 3600,
+            "09:00 and 10:00 leaves 23 hours overnight; got {}h",
+            gap / 3600
+        );
+
+        // And a uniform grid is unchanged, which is the half that already
+        // worked and must keep working.
+        let uniform = config(
+            "schema = 1
+every = \"6h\"
+",
+        );
+        assert_eq!(expected_gap(&uniform, NOW), Some(6 * 3600));
     }
 
     /// A run belonging to an account the file no longer names is worth a line,
