@@ -93,6 +93,38 @@ pub enum Mutation {
 }
 
 impl Mutation {
+    /// Every write this program can make.
+    ///
+    /// Named as a set so that "there are two, and there is no third" is a value
+    /// a test can read rather than a sentence in a document. The same shape
+    /// `ExitCode::ALL` and `secrets::Kind::ALL` use, and for the same reason.
+    ///
+    /// Adding a variant is already a compile error in the two matches below,
+    /// which have no wildcard arm on purpose. This is what stops the quieter
+    /// version: pointing an existing variant at a different operation.
+    pub const ALL: [Self; 2] = [Self::Follow, Self::Unfollow];
+
+    /// Where the write goes.
+    ///
+    /// **On the mutation rather than at the call site, and that is the point.**
+    /// `IgClient::post` used to take a path, which meant the promise that only
+    /// two writes exist rested on nobody having typed a third string. A guard
+    /// that reads the source for spellings cannot hold that line -- the
+    /// identifier Instagram acts on is a `doc_id`, a number, and no list of
+    /// English words contains it. Taking a `Mutation` instead means a third
+    /// write needs a third variant, and a third variant does not compile until
+    /// somebody has written it into all three matches here.
+    pub fn path(self) -> &'static str {
+        match self {
+            // Both go to the same place today. Kept per-variant anyway, because
+            // the browser also uses `/graphql/query` for some operations and a
+            // future variant may need it -- and because a single shared
+            // constant would put the path back at the call site by the back
+            // door.
+            Self::Follow | Self::Unfollow => "/api/graphql",
+        }
+    }
+
     /// The name the request announces itself with, and the name to look for
     /// when discovering the `doc_id`. One constant for both, because a
     /// disagreement between them would send a request whose id belongs to a
@@ -362,6 +394,39 @@ pub fn mutation_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **There are two writes, and there is no third.**
+    ///
+    /// The rule this pins is the one in `AGENTS.md`, and it is pinned in two
+    /// directions because there are two ways to break it. Adding a variant is
+    /// already a compile error -- `path`, `friendly_name` and `seed_doc_id`
+    /// have no wildcard arm between them. What this catches is the quieter
+    /// one: pointing a variant that already exists at a different operation,
+    /// which changes what the program does to somebody else's account without
+    /// changing a single type.
+    ///
+    /// The names are written out rather than derived, so that changing one is
+    /// a decision somebody has to make here, in front of this comment.
+    #[test]
+    fn the_only_two_writes_are_the_two_that_are_named() {
+        assert_eq!(Mutation::ALL.len(), 2);
+        assert_eq!(
+            Mutation::ALL.map(Mutation::friendly_name),
+            ["usePolarisFollowMutation", "usePolarisUnfollowMutation"],
+        );
+        for mutation in Mutation::ALL {
+            assert_eq!(mutation.path(), "/api/graphql");
+            // Nothing that registers a view. The web client's operation for
+            // that is named in `crates/snob-core/tests/no_seen.rs`, which is
+            // the one file allowed to write it down; this checks the value that
+            // would actually go on the wire, which that guard cannot see.
+            let name = mutation.friendly_name();
+            assert!(
+                !name.contains("Seen"),
+                "a write that marks something seen: {name}"
+            );
+        }
+    }
 
     /// The literal `2` and the sum of the bytes. Checked against a hand-worked
     /// value rather than against the implementation restated.

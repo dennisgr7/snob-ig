@@ -94,15 +94,30 @@ fn unguarded_in(relative: &str, contents: &str) -> Vec<String> {
     let lines: Vec<&str> = contents.lines().collect();
     let mut violations = Vec::new();
 
-    for (number, line) in lines.iter().enumerate() {
-        // In `src/`, everything after the first `#[cfg(test)]` is test code and
-        // is not in a released binary either — the same halving `keyring.rs`
-        // does, and needed here for the same reason: `cli.rs` parses both flags
-        // in its own unit tests, which is exactly where they should be parsed.
-        // The old fixed reach passed those by accident rather than by rule.
+    let mut number = 0;
+    while number < lines.len() {
+        let line = lines[number];
+
+        // Test code is not in a released binary either, so it is stepped over
+        // rather than examined — the same halving `keyring.rs` does, and needed
+        // here for the same reason: `cli.rs` parses both flags in its own unit
+        // tests, which is exactly where they should be parsed.
+        //
+        // **What is stepped over is the gated item, not the rest of the file.**
+        // This used to stop reading at the first `#[cfg(test)]` of any kind, on
+        // the assumption that it was always the trailing test module. It is
+        // not: `paths.rs` has two gated helpers and `progress.rs` one, and
+        // everything below each of them was going unchecked — which is the same
+        // stopped-reading-too-early defect this function's own doc comment
+        // congratulates itself for having fixed in the other direction. A
+        // trailing test module is just the case where the item happens to run
+        // to the end of the file, so one rule covers both.
         if is_a_test_gate(line) {
-            break;
+            number += lines_in_the_item_after(&lines[number..]);
+            continue;
         }
+
+        number += 1;
 
         // Not a mention: the `#[cfg]` itself, and the comment prose that
         // explains the seam, which names the flags on purpose.
@@ -114,7 +129,7 @@ fn unguarded_in(relative: &str, contents: &str) -> Vec<String> {
         }
 
         let mut guarded = false;
-        for above in lines[..=number].iter().rev() {
+        for above in lines[..number].iter().rev() {
             if above.trim().is_empty() {
                 break; // the previous item's guard is not this item's guard
             }
@@ -124,11 +139,44 @@ fn unguarded_in(relative: &str, contents: &str) -> Vec<String> {
             }
         }
         if !guarded {
-            violations.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+            violations.push(format!("{relative}:{}: {}", number, line.trim()));
         }
     }
 
     violations
+}
+
+/// How many lines the item introduced at `rest[0]` occupies, attributes and
+/// all, so the walk can step over it.
+///
+/// Braces rather than indentation, because `rustfmt` is not the authority here
+/// and a string containing a brace is rarer in an item's signature than an
+/// unusual layout is. An item with no braces at all — a gated `use`, a gated
+/// `const` — ends at its semicolon. An item whose braces never close runs to
+/// the end of the file, which is exactly what the trailing test module does.
+fn lines_in_the_item_after(rest: &[&str]) -> usize {
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (offset, line) in rest.iter().enumerate() {
+        for byte in line.chars() {
+            match byte {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return offset + 1;
+        }
+        // A one-line item with no block: `#[cfg(test)] use x;` on the next line.
+        if !opened && offset > 0 && line.trim_end().ends_with(';') {
+            return offset + 1;
+        }
+    }
+    rest.len()
 }
 
 /// Whether a line is a `cfg` that carries this feature.
@@ -196,5 +244,41 @@ pub ig_base_url: Option<Url>,
         unguarded_in("x.rs", borrowed_from_the_item_above),
         vec!["x.rs:5: pub ig_base_url: Option<Url>,".to_string()],
         "the guard above the blank line belongs to the field above it"
+    );
+
+    // **The hole this walk had until the item skip replaced the file skip.**
+    // One gated helper near the top, and everything below it stopped being
+    // read. `paths.rs` has two of these and `progress.rs` one, so the tree was
+    // already relying on nobody putting a seam mention underneath them.
+    let a_gated_helper_then_an_unguarded_field = "#[cfg(test)]
+fn a_helper() -> bool {
+    true
+}
+
+/// Ask this server instead
+pub ig_base_url: Option<Url>,
+";
+    assert_eq!(
+        unguarded_in("x.rs", a_gated_helper_then_an_unguarded_field),
+        vec!["x.rs:7: pub ig_base_url: Option<Url>,".to_string()],
+        "a lone #[cfg(test)] item must not stop the walk for the rest of the file"
+    );
+
+    // And the trailing test module still ends it, because the item it gates
+    // runs to the end of the file. Same rule, no special case.
+    let the_trailing_test_module = "pub sandbox_root: Option<PathBuf>,
+
+#[cfg(test)]
+mod tests {
+    fn uses_the_seam() -> &'static str {
+        \"--ig-base-url\"
+    }
+}
+";
+    assert!(
+        unguarded_in("x.rs", the_trailing_test_module)
+            .iter()
+            .all(|found| !found.contains("ig-base-url")),
+        "the test module is test code and is not examined"
     );
 }

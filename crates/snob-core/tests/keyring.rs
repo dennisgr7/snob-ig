@@ -29,6 +29,35 @@
 mod common;
 use common::{relative, repo_root, source_files};
 
+/// Whether a `cfg` line is the start of test code.
+///
+/// The literal `#[cfg(test)]` was the only spelling recognized, which missed
+/// `#[cfg(any(test, feature = "testing"))]` — the gate a helper wears when both
+/// the unit tests and the sandbox build need it, and therefore exactly the kind
+/// of place a store gets built.
+///
+/// **`#[cfg(feature = "testing")]` on its own is deliberately not test code.**
+/// It ships in a `--features testing` binary, so an item behind it is
+/// production for that build; `main.rs` has one above the real
+/// `SecretStore::new`, and treating it as a boundary would have declared the
+/// program's own store a test violation. The `test` token is what separates
+/// them, and it is looked for as a token so that the `test` inside `"testing"`
+/// does not answer for it.
+fn admits_a_test_build(line: &str) -> bool {
+    let line = line.trim();
+    if !line.starts_with("#[cfg") {
+        return false;
+    }
+    // The feature's name contains the word, so it is removed before looking.
+    let predicate = line.replace("feature = \"testing\"", "");
+    predicate.match_indices("test").any(|(at, _)| {
+        let before = predicate[..at].chars().next_back();
+        let after = predicate[at + 4..].chars().next();
+        let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        boundary(before) && boundary(after)
+    })
+}
+
 #[test]
 fn no_test_builds_a_secret_store_pointing_at_the_real_service() {
     let Some(root) = repo_root() else {
@@ -69,7 +98,11 @@ fn offenders_in(relative: &str, contents: &str) -> Vec<String> {
 
     {
         // Everything under a `tests/` directory is test code. In `src/`, only
-        // what comes after the first `#[cfg(test)]`.
+        // what comes after the first gate that admits test builds — which is
+        // **not only `#[cfg(test)]`**: this project ships a `testing` feature
+        // whose whole purpose is test code compiled into the binary, so a
+        // helper behind `#[cfg(any(test, feature = "testing"))]` is exactly the
+        // kind of place a store gets built, and it was not being examined.
         let in_a_test_file = relative.contains("/tests/");
         let mut reached_the_tests = in_a_test_file;
 
@@ -90,7 +123,7 @@ fn offenders_in(relative: &str, contents: &str) -> Vec<String> {
             offset += raw.len();
             let line = raw.trim_end_matches(['\n', '\r']);
 
-            if line.contains("#[cfg(test)]") {
+            if admits_a_test_build(line) {
                 reached_the_tests = true;
             }
             if !reached_the_tests || !line.contains("SecretStore::new(") {
@@ -193,3 +226,29 @@ mod tests {
 /// same reason: this file holds the shapes it is looking for, so it flags
 /// itself.
 const ALLOWLIST: [&str; 1] = ["crates/snob-core/tests/keyring.rs"];
+
+/// The gate spellings, told apart.
+///
+/// The middle two are the ones that used to be missed, and the last is the one
+/// that must keep being missed: an item shipped behind the feature is
+/// production code for that build, not a test.
+#[test]
+fn a_test_gate_is_recognized_in_every_spelling_it_is_written_in() {
+    for gate in [
+        "#[cfg(test)]",
+        "#[cfg(any(test, feature = \"testing\"))]",
+        "    #[cfg(all(test, unix))]",
+    ] {
+        assert!(admits_a_test_build(gate), "not seen as a test gate: {gate}");
+    }
+    for not_a_gate in [
+        "#[cfg(feature = \"testing\")]",
+        "#[cfg(windows)]",
+        "let testing = true;",
+    ] {
+        assert!(
+            !admits_a_test_build(not_a_gate),
+            "wrongly seen as a test gate: {not_a_gate}"
+        );
+    }
+}

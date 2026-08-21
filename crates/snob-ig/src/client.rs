@@ -797,29 +797,40 @@ impl IgClient {
     ///   so this is the common case rather than the odd one.
     /// - **It sends `Origin`**, which the Fetch standard requires on a POST even
     ///   when the request is same-origin. See the comment in
-    ///   [`IgClient::browser_headers`] for the half of that rule which lives on
+    ///   [`IgClient::dressed`] for the half of that rule which lives on
     ///   the read side.
     /// - **It follows no redirect at all**, through [`IgClient::writer`].
+    /// - **It cannot be pointed anywhere.** It takes a
+    ///   [`graphql::Mutation`], not a path, so the set of things this program
+    ///   can write is the set of variants that enum has. It used to take a
+    ///   `&str`, and then "there is no third write" rested on nobody typing a
+    ///   third string -- which a source-reading guard cannot check, because the
+    ///   identifier Instagram acts on is a `doc_id` and no list of words
+    ///   contains a number.
+    ///
+    /// The two doc links below name [`IgClient::dressed`], which is where the
+    /// shared header list actually lives; they said `browser_headers` for a
+    /// while after it was renamed.
     ///
     /// `referer` is the profile page the button would have been clicked on, in
     /// the same spelling `get` wants: a path with no leading slash.
     async fn post<T: DeserializeOwned>(
         &self,
-        path: &str,
+        write: graphql::Mutation,
         form: &[(&str, &str)],
         referer: &str,
         style: Surface,
     ) -> Result<T, IgError> {
         // Before the budget is charged, so that a session which cannot write
         // does not spend a slot discovering it. The token itself is put on the
-        // request by `browser_headers`, which adds it whenever the session has
+        // request by `dressed`, which adds it whenever the session has
         // one; this guard is what makes "whenever" mean "always" on this path.
         if self.session.csrftoken.is_none() {
             return Err(IgError::NoCsrfToken);
         }
 
-        let url = self.base.join(path)?;
-        tracing::debug!(%url, "POST");
+        let url = self.base.join(write.path())?;
+        tracing::debug!(%url, operation = write.friendly_name(), "POST");
 
         self.pacer.clear_to_send_write().await?;
 
@@ -1049,9 +1060,7 @@ impl IgClient {
         let body = graphql::mutation_body(tokens, mutation, doc_id, pk);
         let form: Vec<(&str, &str)> = body.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let answer: FriendshipResult = self
-            .post("/api/graphql", &form, referer, Surface::App)
-            .await?;
+        let answer: FriendshipResult = self.post(mutation, &form, referer, Surface::App).await?;
         Ok(answer.status())
     }
 

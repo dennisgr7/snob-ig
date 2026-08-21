@@ -13,6 +13,23 @@
 //! read into a write. So the check reads the source: if any spelling of the
 //! call appears anywhere in the three crates, this fails and says where.
 //!
+//! # This is a backstop, and it is not the guarantee
+//!
+//! **A list of spellings cannot hold this line, and it is worth being honest
+//! about why.** A browser capture in August 2026 showed what Instagram's own
+//! client actually sends when a story is viewed: not `media/seen`, but the
+//! GraphQL mutation `PolarisStoriesV3SeenMutation`, whose identifier on the
+//! wire is `doc_id=26234228992942885`. A number. No list of English words
+//! contains a number, and extending the list every time Meta renames something
+//! is a race this file loses.
+//!
+//! What actually holds the line is in `snob-ig`: `IgClient::post` takes a
+//! `graphql::Mutation` rather than a path, and that enum has two variants whose
+//! absence of a wildcard arm makes a third a compile error. This file catches
+//! the earlier mistake — a helper, a constant, a URL written before the request
+//! exists — which is the case its own planted-call test is about. Both are
+//! worth having. Only one of them is structural.
+//!
 //! A source check rather than a runtime one, for the reason `tests/keyring.rs`
 //! and `tests/sandbox.rs` both give: an integration test compiles the library
 //! without `cfg(test)`, so an assertion inside the process is blind in exactly
@@ -28,20 +45,28 @@ use common::{relative, repo_root, source_files};
 
 /// Every spelling of "tell them I looked".
 ///
-/// `media/seen` is the endpoint; `reels/seen` is what the mobile clients call
-/// the same thing on a reel; `mark_seen` and `mark_as_seen` are what somebody
-/// would name the function before they wrote the path. The last two are here
-/// because the guard has to catch the change at the moment it is made, and the
-/// function usually arrives before the URL does.
-const SEEN: [&str; 5] = [
+/// `media/seen` is the endpoint the mobile API uses; `reels/seen` is the same
+/// thing on a reel; `mark_seen` and `mark_as_seen` are what somebody would name
+/// the function before they wrote the path, and the function usually arrives
+/// before the URL does.
+///
+/// The last two are what the **web** client sends, which is the surface this
+/// program is on and was therefore the gap that mattered: `SeenMutation` is the
+/// Relay operation, and the seventeen digits are the `doc_id` it travels as.
+/// Both were read off a real browser session in August 2026. The number is here
+/// with no illusions about what it buys -- it catches a copied line, and it
+/// catches nothing else, which is the point made at the top of this file.
+const SEEN: [&str; 7] = [
     "media/seen",
     "reels/seen",
     "mark_seen",
     "mark_as_seen",
     "MarkSeen",
+    "SeenMutation",
+    "26234228992942885",
 ];
 
-/// This file, which names all five above.
+/// This file, which names all seven above.
 const EXEMPT: [&str; 1] = ["crates/snob-core/tests/no_seen.rs"];
 
 #[test]
@@ -112,4 +137,18 @@ fn the_guard_sees_the_call_it_exists_to_stop() {
         mentions_in("x.rs", "let seen = already_downloaded.contains(&pk);").is_empty(),
         "the word \"seen\" on its own is not the call, and must not be reported"
     );
+
+    // The spelling the web client actually uses, which is the one the list was
+    // missing until a capture showed it. Planted in both of its forms, because
+    // whoever adds this will have copied one or the other.
+    for planted in [
+        r#"        Self::Seen => "PolarisStoriesV3SeenMutation","#,
+        r#"        Self::Seen => "26234228992942885","#,
+    ] {
+        assert_eq!(
+            mentions_in("crates/snob-ig/src/graphql.rs", planted).len(),
+            1,
+            "the guard missed the mutation a browser really sends: {planted}"
+        );
+    }
 }

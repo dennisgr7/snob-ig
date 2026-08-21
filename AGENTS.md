@@ -69,9 +69,11 @@ risk:
   - **A `feedback_required` on a write is an action block**, not a throttle, and
     it earns the twelve-hour cooldown rather than the two-hour one.
   The enforcement is structural, not a promise: writing goes through
-  `IgClient::post`, which cannot be reached without paying the write budget, and
-  a test reads the source of all three crates to check that no `media/seen` call
-  has appeared anywhere.
+  `IgClient::post`, which cannot be reached without paying the write budget and
+  which takes a `graphql::Mutation` rather than a path — so the set of writes
+  this program can make is the set of variants that enum has, and adding one is
+  a build error rather than a code review. A test reads the source of all three
+  crates as a backstop, for the mistake that arrives before the request does.
 - **Never read or decrypt the user's browser cookie store.** Chrome and Edge on
   Windows have protected it with App-Bound Encryption since v127, and getting
   past that protection is what credential-stealing malware is built to do. This
@@ -314,9 +316,10 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Everything a scheduled run needs is checked while somebody is there | `snob watch check`, through `engine::check` — which takes `&App`, so it cannot record, and walks no list |
 | Whether the monitor is working is an answer, not a reading | `watch_setup::health`, in `status`'s output and in its exit code |
 | A write is paid for out of the write budget, and there is no other way to send one | `Pacer::clear_to_send_write`, inside `IgClient::post`, which is the only function in the workspace that sends a method other than GET to Instagram |
+| There are two writes, and a third one does not compile | `IgClient::post` takes a `graphql::Mutation`, not a path, so what this program can write is the set of variants that enum has — and `path`, `friendly_name` and `seed_doc_id` have no wildcard arm between them, so a new variant is a build error until somebody has written it into all three. `Mutation::ALL` and its test pin the quieter half: pointing a variant that already exists at a different operation |
 | A write is never replayed by a redirect | the POST client is built on `redirect::Policy::none()` — following a hop on a write means doing the thing twice, which is not what "follow the redirect" costs on a read |
 | A write without a CSRF token is refused before it is sent | `IgClient::post` returns `IgError::NoCsrfToken` on an absent token rather than sending a request that will fail, so a `--paste` session cannot spend budget discovering it cannot write |
-| Nothing tells anybody you looked at their story | `crates/snob-core/tests/no_seen.rs` reads the source of all three crates for `media/seen` and its spellings. There is no function to call, and the guard is there so that adding one is a test failure rather than a code review |
+| Nothing tells anybody you looked at their story | The row above is what holds this: registering a view is a write, and there is no variant for one. `crates/snob-core/tests/no_seen.rs` is the backstop, reading all three crates for `media/seen` and its spellings — including the Relay operation the web client really sends, which a capture turned up in August 2026. It is a denylist and it says so: the identifier Instagram acts on is a `doc_id`, and no list of words contains a number |
 
 ## Running headless
 
