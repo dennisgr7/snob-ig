@@ -107,7 +107,22 @@ wiremock = "0.6"
 tempfile = "3"
 
 [profile.release]
-opt-level = 3
+# `"s"` rather than `3`, and the numbers are from this program rather than from
+# folklore. It takes 1,790,464 bytes off the Windows ARM64 binary -- 23.7%, and
+# 847,648 off every download -- and builds faster. What it costs, measured on
+# the commands where CPU is the wall clock: csv +1.4%, json +3.4%, ndjson and
+# markdown +6.0%, xlsx +7.7%. In absolute terms the worst case is 22 ms on a
+# 285 ms export.
+#
+# Nothing on a walk is affected, because a walk is not compute: the client's own
+# CPU for a twelve-thousand-follower walk is 0.69 s against about fifteen
+# minutes of deliberate pacing. That is the ratio every optimization decision in
+# this file has to be read against.
+#
+# `"z"` is the wrong end of the curve -- 493 KB smaller again for csv +27% and
+# xlsx +42% -- and an `opt-level = 3` carve-out for `libsqlite3-sys` costs most
+# of the win back for work that is already measured in milliseconds.
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true

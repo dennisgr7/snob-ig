@@ -603,6 +603,32 @@ deliberately unfinished:
     gives up on a report that reached a day, and `forget_settled` forgets a
     delivered one after seven.
 
+## What it costs, in bytes
+
+Measured on `aarch64-pc-windows-msvc` in August 2026, which is the odd target —
+it is the one on schannel rather than rustls. Recorded because these are
+decisions somebody will otherwise re-open every year with no number to argue
+against.
+
+| | |
+|---|---|
+| Binary, aarch64-pc-windows-msvc | 5,885,952 B |
+| Binary, x86_64-pc-windows-msvc | larger by roughly a third |
+| Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
+| `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats |
+| Static CRT on Windows | +126,976 B per binary |
+| Chromium profile after `snob login --browser` | 87.2 MB, 886 files |
+
+The first two of those are the price of "one binary, no runtime", and they are
+the right price. **The third is the largest single feature cost in the tree**
+and nothing recorded that anybody had weighed it; it stays, but it is written
+down now. The last is not a build cost at all and dwarfs all of them, which is
+why `login` removes the profile when it is done with it.
+
+The three Unix targets have never been measured — nothing here cross-links
+them. Note that musl carries the Secret Service stack, some thirty crates a
+Windows build does not, so it is not comparable.
+
 ## Known walls
 
 - **A list of tens of thousands does not come back.** On an account declaring
