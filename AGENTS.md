@@ -767,6 +767,12 @@ left in a report nobody can find, and in the order they are worth doing.
   how long an account is left alone after Instagram has objected. That is
   written at `note_push_back`, where somebody adding it will be looking. Two
   tests read the log back and assert the recorded cooldown is unchanged.
+
+  **What is still owed is a real run.** The logging is in so that somebody who
+  gets throttled with `--verbose` on can say whether the header ever arrives and
+  in which of its two forms — seconds or an HTTP date. Until somebody has, there
+  is nothing here to implement, which is why it is parsed into nothing and kept
+  as the string that was sent.
 - **`friendships/show_many`** would take a 1000/500 crossing from 52 requests
   to 14. It is a POST, which this project has never sent, and its page limit,
   response shape and throttle weighting are all unverified. Settle whether a
