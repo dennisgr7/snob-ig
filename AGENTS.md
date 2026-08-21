@@ -275,6 +275,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
 | A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
 | No request is sent after the user asks it to stop | `Pacer::clear_to_send`, which reads the token before it reserves — it was read only inside the wait, so with nothing owed a canceled run kept sending |
+| A request already in flight is given up on when the user asks | `IgClient::send_or_cancel` and `read_or_cancel`, racing the token against the socket. Cancellation was read in every wait this program chose to take, which is where about nine interrupts in ten land; the tenth landed in the request itself, where nothing was watching and the exit tracked the server's patience — up to `REQUEST_TIMEOUT`, or 254 s on a black-holed connection because `Network` is retried. The cancel branch answers `Canceled` and not `Network`, or the reaction would be `Retry` and a Ctrl+C would send the request three more times |
 | A push-back the body could not be read from is still a push-back | `IgClient::get` classifies from the status it already has when the body fails, rather than letting the read failure become a retryable network error |
 | A credential is sent only to the address it was stored for | `plan`, for the token **and** the signing key, treating an absent or unparseable configured origin as a different destination |
 | A calendar moment that went by is taken, not lost | `schedule::next_after` looks back from `now` to the floor before it looks forward |
@@ -680,14 +681,6 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **Ctrl+C during an in-flight request waits for the server.** Measured: a
-  stop during a budget wait takes 1.13 s, and about nine interrupts in ten land
-  there — but during a request the exit tracks the server's hold, up to
-  `REQUEST_TIMEOUT`, or 254 s on a black-holed connection because `Network`
-  retries. It matters most under a service manager, where a stalled request can
-  outlast the stop grace period and the process is killed before it closes its
-  snapshot. Ten lines of `tokio::select!` in `get`, and the cancel branch must
-  return `Canceled` rather than falling into `Network`.
 - **`Retry-After` is never read.** `classify` receives no headers. Reading it
   would make snob the only tool of its class that does — but nobody has
   established whether these endpoints send it. Log the header at `debug` on

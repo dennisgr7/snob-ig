@@ -534,10 +534,11 @@ impl IgClient {
         // about this client is deliberately unlike the API one; this is not one
         // of those things.
         let response = self
-            .cdn()?
-            .get(url)
-            .header("Accept-Encoding", self.hints.accept_encoding)
-            .send()
+            .send_or_cancel(
+                self.cdn()?
+                    .get(url)
+                    .header("Accept-Encoding", self.hints.accept_encoding),
+            )
             .await?;
         let status = response.status();
 
@@ -552,7 +553,14 @@ impl IgClient {
             });
         }
 
-        read_capped_bytes(response, cap as u64).await
+        // Raced against the token like the API read, for the same reason: a
+        // CDN that answers with headers and then stalls holds this process for
+        // as long as it likes.
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            bytes = read_capped_bytes(response, cap as u64) => bytes,
+        }
     }
 
     /// One request to Instagram's API, with the headers a browser would send.
@@ -636,7 +644,9 @@ impl IgClient {
             // this — the hops included, which is the whole point of the loop.
             self.pacer.clear_to_send().await?;
 
-            let response = self.api_request(&url, query, referer).send().await?;
+            let response = self
+                .send_or_cancel(self.api_request(&url, query, referer))
+                .await?;
             self.remember_claim(&response);
             let status = response.status();
 
@@ -659,14 +669,66 @@ impl IgClient {
             // `cooldown_for` there is, never ran: nothing was written down and
             // the next run knocked again. What Instagram said is the status;
             // the body only refines it.
-            let body = match read_capped(response, MAX_BODY_BYTES).await {
+            let body = match self.read_or_cancel(response, MAX_BODY_BYTES).await {
                 Ok(body) => body,
+                // A canceled read is the user, not the server, and must not be
+                // turned into a push-back that gets written down as one.
+                Err(IgError::Canceled) => return Err(IgError::Canceled),
                 Err(_) if !status.is_success() => {
                     return Err(self.classify_and_record(status.as_u16(), ""));
                 }
                 Err(e) => return Err(e),
             };
             return Ok((status.as_u16(), body));
+        }
+    }
+
+    /// Sends the request, or gives up the moment the user asks it to.
+    ///
+    /// **Ctrl+C used to wait for the server.** Cancellation was read in
+    /// `Pacer::clear_to_send` and in every deliberate wait, which is where about
+    /// nine interrupts in ten land — a stop during a budget wait takes about a
+    /// second. The tenth lands here, and here nothing was watching: the exit
+    /// tracked however long the far end chose to hold the connection, up to
+    /// `REQUEST_TIMEOUT`, or 254 seconds on a black-holed connection because
+    /// `Network` is retried. That matters most under a service manager, where a
+    /// stalled request outlasts the stop grace period and the process is killed
+    /// before it can close its snapshot.
+    ///
+    /// **The cancel branch must answer [`IgError::Canceled`]**, and that is the
+    /// part worth guarding. Dropping the future and letting the resulting
+    /// `reqwest::Error` fall through would classify as `Network`, whose reaction
+    /// is `Retry`, so the pager would answer a Ctrl+C by sending the request
+    /// three more times.
+    ///
+    /// `biased`, so a token that is already set wins against a response that
+    /// happens to be ready in the same poll.
+    async fn send_or_cancel(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, IgError> {
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            response = request.send() => Ok(response?),
+        }
+    }
+
+    /// Reads the body, or gives up the moment the user asks it to.
+    ///
+    /// The other half of [`IgClient::send_or_cancel`], and not an afterthought:
+    /// a server that answers with headers and then stalls mid-body holds the
+    /// connection exactly as long, and the read is where those seconds are
+    /// spent.
+    async fn read_or_cancel(
+        &self,
+        response: reqwest::Response,
+        cap: u64,
+    ) -> Result<String, IgError> {
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            body = read_capped(response, cap) => body,
         }
     }
 
@@ -1688,6 +1750,95 @@ mod tests {
         assert!(
             matches!(error, IgError::Unexpected { status: 302, .. }),
             "{error:?}"
+        );
+    }
+    /// A stop during a request in flight does not wait for the server.
+    ///
+    /// This is the tenth interrupt in ten. The other nine land in a budget wait
+    /// and take about a second; this one used to track however long the far end
+    /// chose to hold the connection — up to `REQUEST_TIMEOUT`, or 254 seconds
+    /// on a black-holed connection, because `Network` is retried. Under a
+    /// service manager that outlasts the stop grace period and the process is
+    /// killed before it can close its snapshot.
+    ///
+    /// The delay here is thirty seconds so that a passing run cannot be one
+    /// that simply waited it out: the assertion is that the call came back in a
+    /// fraction of it.
+    #[tokio::test]
+    async fn canceling_does_not_wait_for_the_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(r#"{"users":[],"next_max_id":null}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let token = client.pacer().cancel_token().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("the run was canceled");
+
+        // `Canceled`, not `Network`. Letting the dropped request become a
+        // network error would give it `Reaction::Retry`, so the pager would
+        // answer a Ctrl+C by sending the request three more times.
+        assert!(matches!(error, IgError::Canceled), "{error:?}");
+        assert_eq!(error.reaction(), crate::error::Reaction::Abort);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "it waited {:?}, which is the server's patience rather than the user's",
+            started.elapsed()
+        );
+    }
+
+    /// A stop is the user's answer, not Instagram's, and nothing is written
+    /// down as though it were.
+    ///
+    /// The endpoint here would classify as a push-back and earn a cooldown if
+    /// its answer were ever read. Cancellation has to win first, and win
+    /// without the interrupted request leaving a mark: a cooldown recorded
+    /// because somebody pressed Ctrl+C would refuse the next run for half an
+    /// hour over something Instagram never said.
+    #[tokio::test]
+    async fn canceling_records_no_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(r#"{"message":"feedback_required"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(session, crate::pace::Pacer::new(budget.clone()))
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        let token = client.pacer().cancel_token().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let error = client.validate().await.expect_err("the run was canceled");
+        assert!(matches!(error, IgError::Canceled), "{error:?}");
+        assert!(
+            budget.calls().is_empty(),
+            "a canceled request was recorded as a push-back: {:?}",
+            budget.calls()
         );
     }
 }

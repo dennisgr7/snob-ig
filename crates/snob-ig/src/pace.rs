@@ -291,6 +291,16 @@ impl CancelToken {
         self.flag.load(Ordering::Acquire)
     }
 
+    /// Resolves when the run is canceled, and never otherwise.
+    ///
+    /// Public because [`crate::client::IgClient`] races it against a request in
+    /// flight. `sleep_or_cancel` covers a wait this program chose to take; this
+    /// covers the one it did not — a server holding the connection, where the
+    /// exit used to track the server's patience rather than the user's.
+    pub async fn canceled(&self) {
+        self.wait_for_cancel().await;
+    }
+
     async fn wait_for_cancel(&self) {
         loop {
             // Register BEFORE checking the flag. The other way round loses a
