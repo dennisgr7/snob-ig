@@ -141,20 +141,31 @@ pub fn builder(
         return Ok(built);
     };
 
+    // Unreachable on the schannel target, and it has to *compile* there all the
+    // same: `webpki-root-certs` is only a dependency where rustls is, so the
+    // narrowing below does not exist on that build at all. `CAN_NARROW` is
+    // false there and `main` refuses the flag before any client is made, so
+    // this arm answers the only thing it can.
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    {
+        let _ = extra;
+        return Ok(built);
+    }
+
     // Mozilla's list in full, then whatever the user named. `tls_certs_only`
     // is the one that turns the platform store off; `tls_certs_merge` would
     // add to it and leave the enterprise root exactly where it was.
-    //
-    // On the schannel target this is unreachable: `CAN_NARROW` is false there
-    // and the binary refuses the flag before a client is ever built.
-    let mut roots: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
-        .map(|der| reqwest::Certificate::from_der(der))
-        .collect::<reqwest::Result<_>>()?;
-    for bundle in extra {
-        roots.extend(reqwest::Certificate::from_pem_bundle(bundle)?);
+    #[cfg(not(all(windows, target_arch = "aarch64")))]
+    {
+        let mut roots: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der))
+            .collect::<reqwest::Result<_>>()?;
+        for bundle in extra {
+            roots.extend(reqwest::Certificate::from_pem_bundle(bundle)?);
+        }
+        Ok(built.tls_certs_only(roots))
     }
-    Ok(built.tls_certs_only(roots))
 }
 
 /// A client that carries no credential.
