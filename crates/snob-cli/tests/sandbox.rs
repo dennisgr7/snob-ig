@@ -391,10 +391,17 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
         "and it is addressed here: {said}"
     );
 
-    // The receiver comes back on the same address, and the next run drains it
-    // with the same bytes under the same id.
-    drop(down);
+    // A second receiver, on an address of its own.
+    //
+    // **Started before the first is dropped, and that ordering is the test.**
+    // Taking `down` away first frees its port, and an operating system is
+    // entitled to hand the very same one straight back — macOS does, reliably
+    // enough that this failed there and passed on Linux and Windows. Both
+    // servers then have one address, the queued row is addressed to it after
+    // all, and the assertion below reads `waiting: 1` where it wants
+    // `elsewhere: 1`: a test about two addresses, quietly run against one.
     let up = MockServer::start().await;
+    drop(down);
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&up)
