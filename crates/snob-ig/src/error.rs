@@ -202,6 +202,31 @@ impl IgError {
         matches!(self, Self::RateLimited | Self::Network(_))
     }
 
+    /// Whether a **second, different** request is allowed to be sent after this
+    /// one, to answer the same question another way.
+    ///
+    /// Deliberately narrow, because the standing rule is that when a service
+    /// says no the answer is to stop asking. Everything that means "no" says no
+    /// here: a 429, an action block and a challenge all carry a cooldown; a 401
+    /// or 403 arrives as [`IgError::SessionExpired`]; a cancel is the user; a
+    /// 404 is a real answer, and asking a second endpoint about a name nobody
+    /// owns spends a request to be told the same thing. A 5xx is the server
+    /// being unwell, which [`Reaction::Retry`] already covers, and a second
+    /// route there would only hide an outage.
+    ///
+    /// What is left is a 4xx that is none of those: Instagram answered, and its
+    /// answer was broken. That is the case this exists for — certain business
+    /// accounts make `web_profile_info` answer 400 with
+    /// `Asset asset://laser.provider/ig_business_category_subvertical has been
+    /// deleted`, which is Instagram failing to serialize its own reply and has
+    /// nothing to do with the request. Reproduced against the live API in
+    /// August 2026.
+    ///
+    /// [`Reaction::Retry`]: crate::error::Reaction::Retry
+    pub fn worth_a_second_route(&self) -> bool {
+        matches!(self, Self::Unexpected { status, .. } if (400..500).contains(status))
+    }
+
     /// Whether it invalidates the stored session, and so must not be persisted.
     pub fn invalidates_session(&self) -> bool {
         matches!(

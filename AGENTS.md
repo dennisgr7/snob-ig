@@ -233,6 +233,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get_body` — **once per hop**, because the redirects it follows are requests too. Leaving them to reqwest's policy meant a chain of two reported one request and sent three, unpaced and uncounted, and the count is what the user is shown |
 | A redirect this client will not follow stops the walk | `IgError::OffOrigin` and `IgError::TooManyRedirects`, whose reaction is `Abort`. They are variants of their own for that reason alone: when the refusal was reqwest's it arrived as `Network`, whose reaction is `Retry`, and the pager sent the same impossible request three more times with the session on it |
 | A 429 puts the account in cooldown | `IgClient::classify_and_record` |
+| A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route`, which is true only for a 4xx that is none of the refusals — a 429, an action block, a challenge, an expired session, a cancel and a 404 all answer `false`. It is what stops `web_profile_info`'s search fallback becoming a retry against an endpoint that has just said no |
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
 | Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
@@ -792,6 +793,43 @@ left in a report nobody can find, and in the order they are worth doing.
   reason as an answer.
   Whether the limit is the account, the session or the endpoint is not known;
   what is known is that the tool reports it instead of answering wrongly.
+- **Instagram cannot serialize its own profile reply for some business
+  accounts.** `GET /api/v1/users/web_profile_info/?username=elrubiuswtf` answers
+  **400** with `Asset asset://laser.provider/ig_business_category_subvertical
+  has been deleted. You cannot use this schema`. Reproducible, nothing to do
+  with the request, and it took down every command that names an account,
+  because they all begin by turning a username into an id. Confirmed against the
+  live API in August 2026 — 400 for that account, 200 for an ordinary one in the
+  same session, which is what scopes the answer to the failure.
+
+  The answer is a **fallback, not a replacement**: `web_profile_info` tries the
+  profile endpoint exactly as before and reaches
+  `/web/search/topsearch/?context=blended&query=<name>` only after a failure
+  that `IgError::worth_a_second_route` allows. An ordinary account still costs
+  one request; the broken one costs two, both charged, and the wait between them
+  is the ordinary pace. `instantgram` hit the same wall in July 2026 and solved
+  it the same way.
+
+  **Search answers with less, and the gap is not filled in.** It carries the id,
+  the name, `is_private`, and — under `friendship_status` — the two flags the
+  private-account refusal turns on, so that refusal still happens before a page
+  is walked. It carries **no follower or following counters**, and those stay
+  `None` rather than becoming zero: `pager::verify_completion` compares a walk
+  against the declared size, so a declared zero would make every short walk look
+  complete and the truncation wall would stop being detectable at all. Two
+  things therefore quietly stop working for such an account, and both are said
+  out loud rather than left to be discovered — `engine::target` warns that the
+  run cannot tell a truncated list from a complete one nor judge a cached one,
+  and `snob watch check` returns `Warned` with the same reason, because finding
+  the truncation wall before six hours of walking is half of what that command
+  is for. `WebProfileInfo::counters_are_knowable` is the question a caller asks;
+  the reasoning is at `IgClient::web_profile_info`.
+
+  Search matches loosely, so the hit is held to an exact, case-insensitive name
+  match. Without that, a name Instagram would not serve hands back whatever the
+  search box suggested instead, and the run walks a stranger's followers under
+  the name that was typed. That is the one failure this route could introduce,
+  and it has a test of its own.
 - **Real behavior on a 429 has never been provoked on purpose.** The handling is
   verified against a recorded body. Everything downstream of it — the cooldown,
   the hard stop, the exit code — is tested; the classification of a live one is

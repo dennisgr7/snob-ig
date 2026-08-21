@@ -108,8 +108,29 @@ pub struct WebProfileInfoData {
     pub user: Option<WebProfileInfo>,
 }
 
+/// Which route answered.
+///
+/// It exists because the two do not answer the same question.
+/// `web_profile_info` carries the follower and following counters; search does
+/// not, and there is no third endpoint that would fill them in for free. A
+/// caller that needs a counter has to be able to tell "nobody asked" from
+/// "asked, and this route cannot say" — [`WebProfileInfo::counters_are_knowable`]
+/// is that question, and `engine::target` is where it is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Via {
+    /// `/api/v1/users/web_profile_info/`, which answers with everything.
+    #[default]
+    Profile,
+    /// The search box, which answers with an identity and no counters.
+    Search,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebProfileInfo {
+    /// Not deserialized: no response carries it. It is set by whichever route
+    /// built the value, and defaults to the one that parses from JSON.
+    #[serde(skip)]
+    pub via: Via,
     #[serde(deserialize_with = "flexible_pk")]
     pub id: Pk,
     pub username: String,
@@ -151,6 +172,47 @@ impl WebProfileInfo {
 
     pub fn following_count(&self) -> Option<u64> {
         self.following.map(|e| e.count)
+    }
+
+    /// Whether this route could have answered with counters at all.
+    ///
+    /// **Not the same question as whether there are any.** `None` from
+    /// `web_profile_info` means Instagram left the field out of an answer that
+    /// carries it for everybody else; `None` from search means the endpoint has
+    /// no such field. The first is worth reporting as odd, the second is
+    /// ordinary — and neither is zero, which is the reading that would turn a
+    /// short walk into a silent truncation nobody was warned about.
+    pub fn counters_are_knowable(&self) -> bool {
+        self.via == Via::Profile
+    }
+
+    /// Builds one from what search knows.
+    ///
+    /// Everything absent stays absent. The counters in particular are **not**
+    /// defaulted to zero: `pager::verify_completion` compares a walk against
+    /// the declared size, and a declared zero would make every walk look
+    /// complete.
+    pub fn from_search(user: SearchUser) -> Self {
+        Self {
+            via: Via::Search,
+            id: user.pk,
+            username: user.username,
+            full_name: user.full_name,
+            is_private: user.is_private,
+            is_verified: user.is_verified,
+            // Search spells the same two facts differently, and they are the
+            // two the private-account refusal in `engine::target` turns on, so
+            // they are worth carrying across rather than dropping.
+            followed_by_viewer: user.friendship_status.as_ref().map(|f| f.following),
+            requested_by_viewer: user.friendship_status.as_ref().map(|f| f.outgoing_request),
+            profile_pic_url: user.profile_pic_url,
+            // Search has no high-resolution URL. `pfp` does not need one: it
+            // asks `/users/{pk}/info/` for the full size, and that works from
+            // the id alone.
+            profile_pic_url_hd: None,
+            followers: None,
+            following: None,
+        }
     }
 }
 
@@ -265,4 +327,55 @@ mod tests {
         assert_eq!(domain.pk, 7);
         assert_eq!(domain.pfp_url.as_deref(), Some("https://example/pic.jpg"));
     }
+}
+
+/// Response of the web client's search box.
+///
+/// Only the accounts matter here: the endpoint also answers with places and
+/// hashtags, and both are ignored rather than modeled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopSearch {
+    #[serde(default)]
+    pub users: Vec<TopSearchHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopSearchHit {
+    pub user: SearchUser,
+}
+
+/// What search says about an account.
+///
+/// **Far less than [`WebProfileInfo`]**, and the gap is the point: there are no
+/// counters and no `followed_by_viewer` here, so anything resolved this way has
+/// to say "unknown" rather than fill a number in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchUser {
+    #[serde(deserialize_with = "flexible_pk")]
+    pub pk: Pk,
+    pub username: String,
+    #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default)]
+    pub is_private: Option<bool>,
+    #[serde(default)]
+    pub is_verified: Option<bool>,
+    #[serde(default)]
+    pub profile_pic_url: Option<String>,
+    /// What search says about the viewer's relationship to this account.
+    ///
+    /// The two fields that matter are the two `web_profile_info` spells
+    /// `followed_by_viewer` and `requested_by_viewer`, so a private account is
+    /// still refused before a page is walked when this route was the one that
+    /// answered.
+    #[serde(default)]
+    pub friendship_status: Option<FriendshipStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct FriendshipStatus {
+    #[serde(default)]
+    pub following: bool,
+    #[serde(default)]
+    pub outgoing_request: bool,
 }
