@@ -78,24 +78,16 @@ fn serves_pictures(base: &Url, url: &Url) -> bool {
         .any(|cdn| host == *cdn || host.ends_with(&format!(".{cdn}")))
 }
 
-/// Redirects for the API: the same origin, or nowhere.
+/// Redirects for the API: none, because following one is a request and a
+/// request has to be paid for.
 ///
-/// Instagram's JSON endpoints do not redirect off their own host, so refusing
-/// costs nothing — and two of the headers on those requests are credentials.
-/// reqwest drops `Cookie` when a redirect crosses hosts, but `X-CSRFToken` is
-/// not on the list it knows about and would travel to wherever the response
-/// pointed. A boundary that depends on somebody else's list of header names is
-/// not one, so this one is drawn here.
-fn api_policy(base: Url) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_HOPS {
-            attempt.error("too many redirects")
-        } else if same_origin(&base, attempt.url()) {
-            attempt.follow()
-        } else {
-            attempt.error("a redirect tried to take an API call off instagram.com")
-        }
-    })
+/// `IgClient::get_body` follows them itself, charging `Pacer::clear_to_send`
+/// per hop and holding every hop to the same origin. Leaving it to the HTTP
+/// client meant the hops went out unpaced and uncounted, which is what this
+/// exists to stop — the reasoning is on `get_body`, next to the loop that does
+/// it.
+fn api_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::none()
 }
 
 /// Redirects for an asset: every hop held to the same rule as the first.
@@ -274,7 +266,7 @@ impl IgClient {
     fn pointed_at(session: Session, pacer: Pacer, base: Url) -> Result<Self, IgError> {
         Ok(Self {
             hints: ClientHints::from_user_agent(&session.user_agent),
-            api: build_client(&session.user_agent, api_policy(base.clone()))?,
+            api: build_client(&session.user_agent, api_policy())?,
             cdn: OnceLock::new(),
             base,
             session,
@@ -576,16 +568,151 @@ impl IgClient {
         query: &[(&str, &str)],
         referer: &str,
     ) -> Result<T, IgError> {
-        let url = self.base.join(path)?;
-        tracing::debug!(%url, "GET");
+        let (status, body) = self.get_body(path, query, referer).await?;
 
-        // Paid for before it is sent, and there is no way in that skips this.
-        self.pacer.clear_to_send().await?;
+        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
+        // with a 200 in some cases.
+        if !(200..300).contains(&status) || declares_failure(&body) {
+            return Err(self.classify_and_record(status, &body));
+        }
 
+        serde_json::from_str(&body).map_err(|e| {
+            // The same excerpt every other error gets. This one had a copy of
+            // its own that took 200 raw characters: unfiltered, though it is
+            // printed to a terminal, and with no idea that a body starting with
+            // `<` is a captive portal rather than the API — which is exactly
+            // what a body that will not parse usually is.
+            IgError::Decode(format!(
+                "{e} - response: {}",
+                crate::error::body_excerpt(&body)
+            ))
+        })
+    }
+
+    /// Sends the request and follows any redirect itself, **paying for every
+    /// hop**.
+    ///
+    /// The redirect policy used to be reqwest's, and that is why this loop
+    /// exists. `Pacer::clear_to_send` sits inside this function, so a hop the
+    /// HTTP client followed on its own went out without being charged and
+    /// without waiting — against the rule that every request is paid for, and
+    /// invisibly, because the budget's own count is what the user is shown. A
+    /// chain of three therefore reported one request and sent four, at whatever
+    /// rate the network allowed rather than at the tool's.
+    ///
+    /// The origin rule is unchanged and is applied to every hop rather than to
+    /// the first: Instagram's JSON endpoints do not redirect off their own
+    /// host, so refusing costs nothing — and two of the headers on these
+    /// requests are credentials. reqwest drops `Cookie` when a redirect crosses
+    /// hosts, but `X-CSRFToken` is not on the list it knows about and would
+    /// travel to wherever the response pointed. A boundary that depends on
+    /// somebody else's list of header names is not one.
+    ///
+    /// **A refusal here has to reach [`Reaction::Abort`]**, which is why the
+    /// two ways out are variants of their own rather than an `Unexpected`. When
+    /// reqwest refused the hop it raised an ordinary `reqwest::Error`, that
+    /// landed as `Network`, whose reaction is `Retry`, and the pager sent the
+    /// same impossible request three more times with the session on it —
+    /// measured at 13 requests on the wire against 5 charged. Moving the
+    /// refusal here must not reintroduce the same thing under a new name.
+    ///
+    /// The query is attached to the first request only. A `Location` carries
+    /// whatever query it means to carry, and appending ours to it would send a
+    /// parameter the server did not ask to see twice.
+    async fn get_body(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        referer: &str,
+    ) -> Result<(u16, String), IgError> {
+        let mut url = self.base.join(path)?;
+        let mut query: Option<&[(&str, &str)]> = Some(query);
+        let mut hops: usize = 0;
+
+        loop {
+            tracing::debug!(%url, "GET");
+
+            // Paid for before it is sent, and there is no way in that skips
+            // this — the hops included, which is the whole point of the loop.
+            self.pacer.clear_to_send().await?;
+
+            let response = self.api_request(&url, query, referer).send().await?;
+            self.remember_claim(&response);
+            let status = response.status();
+
+            if status.is_redirection() {
+                let next = self.next_hop(&url, &response)?;
+                if hops >= MAX_HOPS {
+                    return Err(IgError::TooManyRedirects);
+                }
+                hops += 1;
+                url = next;
+                query = None;
+                continue;
+            }
+
+            // The status is already in hand, and a body that will not read must
+            // not take it away. With `?` here, a 429 whose body died mid-stream
+            // became `IgError::Network` — whose reaction is `Retry` — so the
+            // walker fired three more requests into an endpoint that had just
+            // said no, and `classify_and_record`, the only caller of
+            // `cooldown_for` there is, never ran: nothing was written down and
+            // the next run knocked again. What Instagram said is the status;
+            // the body only refines it.
+            let body = match read_capped(response, MAX_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(_) if !status.is_success() => {
+                    return Err(self.classify_and_record(status.as_u16(), ""));
+                }
+                Err(e) => return Err(e),
+            };
+            return Ok((status.as_u16(), body));
+        }
+    }
+
+    /// Where a redirect points, if it points somewhere this client may go.
+    ///
+    /// A `Location` is allowed to be relative, so it is resolved against the
+    /// URL that produced it rather than parsed on its own — and the result is
+    /// held to the same origin rule as the first request. Both refusals are
+    /// excerpted like every other error that prints something a server chose:
+    /// this string is printed to a terminal and Instagram wrote it.
+    fn next_hop(&self, from: &Url, response: &reqwest::Response) -> Result<Url, IgError> {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| IgError::Unexpected {
+                status: response.status().as_u16(),
+                body: "a redirect arrived with nowhere to go".into(),
+            })?;
+
+        let next = from.join(location).map_err(|_| IgError::OffOrigin {
+            to: crate::error::body_excerpt(location),
+        })?;
+
+        if !same_origin(&self.base, &next) {
+            return Err(IgError::OffOrigin {
+                to: crate::error::body_excerpt(next.as_str()),
+            });
+        }
+        Ok(next)
+    }
+
+    /// The request itself, with the headers a browser would send.
+    ///
+    /// Split from the sending so that a redirect hop is built the same way the
+    /// first request was, rather than by whatever the HTTP client decided to
+    /// carry forward.
+    fn api_request(
+        &self,
+        url: &Url,
+        query: Option<&[(&str, &str)]>,
+        referer: &str,
+    ) -> reqwest::RequestBuilder {
         let mut request = self
             .api
-            .get(url)
-            .query(query)
+            .get(url.clone())
             // Without this header Instagram answers 403 even with a good session.
             .header("X-IG-App-ID", IG_APP_ID)
             .header("X-ASBD-ID", client_hints::ASBD_ID)
@@ -625,6 +752,10 @@ impl IgClient {
             )
             .header("Cookie", self.session.cookie_header().as_str());
 
+        if let Some(query) = query {
+            request = request.query(query);
+        }
+
         // Deliberately no `Origin`: the Fetch standard omits it on same-origin
         // GETs, so sending one next to `Sec-Fetch-Site: same-origin` would be
         // two headers contradicting each other. Easy to add by reflex, which is
@@ -648,43 +779,7 @@ impl IgClient {
             request = request.header("Priority", priority);
         }
 
-        let response = request.send().await?;
-        self.remember_claim(&response);
-
-        let status = response.status();
-
-        // The status is already in hand, and a body that will not read must not
-        // take it away. With `?` here, a 429 whose body died mid-stream became
-        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
-        // three more requests into an endpoint that had just said no, and
-        // `classify_and_record`, the only caller of `cooldown_for` there is,
-        // never ran: nothing was written down and the next run knocked again.
-        // What Instagram said is the status; the body only refines it.
-        let body = match read_capped(response, MAX_BODY_BYTES).await {
-            Ok(body) => body,
-            Err(_) if !status.is_success() => {
-                return Err(self.classify_and_record(status.as_u16(), ""));
-            }
-            Err(e) => return Err(e),
-        };
-
-        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
-        // with a 200 in some cases.
-        if !status.is_success() || declares_failure(&body) {
-            return Err(self.classify_and_record(status.as_u16(), &body));
-        }
-
-        serde_json::from_str(&body).map_err(|e| {
-            // The same excerpt every other error gets. This one had a copy of
-            // its own that took 200 raw characters: unfiltered, though it is
-            // printed to a terminal, and with no idea that a body starting with
-            // `<` is a captive portal rather than the API — which is exactly
-            // what a body that will not parse usually is.
-            IgError::Decode(format!(
-                "{e} - response: {}",
-                crate::error::body_excerpt(&body)
-            ))
-        })
+        request
     }
 }
 
@@ -1404,7 +1499,10 @@ mod tests {
             .await;
 
         let error = client(&server).await.validate().await.unwrap_err();
-        assert!(matches!(error, IgError::Network(_)), "{error:?}");
+        // `OffOrigin` rather than `Network`: the refusal is this client's now
+        // that `get_body` follows the chain itself, and it has to keep landing
+        // on `Abort` — see `a_hop_off_the_origin_is_refused_and_not_retried`.
+        assert!(matches!(error, IgError::OffOrigin { .. }), "{error:?}");
 
         // The one request that was made is the one we made on purpose.
         let requests = server.received_requests().await.unwrap();
@@ -1421,5 +1519,175 @@ mod tests {
 
         let error = client(&server).await.validate().await.unwrap_err();
         assert!(matches!(error, IgError::Decode(_)));
+    }
+    /// A followed hop is a request, and every request is paid for.
+    ///
+    /// This is the whole of the change: the hops were followed by reqwest, so
+    /// they went out without being charged and without waiting. The budget's
+    /// count is what the user is shown and what rate control is built on, so a
+    /// chain of two reported one request and sent three.
+    #[tokio::test]
+    async fn every_redirect_hop_is_charged() {
+        let server = MockServer::start().await;
+        let body = r#"{"users":[],"next_max_id":null}"#;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/api/v1/hop-one/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hop-one/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/api/v1/hop-two/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hop-two/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let page = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect("the chain ends in an answer");
+        assert!(page.users.is_empty());
+
+        assert_eq!(
+            client.pacer().spent(),
+            3,
+            "one request and two hops is three requests, and the budget has to know"
+        );
+    }
+
+    /// A hop off instagram.com is refused, and refused in a way that stops the
+    /// walk rather than making it try again.
+    ///
+    /// Two of the headers on these requests are credentials. reqwest drops
+    /// `Cookie` across hosts but has never heard of `X-CSRFToken`, so a
+    /// followed hop would carry it wherever the response pointed.
+    ///
+    /// The reaction matters as much as the refusal. When this was reqwest's
+    /// refusal it arrived as `Network`, whose reaction is `Retry`, and the
+    /// pager sent the same impossible request three more times.
+    #[tokio::test]
+    async fn a_hop_off_the_origin_is_refused_and_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "https://example.invalid/collect"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("it must not follow that");
+
+        assert!(
+            matches!(&error, IgError::OffOrigin { to } if to.contains("example.invalid")),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.reaction(),
+            crate::error::Reaction::Abort,
+            "retrying a redirect that will be refused again is what cost 13 requests"
+        );
+        assert_eq!(
+            client.pacer().spent(),
+            1,
+            "the hop was never sent, so it is never charged"
+        );
+    }
+
+    /// A chain that never ends stops at `MAX_HOPS`, having paid for exactly the
+    /// requests it made.
+    #[tokio::test]
+    async fn a_redirect_loop_stops_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/api/v1/friendships/1/followers/"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("a loop is not an answer");
+
+        assert!(matches!(error, IgError::TooManyRedirects), "{error:?}");
+        assert_eq!(error.reaction(), crate::error::Reaction::Abort);
+        assert_eq!(
+            client.pacer().spent(),
+            (MAX_HOPS + 1) as u32,
+            "the first request and every hop it was allowed"
+        );
+    }
+
+    /// The query goes on the first request and not on the hops.
+    ///
+    /// A `Location` carries whatever query it means to carry. Appending ours to
+    /// it would send a parameter the server did not ask to see twice, and on an
+    /// endpoint that takes a cursor that is a different request from the one
+    /// the redirect described.
+    #[tokio::test]
+    async fn the_query_is_not_reattached_to_a_hop() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .and(query_param("count", "50"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "/api/v1/landed/?count=7"),
+            )
+            .mount(&server)
+            .await;
+        // Mounted with the hop's own count, so it only matches if ours was not
+        // added alongside it.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/landed/"))
+            .and(query_param("count", "7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"users":[],"next_max_id":null}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect("the hop's own query is the one that travels");
+    }
+
+    /// A redirect with no `Location` is an answer nobody can act on, and it must
+    /// not become a silent success or a retry.
+    #[tokio::test]
+    async fn a_redirect_with_nowhere_to_go_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(ResponseTemplate::new(302))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("there is nowhere to go");
+        assert!(
+            matches!(error, IgError::Unexpected { status: 302, .. }),
+            "{error:?}"
+        );
     }
 }

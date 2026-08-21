@@ -36,6 +36,21 @@ pub enum IgError {
     #[error("Instagram answered {status}: {body}")]
     Unexpected { status: u16, body: String },
 
+    /// A redirect pointed somewhere this client will not follow.
+    ///
+    /// Its own variant rather than an [`IgError::Unexpected`] because the
+    /// reaction is what matters: retrying cannot help, and when this refusal
+    /// was reqwest's it arrived as [`IgError::Network`], whose reaction is
+    /// `Retry`. The pager then sent the same impossible request three more
+    /// times with the session on it.
+    #[error("a redirect tried to take an API call off instagram.com: {to}")]
+    OffOrigin { to: String },
+
+    /// A redirect chain that is a loop by another name. Same reasoning as
+    /// [`IgError::OffOrigin`] for why it is not an `Unexpected`.
+    #[error("too many redirects")]
+    TooManyRedirects,
+
     #[error("the download exceeds {limit} bytes, so it is not a profile picture")]
     TooLarge { limit: usize },
 
@@ -164,6 +179,8 @@ impl IgError {
             // `is_redirect()` is true exactly for a policy refusal, which is
             // what makes this a one-line question rather than a guess about the
             // message.
+            // Still reachable: the CDN client keeps a policy of its own, and a
+            // hop it refuses arrives this way.
             Self::Network(e) if e.is_redirect() => Reaction::Abort,
             Self::Network(_) => Reaction::Retry,
             // A 5xx is the server's problem, not ours.

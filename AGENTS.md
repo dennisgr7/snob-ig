@@ -230,7 +230,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 
 | Rule | Where it lives |
 |---|---|
-| Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get` |
+| Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get_body` — **once per hop**, because the redirects it follows are requests too. Leaving them to reqwest's policy meant a chain of two reported one request and sent three, unpaced and uncounted, and the count is what the user is shown |
+| A redirect this client will not follow stops the walk | `IgError::OffOrigin` and `IgError::TooManyRedirects`, whose reaction is `Abort`. They are variants of their own for that reason alone: when the refusal was reqwest's it arrived as `Network`, whose reaction is `Retry`, and the pager sent the same impossible request three more times with the session on it |
 | A 429 puts the account in cooldown | `IgClient::classify_and_record` |
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
@@ -678,11 +679,6 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **Redirect hops are followed without being paced or charged.** Fixed: a
-  *refused* redirect no longer retries. Still owed: the hops that are followed
-  go out unpaid, against the standing rule that every request is paid for. The
-  shape is `Policy::none()` plus a bounded loop in `IgClient::get` charging
-  `clear_to_send()` per hop.
 - **The Windows data directory has no DACL of its own.** `create_private_dir`
   chmods 0700 on Unix and does nothing on Windows, on the assumption that
   `%LOCALAPPDATA%` already limits access. On a machine with a non-default
