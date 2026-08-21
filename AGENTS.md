@@ -447,8 +447,13 @@ Two judgment calls worth understanding before touching them:
   about which crypto backend compiles on that target and nothing else, and
   `http2` stays mandatory on both.
 - **Headers are sent so that the request is internally consistent, and for no
-  other reason.** Instagram answers `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, so
-  those are sent; `Accept` is `*/*` because that is what `fetch()` sends when
+  other reason.** `Sec-Fetch-Site` and `Sec-Fetch-Mode` are sent because a
+  browser sends them and a request without them is the anomaly — this used to
+  say Instagram answers `Vary` on the pair, which is **unverified**: the August
+  2026 capture saw `Vary` on `Origin`, on `Accept-Encoding` and on
+  `Accept-Language, Cookie`, and on no `Sec-Fetch-*`, but it kept no response
+  headers that survive to be re-read, so nobody has actually checked. It changes
+  nothing either way. `Accept` is `*/*` because that is what `fetch()` sends when
   the page sets nothing; `sec-ch-ua` is computed from the version rather than
   hardcoded, including the order of its three entries; no `Origin` on a
   same-origin GET, which the Fetch standard omits there. The stored User-Agent
