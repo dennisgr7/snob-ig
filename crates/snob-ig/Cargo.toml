@@ -80,3 +80,7 @@ windows-sys.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 wiremock.workspace = true
+# Only to read back what was logged. The `Retry-After` work is a logging change
+# and nothing else, so the log is the artifact under test -- reading the header
+# and throwing it away would pass any test written against behavior.
+tracing-subscriber.workspace = true

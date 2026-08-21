@@ -681,12 +681,19 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **`Retry-After` is never read.** `classify` receives no headers. Reading it
-  would make snob the only tool of its class that does — but nobody has
-  established whether these endpoints send it. Log the header at `debug` on
-  every push-back first, so a real run answers the question. When implemented
-  it is a floor and never a ceiling: a server-named 30 s must not shorten the
-  local cooldown.
+- **`Retry-After` is measured, not acted on.** `classify` takes a status and a
+  body and never sees a header, so whether these endpoints send this at all has
+  never been answerable from a real run. `IgClient::note_push_back` now logs it
+  at `debug` on every push-back — including the two a check on the status alone
+  walks past, a 200 carrying `spam: true` and a push-back whose body died
+  mid-read — and logs `<absent>` when there is none, which is the answer the
+  logging is really after. **Nothing decides anything from it**, deliberately:
+  inventing behavior on the assumption that the header arrives is guessing with
+  somebody's account. When it is implemented it is a floor and never a ceiling,
+  because a server naming thirty seconds is answering a different question from
+  how long an account is left alone after Instagram has objected. That is
+  written at `note_push_back`, where somebody adding it will be looking. Two
+  tests read the log back and assert the recorded cooldown is unchanged.
 - **The pacing rate has no reference behind it.** The best public figure for
   this endpoint family is instaloader's field-report guess of 75 requests per
   660 s for non-GraphQL; snob walks at 172, because the cadence was copied from

@@ -164,6 +164,33 @@ async fn read_capped_bytes(mut response: reqwest::Response, cap: u64) -> Result<
     Ok(bytes)
 }
 
+/// `Retry-After`, if the answer carried one.
+///
+/// A string rather than a parsed duration on purpose: the header has two legal
+/// forms, seconds and an HTTP date, and until it is known which of them these
+/// endpoints send — if either — turning it into a number would be deciding the
+/// answer to the question the logging exists to ask.
+fn retry_after(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// One answer from Instagram: what it said, and the one header worth keeping
+/// hold of.
+///
+/// `classify` is a pure function of a status and a body and does not receive
+/// headers, which is why `Retry-After` travels separately rather than being
+/// read where the decision is made. **Nothing decides anything from it yet**,
+/// deliberately — see [`IgClient::note_push_back`].
+struct Answer {
+    status: u16,
+    body: String,
+    retry_after: Option<String>,
+}
+
 /// Which side of the relationship is being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -576,14 +603,16 @@ impl IgClient {
         query: &[(&str, &str)],
         referer: &str,
     ) -> Result<T, IgError> {
-        let (status, body) = self.get_body(path, query, referer).await?;
+        let answer = self.get_body(path, query, referer).await?;
 
         // A 200 can still be an error: Instagram returns `{"status":"fail"}`
         // with a 200 in some cases.
-        if !(200..300).contains(&status) || declares_failure(&body) {
-            return Err(self.classify_and_record(status, &body));
+        if !(200..300).contains(&answer.status) || declares_failure(&answer.body) {
+            self.note_push_back(&answer);
+            return Err(self.classify_and_record(answer.status, &answer.body));
         }
 
+        let body = answer.body;
         serde_json::from_str(&body).map_err(|e| {
             // The same excerpt every other error gets. This one had a copy of
             // its own that took 200 raw characters: unfiltered, though it is
@@ -632,7 +661,7 @@ impl IgClient {
         path: &str,
         query: &[(&str, &str)],
         referer: &str,
-    ) -> Result<(u16, String), IgError> {
+    ) -> Result<Answer, IgError> {
         let mut url = self.base.join(path)?;
         let mut query: Option<&[(&str, &str)]> = Some(query);
         let mut hops: usize = 0;
@@ -669,17 +698,29 @@ impl IgClient {
             // `cooldown_for` there is, never ran: nothing was written down and
             // the next run knocked again. What Instagram said is the status;
             // the body only refines it.
+            let retry_after = retry_after(&response);
+
             let body = match self.read_or_cancel(response, MAX_BODY_BYTES).await {
                 Ok(body) => body,
                 // A canceled read is the user, not the server, and must not be
                 // turned into a push-back that gets written down as one.
                 Err(IgError::Canceled) => return Err(IgError::Canceled),
                 Err(_) if !status.is_success() => {
-                    return Err(self.classify_and_record(status.as_u16(), ""));
+                    let answer = Answer {
+                        status: status.as_u16(),
+                        body: String::new(),
+                        retry_after,
+                    };
+                    self.note_push_back(&answer);
+                    return Err(self.classify_and_record(answer.status, ""));
                 }
                 Err(e) => return Err(e),
             };
-            return Ok((status.as_u16(), body));
+            return Ok(Answer {
+                status: status.as_u16(),
+                body,
+                retry_after,
+            });
         }
     }
 
@@ -730,6 +771,37 @@ impl IgClient {
             () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
             body = read_capped(response, cap) => body,
         }
+    }
+
+    /// Writes down what a push-back looked like, and changes nothing.
+    ///
+    /// **This is a measurement, not a mechanism.** Reading `Retry-After` would
+    /// make snob the only tool of its class that does, and nobody has
+    /// established whether these endpoints send it at all; the honest first
+    /// step is to log it on every push-back so that a real run answers the
+    /// question. Until it has, inventing behavior on the assumption that the
+    /// header arrives is guessing with somebody's account.
+    ///
+    /// **When it is implemented it is a floor and never a ceiling.** A server
+    /// naming thirty seconds must not shorten a local cooldown that is longer:
+    /// the cooldown lengths here are about how long an account is left alone
+    /// after Instagram has objected, which is a different question from how
+    /// soon the endpoint will answer again. Written here because this is where
+    /// somebody will come looking when they add it.
+    ///
+    /// `debug` rather than `warn`: on a run that is going badly this fires
+    /// once per push-back, and the user already gets told what happened.
+    ///
+    /// The value is logged as it arrived. A header value cannot carry a byte
+    /// below 0x20 — the HTTP parser refuses one before we ever see it — so
+    /// there is nothing here that a terminal would act on, which is the same
+    /// argument the `Referer` above rests on.
+    fn note_push_back(&self, answer: &Answer) {
+        tracing::debug!(
+            status = answer.status,
+            retry_after = answer.retry_after.as_deref().unwrap_or("<absent>"),
+            "Instagram pushed back"
+        );
     }
 
     /// Where a redirect points, if it points somewhere this client may go.
@@ -1840,5 +1912,126 @@ mod tests {
             "a canceled request was recorded as a push-back: {:?}",
             budget.calls()
         );
+    }
+    /// Collects what was logged, so a `debug!` can be asserted on.
+    ///
+    /// The whole of this item is a logging change, so the log is the artifact
+    /// under test. There is nothing else to call: reading the header and
+    /// throwing it away would pass any test written against behavior, which is
+    /// exactly what a measurement step looks like from the outside.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<String>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every push-back says what `Retry-After` it carried, and nothing acts on
+    /// it.
+    ///
+    /// `classify` takes a status and a body and never sees a header, so the
+    /// question of whether these endpoints send this at all has never been
+    /// answerable from a real run. It is now. What must **not** happen is the
+    /// header changing anything before somebody has seen one: the cooldown
+    /// recorded here is the same one that was recorded before, and a
+    /// server-named thirty seconds must never shorten it.
+    #[tokio::test]
+    async fn a_push_back_says_what_retry_after_it_carried() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(log.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "30")
+                    .set_body_string(r#"{"message":"Please wait a few minutes"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(session, crate::pace::Pacer::new(budget.clone()))
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
+
+        let text = log.text();
+        assert!(text.contains("Instagram pushed back"), "{text}");
+        assert!(
+            text.contains("retry_after") && text.contains("30"),
+            "the header was not written down: {text}"
+        );
+
+        // And the cooldown is untouched by it. Thirty seconds is far shorter
+        // than the rate-limit cooldown, so a header that had been allowed to
+        // shorten anything would show up right here.
+        let recorded = budget.calls();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "rate_limit");
+        assert_eq!(
+            recorded[0].1,
+            snob_core::store::rate_budget::rate_limit_cooldown(),
+            "the server's number reached the cooldown, and it must not"
+        );
+    }
+
+    /// A push-back with no such header still says so, which is the answer the
+    /// logging is really after: these endpoints may simply never send one.
+    #[tokio::test]
+    async fn a_push_back_without_the_header_is_recorded_as_absent() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(log.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"status":"fail","spam":true}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
+
+        let text = log.text();
+        // A 200 carrying `spam: true` is a push-back, and one that a check on
+        // the status alone would have walked straight past.
+        assert!(text.contains("Instagram pushed back"), "{text}");
+        assert!(text.contains("<absent>"), "{text}");
     }
 }
