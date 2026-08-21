@@ -345,9 +345,15 @@ Two judgment calls worth understanding before touching them:
   with no counters and a 150x150 picture whose URL is signed for that size.
   Everything needs a session; that is how Instagram has built it, not a gap
   here.
-- **The TLS stack is chosen for portability, and is not to be tuned to imitate
-  anything.** There would be nothing to imitate in any case: Chrome has
-  randomized its ClientHello extension order since v110. Trying would mean
+- **The wire signature is chosen for portability, and is not to be tuned to
+  imitate anything** — the TLS handshake, the HTTP/2 SETTINGS and the header
+  order alike. The reason written here used to be that there is nothing to
+  imitate, because Chrome has randomized its ClientHello extension order since
+  v110. That premise is true and the conclusion stopped holding in 2023: JA4
+  sorts the extension list before hashing it, exactly so the shuffling changes
+  nothing. The reasons that do hold are that copying a browser's cryptographic
+  identity is detection evasion rather than honesty — and this tool exists to
+  lower a real account's risk, not to be harder to recognize as a program — Trying would mean
   leaving `rustls`, and the clean static cross-compilation with it, and would
   buy nothing — what determines whether Instagram throttles an account is, in
   order, the address the requests come from, how many there are, and how fast.
