@@ -1,3 +1,15 @@
+# Pinned to an exact version, not to `stable`.
+#
+# Two builds of the same tag have to produce the same bytes, and `stable` makes
+# that impossible by construction: a rebuild months later picks up whatever
+# stable has become, and a different compiler is a different binary however
+# careful everything downstream is. It also means a release built today and one
+# rebuilt to check it were never compiled by the same thing, so a mismatch
+# proves nothing.
+#
+# The cost is that this needs a deliberate bump. That is the point -- a
+# toolchain upgrade becomes a commit somebody reviewed rather than something
+# that happened on a Thursday.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

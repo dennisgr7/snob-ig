@@ -501,13 +501,34 @@ async fn account_of(
                 following: profile.following_count(),
                 may_run_unattended,
             };
-            let verdict = if may_run_unattended {
-                Verdict::Ok
-            } else {
+            // Counters that cannot be known are the preflight's own subject.
+            // Half of what `check` is for is finding the truncation wall before
+            // six hours of walking, and that check is a comparison against the
+            // declared size — so on an account whose profile Instagram will not
+            // serve, and whose id therefore came from search, the preflight can
+            // no longer make the promise it exists to make. A warning rather
+            // than a failure: the run would still work, and only what would
+            // stop one reaches the exit code.
+            let counters_unknown = !profile.counters_are_knowable();
+            let verdict = if !may_run_unattended {
                 Verdict::Failed
+            } else if counters_unknown {
+                Verdict::Warned
+            } else {
+                Verdict::Ok
             };
-            let problem =
-                (!may_run_unattended).then(|| crate::report::NO_RECORDED_CONSENT.to_string());
+            let problem = if !may_run_unattended {
+                Some(crate::report::NO_RECORDED_CONSENT.to_string())
+            } else if counters_unknown {
+                Some(
+                    "Instagram would not serve this account's profile, so its id came from \
+                     search, which carries no counters. A scheduled run will work, but it \
+                     cannot tell a truncated list from a complete one."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             (
                 Checked {
                     what,

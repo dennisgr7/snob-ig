@@ -22,6 +22,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Inside the checkout on purpose, and it is what makes the build independent
+  # of where it ran. Absolute paths reach the binary from two places -- the
+  # sources being compiled and the registry the dependencies were unpacked into
+  # -- and the second is normally in the home directory, which differs per
+  # runner and per operating system. Moved under the workspace, one
+  # `--remap-path-prefix` covers both. Nothing is cached here anyway; the `build`
+  # job deliberately has no cache, for the reason written at that step.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
 
 # Read-only unless a job asks for more, and two of them do: `publish` creates
 # the release and `packaging` pushes the manifests. Without this the rest
@@ -119,6 +127,28 @@ jobs:
       # against Angular's release infrastructure. CI can have one because
       # nothing it produces is published.
 
+      # Two builds of one tag have to produce the same bytes, and an absolute
+      # path baked into the binary is the difference that is easiest to miss.
+      #
+      # **Not `RUSTFLAGS`.** That variable *replaces* `.cargo/config.toml`
+      # rather than adding to it, so exporting it here would silently drop
+      # `+crt-static` and `/Brepro` and both Windows binaries would go back to
+      # needing the Visual C++ redistributable -- with nothing failing until
+      # somebody's machine could not launch it. A second config file is the
+      # shape that works: cargo reads `$CARGO_HOME/config.toml` as well as the
+      # repository's and **joins** the `rustflags` arrays.
+      #
+      # A TOML literal string, single-quoted, because the Windows path is full
+      # of backslashes and a basic string would eat them.
+      - name: Make the build independent of where it ran
+        shell: bash
+        run: |
+          mkdir -p "$CARGO_HOME"
+          cat >> "$CARGO_HOME/config.toml" <<'EOF'
+          [target.'cfg(all())']
+          rustflags = ['--remap-path-prefix=${{ github.workspace }}=/snob']
+          EOF
+
       # rusqlite compiles SQLite from C, which a musl target cannot do without
       # a musl C compiler.
       - name: musl toolchain
@@ -138,21 +168,46 @@ jobs:
       #
       # Both hold a directory rather than loose files, so unpacking in the
       # wrong place leaves one folder to delete instead of four files to find.
+      # The binaries are reproducible; the archives were not, and an archive
+      # nobody can rebuild byte for byte makes the binary inside it unverifiable
+      # too. Both formats embed a modification time, so both are given one: the
+      # committer date of the tagged commit, which is derived from the tag like
+      # everything else in this workflow rather than being a wall clock.
+      #
+      # The `.deb` needs nothing -- `cargo-deb` is already reproducible.
       - name: Package
         shell: bash
         run: |
           name="snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          # The tag's own commit date. `%ct` is seconds since the epoch, which
+          # is what every tool below wants.
+          epoch=$(git log -1 --format=%ct)
           mkdir -p "staging/$name"
           cp README.md LICENSE CHANGELOG.md "staging/$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/snob.exe" "staging/$name/"
             # Compress-Archive rather than 7z: it ships with PowerShell, and
             # the Windows on ARM image cannot be assumed to carry 7-Zip.
+            #
+            # It stores each entry's LastWriteTime, and there is no flag for
+            # that, so the times are set on the files first. A zip's DOS
+            # timestamp has two-second resolution, so the value is rounded down
+            # to an even second here rather than left for the format to round
+            # unpredictably.
+            even=$(( epoch - epoch % 2 ))
             (cd staging && powershell -NoProfile -Command \
-              "Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
+              "\$stamp = [DateTimeOffset]::FromUnixTimeSeconds($even).UtcDateTime; \
+               Get-ChildItem -Recurse '$name' | ForEach-Object { \$_.LastWriteTimeUtc = \$stamp }; \
+               Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
           else
             cp "target/${{ matrix.target }}/release/snob" "staging/$name/"
-            tar -C staging -czf "$name.tar.gz" "$name"
+            # --sort=name so the order does not depend on the filesystem,
+            # --mtime so it does not depend on when this ran, and --owner/--group
+            # so it does not depend on who the runner is. gzip -n because gzip
+            # writes its own timestamp into the header as well, which is the one
+            # everybody forgets.
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+              -C staging -cf - "$name" | gzip -n > "$name.tar.gz"
           fi
 
       # A .deb as well on Linux, so Debian and Ubuntu get an install that their

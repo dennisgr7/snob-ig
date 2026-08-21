@@ -46,8 +46,6 @@ comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
 rust_xlsxwriter.workspace = true
 zip.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -69,9 +67,24 @@ fastrand.workspace = true
 # `[::1]` does not parse as an address.
 url.workspace = true
 
+# Launching the browser with the debugging protocol on a pipe. Windows needs the
+# handle-inheritance blob and the job object; Unix needs `dup2`. Neither is
+# reachable through `std::process::Command`, and the reasoning is in
+# `src/pipe.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
+# Only so the test for `--tls-extra-root` can check its predicate against a real
+# certificate as well as against rejections: one that refuses everything also
+# passes a test made only of rejections. Pure data, so it builds on every target
+# including the one where narrowing is refused.
+webpki-root-certs.workspace = true
 
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key

@@ -287,6 +287,10 @@ mod tests {
             profile_pic_url_hd: None,
             followers: None,
             following: None,
+            // The route that answered. Search is the fallback for the accounts
+            // `web_profile_info` cannot serialize; these fixtures are the
+            // ordinary case.
+            via: snob_ig::model::Via::Profile,
         }
     }
 

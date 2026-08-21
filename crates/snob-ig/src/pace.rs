@@ -21,6 +21,33 @@
 //!   in the same response. This walks both lists, so for a symmetric account it
 //!   spends roughly twice the requests for the same answer. What offsets that is
 //!   a budget that persists across runs, which the reference also does not have.
+//!
+//! **And there is a third limit, which is the honest one: nothing behind these
+//! numbers is a published rate.** An audit in August 2026 went looking for one
+//! and this is what there is, written down here because it is the sort of thing
+//! that gets rediscovered every year with nothing to argue against.
+//!
+//! The best public figure for this endpoint family is instaloader's
+//! field-report guess of 75 requests per 660 seconds for its non-GraphQL calls.
+//! Against that, this walks at about 172 in the same window — because the
+//! cadence was copied from a project that walks **GraphQL**, which is a
+//! different endpoint family with different weighting, and that difference was
+//! never noticed when the numbers were taken.
+//!
+//! **This is recorded, not proposed, and the arithmetic is why.** Slowing to
+//! instaloader's guess means about 8.8 seconds a request; a 235-page walk then
+//! takes 34 minutes against a 900-second resume window, so an interrupted walk
+//! could never be continued and would begin again at page one. Worse, a list
+//! that took 34 minutes to read no longer describes one moment, and one list
+//! describing one moment is worth more than the rate — the whole comparison
+//! rests on it, which is what `engine::cooldown::check_same_moment` exists to
+//! protect. Trading that away to match a number that is itself a guess would be
+//! paying a certain cost for an uncertain benefit.
+//!
+//! One figure that is **not** evidence, because it is quoted at this problem
+//! constantly: the ubiquitous "200 calls per user per hour" is Meta's Graph API
+//! platform limit for `graph.facebook.com`. It has nothing to do with these
+//! endpoints, and anybody reaching for it here has the wrong document.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -323,6 +350,16 @@ impl CancelToken {
 
     pub fn is_canceled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the run is canceled, and never otherwise.
+    ///
+    /// Public because [`crate::client::IgClient`] races it against a request in
+    /// flight. `sleep_or_cancel` covers a wait this program chose to take; this
+    /// covers the one it did not — a server holding the connection, where the
+    /// exit used to track the server's patience rather than the user's.
+    pub async fn canceled(&self) {
+        self.wait_for_cancel().await;
     }
 
     async fn wait_for_cancel(&self) {

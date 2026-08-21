@@ -14,7 +14,7 @@ thiserror.workspace = true
 zeroize.workspace = true
 chrono.workspace = true
 directories.workspace = true
-keyring.workspace = true
+keyring-core.workspace = true
 tracing.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
@@ -27,9 +27,20 @@ toml.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 
+# One credential store per platform, chosen here rather than by a wrapper crate.
+# See the workspace manifest for what going direct bought, and `secrets.rs` for
+# how the store is installed and why the Windows one is asked for local
+# persistence.
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 base64.workspace = true
+windows-native-keyring-store.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

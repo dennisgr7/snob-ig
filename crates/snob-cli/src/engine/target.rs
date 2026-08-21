@@ -134,11 +134,41 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
         );
     }
 
+    // The profile endpoint answers 400 for certain business accounts, and the
+    // client falls back to search to get an id at all. Search has no counters,
+    // so this run has none — and that is worth a sentence rather than a silent
+    // `None`, because two things people expect quietly stop happening.
+    //
+    // `pager::verify_completion` compares a finished walk against the declared
+    // size and skips the check entirely when there is nothing to compare with,
+    // so the truncation wall — the one that catches Instagram serving 39 of
+    // 21631 followers — cannot be detected on this account. And the counters
+    // are what `--cache` weighs freshness against, so every run re-walks.
+    //
+    // Said here rather than in the client because this is where a *walk* is
+    // being set up; `pfp` reaches the same fallback and loses nothing by it.
+    if !profile.counters_are_knowable() {
+        app.progress().warn(&format!(
+            "Instagram would not serve the profile of @{}, so its id came from search \
+             instead. That route carries no follower or following counts, so this run \
+             cannot tell a truncated list from a complete one, and cannot judge whether \
+             a cached list is still current.",
+            printable(&profile.username)
+        ));
+    }
+
     Ok(Target {
         is_self,
         pk: profile.id,
         // The same answer that named the account also counted it. Asking again
         // would be the identical request to the identical endpoint.
+        //
+        // `Some` with two `None`s inside it, never `None`: the outer one means
+        // "nobody has asked", which would send `freshness::poll` off to ask
+        // again and spend a request on the endpoint that just refused. The
+        // inner ones mean "asked, and this route cannot say", which is the
+        // truth. Neither is zero, and zero is the reading that would make every
+        // short walk look complete.
         counters: Some(Counters {
             followers: profile.follower_count(),
             following: profile.following_count(),

@@ -16,8 +16,8 @@ use crate::client_hints::{self, ClientHints};
 use crate::error::{IgError, classify, declares_failure};
 use crate::graphql;
 use crate::model::{
-    FriendshipResult, FriendshipStatus, FriendshipsPage, Identity, Reel, ReelsMedia, UserInfo,
-    UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
+    FriendshipResult, FriendshipStatus, FriendshipsPage, Identity, Reel, ReelsMedia, SearchUser,
+    TopSearch, UserInfo, UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
 };
 use crate::pace::Pacer;
 use crate::{BASE_URL, IG_APP_ID};
@@ -80,24 +80,16 @@ fn serves_pictures(base: &Url, url: &Url) -> bool {
         .any(|cdn| host == *cdn || host.ends_with(&format!(".{cdn}")))
 }
 
-/// Redirects for the API: the same origin, or nowhere.
+/// Redirects for the API: none, because following one is a request and a
+/// request has to be paid for.
 ///
-/// Instagram's JSON endpoints do not redirect off their own host, so refusing
-/// costs nothing — and two of the headers on those requests are credentials.
-/// reqwest drops `Cookie` when a redirect crosses hosts, but `X-CSRFToken` is
-/// not on the list it knows about and would travel to wherever the response
-/// pointed. A boundary that depends on somebody else's list of header names is
-/// not one, so this one is drawn here.
-fn api_policy(base: Url) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_HOPS {
-            attempt.error("too many redirects")
-        } else if same_origin(&base, attempt.url()) {
-            attempt.follow()
-        } else {
-            attempt.error("a redirect tried to take an API call off instagram.com")
-        }
-    })
+/// `IgClient::get_body` follows them itself, charging `Pacer::clear_to_send`
+/// per hop and holding every hop to the same origin. Leaving it to the HTTP
+/// client meant the hops went out unpaced and uncounted, which is what this
+/// exists to stop — the reasoning is on `get_body`, next to the loop that does
+/// it.
+fn api_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::none()
 }
 
 /// Redirects for an asset: every hop held to the same rule as the first.
@@ -127,7 +119,17 @@ fn build_client(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, IgError> {
-    Ok(crate::http::builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()?)
+    // The trust store is read here rather than passed in, for the reason
+    // `http::TRUST` gives: `login::validate` builds a client inside this crate
+    // and never sees the binary's arguments.
+    Ok(crate::http::builder(
+        user_agent,
+        redirect,
+        CONNECT_TIMEOUT,
+        REQUEST_TIMEOUT,
+        &crate::http::chosen_trust(),
+    )?
+    .build()?)
 }
 
 /// Reads a response body, refusing one that will not fit.
@@ -172,6 +174,33 @@ async fn read_capped_bytes(mut response: reqwest::Response, cap: u64) -> Result<
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// `Retry-After`, if the answer carried one.
+///
+/// A string rather than a parsed duration on purpose: the header has two legal
+/// forms, seconds and an HTTP date, and until it is known which of them these
+/// endpoints send — if either — turning it into a number would be deciding the
+/// answer to the question the logging exists to ask.
+fn retry_after(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// One answer from Instagram: what it said, and the one header worth keeping
+/// hold of.
+///
+/// `classify` is a pure function of a status and a body and does not receive
+/// headers, which is why `Retry-After` travels separately rather than being
+/// read where the decision is made. **Nothing decides anything from it yet**,
+/// deliberately — see [`IgClient::note_push_back`].
+struct Answer {
+    status: u16,
+    body: String,
+    retry_after: Option<String>,
 }
 
 /// Which side of the relationship is being requested.
@@ -356,7 +385,7 @@ impl IgClient {
     fn pointed_at(session: Session, pacer: Pacer, base: Url) -> Result<Self, IgError> {
         Ok(Self {
             hints: ClientHints::from_user_agent(&session.user_agent),
-            api: build_client(&session.user_agent, api_policy(base.clone()))?,
+            api: build_client(&session.user_agent, api_policy())?,
             cdn: OnceLock::new(),
             writer: OnceLock::new(),
             base,
@@ -530,8 +559,80 @@ impl IgClient {
     }
 
     /// Public profile data, including the follower and following counters and
-    /// the high-resolution picture. One request.
+    /// the high-resolution picture.
+    ///
+    /// **One request in the ordinary case, and two only when the first fails in
+    /// one particular way.** Nothing that works today costs anything extra:
+    /// [`IgClient::profile_by_name`] is tried first and its answer is returned
+    /// as it always was.
+    ///
+    /// The fallback exists because this endpoint answers **400** for certain
+    /// business accounts, with
+    /// `Asset asset://laser.provider/ig_business_category_subvertical has been
+    /// deleted. You cannot use this schema` — Instagram failing to serialize
+    /// its own reply, reproducible, and nothing to do with the request. It
+    /// takes down every command that names an account, because they all start
+    /// by turning a username into an id. Verified against the live API in
+    /// August 2026: 400 for `elrubiuswtf`, 200 for an ordinary account, which is
+    /// why the second route is reached only from the failure and never
+    /// replaces the first.
+    ///
+    /// [`IgError::worth_a_second_route`] is what keeps this from becoming a
+    /// retry loop. A 429, an action block, a challenge, an expired session, a
+    /// cancel and a 404 all answer `false` there, so the one rule that matters
+    /// — when a service says no, stop asking — is not weakened by having a
+    /// second route at all.
+    ///
+    /// What comes back from search is **less**: an identity and the two
+    /// friendship flags, and no counters. It is not padded out.
+    /// [`WebProfileInfo::counters_are_knowable`] is how a caller tells the
+    /// difference, and `engine::target` says so out loud, because a walk with
+    /// no declared size is a walk `pager::verify_completion` cannot check for
+    /// truncation.
     pub async fn web_profile_info(&self, username: &str) -> Result<WebProfileInfo, IgError> {
+        let failure = match self.profile_by_name(username).await {
+            Ok(profile) => return Ok(profile),
+            Err(e) => e,
+        };
+        if !failure.worth_a_second_route() {
+            return Err(failure);
+        }
+
+        tracing::debug!(
+            error = %failure,
+            "the profile endpoint would not answer; trying search"
+        );
+
+        match self.search_user_id(username).await {
+            Ok(Some(user)) => {
+                tracing::debug!(pk = user.pk, "search resolved the account the profile lost");
+                Ok(WebProfileInfo::from_search(user))
+            }
+            // Search answered and knows no such account. The original failure
+            // is still the truthful thing to report: this route not finding it
+            // is not evidence that the name is free, and a 400 reported as
+            // "no such account" sends somebody hunting for a typo that is not
+            // there.
+            Ok(None) => {
+                tracing::debug!("search knows no such account either");
+                Err(failure)
+            }
+            // The fallback's own failure must not replace the real one --
+            // **except** when it is one the user has to act on. A cooldown or a
+            // dead session recorded on this request is a fact about the account
+            // that would otherwise be swallowed by an error about serialization.
+            Err(second) => {
+                if crate::error::cooldown_for(&second).is_some() || second.invalidates_session() {
+                    Err(second)
+                } else {
+                    Err(failure)
+                }
+            }
+        }
+    }
+
+    /// The profile endpoint on its own, with no fallback behind it.
+    async fn profile_by_name(&self, username: &str) -> Result<WebProfileInfo, IgError> {
         let missing = || IgError::NotFound {
             what: Some(username.to_string()),
         };
@@ -550,6 +651,41 @@ impl IgClient {
                 other => other,
             })?;
         envelope.data.user.ok_or_else(missing)
+    }
+
+    /// Resolves a username to an id through the web client's search box.
+    ///
+    /// **A fallback, never a first choice.** It exists because
+    /// `web_profile_info` answers 400 for certain business accounts with a
+    /// serialization failure of Instagram's own -- see `resolve_id` -- and it
+    /// is used only after that has happened.
+    ///
+    /// Search matches loosely, so the answer is filtered to an exact,
+    /// case-insensitive match on the name asked for. Without that, asking about
+    /// a name that does not exist hands back whatever the search box would have
+    /// suggested instead, and the run then walks a stranger's followers under
+    /// the name that was typed. That is the failure this whole route could
+    /// introduce, and it is the only reason the comparison is here rather than
+    /// left to the caller.
+    ///
+    /// `None` means search knows no such account, which is what a caller should
+    /// report as "no such account" rather than as a failure of the fallback.
+    pub async fn search_user_id(&self, username: &str) -> Result<Option<SearchUser>, IgError> {
+        let found: TopSearch = self
+            .get(
+                "/web/search/topsearch/",
+                &[("context", "blended"), ("query", username), ("count", "1")],
+                // In a browser this is called from whatever page the search box
+                // is open on. The site's own address is the truthful one.
+                "",
+            )
+            .await?;
+
+        Ok(found
+            .users
+            .into_iter()
+            .map(|hit| hit.user)
+            .find(|user| user.username.eq_ignore_ascii_case(username)))
     }
 
     /// One page of followers or following. Pagination is the caller's job.
@@ -585,6 +721,131 @@ impl IgClient {
         .await
     }
 
+    /// A page, as HTML, exactly as a browser navigating to it would get it.
+    ///
+    /// The one reader here that does not want JSON. It exists because the two
+    /// tokens a mutation needs — `fb_dtsg` and `lsd` — are only ever handed out
+    /// inside a rendered page; see [`crate::graphql`].
+    ///
+    /// It costs a request like everything else, and it is a **large** one: a
+    /// profile page is around six hundred kilobytes of bootstrapped Relay
+    /// state. That is why the caller caches what it finds rather than reading
+    /// the page per write.
+    pub async fn page(&self, path: &str) -> Result<String, IgError> {
+        let answer = self.get_body(path, &[], "", Surface::Document).await?;
+        if !(200..300).contains(&answer.status) {
+            self.note_push_back(&answer);
+            return Err(self.classify_and_record(answer.status, &answer.body));
+        }
+        Ok(answer.body)
+    }
+
+    /// Turns what Instagram said into either the value asked for or an error,
+    /// recording a cooldown on the way if the answer earned one.
+    ///
+    /// Shared by the read and the write path so that "a 200 can still be a
+    /// failure" is one rule rather than two. It was inline in `get` when `get`
+    /// was the only caller.
+    fn decode<T: DeserializeOwned>(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> Result<T, IgError> {
+        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
+        // with a 200 in some cases.
+        if !status.is_success() || declares_failure(body) {
+            return Err(self.classify_and_record(status.as_u16(), body));
+        }
+
+        serde_json::from_str(body).map_err(|e| {
+            // The same excerpt every other error gets. This one had a copy of
+            // its own that took 200 raw characters: unfiltered, though it is
+            // printed to a terminal, and with no idea that a body starting with
+            // `<` is a captive portal rather than the API — which is exactly
+            // what a body that will not parse usually is.
+            IgError::Decode(format!(
+                "{e} - response: {}",
+                crate::error::body_excerpt(body)
+            ))
+        })
+    }
+
+    /// **The only function in this workspace that sends anything other than a
+    /// GET to Instagram.** Everything the write rule in `AGENTS.md` promises is
+    /// enforced on the way through here.
+    ///
+    /// Four things it does that [`IgClient::get`] does not, each of them there
+    /// because a write is not a read:
+    ///
+    /// - **It pays the write budget**, not the read one, and like `get` it pays
+    ///   before it sends. There is no argument that selects between the two:
+    ///   `get` calls `clear_to_send` and this calls `clear_to_send_write`, so
+    ///   the choice is made by which function the caller reached rather than by
+    ///   a value it passed.
+    /// - **It refuses without a CSRF token instead of finding out.** Instagram
+    ///   would answer 403, and that 403 would cost a request, a slot of write
+    ///   budget and — because `classify` reads a 403 as a dead session — a
+    ///   message telling the user to log in again when their session is fine.
+    ///   A `snob login --paste` session has no `csrftoken` unless one was given,
+    ///   so this is the common case rather than the odd one.
+    /// - **It sends `Origin`**, which the Fetch standard requires on a POST even
+    ///   when the request is same-origin. See the comment in
+    ///   [`IgClient::browser_headers`] for the half of that rule which lives on
+    ///   the read side.
+    /// - **It follows no redirect at all**, through [`IgClient::writer`].
+    ///
+    /// `referer` is the profile page the button would have been clicked on, in
+    /// the same spelling `get` wants: a path with no leading slash.
+    async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        referer: &str,
+        style: Surface,
+    ) -> Result<T, IgError> {
+        // Before the budget is charged, so that a session which cannot write
+        // does not spend a slot discovering it. The token itself is put on the
+        // request by `browser_headers`, which adds it whenever the session has
+        // one; this guard is what makes "whenever" mean "always" on this path.
+        if self.session.csrftoken.is_none() {
+            return Err(IgError::NoCsrfToken);
+        }
+
+        let url = self.base.join(path)?;
+        tracing::debug!(%url, "POST");
+
+        self.pacer.clear_to_send_write().await?;
+
+        let request = self
+            .dressed(self.writer()?.post(url), referer, style)
+            .header("Origin", self.base.as_str().trim_end_matches('/'))
+            .form(form);
+
+        let response = request.send().await?;
+        self.remember_claim(&response);
+
+        let status = response.status();
+
+        // A redirect reaches here as a status rather than as a new request,
+        // because the policy is `none()`. It is not success and it is not
+        // something to replay, so it is reported as what it is.
+        if status.is_redirection() {
+            return Err(IgError::Unexpected {
+                status: status.as_u16(),
+                body: "Instagram redirected a write, which is never followed".into(),
+            });
+        }
+
+        let body = match read_capped(response, MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(_) if !status.is_success() => {
+                return Err(self.classify_and_record(status.as_u16(), ""));
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.decode(status, &body)
+    }
     /// The stories an account has up right now. One request.
     ///
     /// **This does not tell anybody you looked.** Instagram registers a view
@@ -847,10 +1108,11 @@ impl IgClient {
         // about this client is deliberately unlike the API one; this is not one
         // of those things.
         let response = self
-            .cdn()?
-            .get(url)
-            .header("Accept-Encoding", self.hints.accept_encoding)
-            .send()
+            .send_or_cancel(
+                self.cdn()?
+                    .get(url)
+                    .header("Accept-Encoding", self.hints.accept_encoding),
+            )
             .await?;
         let status = response.status();
 
@@ -865,7 +1127,14 @@ impl IgClient {
             });
         }
 
-        read_capped_bytes(response, cap as u64).await
+        // Raced against the token like the API read, for the same reason: a
+        // CDN that answers with headers and then stalls holds this process for
+        // as long as it likes.
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            bytes = read_capped_bytes(response, cap as u64) => bytes,
+        }
     }
 
     /// One request to Instagram's API, with the headers a browser would send.
@@ -881,109 +1150,284 @@ impl IgClient {
         query: &[(&str, &str)],
         referer: &str,
     ) -> Result<T, IgError> {
-        let (status, body) = self.get_body(path, query, referer, Surface::App).await?;
-        self.decode(status, &body)
-    }
+        let answer = self.get_body(path, query, referer, Surface::App).await?;
 
-    /// A page, as HTML, exactly as a browser navigating to it would get it.
-    ///
-    /// The one reader here that does not want JSON. It exists because the two
-    /// tokens a mutation needs — `fb_dtsg` and `lsd` — are only ever handed out
-    /// inside a rendered page; see [`crate::graphql`].
-    ///
-    /// It costs a request like everything else, and it is a **large** one: a
-    /// profile page is around six hundred kilobytes of bootstrapped Relay
-    /// state. That is why the caller caches what it finds rather than reading
-    /// the page per write.
-    pub async fn page(&self, path: &str) -> Result<String, IgError> {
-        let (status, body) = self.get_body(path, &[], "", Surface::Document).await?;
-        if !status.is_success() {
-            return Err(self.classify_and_record(status.as_u16(), &body));
+        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
+        // with a 200 in some cases.
+        if !(200..300).contains(&answer.status) || declares_failure(&answer.body) {
+            self.note_push_back(&answer);
+            return Err(self.classify_and_record(answer.status, &answer.body));
         }
-        Ok(body)
+
+        let body = answer.body;
+        serde_json::from_str(&body).map_err(|e| {
+            // The same excerpt every other error gets. This one had a copy of
+            // its own that took 200 raw characters: unfiltered, though it is
+            // printed to a terminal, and with no idea that a body starting with
+            // `<` is a captive portal rather than the API — which is exactly
+            // what a body that will not parse usually is.
+            IgError::Decode(format!(
+                "{e} - response: {}",
+                crate::error::body_excerpt(&body)
+            ))
+        })
     }
 
-    /// The request and the answer, without deciding what the answer means.
+    /// Sends the request and follows any redirect itself, **paying for every
+    /// hop**.
     ///
-    /// Split out of [`Self::get`] when the page reader arrived: a page is not
-    /// JSON, so it cannot go through `decode`, but it must go through
-    /// everything before it — the budget, the headers, the claim, and the rule
-    /// that a body which will not read does not take the status away with it.
-    /// Two copies of that sequence is how one of them ends up not paying.
+    /// The redirect policy used to be reqwest's, and that is why this loop
+    /// exists. `Pacer::clear_to_send` sits inside this function, so a hop the
+    /// HTTP client followed on its own went out without being charged and
+    /// without waiting — against the rule that every request is paid for, and
+    /// invisibly, because the budget's own count is what the user is shown. A
+    /// chain of three therefore reported one request and sent four, at whatever
+    /// rate the network allowed rather than at the tool's.
+    ///
+    /// The origin rule is unchanged and is applied to every hop rather than to
+    /// the first: Instagram's JSON endpoints do not redirect off their own
+    /// host, so refusing costs nothing — and two of the headers on these
+    /// requests are credentials. reqwest drops `Cookie` when a redirect crosses
+    /// hosts, but `X-CSRFToken` is not on the list it knows about and would
+    /// travel to wherever the response pointed. A boundary that depends on
+    /// somebody else's list of header names is not one.
+    ///
+    /// **A refusal here has to reach [`Reaction::Abort`]**, which is why the
+    /// two ways out are variants of their own rather than an `Unexpected`. When
+    /// reqwest refused the hop it raised an ordinary `reqwest::Error`, that
+    /// landed as `Network`, whose reaction is `Retry`, and the pager sent the
+    /// same impossible request three more times with the session on it —
+    /// measured at 13 requests on the wire against 5 charged. Moving the
+    /// refusal here must not reintroduce the same thing under a new name.
+    ///
+    /// The query is attached to the first request only. A `Location` carries
+    /// whatever query it means to carry, and appending ours to it would send a
+    /// parameter the server did not ask to see twice.
     async fn get_body(
         &self,
         path: &str,
         query: &[(&str, &str)],
         referer: &str,
         style: Surface,
-    ) -> Result<(reqwest::StatusCode, String), IgError> {
-        let url = self.base.join(path)?;
-        tracing::debug!(%url, "GET");
+    ) -> Result<Answer, IgError> {
+        let mut url = self.base.join(path)?;
+        let mut query: Option<&[(&str, &str)]> = Some(query);
+        let mut hops: usize = 0;
 
-        // Paid for before it is sent, and there is no way in that skips this.
-        self.pacer.clear_to_send().await?;
+        loop {
+            tracing::debug!(%url, "GET");
 
-        let request = self.browser_headers(self.api.get(url).query(query), referer, style);
+            // Paid for before it is sent, and there is no way in that skips
+            // this — the hops included, which is the whole point of the loop.
+            self.pacer.clear_to_send().await?;
 
-        let response = request.send().await?;
-        self.remember_claim(&response);
+            let response = self
+                .send_or_cancel(self.api_request(&url, query, referer, style))
+                .await?;
+            self.remember_claim(&response);
+            let status = response.status();
 
-        let status = response.status();
-
-        // The status is already in hand, and a body that will not read must not
-        // take it away. With `?` here, a 429 whose body died mid-stream became
-        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
-        // three more requests into an endpoint that had just said no, and
-        // `classify_and_record`, the only caller of `cooldown_for` there is,
-        // never ran: nothing was written down and the next run knocked again.
-        // What Instagram said is the status; the body only refines it.
-        let body = match read_capped(response, MAX_BODY_BYTES).await {
-            Ok(body) => body,
-            Err(_) if !status.is_success() => {
-                return Err(self.classify_and_record(status.as_u16(), ""));
+            if status.is_redirection() {
+                let next = self.next_hop(&url, &response)?;
+                if hops >= MAX_HOPS {
+                    return Err(IgError::TooManyRedirects);
+                }
+                hops += 1;
+                url = next;
+                query = None;
+                continue;
             }
-            Err(e) => return Err(e),
-        };
 
-        Ok((status, body))
+            // The status is already in hand, and a body that will not read must
+            // not take it away. With `?` here, a 429 whose body died mid-stream
+            // became `IgError::Network` — whose reaction is `Retry` — so the
+            // walker fired three more requests into an endpoint that had just
+            // said no, and `classify_and_record`, the only caller of
+            // `cooldown_for` there is, never ran: nothing was written down and
+            // the next run knocked again. What Instagram said is the status;
+            // the body only refines it.
+            let retry_after = retry_after(&response);
+
+            let body = match self.read_or_cancel(response, MAX_BODY_BYTES).await {
+                Ok(body) => body,
+                // A canceled read is the user, not the server, and must not be
+                // turned into a push-back that gets written down as one.
+                Err(IgError::Canceled) => return Err(IgError::Canceled),
+                Err(_) if !status.is_success() => {
+                    let answer = Answer {
+                        status: status.as_u16(),
+                        body: String::new(),
+                        retry_after,
+                    };
+                    self.note_push_back(&answer);
+                    return Err(self.classify_and_record(answer.status, ""));
+                }
+                Err(e) => return Err(e),
+            };
+            return Ok(Answer {
+                status: status.as_u16(),
+                body,
+                retry_after,
+            });
+        }
     }
 
-    /// The headers every request to Instagram carries, in one place.
+    /// Sends the request, or gives up the moment the user asks it to.
     ///
-    /// Factored out when the write path arrived. Two copies of this list is how
-    /// the coherence `client_hints.rs` exists to maintain gets lost: a header
-    /// added for a good reason on the read path and forgotten on the write path
-    /// makes the two requests look like they came from different clients, on
-    /// one session, which is the anomaly and not the fix.
+    /// **Ctrl+C used to wait for the server.** Cancellation was read in
+    /// `Pacer::clear_to_send` and in every deliberate wait, which is where about
+    /// nine interrupts in ten land — a stop during a budget wait takes about a
+    /// second. The tenth lands here, and here nothing was watching: the exit
+    /// tracked however long the far end chose to hold the connection, up to
+    /// `REQUEST_TIMEOUT`, or 254 seconds on a black-holed connection because
+    /// `Network` is retried. That matters most under a service manager, where a
+    /// stalled request outlasts the stop grace period and the process is killed
+    /// before it can close its snapshot.
     ///
-    /// What is deliberately **not** here is `Origin` and `Content-Type`. Both
-    /// belong to the write path only, and both are added there — see
-    /// [`IgClient::post`].
+    /// **The cancel branch must answer [`IgError::Canceled`]**, and that is the
+    /// part worth guarding. Dropping the future and letting the resulting
+    /// `reqwest::Error` fall through would classify as `Network`, whose reaction
+    /// is `Retry`, so the pager would answer a Ctrl+C by sending the request
+    /// three more times.
     ///
-    /// `style` picks which of the two things a browser is doing on
-    /// instagram.com this request is. See [`Surface`].
-    fn browser_headers(
+    /// `biased`, so a token that is already set wins against a response that
+    /// happens to be ready in the same poll.
+    async fn send_or_cancel(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, IgError> {
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            response = request.send() => Ok(response?),
+        }
+    }
+
+    /// Reads the body, or gives up the moment the user asks it to.
+    ///
+    /// The other half of [`IgClient::send_or_cancel`], and not an afterthought:
+    /// a server that answers with headers and then stalls mid-body holds the
+    /// connection exactly as long, and the read is where those seconds are
+    /// spent.
+    async fn read_or_cancel(
+        &self,
+        response: reqwest::Response,
+        cap: u64,
+    ) -> Result<String, IgError> {
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            body = read_capped(response, cap) => body,
+        }
+    }
+
+    /// Writes down what a push-back looked like, and changes nothing.
+    ///
+    /// **This is a measurement, not a mechanism.** Reading `Retry-After` would
+    /// make snob the only tool of its class that does, and nobody has
+    /// established whether these endpoints send it at all; the honest first
+    /// step is to log it on every push-back so that a real run answers the
+    /// question. Until it has, inventing behavior on the assumption that the
+    /// header arrives is guessing with somebody's account.
+    ///
+    /// **When it is implemented it is a floor and never a ceiling.** A server
+    /// naming thirty seconds must not shorten a local cooldown that is longer:
+    /// the cooldown lengths here are about how long an account is left alone
+    /// after Instagram has objected, which is a different question from how
+    /// soon the endpoint will answer again. Written here because this is where
+    /// somebody will come looking when they add it.
+    ///
+    /// `debug` rather than `warn`: on a run that is going badly this fires
+    /// once per push-back, and the user already gets told what happened.
+    ///
+    /// The value is logged as it arrived. A header value cannot carry a byte
+    /// below 0x20 — the HTTP parser refuses one before we ever see it — so
+    /// there is nothing here that a terminal would act on, which is the same
+    /// argument the `Referer` above rests on.
+    fn note_push_back(&self, answer: &Answer) {
+        tracing::debug!(
+            status = answer.status,
+            retry_after = answer.retry_after.as_deref().unwrap_or("<absent>"),
+            "Instagram pushed back"
+        );
+    }
+
+    /// Where a redirect points, if it points somewhere this client may go.
+    ///
+    /// A `Location` is allowed to be relative, so it is resolved against the
+    /// URL that produced it rather than parsed on its own — and the result is
+    /// held to the same origin rule as the first request. Both refusals are
+    /// excerpted like every other error that prints something a server chose:
+    /// this string is printed to a terminal and Instagram wrote it.
+    fn next_hop(&self, from: &Url, response: &reqwest::Response) -> Result<Url, IgError> {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| IgError::Unexpected {
+                status: response.status().as_u16(),
+                body: "a redirect arrived with nowhere to go".into(),
+            })?;
+
+        let next = from.join(location).map_err(|_| IgError::OffOrigin {
+            to: crate::error::body_excerpt(location),
+        })?;
+
+        if !same_origin(&self.base, &next) {
+            return Err(IgError::OffOrigin {
+                to: crate::error::body_excerpt(next.as_str()),
+            });
+        }
+        Ok(next)
+    }
+
+    /// The request itself, with the headers a browser would send.
+    ///
+    /// Split from the sending so that a redirect hop is built the same way the
+    /// first request was, rather than by whatever the HTTP client decided to
+    /// carry forward.
+    fn api_request(
+        &self,
+        url: &Url,
+        query: Option<&[(&str, &str)]>,
+        referer: &str,
+        style: Surface,
+    ) -> reqwest::RequestBuilder {
+        let request = self.api.get(url.clone());
+        let request = match query {
+            Some(q) => request.query(q),
+            None => request,
+        };
+        self.dressed(request, referer, style)
+    }
+
+    /// The headers every request to Instagram carries, whatever its method.
+    ///
+    /// Split out of [`Self::api_request`] at the merge, because the write path
+    /// needs the same set on a POST. Two copies of this list is how the
+    /// coherence `client_hints.rs` exists to maintain gets lost: a header added
+    /// for a good reason on one and forgotten on the other makes two requests
+    /// on one session look like two clients.
+    fn dressed(
         &self,
         request: reqwest::RequestBuilder,
         referer: &str,
         style: Surface,
     ) -> reqwest::RequestBuilder {
         let mut request = request;
-
         if style == Surface::App {
             request = request
                 // Without this header Instagram answers 403 even with a good
-                // session — on the `/api/v1/` routes. On the `/web/` ones it is
-                // the header that makes the request fail.
+                // session -- on the API routes. A navigation announces none of
+                // these, because at that moment there is no app yet.
                 .header("X-IG-App-ID", IG_APP_ID)
                 .header("X-ASBD-ID", client_hints::ASBD_ID)
                 .header("X-IG-WWW-Claim", self.claim())
                 .header("X-Requested-With", "XMLHttpRequest");
         }
-
         let mut request = request
-            // Not a literal: a navigation asks for HTML and an XHR asks for
-            // anything, and Instagram answers `Vary` on the pair below.
+            // Not a literal: a navigation asks for HTML and an XHR asks
+            // for anything, and Instagram answers `Vary` on the pair below.
             .header("Accept", style.accept())
             // Computed from the User-Agent like the rest of the set rather
             // than written out, because Chromium began offering `zstd` in the
@@ -1022,7 +1466,7 @@ impl IgClient {
         // add by reflex, which is why it is called out rather than left to be
         // noticed.
         //
-        // The other half of the same rule, and the reason this comment now says
+        // The other half of the same rule, and the reason this now says
         // "here": the standard requires `Origin` on a POST even when it is
         // same-origin. Omitting it there would be the identical incoherence the
         // other way round, so `post` adds it, and only `post`.
@@ -1046,113 +1490,6 @@ impl IgClient {
         }
 
         request
-    }
-
-    /// Turns what Instagram said into either the value asked for or an error,
-    /// recording a cooldown on the way if the answer earned one.
-    ///
-    /// Shared by the read and the write path so that "a 200 can still be a
-    /// failure" is one rule rather than two. It was inline in `get` when `get`
-    /// was the only caller.
-    fn decode<T: DeserializeOwned>(
-        &self,
-        status: reqwest::StatusCode,
-        body: &str,
-    ) -> Result<T, IgError> {
-        // A 200 can still be an error: Instagram returns `{"status":"fail"}`
-        // with a 200 in some cases.
-        if !status.is_success() || declares_failure(body) {
-            return Err(self.classify_and_record(status.as_u16(), body));
-        }
-
-        serde_json::from_str(body).map_err(|e| {
-            // The same excerpt every other error gets. This one had a copy of
-            // its own that took 200 raw characters: unfiltered, though it is
-            // printed to a terminal, and with no idea that a body starting with
-            // `<` is a captive portal rather than the API — which is exactly
-            // what a body that will not parse usually is.
-            IgError::Decode(format!(
-                "{e} - response: {}",
-                crate::error::body_excerpt(body)
-            ))
-        })
-    }
-
-    /// **The only function in this workspace that sends anything other than a
-    /// GET to Instagram.** Everything the write rule in `AGENTS.md` promises is
-    /// enforced on the way through here.
-    ///
-    /// Four things it does that [`IgClient::get`] does not, each of them there
-    /// because a write is not a read:
-    ///
-    /// - **It pays the write budget**, not the read one, and like `get` it pays
-    ///   before it sends. There is no argument that selects between the two:
-    ///   `get` calls `clear_to_send` and this calls `clear_to_send_write`, so
-    ///   the choice is made by which function the caller reached rather than by
-    ///   a value it passed.
-    /// - **It refuses without a CSRF token instead of finding out.** Instagram
-    ///   would answer 403, and that 403 would cost a request, a slot of write
-    ///   budget and — because `classify` reads a 403 as a dead session — a
-    ///   message telling the user to log in again when their session is fine.
-    ///   A `snob login --paste` session has no `csrftoken` unless one was given,
-    ///   so this is the common case rather than the odd one.
-    /// - **It sends `Origin`**, which the Fetch standard requires on a POST even
-    ///   when the request is same-origin. See the comment in
-    ///   [`IgClient::browser_headers`] for the half of that rule which lives on
-    ///   the read side.
-    /// - **It follows no redirect at all**, through [`IgClient::writer`].
-    ///
-    /// `referer` is the profile page the button would have been clicked on, in
-    /// the same spelling `get` wants: a path with no leading slash.
-    async fn post<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        form: &[(&str, &str)],
-        referer: &str,
-        style: Surface,
-    ) -> Result<T, IgError> {
-        // Before the budget is charged, so that a session which cannot write
-        // does not spend a slot discovering it. The token itself is put on the
-        // request by `browser_headers`, which adds it whenever the session has
-        // one; this guard is what makes "whenever" mean "always" on this path.
-        if self.session.csrftoken.is_none() {
-            return Err(IgError::NoCsrfToken);
-        }
-
-        let url = self.base.join(path)?;
-        tracing::debug!(%url, "POST");
-
-        self.pacer.clear_to_send_write().await?;
-
-        let request = self
-            .browser_headers(self.writer()?.post(url), referer, style)
-            .header("Origin", self.base.as_str().trim_end_matches('/'))
-            .form(form);
-
-        let response = request.send().await?;
-        self.remember_claim(&response);
-
-        let status = response.status();
-
-        // A redirect reaches here as a status rather than as a new request,
-        // because the policy is `none()`. It is not success and it is not
-        // something to replay, so it is reported as what it is.
-        if status.is_redirection() {
-            return Err(IgError::Unexpected {
-                status: status.as_u16(),
-                body: "Instagram redirected a write, which is never followed".into(),
-            });
-        }
-
-        let body = match read_capped(response, MAX_BODY_BYTES).await {
-            Ok(body) => body,
-            Err(_) if !status.is_success() => {
-                return Err(self.classify_and_record(status.as_u16(), ""));
-            }
-            Err(e) => return Err(e),
-        };
-
-        self.decode(status, &body)
     }
 }
 
@@ -1885,7 +2222,10 @@ mod tests {
             .await;
 
         let error = client(&server).await.validate().await.unwrap_err();
-        assert!(matches!(error, IgError::Network(_)), "{error:?}");
+        // `OffOrigin` rather than `Network`: the refusal is this client's now
+        // that `get_body` follows the chain itself, and it has to keep landing
+        // on `Abort` — see `a_hop_off_the_origin_is_refused_and_not_retried`.
+        assert!(matches!(error, IgError::OffOrigin { .. }), "{error:?}");
 
         // The one request that was made is the one we made on purpose.
         let requests = server.received_requests().await.unwrap();
@@ -1902,6 +2242,611 @@ mod tests {
 
         let error = client(&server).await.validate().await.unwrap_err();
         assert!(matches!(error, IgError::Decode(_)));
+    }
+    /// A followed hop is a request, and every request is paid for.
+    ///
+    /// This is the whole of the change: the hops were followed by reqwest, so
+    /// they went out without being charged and without waiting. The budget's
+    /// count is what the user is shown and what rate control is built on, so a
+    /// chain of two reported one request and sent three.
+    #[tokio::test]
+    async fn every_redirect_hop_is_charged() {
+        let server = MockServer::start().await;
+        let body = r#"{"users":[],"next_max_id":null}"#;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/api/v1/hop-one/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hop-one/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/api/v1/hop-two/"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hop-two/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let page = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect("the chain ends in an answer");
+        assert!(page.users.is_empty());
+
+        assert_eq!(
+            client.pacer().spent(),
+            3,
+            "one request and two hops is three requests, and the budget has to know"
+        );
+    }
+
+    /// A hop off instagram.com is refused, and refused in a way that stops the
+    /// walk rather than making it try again.
+    ///
+    /// Two of the headers on these requests are credentials. reqwest drops
+    /// `Cookie` across hosts but has never heard of `X-CSRFToken`, so a
+    /// followed hop would carry it wherever the response pointed.
+    ///
+    /// The reaction matters as much as the refusal. When this was reqwest's
+    /// refusal it arrived as `Network`, whose reaction is `Retry`, and the
+    /// pager sent the same impossible request three more times.
+    #[tokio::test]
+    async fn a_hop_off_the_origin_is_refused_and_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "https://example.invalid/collect"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("it must not follow that");
+
+        assert!(
+            matches!(&error, IgError::OffOrigin { to } if to.contains("example.invalid")),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.reaction(),
+            crate::error::Reaction::Abort,
+            "retrying a redirect that will be refused again is what cost 13 requests"
+        );
+        assert_eq!(
+            client.pacer().spent(),
+            1,
+            "the hop was never sent, so it is never charged"
+        );
+    }
+
+    /// A chain that never ends stops at `MAX_HOPS`, having paid for exactly the
+    /// requests it made.
+    #[tokio::test]
+    async fn a_redirect_loop_stops_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/api/v1/friendships/1/followers/"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("a loop is not an answer");
+
+        assert!(matches!(error, IgError::TooManyRedirects), "{error:?}");
+        assert_eq!(error.reaction(), crate::error::Reaction::Abort);
+        assert_eq!(
+            client.pacer().spent(),
+            (MAX_HOPS + 1) as u32,
+            "the first request and every hop it was allowed"
+        );
+    }
+
+    /// The query goes on the first request and not on the hops.
+    ///
+    /// A `Location` carries whatever query it means to carry. Appending ours to
+    /// it would send a parameter the server did not ask to see twice, and on an
+    /// endpoint that takes a cursor that is a different request from the one
+    /// the redirect described.
+    #[tokio::test]
+    async fn the_query_is_not_reattached_to_a_hop() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .and(query_param("count", "50"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "/api/v1/landed/?count=7"),
+            )
+            .mount(&server)
+            .await;
+        // Mounted with the hop's own count, so it only matches if ours was not
+        // added alongside it.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/landed/"))
+            .and(query_param("count", "7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"users":[],"next_max_id":null}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect("the hop's own query is the one that travels");
+    }
+
+    /// A redirect with no `Location` is an answer nobody can act on, and it must
+    /// not become a silent success or a retry.
+    #[tokio::test]
+    async fn a_redirect_with_nowhere_to_go_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/1/followers/"))
+            .respond_with(ResponseTemplate::new(302))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("there is nowhere to go");
+        assert!(
+            matches!(error, IgError::Unexpected { status: 302, .. }),
+            "{error:?}"
+        );
+    }
+    /// A stop during a request in flight does not wait for the server.
+    ///
+    /// This is the tenth interrupt in ten. The other nine land in a budget wait
+    /// and take about a second; this one used to track however long the far end
+    /// chose to hold the connection — up to `REQUEST_TIMEOUT`, or 254 seconds
+    /// on a black-holed connection, because `Network` is retried. Under a
+    /// service manager that outlasts the stop grace period and the process is
+    /// killed before it can close its snapshot.
+    ///
+    /// The delay here is thirty seconds so that a passing run cannot be one
+    /// that simply waited it out: the assertion is that the call came back in a
+    /// fraction of it.
+    #[tokio::test]
+    async fn canceling_does_not_wait_for_the_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(r#"{"users":[],"next_max_id":null}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let token = client.pacer().cancel_token().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = client
+            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .await
+            .expect_err("the run was canceled");
+
+        // `Canceled`, not `Network`. Letting the dropped request become a
+        // network error would give it `Reaction::Retry`, so the pager would
+        // answer a Ctrl+C by sending the request three more times.
+        assert!(matches!(error, IgError::Canceled), "{error:?}");
+        assert_eq!(error.reaction(), crate::error::Reaction::Abort);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "it waited {:?}, which is the server's patience rather than the user's",
+            started.elapsed()
+        );
+    }
+
+    /// A stop is the user's answer, not Instagram's, and nothing is written
+    /// down as though it were.
+    ///
+    /// The endpoint here would classify as a push-back and earn a cooldown if
+    /// its answer were ever read. Cancellation has to win first, and win
+    /// without the interrupted request leaving a mark: a cooldown recorded
+    /// because somebody pressed Ctrl+C would refuse the next run for half an
+    /// hour over something Instagram never said.
+    #[tokio::test]
+    async fn canceling_records_no_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(r#"{"message":"feedback_required"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(session, crate::pace::Pacer::new(budget.clone()))
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        let token = client.pacer().cancel_token().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let error = client.validate().await.expect_err("the run was canceled");
+        assert!(matches!(error, IgError::Canceled), "{error:?}");
+        assert!(
+            budget.calls().is_empty(),
+            "a canceled request was recorded as a push-back: {:?}",
+            budget.calls()
+        );
+    }
+
+    /// Every push-back says what `Retry-After` it carried, and nothing acts on
+    /// it.
+    ///
+    /// `classify` takes a status and a body and never sees a header, so the
+    /// question of whether these endpoints send this at all has never been
+    /// answerable from a real run. It is now. What must **not** happen is the
+    /// header changing anything before somebody has seen one: the cooldown
+    /// recorded here is the same one that was recorded before, and a
+    /// server-named thirty seconds must never shorten it.
+    #[tokio::test]
+    async fn a_push_back_says_what_retry_after_it_carried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "30")
+                    .set_body_string(r#"{"message":"Please wait a few minutes"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(session, crate::pace::Pacer::new(budget.clone()))
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        // **The header on the answer, not the line in the log.**
+        //
+        // This used to install a capturing subscriber and read the debug line
+        // back, and it failed about one run in three once the suite grew: a
+        // subscriber is thread-local, an async path is polled wherever the
+        // runtime likes, and `WithSubscriber` did not close the gap either.
+        // What the test is really about is that the header is read off the
+        // response and carried, which `Answer` holds — so it is asserted there,
+        // where no scheduler can move it. The logging is one line over this
+        // value and does not need its own test.
+        let answer = client
+            .get_body(
+                &format!(
+                    "/api/v1/friendships/{}/following/",
+                    client.session.ds_user_id
+                ),
+                &[("count", "1")],
+                "",
+                Surface::App,
+            )
+            .await
+            .expect("a 429 is an answer, not a transport failure");
+        assert_eq!(answer.status, 429);
+        assert_eq!(answer.retry_after.as_deref(), Some("30"));
+
+        // And the cooldown is untouched by it. Thirty seconds is far shorter
+        // than the rate-limit cooldown, so a header that had been allowed to
+        // shorten anything would show up right here.
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
+        let recorded = budget.calls();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "rate_limit");
+        assert_eq!(
+            recorded[0].1,
+            snob_core::store::rate_budget::rate_limit_cooldown(),
+            "the server's number reached the cooldown, and it must not"
+        );
+    }
+
+    /// A push-back with no such header still says so, which is the answer the
+    /// logging is really after: these endpoints may simply never send one.
+    ///
+    /// A 200 carrying `spam: true` is a push-back, and one that a check on the
+    /// status alone would have walked straight past.
+    #[tokio::test]
+    async fn a_push_back_without_the_header_is_recorded_as_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"status":"fail","spam":true}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let answer = client
+            .get_body("/api/v1/friendships/42/following/", &[], "", Surface::App)
+            .await
+            .expect("a 200 is an answer");
+        assert_eq!(answer.status, 200);
+        assert!(
+            answer.retry_after.is_none(),
+            "nothing sent one, so nothing may be invented"
+        );
+
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
+    }
+
+    /// The body Instagram really sends for the accounts this fallback exists
+    /// for. Captured live in August 2026.
+    const BROKEN_PROFILE: &str = r#"{"message":"Asset asset://laser.provider/ig_business_category_subvertical has been deleted. You cannot use this schema","status":"fail"}"#;
+
+    /// One search hit, shaped like the live answer: `pk` as a string, no
+    /// counters anywhere, and the relationship under `friendship_status`.
+    fn search_body(username: &str, pk: &str) -> String {
+        format!(
+            r#"{{"users":[{{"position":0,"user":{{"pk":"{pk}","username":"{username}",
+               "full_name":"Someone","is_private":false,"is_verified":true,
+               "profile_pic_url":"https://cdninstagram.com/p.jpg",
+               "friendship_status":{{"following":true,"outgoing_request":false,
+               "is_private":false}}}}}}],"status":"ok"}}"#
+        )
+    }
+
+    fn mount_profile(server: &MockServer, response: ResponseTemplate) -> impl Future<Output = ()> {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users/web_profile_info/"))
+            .respond_with(response)
+            .mount(server)
+    }
+
+    /// The ordinary account is untouched: one request, the full answer, and the
+    /// route it came from says so.
+    ///
+    /// This is the half that is easy to break while fixing the other one. The
+    /// fallback must not cost anybody who does not need it a second request, so
+    /// the charge is asserted rather than assumed.
+    #[tokio::test]
+    async fn an_ordinary_profile_still_costs_one_request() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"user":{"id":"7","username":"ann",
+                   "edge_followed_by":{"count":10},"edge_follow":{"count":4}}}}"#,
+            ),
+        )
+        .await;
+
+        let client = client(&server).await;
+        let profile = client.web_profile_info("ann").await.unwrap();
+
+        assert_eq!(profile.id, 7);
+        assert_eq!(profile.via, crate::model::Via::Profile);
+        assert!(profile.counters_are_knowable());
+        assert_eq!(profile.follower_count(), Some(10));
+        assert_eq!(client.pacer().spent(), 1, "the fallback was not needed");
+
+        let asked = server.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1, "search was reached on a working account");
+    }
+
+    /// Instagram failing to serialize its own reply does not take the account
+    /// down with it.
+    ///
+    /// The 400 here is verbatim from the live API. Every command that names an
+    /// account starts by turning the name into an id, so without the fallback
+    /// this one body stops `pfp`, `scan` and every set command.
+    #[tokio::test]
+    async fn a_profile_instagram_cannot_serialize_is_resolved_by_search() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(400).set_body_string(BROKEN_PROFILE),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/web/search/topsearch/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(search_body("rubius", "1506")))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let profile = client.web_profile_info("rubius").await.unwrap();
+
+        assert_eq!(profile.id, 1506);
+        assert_eq!(profile.username, "rubius");
+        assert_eq!(profile.via, crate::model::Via::Search);
+
+        // The two facts the private-account refusal turns on survive the
+        // change of route, under different names.
+        assert_eq!(profile.followed_by_viewer, Some(true));
+        assert_eq!(profile.requested_by_viewer, Some(false));
+
+        // And the counters do not. **`None`, never `Some(0)`**: a declared zero
+        // is what would make `pager::verify_completion` call every short walk
+        // complete.
+        assert!(!profile.counters_are_knowable());
+        assert_eq!(profile.follower_count(), None);
+        assert_eq!(profile.following_count(), None);
+
+        assert_eq!(client.pacer().spent(), 2, "the failure and the fallback");
+    }
+
+    /// A push-back is never worked around.
+    ///
+    /// This is the rule the whole fallback is written around: when a service
+    /// says no, the answer is to stop asking. A 429 already carries a cooldown
+    /// by the time the fallback would be considered, and sending a second
+    /// request into an endpoint that has just refused is exactly how a
+    /// momentary limit becomes a lasting one.
+    #[tokio::test]
+    async fn a_push_back_is_not_worked_around() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(429).set_body_string(r#"{"message":"feedback_required"}"#),
+        )
+        .await;
+
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(session, crate::pace::Pacer::new(budget.clone()))
+            .unwrap()
+            .with_base_url(Url::parse(&server.uri()).unwrap());
+
+        let error = client.web_profile_info("ann").await.unwrap_err();
+        assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
+        assert_eq!(
+            client.pacer().spent(),
+            1,
+            "a second request was sent anyway"
+        );
+
+        let asked = server.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(budget.calls().len(), 1, "the cooldown still gets recorded");
+    }
+
+    /// Every answer that means "no" means no, and a 404 is a real answer.
+    ///
+    /// Asking search about a name nobody owns spends a request to be told the
+    /// same thing, and the two session errors and the cancel must not be
+    /// retried at all.
+    #[test]
+    fn only_a_broken_answer_earns_a_second_route() {
+        assert!(
+            IgError::Unexpected {
+                status: 400,
+                body: BROKEN_PROFILE.into()
+            }
+            .worth_a_second_route()
+        );
+
+        for refused in [
+            IgError::RateLimited,
+            IgError::FeedbackRequired,
+            IgError::Challenge { url: None },
+            IgError::Checkpoint { url: None },
+            IgError::SessionExpired,
+            IgError::UserAgentMismatch,
+            IgError::Canceled,
+            IgError::NotFound { what: None },
+            IgError::Decode("a captive portal".into()),
+            // The server being unwell is what `Reaction::Retry` is for, and a
+            // second route there would hide an outage behind a worse answer.
+            IgError::Unexpected {
+                status: 503,
+                body: String::new(),
+            },
+        ] {
+            assert!(
+                !refused.worth_a_second_route(),
+                "{refused:?} would be worked around"
+            );
+        }
+    }
+
+    /// Search matches loosely, and a loose match is a different account.
+    ///
+    /// This is the failure the fallback could introduce and the reason the
+    /// exact-name comparison is in `search_user_id` rather than left to a
+    /// caller: without it, asking about a name that Instagram would not serve
+    /// hands back whatever the search box suggested instead, and the run then
+    /// walks a stranger's followers under the name that was typed.
+    #[tokio::test]
+    async fn search_does_not_hand_back_somebody_else() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(400).set_body_string(BROKEN_PROFILE),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/web/search/topsearch/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(search_body("rubius_fanpage", "999")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client.web_profile_info("rubius").await.unwrap_err();
+
+        // The original failure, not a wrong account and not a "no such
+        // account": search not finding it is no evidence the name is free.
+        assert!(
+            matches!(&error, IgError::Unexpected { status: 400, .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Case is not identity, but it is not a different account either.
+    #[tokio::test]
+    async fn search_matches_the_name_whatever_its_case() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(400).set_body_string(BROKEN_PROFILE),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/web/search/topsearch/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(search_body("Rubius", "12")))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let profile = client.web_profile_info("rubius").await.unwrap();
+        assert_eq!(profile.id, 12);
+    }
+
+    /// When the fallback is the one that hits the wall, the wall is what gets
+    /// reported.
+    ///
+    /// A cooldown recorded on the second request is a fact about the account
+    /// that the user has to act on, and letting the first failure stand would
+    /// bury it under a message about serialization.
+    #[tokio::test]
+    async fn a_cooldown_on_the_fallback_is_not_swallowed() {
+        let server = MockServer::start().await;
+        mount_profile(
+            &server,
+            ResponseTemplate::new(400).set_body_string(BROKEN_PROFILE),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/web/search/topsearch/"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"message":"spam"}"#))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let error = client.web_profile_info("rubius").await.unwrap_err();
+        assert!(matches!(error, IgError::RateLimited), "{error:?}");
     }
 
     /// A session with a CSRF token, which is what `login --browser` produces
@@ -2071,6 +3016,55 @@ mod tests {
         }
     }
 
+    /// **A navigation is not an XHR, and the headers say so.**
+    ///
+    /// The page that hands out the tokens is fetched the way a browser fetches
+    /// a page: asking for HTML, saying `navigate`/`document`, and announcing
+    /// none of the four headers that mean "I am the single-page app" — because
+    /// at that moment there is no app yet, the page is what loads it. The API
+    /// requests must keep all four, so both halves are asserted together; a
+    /// change that made one set serve both would pass on its own and be a shape
+    /// no browser produces on either.
+    #[tokio::test]
+    async fn a_navigation_does_not_claim_to_be_the_app() {
+        const APP_ONLY: [&str; 4] = [
+            "x-ig-app-id",
+            "x-asbd-id",
+            "x-ig-www-claim",
+            "x-requested-with",
+        ];
+
+        let server = instagram_that_takes_a_write(FOLLOWED).await;
+        writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let page = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("the page");
+        for header in APP_ONLY {
+            assert!(
+                !page.headers.contains_key(header),
+                "a navigation carried {header}"
+            );
+        }
+        assert_eq!(page.headers.get("sec-fetch-mode").unwrap(), "navigate");
+        assert_eq!(page.headers.get("sec-fetch-dest").unwrap(), "document");
+        assert!(
+            page.headers
+                .get("accept")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "a navigation asks for HTML"
+        );
+    }
+
     /// A private account answers `requested`, and that is not a follow.
     #[tokio::test]
     async fn a_private_account_answers_that_it_was_asked() {
@@ -2113,9 +3107,11 @@ mod tests {
         );
         assert_eq!(headers.get("x-csrftoken").unwrap(), "TOKEN");
         assert!(headers.contains_key("cookie"));
-        // What it does **not** carry is asserted next door, in
-        // `a_page_route_does_not_claim_to_be_the_app`, together with the read
-        // path that must carry it.
+        // And it does announce itself as the app, because `/api/graphql` is
+        // the app's route. The surface that does not is the page fetch, and
+        // `a_navigation_does_not_claim_to_be_the_app` next door asserts the
+        // two against each other.
+        assert!(headers.contains_key("x-ig-app-id"));
         assert!(headers.contains_key("user-agent"));
         assert!(headers.contains_key("accept-language"));
     }

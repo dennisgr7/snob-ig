@@ -1,9 +1,24 @@
 # Build settings that belong to the repository rather than to a profile.
 #
 # **A `RUSTFLAGS` environment variable replaces what is here rather than merging
-# with it.** Anything else that ever wants a rustflag -- the `--remap-path-prefix`
-# a reproducible build needs, for instance -- has to be added to these tables,
-# not exported alongside them, or it silently switches the static CRT back off.
+# with it.** Anything else that ever wants a rustflag has to reach these tables
+# some other way, or it silently switches the static CRT back off. There are two
+# ways that work and one that does not:
+#
+# - Add it to a table below. That is what `/Brepro` does.
+# - Put it in a **second config file**, which is what the release workflow does
+#   for `--remap-path-prefix`. Cargo reads `$CARGO_HOME/config.toml` as well as
+#   this one and **joins** the `rustflags` arrays rather than letting one
+#   replace the other, so a value that can only be computed at build time -- the
+#   checkout directory, which differs per runner and per operating system -- can
+#   be added without touching what is here. Verified rather than assumed.
+# - Export `RUSTFLAGS`. This is the one that does not work, and it fails
+#   silently: both Windows binaries would start importing VCRUNTIME140.dll again
+#   and nothing would say so until somebody's machine failed to launch it.
+#
+# `[target.'cfg(all())']` is worth knowing about for the same reason: it merges
+# with the per-triple tables below rather than replacing them, so a flag that
+# should apply everywhere does not have to be repeated five times.
 #
 # And note what this file does not reach: `cargo install --git`, which is the
 # from-source line in the README, does not read the repository's configuration
@@ -24,8 +39,21 @@
 # arrives with a snob release rather than with Windows Update, which is the
 # ordinary trade for static linking and the one this project already takes for
 # SQLite and for musl.
+# `/Brepro` is the other half, and it is what makes two builds of one tag the
+# same file.
+#
+# Measured: two release builds of the same commit differed in exactly 24 bytes,
+# all of them in the PE header -- the TimeDateStamp, which is the wall clock at
+# link time, and the CodeView GUID, which is random per link. `/Brepro` replaces
+# both with a hash of the input, so the same input gives the same output and a
+# different one still gives a different one. It is a linker flag rather than a
+# rustc one, hence `-Clink-arg`.
+#
+# What it costs is that the TimeDateStamp stops being a date. Nothing here reads
+# it; some very old tooling displays it, and will show a number that is not a
+# time.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-Ctarget-feature=+crt-static"]
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=/Brepro"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-Ctarget-feature=+crt-static"]
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=/Brepro"]

@@ -53,6 +53,11 @@ reqwest = { version = "0.13", default-features = false, features = ["http2", "qu
 # Chrome does: Chrome puts the hybrid first and sends its share. Enabling it
 # costs about a kilobyte on the handshake.
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
+# Mozilla's published root certificates, in full X.509 form, for `--strict-roots`.
+# `webpki-roots` would not do: it publishes trust anchors, and `tls_certs_only`
+# takes certificates. Only compiled for the four rustls targets -- the schannel
+# one has no way to say "these roots and no others", and refuses the flag.
+webpki-root-certs = "1"
 clap = { version = "4", features = ["derive"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.
@@ -61,8 +66,33 @@ rusqlite_migration = "2.6"
 fastrand = "2.5"
 chrono = "0.4"
 directories = "6"
-# Windows and Linux (zbus) come with the defaults; macOS has to be asked for
-keyring = { version = "4", features = ["apple-native-keyring-store"] }
+# `keyring-core` plus one store per platform, rather than the `keyring` crate
+# that used to wrap them. The keyring project split in 2026 and `keyring 4.x`
+# now calls itself sample code; what it does on each platform is one line
+# picking exactly these stores and handing them to `keyring_core::set_default_store`,
+# which is what `secrets::use_the_platform_store` does directly.
+#
+# Two things came with going direct, and the second is why it was worth doing.
+# `default-features = false` on the Windows store drops its `search` feature and
+# `regex` and `aho-corasick` with it -- 863,744 bytes, 11.4% of both Windows
+# binaries, for an API nothing here calls. And the store's `persistence`
+# modifier is a supported way to ask for `CRED_PERSIST_LOCAL_MACHINE`, which
+# `keyring`'s own `Entry` did not expose; see `secrets::entry_for` for what that
+# closes and for the experiment that showed the change is safe to ship.
+#
+# The target names are unchanged by construction: these are the same stores in
+# the same default configuration `keyring 4` was already building.
+keyring-core = "1"
+windows-native-keyring-store = { version = "1", default-features = false }
+# `keychain` is not a default: the crate refuses to compile on macOS without it
+# or `protected`, and `protected` is the one that needs a code-signed
+# application, which this is deliberately not. The `keyring` wrapper used to
+# turn this on for us, and dropping it dropped the feature with it -- caught by
+# cross-checking the target rather than by a macOS release failing.
+apple-native-keyring-store = { version = "1", default-features = false, features = ["keychain"] }
+# `crypto-rust` rather than the OpenSSL default, for the same reason the webhook
+# signs with RustCrypto: this project does not link a C crypto library.
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 comfy-table = "7"
 indicatif = "0.18"
 supports-hyperlinks = "3"
@@ -110,10 +140,16 @@ crossterm = { version = "0.29", default-features = false, features = ["events", 
 # calls -- takes the path as a path.
 opener = { version = "0.8", default-features = false }
 url = "2"
-# Talking to a browser we launched, over the DevTools protocol. Loopback only,
-# so no TLS stack is pulled in: `connect` alone speaks ws:// and nothing more.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Talking to a browser we launched, over the DevTools protocol. It used to be
+# `tokio-tungstenite` and `futures-util` over a loopback WebSocket; the protocol
+# now travels on two inherited pipes instead, which has no address for anything
+# else on the machine to connect to, and framing NUL-separated JSON needs no
+# library. `crates/snob-cli/src/pipe.rs` carries the reasoning and the cost.
+#
+# Only for the Unix half of that: `dup2` in a `pre_exec` hook is what puts the
+# two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
+# no such crate -- it goes through `windows-sys`, which is already here.
+libc = "0.2"
 base64 = "0.23"
 # Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
 # backends are optional features and stay off, which is what makes these build
@@ -137,7 +173,21 @@ percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Storage_FileSystem"] }
+# `Win32_Security_Authorization` and `Win32_Storage_FileSystem` are what the
+# data directory is given at creation, and they answer two separate findings
+# that landed in the same function. The DACL, so that a machine with a
+# non-default profile ACL does not leave the follower database readable by other
+# local accounts. And `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`, because a query
+# against the live Windows Search index returned files out of the browser
+# profile -- where a second copy of the session sits during a login.
+# `paths::create_private_dir` carries both.
+#
+# `Win32_System_Threading`, `Win32_System_Pipes`, `Win32_System_JobObjects` and
+# `Win32_Security` are the Windows half of launching the browser on a pipe:
+# `CreateProcessW` with the handle-inheritance blob `std::process::Command` does
+# not expose, and the job object that takes the browser down with this process
+# however this process dies.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Test-only
 wiremock = "0.6"

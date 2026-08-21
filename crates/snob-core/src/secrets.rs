@@ -20,13 +20,12 @@
 //!   otherwise until it was read against the code. It is the claim somebody
 //!   checks before deciding whether backing up a profile, turning roaming on or
 //!   handing on a disk image is safe, so it is worth the three sentences. The
-//!   Windows credential is written `CRED_PERSIST_ENTERPRISE`, which Microsoft
-//!   documents as visible to this user on other computers wherever the account
-//!   has roamable state — it degrades to local storage on an account with none,
-//!   which is every ordinary machine, so the exposure is real and narrow;
-//!   `entry_for` says why it is not `CRED_PERSIST_LOCAL_MACHINE`. Outside
-//!   Windows the file fallback is `Protection::Plain` — plain JSON at `0600` —
-//!   so a copy of it is a working session anywhere, with no password and no key.
+//!   Windows credential is written `CRED_PERSIST_LOCAL_MACHINE`, so it stays on
+//!   the machine that created it even where the account has roamable state;
+//!   `entry_for` carries how that is asked for and the experiment that showed
+//!   the change does not strand an entry written the old way. Outside Windows
+//!   the file fallback is `Protection::Plain` — plain JSON at `0600` — so a
+//!   copy of it is a working session anywhere, with no password and no key.
 //!   And a keychain or collection carried off together with the login password
 //!   opens wherever it is opened, because that password is the whole of what
 //!   seals it.
@@ -54,6 +53,49 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::paths::{AppPaths, PathError};
 use crate::secret::Secret;
 use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
+
+/// Installs the platform's credential store, once per process.
+///
+/// `keyring-core` holds one default store and every `Entry` is built from it,
+/// so something has to choose. This is that choice, and it is the same one the
+/// `keyring` wrapper used to make on our behalf: the Windows Credential
+/// Manager, the macOS keychain, or the Secret Service over zbus.
+///
+/// **Idempotent and never repeated**, because `set_default_store` replaces what
+/// is there: a second call partway through a run would hand later reads a
+/// different store than the one earlier writes went to. Caching the outcome in
+/// a `OnceLock` also means a store that could not be built is not retried on
+/// every entry, which on a headless box is every command.
+///
+/// A failure here is not an error the tool stops for. It means there is no
+/// keyring on this machine — a server, a container, WSL — which is ordinary,
+/// and the file fallback is what answers next. The caller turns it into
+/// [`SecretsError::KeyringUnavailable`] and `probe_writable` turns that into
+/// the backend the user is told about.
+fn use_the_platform_store() -> Result<(), SecretsError> {
+    use std::sync::OnceLock;
+
+    static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
+
+    let outcome = INSTALLED.get_or_init(|| {
+        #[cfg(windows)]
+        let store = windows_native_keyring_store::Store::new();
+        #[cfg(target_os = "macos")]
+        let store = apple_native_keyring_store::keychain::Store::new();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let store = zbus_secret_service_keyring_store::Store::new();
+
+        match store {
+            Ok(store) => {
+                keyring_core::set_default_store(store);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    });
+
+    outcome.clone().map_err(SecretsError::KeyringUnavailable)
+}
 
 const KEYRING_SERVICE: &str = "snob-ig";
 const KEYRING_USER: &str = "session";
@@ -368,7 +410,7 @@ impl SecretStore {
                 // file just written is never reached.
                 if let Ok(entry) = self.entry()
                     && let Err(e) = entry.delete_credential()
-                    && !matches!(e, keyring::Error::NoEntry)
+                    && !matches!(e, keyring_core::Error::NoEntry)
                 {
                     tracing::warn!(
                         error = %e,
@@ -440,7 +482,7 @@ impl SecretStore {
         match self.entry_for(kind.entry_name()) {
             Ok(entry) => match entry.get_password() {
                 Ok(value) => Ok(Stored::Found(Secret::new(value))),
-                Err(keyring::Error::NoEntry) => Ok(Stored::Nothing),
+                Err(keyring_core::Error::NoEntry) => Ok(Stored::Nothing),
                 Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
             },
             // Not an error — the tool works without one — but not "nothing is
@@ -457,7 +499,7 @@ impl SecretStore {
     pub fn forget_secret(&self, kind: Kind) -> Result<(), SecretsError> {
         match self.entry_for(kind.entry_name()) {
             Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
                 Err(e) => Err(SecretsError::KeyringRefused(e.to_string())),
             },
             Err(_) => Ok(()),
@@ -554,7 +596,7 @@ impl SecretStore {
         for &kind in kinds {
             match self.entry_for(kind.entry_name()) {
                 Ok(entry) => match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Ok(()) | Err(keyring_core::Error::NoEntry) => {}
                     Err(e) => {
                         keyring_refused.get_or_insert(SecretsError::KeyringRefused(e.to_string()));
                     }
@@ -585,7 +627,7 @@ impl SecretStore {
         }
     }
 
-    fn entry(&self) -> Result<keyring::Entry, SecretsError> {
+    fn entry(&self) -> Result<keyring_core::Entry, SecretsError> {
         self.entry_for(KEYRING_USER)
     }
 
@@ -594,30 +636,62 @@ impl SecretStore {
     /// It must not be the session's: checking by writing and deleting over the
     /// real entry would destroy a working session whenever the login that
     /// follows ends up failing.
-    fn probe_entry(&self) -> Result<keyring::Entry, SecretsError> {
+    fn probe_entry(&self) -> Result<keyring_core::Entry, SecretsError> {
         self.entry_for(KEYRING_PROBE_USER)
     }
 
-    /// Builds a keyring entry.
+    /// Builds a keyring entry, installing the platform's credential store the
+    /// first time one is asked for.
     ///
-    /// **Known limitation, Windows.** The backend writes the credential with
+    /// **On Windows the credential is asked for local persistence**, and that
+    /// is the whole reason this goes to `keyring-core` and a store directly
+    /// rather than through the `keyring` wrapper. The default is
     /// `CRED_PERSIST_ENTERPRISE`, which Microsoft documents as visible "to
-    /// logon sessions for this user **on other computers**" — so on a machine
-    /// with a roaming profile, or with Credential Roaming enabled, the session
-    /// cookie follows the user around the network. `CRED_PERSIST_LOCAL_MACHINE`
-    /// would keep it where it was created, which is the same reasoning that put
-    /// the database in the local data directory rather than the roaming one.
+    /// logon sessions for this user **on other computers**": on a machine with
+    /// a roaming profile, or with Credential Roaming enabled, the session
+    /// cookie followed the user around the network. `CRED_PERSIST_LOCAL_MACHINE`
+    /// keeps it where it was created, which is the same reasoning that put the
+    /// database in the local data directory rather than the roaming one.
+    /// `keyring`'s own `Entry` had no way to say so; the store's `persistence`
+    /// modifier is a supported one.
     ///
-    /// It is not set here because `keyring`'s own `Entry` does not expose the
-    /// modifier: reaching it means depending on `keyring-core` directly and
-    /// keeping that version in step with whatever `keyring` pulls in, or the
-    /// default store the two of them share stops being the same one and every
-    /// read fails at run time. Microsoft also notes that the value degrades to
-    /// local storage on accounts with no roamable state, which is every
-    /// ordinary machine — so the exposure is real but narrow.
-    fn entry_for(&self, user: &str) -> Result<keyring::Entry, SecretsError> {
-        keyring::Entry::new(&self.service, user)
-            .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))
+    /// **The question this had to answer before it could ship** was whether an
+    /// entry already written as Enterprise is still found once the lookup asks
+    /// for Local, because if it is not, the first save after an upgrade logs
+    /// every existing user out without saying so. It was run against a real
+    /// Credential Manager on Windows 11, under a throwaway target name:
+    ///
+    /// - An entry written with `CRED_PERSIST_ENTERPRISE` is returned unchanged
+    ///   by a plain `CredReadW(target, CRED_TYPE_GENERIC, 0)`. Persistence is a
+    ///   field of the stored record, not part of the key — the key is the target
+    ///   name and the credential type, and `CredReadW` takes nothing else.
+    /// - Writing the same target with `CRED_PERSIST_LOCAL_MACHINE` replaces
+    ///   that one record in place: the `Persist` field goes from 3 to 2 and the
+    ///   blob is the new one. No second entry appears and the first is not
+    ///   orphaned. The reverse direction behaves the same way.
+    ///
+    /// So an existing session is read normally after the upgrade and quietly
+    /// becomes local the next time it is written. Nobody is logged out, and no
+    /// read-under-both-persistences migration path is needed.
+    ///
+    /// The target name is unchanged for the same reason: this is the same store
+    /// crate in the same default configuration that `keyring 4` was already
+    /// building for us, so it composes the same `{user}.{service}` target it
+    /// always did.
+    fn entry_for(&self, user: &str) -> Result<keyring_core::Entry, SecretsError> {
+        use_the_platform_store()?;
+
+        #[cfg(windows)]
+        {
+            let modifiers = std::collections::HashMap::from([("persistence", "Local")]);
+            keyring_core::Entry::new_with_modifiers(&self.service, user, &modifiers)
+                .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            keyring_core::Entry::new(&self.service, user)
+                .map_err(|e| SecretsError::KeyringUnavailable(e.to_string()))
+        }
     }
 
     fn load_from_keyring(&self) -> Result<Option<Zeroizing<String>>, SecretsError> {
@@ -633,7 +707,7 @@ impl SecretStore {
         match entry.get_password() {
             Ok(json) => Ok(Some(Zeroizing::new(json))),
             // The entry is simply not there.
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             // The keyring is there and refused. Every error used to land here
             // silently alongside `NoEntry`, and the two are not the same
             // claim: a credential that cannot be read this once became "no
@@ -1250,6 +1324,45 @@ mod tests {
         store.delete().unwrap();
     }
 
+    /// The Windows credential stays on the machine it was created on.
+    ///
+    /// The store's default is `CRED_PERSIST_ENTERPRISE`, which Microsoft
+    /// documents as visible to this user's logon sessions **on other
+    /// computers** — so with a roaming profile the session cookie followed the
+    /// user around the network. `entry_for` asks for local persistence
+    /// instead, and this is what stops that being a comment: the modifier is a
+    /// string, a typo in it is accepted by the type system, and nothing else
+    /// in the suite would notice.
+    ///
+    /// Its own throwaway service name, like every other test that reaches the
+    /// credential store, and it deletes what it wrote.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_credential_is_local_to_this_machine() {
+        let _keyring = keyring_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(tmp.path());
+        let store = SecretStore::new(paths, false).with_service(&test_service());
+
+        let entry = store
+            .entry_for("persistence-check")
+            .expect("Windows always has a Credential Manager");
+        entry.set_password("not a session").expect("it writes");
+
+        let attributes = entry
+            .get_attributes()
+            .expect("the store says what it wrote");
+        assert_eq!(
+            attributes.get("persistence").map(String::as_str),
+            Some("Local"),
+            "the credential roams: {attributes:?}"
+        );
+
+        entry
+            .delete_credential()
+            .expect("it cleans up after itself");
+    }
+
     /// Reads the session back, waiting out the credential store if it needs it.
     ///
     /// Not a retry bolted on to make a red test green. What it waits for was
@@ -1297,7 +1410,7 @@ mod tests {
     ///
     /// The guard against the honesty fix going too far: `delete` now reports
     /// what would not go, and the keyring's way of saying "there was nothing
-    /// here" is `keyring::Error::NoEntry` — an answer, not a failure. Reading
+    /// here" is `keyring_core::Error::NoEntry` — an answer, not a failure. Reading
     /// it as one would make every `logout` on a clean machine exit non-zero.
     #[test]
     fn nothing_stored_is_not_a_refusal() {
@@ -1401,14 +1514,21 @@ mod tests {
     /// The header says what the backends do, and no more than that.
     ///
     /// It claimed every backend "ties the secret to this user on this computer",
-    /// which two things in this same file contradict: `entry_for` records that
-    /// the Windows credential is written `CRED_PERSIST_ENTERPRISE` and roams
-    /// with the profile, and outside Windows `protect` stores
-    /// `Protection::Plain` -- plain JSON at `0600`, which is a working session
-    /// on any machine somebody copies it to. That bullet is what a person reads
-    /// before deciding whether to back up a profile or hand on a disk image, so
-    /// it gets a test rather than a proofread. `include_str!` because the claim
-    /// is the artifact under test; there is nothing else to call.
+    /// which two things in this same file contradicted: the Windows credential
+    /// was written `CRED_PERSIST_ENTERPRISE` and roamed with the profile, and
+    /// outside Windows `protect` stores `Protection::Plain` -- plain JSON at
+    /// `0600`, which is a working session on any machine somebody copies it to.
+    /// That bullet is what a person reads before deciding whether to back up a
+    /// profile or hand on a disk image, so it gets a test rather than a
+    /// proofread. `include_str!` because the claim is the artifact under test;
+    /// there is nothing else to call.
+    ///
+    /// The Windows half is now true rather than merely disclosed —
+    /// `entry_for` asks for `CRED_PERSIST_LOCAL_MACHINE` — so what this holds
+    /// down there has turned around: the header has to name the persistence it
+    /// really writes, and must not still be describing the roaming one it left
+    /// behind. Both halves matter, because the two spellings differ by one word
+    /// and the wrong one reads as an answer.
     #[test]
     fn the_header_does_not_promise_more_than_the_backends_do() {
         let header = include_str!("secrets.rs")
@@ -1419,11 +1539,16 @@ mod tests {
 
         assert!(
             !header.contains("ties the secret to this user on this computer"),
-            "the header promises the secret cannot travel, and two backends let it"
+            "the header promises the secret cannot travel, and one backend lets it"
         );
         assert!(
-            header.contains("CRED_PERSIST_ENTERPRISE"),
-            "the Windows credential roams, and the header is where that is read"
+            header.contains("CRED_PERSIST_LOCAL_MACHINE"),
+            "the Windows credential stays on this machine, and the header is where \
+             that is read"
+        );
+        assert!(
+            !header.contains("CRED_PERSIST_ENTERPRISE"),
+            "the header still describes the roaming credential this stopped writing"
         );
         assert!(
             header.contains("Protection::Plain"),

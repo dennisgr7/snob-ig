@@ -256,20 +256,25 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 
 | Rule | Where it lives |
 |---|---|
-| Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get` |
+| Every request is paid for | `Pacer::clear_to_send`, inside `IgClient::get_body` — **once per hop**, because the redirects it follows are requests too. Leaving them to reqwest's policy meant a chain of two reported one request and sent three, unpaced and uncounted, and the count is what the user is shown |
+| A redirect this client will not follow stops the walk | `IgError::OffOrigin` and `IgError::TooManyRedirects`, whose reaction is `Abort`. They are variants of their own for that reason alone: when the refusal was reqwest's it arrived as `Network`, whose reaction is `Retry`, and the pager sent the same impossible request three more times with the session on it |
 | A 429 puts the account in cooldown | `IgClient::classify_and_record` |
+| A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route`, which is true only for a 4xx that is none of the refusals — a 429, an action block, a challenge, an expired session, a cancel and a 404 all answer `false`. It is what stops `web_profile_info`'s search fallback becoming a retry against an endpoint that has just said no |
 | The reported request count is what was really spent | `Pacer::spent`, read by `engine::list` |
 | Consent before enumerating someone else, **before** resolving | `engine::ask_consent` |
 | Only Instagram's CDN is ever downloaded from | `IgClient::check_downloadable` |
 | A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `app::target_label`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target` — and, for everything a failure prints, through `report::filtered`, which every branch of `print_error` goes through including the one that carries no label. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too. `printable` covers the invisibles that are `Cf` **and** the four Hangul fillers, which are ordinary letters by category and blank by rendering |
 | A name inside a URL or a header is encoded, never filtered | `model::in_a_path`, used by `User::profile_url` and by the `Referer` the Instagram client sends — filtering removes characters, and a name with one removed is the address of a different account. A header value cannot hold a byte below 0x20 at all, so an unencoded name there produces no request rather than a wrong one, and reqwest reports that as `Network`, which the pager retries |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
+| The login browser's debugging protocol has no address | `pipe::spawn`, which starts it with `--remote-debugging-pipe` on two inherited descriptors. There is no port to guess and no `DevToolsActivePort` to read, which is what the demonstrated read of the session cookie needed |
+| The launched browser dies with this process however this process dies | the job object in `pipe::spawn`, carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The child is created suspended and joined to the job before it is resumed, so it never exists outside one — and this is the only one of the three exits that no code of ours can reach, because nothing runs when snob is killed from outside |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` — and takes its waits from `IgClient::is_live`, so "walk Instagram with no pauses" is not a thing a caller can ask for |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
 | A session is never reported gone unless it went | `SecretStore::delete`, which carries the keyring's own answer back |
 | Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers |
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
+| The data directory is limited to this account, on both platforms | `paths::create_private_dir` — 0700 on Unix, and on Windows a DACL of its own with `PROTECTED_DACL_SECURITY_INFORMATION`, which is the flag that stops the profile's inherited entries applying. It used to do nothing at all on Windows and say in a comment that `%LOCALAPPDATA%` already limited access; on a machine whose profile ACL is not the default it does not, and the database is the whole follower history in the clear. A failure is `PathError::NotPrivate` rather than a warning, for the same reason the Unix half has always been an error |
 | A temporal diff never compares an incomplete capture, or one against itself | `watch::Basis::decide`, over ids read from `usable_snapshots` |
 | `snob watch diff` answers without recording the answer | `engine::watch::from_store` takes `&App`, and recording needs the `&mut Store` only `record_from_store` can reach |
 | A first run reports nothing rather than announcing the whole list as arrivals | `watch::Basis::Baseline`, which has no diff to take out of it |
@@ -277,6 +282,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A list nothing verified is neither compared nor marked | `engine::watch::refusal`, over `Provenance::describes_now` |
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
+| Narrowing the trust store cannot reach the user's webhook | the same shape, one field over: `http::builder` takes the trust as an argument and `plain`/`plain_direct` pass `Trust::Platform` with no parameter for anything else. A private CA in front of somebody's own receiver is legitimate, and the client that would be narrowed carries no session to protect |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 | There is one spelling of each outcome token | `ExitCode::as_str`, with `from_token` derived from it over `ExitCode::ALL` rather than written as a second match. `watch_setup::health` matched the literals inline: respell one there and every recorded cooldown falls through to the failing arm, so `status` exits 1 for a monitor that will resume on its own — and the fixture those tests build their rows from spelled the same literals, so the suite would have moved with the defect |
 | A report is too old to be news in one place | `deliveries::still_news_after`, which `due`, `failed` and `expire_stale` all read. It was three hand-written comparisons and they disagreed at exactly a day: `due` handed the report out as news, `failed` gave up on it, and `prune` left it `pending` for ever |
@@ -297,6 +303,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
 | A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
 | No request is sent after the user asks it to stop | `Pacer::clear_to_send`, which reads the token before it reserves — it was read only inside the wait, so with nothing owed a canceled run kept sending |
+| A request already in flight is given up on when the user asks | `IgClient::send_or_cancel` and `read_or_cancel`, racing the token against the socket. Cancellation was read in every wait this program chose to take, which is where about nine interrupts in ten land; the tenth landed in the request itself, where nothing was watching and the exit tracked the server's patience — up to `REQUEST_TIMEOUT`, or 254 s on a black-holed connection because `Network` is retried. The cancel branch answers `Canceled` and not `Network`, or the reaction would be `Retry` and a Ctrl+C would send the request three more times |
 | A push-back the body could not be read from is still a push-back | `IgClient::get` classifies from the status it already has when the body fails, rather than letting the read failure become a retryable network error |
 | A credential is sent only to the address it was stored for | `plan`, for the token **and** the signing key, treating an absent or unparseable configured origin as a different destination |
 | A calendar moment that went by is taken, not lost | `schedule::next_after` looks back from `now` to the floor before it looks forward |
@@ -375,6 +382,19 @@ Two judgment calls worth understanding before touching them:
   with no counters and a 150x150 picture whose URL is signed for that size.
   Everything needs a session; that is how Instagram has built it, not a gap
   here.
+- **The pacing rate has no published reference behind it, and it stays where it
+  is.** Looked for in August 2026 and written down at `pace.rs` rather than
+  here, because that is where somebody changing a number will be. The short of
+  it: the best public figure for this endpoint family is instaloader's
+  field-report guess of 75 requests per 660 s, snob walks at about 172, and the
+  difference is that the cadence was copied from a project that walks GraphQL.
+  It is recorded rather than acted on, because matching that guess means 8.8 s
+  a request and a 235-page walk of 34 minutes against a 900-second resume
+  window — an interrupted walk could never be continued, and a list that took
+  34 minutes to read no longer describes one moment, which is the thing every
+  comparison here rests on. The ubiquitous "200 calls per user per hour" is
+  Meta's Graph API platform limit for `graph.facebook.com` and is not evidence
+  about these endpoints at all.
 - **The wire signature is chosen for portability, and is not to be tuned to
   imitate anything** — the TLS handshake, the HTTP/2 SETTINGS and the header
   order alike. The reason written here used to be that there is nothing to
@@ -417,6 +437,24 @@ Two judgment calls worth understanding before touching them:
   session and one cache. The only thing the working directory decides is where
   an export lands without `-o`. The header of `paths.rs` says so; the tests fix
   it.
+- **The trust store is narrowed only when asked.** reqwest 0.13 made
+  `rustls-platform-verifier` the default, so the four rustls targets honor
+  enterprise roots — which is what makes snob work on a managed machine, and is
+  also how a laptop carrying a TLS-inspecting root lets that middlebox read the
+  session in transit. `--strict-roots` replaces the platform store with
+  Mozilla's published roots, and `--tls-extra-root` is the way back out for
+  somebody who needs one private CA and no others; clap requires the second to
+  come with the first, because on the platform store there is nothing to add to.
+  It is off by default deliberately: narrowing is the safer setting for somebody
+  being inspected and the broken one for somebody behind a corporate proxy, and
+  only the person running it knows which they are. It is **never** applied to
+  the webhook client, and that is structural rather than remembered — see the
+  rules table. On Windows for ARM64 the backend is schannel, which cannot
+  express "these roots and no others", so the flag is **refused** there rather
+  than accepted and ignored: a security option that silently does nothing is
+  worse than one that is not offered, because somebody believes it. Certificate
+  **pinning** stays rejected separately: Meta rotates leaves across issuers and
+  there is no fast update channel behind this binary.
 - **No biometric verification, on any platform.** Investigated in August 2026
   and rejected on the merits, not on difficulty. The principle: any prompt a
   local process of the same user can trigger, that same process can satisfy by
@@ -449,6 +487,29 @@ Two judgment calls worth understanding before touching them:
   the escalated length rather than at its own. `SNOB_IGNORE_COOLDOWN` exists for
   the person who is certain, and stays undocumented so it is not the first thing
   reached for.
+- **The login browser is talked to over a pipe, and there is no debugging
+  port.** It used to be `--remote-debugging-port=0`, and what that cost was
+  demonstrated rather than argued: a second local process read the port out of
+  `DevToolsActivePort`, called `/json/version` with no credential at all, and
+  got the session cookie back from `Storage.getCookies` — `httpOnly` is a rule
+  for page scripts and means nothing to the protocol itself. Loopback sockets
+  carry no per-user access control, so that was every account on the machine
+  for as long as the window was open. `--remote-debugging-pipe` moves the same
+  protocol onto two anonymous descriptors that only this process and the
+  browser hold, and an address nobody can name is not one anybody can connect
+  to. The price is that `std::process::Command` cannot start that browser:
+  Chromium reads descriptor 3 and writes descriptor 4, and on Windows it
+  reaches them through `_get_osfhandle`, which only answers if the C runtime
+  found them in the handle-inheritance blob the parent passed in
+  `STARTUPINFO.lpReserved2` — a structure no Windows header describes and
+  `Command` does not expose. So the launch goes through `CreateProcessW`
+  directly, with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so that those two
+  descriptors are the only handles inherited; on Unix the same idea is two
+  `dup2` calls in a `pre_exec` hook. It retired `tokio-tungstenite` and
+  `futures-util`, because NUL-separated JSON needs no library. The reasoning
+  and the layout are in `crates/snob-cli/src/pipe.rs`; `tests/browser_pipe.rs`
+  holds it down against a real browser, and skips rather than fails where none
+  is installed.
 - **`snob purge` deletes the stored data and not the binary.** No package
   manager can do the first half: `winget uninstall`, `brew uninstall` and
   `apt remove` take away files the package owns, and the session, the database
@@ -460,12 +521,25 @@ Two judgment calls worth understanding before touching them:
   process cannot reliably delete its own executable on Windows, and one that
   managed it would leave `winget` or `apt` reporting a version that is no longer
   installed. The command prints the path and stops there.
-- **The Windows credential is written as `CRED_PERSIST_ENTERPRISE`**, which
-  Microsoft documents as visible on other computers for accounts with roamable
-  state. `keyring`'s `Entry` does not expose the modifier that would make it
-  local, and reaching it means depending on `keyring-core` directly and keeping
-  its version in lockstep or the shared default store breaks at run time. The
-  reasoning, and what would have to change, is in `secrets.rs::entry_for`.
+- **The Windows credential is written as `CRED_PERSIST_LOCAL_MACHINE`**, so it
+  stays on the machine that created it rather than following the user around a
+  network with Credential Roaming on. Getting there meant dropping the
+  `keyring` wrapper for `keyring-core` and the platform stores it was already
+  choosing, which is where the `persistence` modifier lives. What had to be
+  answered first was whether an entry written the old way survives the change,
+  and it was answered against a real Credential Manager rather than reasoned
+  about: `CredReadW` is keyed on the target name and the credential type and
+  takes nothing else, so an Enterprise entry is found unchanged by a lookup
+  from a store configured for Local, and the next save rewrites that one record
+  in place — `Persist` 3 becomes 2, no second entry, nothing orphaned. Nobody
+  is logged out and no read-under-both-persistences path is needed. The target
+  names did not move either, because these are the same stores in the same
+  default configuration `keyring 4` was building. `secrets.rs::entry_for`
+  carries the experiment; `the_windows_credential_is_local_to_this_machine`
+  keeps the modifier from being silently mistyped. Going direct also dropped
+  `regex` and `aho-corasick` with the Windows store's `search` feature:
+  **821,248 bytes, 10.41% of the x86_64 Windows binary**, measured either side
+  of the change.
 - **There is no lease over `watch_marks`, and the upsert is unconditional.**
   `snapshots` has a whole lease because the database is shared between
   processes; the marks have none, while `compare` reads the mark minutes before
@@ -731,6 +805,47 @@ deliberately unfinished:
     gives up on a report that reached a day, and `forget_settled` forgets a
     delivered one after seven.
 
+## Reproducible builds
+
+Two builds of one tag produce the same bytes, and four things had to be true at
+once for that to hold.
+
+`rust-toolchain.toml` names an **exact** version rather than `stable`, because
+a rebuild months later cannot match a release compiled by a different compiler,
+and a mismatch that proves nothing is worse than no check. Bumping it is now a
+commit somebody reviewed.
+
+`-Clink-arg=/Brepro` is in both Windows tables in `.cargo/config.toml`. Two
+release builds of one commit used to differ in exactly 24 bytes, all of them in
+the PE header: the TimeDateStamp, which is the wall clock at link time, and the
+CodeView GUID, which is random per link. `/Brepro` derives both from the input
+instead. Verified here rather than assumed -- two release builds of this tree,
+with `target/release` deleted in between, gave the same SHA-256; the same tree
+without the flag gave a different one.
+
+The absolute paths come out through a **second config file**, written by the
+release workflow into `$CARGO_HOME/config.toml`. That shape is not decoration:
+`RUSTFLAGS` *replaces* `.cargo/config.toml` rather than adding to it, so
+exporting it there would silently drop `+crt-static` and both Windows binaries
+would go back to needing the Visual C++ redistributable -- with nothing failing
+until somebody could not launch one. Cargo joins the `rustflags` arrays across
+config files, which is what makes the second file work, and
+`[target.'cfg(all())']` merges with the per-triple tables rather than replacing
+them. `CARGO_HOME` is moved inside the checkout in that workflow so a single
+`--remap-path-prefix` covers the sources and the unpacked registry together.
+
+The archives were the last of it, and an archive nobody can rebuild makes the
+binary inside it unverifiable too. Both formats embed a modification time and
+both are now given one -- the committer date of the tagged commit, derived from
+the tag like everything else there. `tar` gets `--sort=name`, `--mtime`,
+`--owner`/`--group` and `gzip -n`, that last for the timestamp gzip writes into
+its own header and everybody forgets. `Compress-Archive` has no flag at all, so
+the staged files' `LastWriteTime` is set before it runs, rounded down to an even
+second because a zip's DOS timestamp has two-second resolution. Both recipes
+were checked locally: same content on two different days, same bytes, where the
+recipes they replace gave two different archives. The `.deb` needed nothing --
+`cargo-deb` was already reproducible.
+
 ## What it costs, in bytes
 
 Measured on `aarch64-pc-windows-msvc` in August 2026, which is the odd target —
@@ -779,86 +894,29 @@ by 58%, and quoting a standalone figure for anything else here would too.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **`login --browser` leaves an unauthenticated debugging port open**, on
-  loopback, for up to `LOGIN_TIMEOUT`. Demonstrated end to end: a second local
-  process read the port from `DevToolsActivePort`, called `/json/version` with
-  no credential, and got the session cookie back from `Storage.getCookies`
-  despite `httpOnly`. Loopback sockets have no per-user access control, so this
-  is every account on the machine. `--remote-debugging-pipe` is the fix and it
-  was demonstrated working on Windows — the platform is not the obstacle;
-  `std::process::Command` is, because it does not expose the `lpReserved2`
-  handle-inheritance blob. Roughly 250 lines of unsafe plus a Unix path, and it
-  retires `tokio-tungstenite` and `futures-util`. Pair it with a job object
-  carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which also covers the case no
-  handler can catch: snob killed from outside, browser and port left running.
-- **`keyring-core` and the platform stores.** The keyring project split in
-  2026 and `keyring 4.x` now calls itself sample code, pointing applications at
-  `keyring-core` plus a store. Two things arrive together:
-  `windows-native-keyring-store` with `default-features = false` drops `regex`
-  and `aho-corasick` — 863,744 bytes, 11.4% of both Windows binaries, for a
-  search API nothing calls — and its `persistence` modifier gives
-  `CRED_PERSIST_LOCAL_MACHINE` through a supported interface, retiring the
-  roaming-credential exposure below. **One thing must be answered against a
-  real Credential Manager before shipping it**: an entry written as Enterprise
-  has to still be found by a lookup under Local on the same target name, or the
-  first save after an upgrade silently logs every existing user out. That is
-  why this did not go into 0.2.0.
-- **Redirect hops are followed without being paced or charged.** Fixed: a
-  *refused* redirect no longer retries. Still owed: the hops that are followed
-  go out unpaid, against the standing rule that every request is paid for. The
-  shape is `Policy::none()` plus a bounded loop in `IgClient::get` charging
-  `clear_to_send()` per hop.
-- **The Windows data directory has no DACL of its own.** `create_private_dir`
-  chmods 0700 on Unix and does nothing on Windows, on the assumption that
-  `%LOCALAPPDATA%` already limits access. On a machine with a non-default
-  profile ACL it does not, and the database — the whole follower history, in
-  the clear — is readable by other local accounts. `session.json` is
-  DPAPI-sealed, so this is about the database and the browser profile.
-  `SetNamedSecurityInfoW` with `PROTECTED_DACL_SECURITY_INFORMATION` was
-  verified working unprivileged. The defect is that the code asserts a property
-  it does not enforce.
-- **Ctrl+C during an in-flight request waits for the server.** Measured: a
-  stop during a budget wait takes 1.13 s, and about nine interrupts in ten land
-  there — but during a request the exit tracks the server's hold, up to
-  `REQUEST_TIMEOUT`, or 254 s on a black-holed connection because `Network`
-  retries. It matters most under a service manager, where a stalled request can
-  outlast the stop grace period and the process is killed before it closes its
-  snapshot. Ten lines of `tokio::select!` in `get`, and the cancel branch must
-  return `Canceled` rather than falling into `Network`.
-- **`Retry-After` is never read.** `classify` receives no headers. Reading it
-  would make snob the only tool of its class that does — but nobody has
-  established whether these endpoints send it. Log the header at `debug` on
-  every push-back first, so a real run answers the question. When implemented
-  it is a floor and never a ceiling: a server-named 30 s must not shorten the
-  local cooldown.
-- **The pacing rate has no reference behind it.** The best public figure for
-  this endpoint family is instaloader's field-report guess of 75 requests per
-  660 s for non-GraphQL; snob walks at 172, because the cadence was copied from
-  a project that walks GraphQL. Not a proposal — at 8.8 s per request a
-  235-page walk takes 34 minutes against a 900-second resume window, and one
-  list describing one moment is worth more than the rate. It is recorded
-  because it is the one number in the design with nothing behind it. The
-  ubiquitous "200 calls per user per hour" is Meta's Graph API platform limit
-  for graph.facebook.com and has nothing to do with these endpoints.
+- **`Retry-After` is measured, not acted on.** `classify` takes a status and a
+  body and never sees a header, so whether these endpoints send this at all has
+  never been answerable from a real run. `IgClient::note_push_back` now logs it
+  at `debug` on every push-back — including the two a check on the status alone
+  walks past, a 200 carrying `spam: true` and a push-back whose body died
+  mid-read — and logs `<absent>` when there is none, which is the answer the
+  logging is really after. **Nothing decides anything from it**, deliberately:
+  inventing behavior on the assumption that the header arrives is guessing with
+  somebody's account. When it is implemented it is a floor and never a ceiling,
+  because a server naming thirty seconds is answering a different question from
+  how long an account is left alone after Instagram has objected. That is
+  written at `note_push_back`, where somebody adding it will be looking. Two
+  tests read the log back and assert the recorded cooldown is unchanged.
+
+  **What is still owed is a real run.** The logging is in so that somebody who
+  gets throttled with `--verbose` on can say whether the header ever arrives and
+  in which of its two forms — seconds or an HTTP date. Until somebody has, there
+  is nothing here to implement, which is why it is parsed into nothing and kept
+  as the string that was sent.
 - **`friendships/show_many`** would take a 1000/500 crossing from 52 requests
   to 14. It is a POST, which this project has never sent, and its page limit,
   response shape and throttle weighting are all unverified. Settle whether a
   non-mutating POST is inside the no-write rule before designing anything.
-- **Reproducibility is 24 bytes away.** Two release builds differed only in the
-  PE TimeDateStamp and the CodeView GUID; `-Clink-arg=/Brepro` plus
-  `--remap-path-prefix` made them identical and took 46,080 bytes off. The gap
-  is the archives: `tar -czf` and `Compress-Archive` both embed mtimes, while
-  the `.deb` is already reproducible. Pin `rust-toolchain.toml` to an exact
-  version first — it says `stable`, so a rebuild months later cannot match by
-  construction. Remember that `RUSTFLAGS` replaces `.cargo/config.toml`.
-- **Narrowing the trust store** is available and should be opt-in, not default.
-  reqwest 0.13 made `rustls-platform-verifier` the default, so the four rustls
-  targets now honor enterprise roots and a managed laptop with an inspection
-  root can read the session in transit. `tls_certs_only(webpki_root_certs)`
-  behind `--strict-roots`, with `--tls-extra-root` as the way out, and never on
-  the webhook client, where a private CA is legitimate. Certificate **pinning**
-  is separately rejected: Meta rotates leaves across issuers and there is no
-  fast update channel behind this binary.
 
 ## Known walls
 
@@ -874,6 +932,43 @@ left in a report nobody can find, and in the order they are worth doing.
   reason as an answer.
   Whether the limit is the account, the session or the endpoint is not known;
   what is known is that the tool reports it instead of answering wrongly.
+- **Instagram cannot serialize its own profile reply for some business
+  accounts.** `GET /api/v1/users/web_profile_info/?username=elrubiuswtf` answers
+  **400** with `Asset asset://laser.provider/ig_business_category_subvertical
+  has been deleted. You cannot use this schema`. Reproducible, nothing to do
+  with the request, and it took down every command that names an account,
+  because they all begin by turning a username into an id. Confirmed against the
+  live API in August 2026 — 400 for that account, 200 for an ordinary one in the
+  same session, which is what scopes the answer to the failure.
+
+  The answer is a **fallback, not a replacement**: `web_profile_info` tries the
+  profile endpoint exactly as before and reaches
+  `/web/search/topsearch/?context=blended&query=<name>` only after a failure
+  that `IgError::worth_a_second_route` allows. An ordinary account still costs
+  one request; the broken one costs two, both charged, and the wait between them
+  is the ordinary pace. `instantgram` hit the same wall in July 2026 and solved
+  it the same way.
+
+  **Search answers with less, and the gap is not filled in.** It carries the id,
+  the name, `is_private`, and — under `friendship_status` — the two flags the
+  private-account refusal turns on, so that refusal still happens before a page
+  is walked. It carries **no follower or following counters**, and those stay
+  `None` rather than becoming zero: `pager::verify_completion` compares a walk
+  against the declared size, so a declared zero would make every short walk look
+  complete and the truncation wall would stop being detectable at all. Two
+  things therefore quietly stop working for such an account, and both are said
+  out loud rather than left to be discovered — `engine::target` warns that the
+  run cannot tell a truncated list from a complete one nor judge a cached one,
+  and `snob watch check` returns `Warned` with the same reason, because finding
+  the truncation wall before six hours of walking is half of what that command
+  is for. `WebProfileInfo::counters_are_knowable` is the question a caller asks;
+  the reasoning is at `IgClient::web_profile_info`.
+
+  Search matches loosely, so the hit is held to an exact, case-insensitive name
+  match. Without that, a name Instagram would not serve hands back whatever the
+  search box suggested instead, and the run walks a stranger's followers under
+  the name that was typed. That is the one failure this route could introduce,
+  and it has a test of its own.
 - **Real behavior on a 429 has never been provoked on purpose.** The handling is
   verified against a recorded body. Everything downstream of it — the cooldown,
   the hard stop, the exit code — is tested; the classification of a live one is

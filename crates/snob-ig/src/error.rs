@@ -36,6 +36,21 @@ pub enum IgError {
     #[error("Instagram answered {status}: {body}")]
     Unexpected { status: u16, body: String },
 
+    /// A redirect pointed somewhere this client will not follow.
+    ///
+    /// Its own variant rather than an [`IgError::Unexpected`] because the
+    /// reaction is what matters: retrying cannot help, and when this refusal
+    /// was reqwest's it arrived as [`IgError::Network`], whose reaction is
+    /// `Retry`. The pager then sent the same impossible request three more
+    /// times with the session on it.
+    #[error("a redirect tried to take an API call off instagram.com: {to}")]
+    OffOrigin { to: String },
+
+    /// A redirect chain that is a loop by another name. Same reasoning as
+    /// [`IgError::OffOrigin`] for why it is not an `Unexpected`.
+    #[error("too many redirects")]
+    TooManyRedirects,
+
     #[error("the download exceeds {limit} bytes, so it is not a profile picture")]
     TooLarge { limit: usize },
 
@@ -191,6 +206,8 @@ impl IgError {
             // `is_redirect()` is true exactly for a policy refusal, which is
             // what makes this a one-line question rather than a guess about the
             // message.
+            // Still reachable: the CDN client keeps a policy of its own, and a
+            // hop it refuses arrives this way.
             Self::Network(e) if e.is_redirect() => Reaction::Abort,
             Self::Network(_) => Reaction::Retry,
             // A 5xx is the server's problem, not ours.
@@ -210,6 +227,31 @@ impl IgError {
     /// what [`IgError::reaction`] is for.
     pub fn is_login_tolerable(&self) -> bool {
         matches!(self, Self::RateLimited | Self::Network(_))
+    }
+
+    /// Whether a **second, different** request is allowed to be sent after this
+    /// one, to answer the same question another way.
+    ///
+    /// Deliberately narrow, because the standing rule is that when a service
+    /// says no the answer is to stop asking. Everything that means "no" says no
+    /// here: a 429, an action block and a challenge all carry a cooldown; a 401
+    /// or 403 arrives as [`IgError::SessionExpired`]; a cancel is the user; a
+    /// 404 is a real answer, and asking a second endpoint about a name nobody
+    /// owns spends a request to be told the same thing. A 5xx is the server
+    /// being unwell, which [`Reaction::Retry`] already covers, and a second
+    /// route there would only hide an outage.
+    ///
+    /// What is left is a 4xx that is none of those: Instagram answered, and its
+    /// answer was broken. That is the case this exists for — certain business
+    /// accounts make `web_profile_info` answer 400 with
+    /// `Asset asset://laser.provider/ig_business_category_subvertical has been
+    /// deleted`, which is Instagram failing to serialize its own reply and has
+    /// nothing to do with the request. Reproduced against the live API in
+    /// August 2026.
+    ///
+    /// [`Reaction::Retry`]: crate::error::Reaction::Retry
+    pub fn worth_a_second_route(&self) -> bool {
+        matches!(self, Self::Unexpected { status, .. } if (400..500).contains(status))
     }
 
     /// Whether it invalidates the stored session, and so must not be persisted.

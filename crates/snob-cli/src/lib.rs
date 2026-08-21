@@ -13,6 +13,9 @@ pub mod engine;
 pub mod exit;
 pub mod interrupt;
 pub mod output;
+/// Starting the browser with the debugging protocol on a pipe rather than on a
+/// loopback port. See the module for why it cannot be `std::process::Command`.
+pub mod pipe;
 pub mod progress;
 pub mod report;
 pub mod ui;
