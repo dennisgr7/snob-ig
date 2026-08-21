@@ -114,10 +114,31 @@ pub fn pacer(
         .announcing(announce))
 }
 
+/// How a run could have been given consent before it started.
+///
+/// The refusal printed when nobody is at a terminal names the way *this*
+/// command takes an answer in advance, and the two commands do not take it the
+/// same way. The list commands have `-y`. `snob watch once` deliberately does
+/// not — the reasoning is written at `WatchOnceArgs` in `cli.rs`, and it is
+/// that consent handed over on a command line is consent from whoever wrote
+/// the cron entry. One shared sentence named `-y` for both, so the monitor
+/// answered "there is no terminal to ask at" with advice that then failed to
+/// parse: `snob watch once someone -y` is `error: unexpected argument`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsentInAdvance {
+    /// `-y` on the command line.
+    #[default]
+    Flag,
+    /// An `[[account]]` in `watch.toml` carrying the answer somebody gave once,
+    /// which is what `snob watch setup` writes.
+    WatchConfig,
+}
+
 pub struct App {
     client: IgClient,
     db: Store,
     progress: Progress,
+    consent_in_advance: ConsentInAdvance,
     cancel: CancelToken,
     viewer: Viewer,
     consented: Option<String>,
@@ -207,6 +228,7 @@ impl App {
             cancel,
             viewer,
             consented: None,
+            consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
         }))
     }
@@ -232,6 +254,7 @@ impl App {
             cancel,
             viewer,
             consented: None,
+            consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
         }
     }
@@ -296,6 +319,23 @@ impl App {
 
     pub fn record_consent(&mut self, asked: &str) {
         self.consented = Some(asked.to_string());
+    }
+
+    /// How this run could have been given consent before it started.
+    ///
+    /// Read only by the refusal in `engine::ask_consent_with`, which is shared
+    /// by every command that enumerates somebody else and therefore cannot know
+    /// on its own which of the two answers applies.
+    pub fn consent_in_advance(&self) -> ConsentInAdvance {
+        self.consent_in_advance
+    }
+
+    /// Said by the monitor's two walking entry points, and nothing else.
+    ///
+    /// One process is one command, so this is a property of the run rather
+    /// than of a call.
+    pub fn consent_comes_from_the_config(&mut self) {
+        self.consent_in_advance = ConsentInAdvance::WatchConfig;
     }
 
     /// The target this run already worked out, if anything did.

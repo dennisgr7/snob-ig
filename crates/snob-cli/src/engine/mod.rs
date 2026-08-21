@@ -21,7 +21,7 @@ use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::store::{accounts, snapshots, users};
 
-use crate::app::App;
+use crate::app::{App, ConsentInAdvance};
 use crate::cli::ListArgs;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
@@ -405,11 +405,23 @@ pub async fn ask_consent_with(
     // to standard output. That stopped being true when the prompt moved to
     // standard error, and the gate did not follow it.
     if !someone_is_there {
+        // Which way to answer in advance is the *caller's* fact, not this
+        // function's. Both commands that reach here take an answer beforehand
+        // and they do not take it the same way, and one sentence named `-y` for
+        // both — so `snob watch once someone` refused with advice that then
+        // failed to parse, because `watch once` deliberately has no `-y`.
+        let in_advance = match app.consent_in_advance() {
+            ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
+            ConsentInAdvance::WatchConfig => format!(
+                "Run \"snob watch setup\" to answer it once, or ask about {shown} \
+                 while you are here."
+            ),
+        };
         return Err(ExitError::new(
             ExitCode::Interrupted,
             format!(
                 "reading {shown}'s lists needs confirmation, and there is no terminal to \
-                 ask at. Pass -y to confirm in advance."
+                 ask at. {in_advance}"
             ),
         )
         .into());
