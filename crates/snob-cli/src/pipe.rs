@@ -797,6 +797,7 @@ mod unix_impl {
         // SAFETY: two descriptors this process owns and hands over exactly
         // once; `File` closes them from here on.
         let writer = unsafe { std::fs::File::from_raw_fd(to_browser_write) };
+        // SAFETY: the same, for the other end.
         let reader = unsafe { std::fs::File::from_raw_fd(from_browser_read) };
 
         Ok((
