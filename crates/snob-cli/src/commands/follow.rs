@@ -96,6 +96,28 @@ pub async fn run(
         .into());
     }
 
+    // **Also before anything is spent.** Whether anybody can answer is a
+    // property of this process's streams, not of the account, so it is known
+    // now — and a run that is going to refuse for want of an answer should not
+    // pay for a lookup first. Found by running it: under a pipe it resolved the
+    // profile and then said there was nobody to ask.
+    //
+    // The question itself still waits until after the lookup, deliberately: it
+    // names the account the way Instagram spells it, it says "send a follow
+    // request" rather than "follow" for a private account, and it is not asked
+    // at all when the relationship already holds. All three need the profile.
+    if !args.yes && !ui::can_be_asked() {
+        return Err(ExitError::new(
+            ExitCode::Interrupted,
+            format!(
+                "nothing was {}ed: there is nobody to confirm it",
+                verb.present()
+            ),
+        )
+        .with_hint("pass -y to confirm in advance")
+        .into());
+    }
+
     let profile = app
         .client()
         .web_profile_info(target::clean(&args.target))
@@ -129,25 +151,13 @@ pub async fn run(
         Verb::Unfollow => format!("Unfollow @{name}?"),
     };
 
-    // `confirm` answers with its default the moment nobody can answer, so the
-    // two cases are told apart here: `-y` is somebody answering in advance,
-    // and no terminal without `-y` is nobody having been asked at all. A write
-    // nobody agreed to is the one outcome this command exists to prevent.
-    if !args.yes {
-        if !ui::can_be_asked() {
-            return Err(ExitError::new(
-                ExitCode::Interrupted,
-                format!(
-                    "nothing was {}ed: there is nobody to confirm it",
-                    verb.present()
-                ),
-            )
-            .with_hint("pass -y to confirm in advance")
-            .into());
-        }
-        if !ui::confirm(&question, false)? {
-            return Ok(ExitCode::Interrupted);
-        }
+    // `confirm` answers with its default the moment nobody can answer, which
+    // would turn "nobody was there" into "they said no" — two different events
+    // that were reported as one everywhere else in this tool until it was
+    // fixed. The guard above is what stops that being reachable here, so this
+    // branch only ever runs with somebody at the keyboard.
+    if !args.yes && !ui::confirm(&question, false)? {
+        return Ok(ExitCode::Interrupted);
     }
 
     let status = send(app.client(), verb, profile.id, &profile.username).await?;

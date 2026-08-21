@@ -221,10 +221,15 @@ fn list(
     let format = output::effective_format(format.map(Into::into), destination);
     output::check_destination(format, destination)?;
 
-    let rendered = match format {
-        Format::Json | Format::Ndjson => Rendered::Text(as_json(stories, format)?),
-        _ => Rendered::Text(as_table(stories, Presentation::detect(destination))),
+    // Every rendering ends in a newline, like `output::render`'s do. Neither
+    // `serde_json::to_string_pretty` nor comfy-table adds one, and without it
+    // the shell prompt comes back glued to the last row.
+    let mut text = match format {
+        Format::Json | Format::Ndjson => as_json(stories, format)?,
+        _ => as_table(stories, Presentation::detect(destination)),
     };
+    text.push('\n');
+    let rendered = Rendered::Text(text);
     output::write_rendered(&rendered, destination)?;
 
     // On standard error, so it does not land in a redirect. The listing is the
