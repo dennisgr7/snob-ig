@@ -231,7 +231,19 @@ pub enum Skipped {
     NobodyLooked(Provenance),
     /// The walk did not finish, so accounts are missing from it — and every one
     /// of them would be reported as somebody who left.
-    Incomplete(StopReason),
+    ///
+    /// The second field is what Instagram actually said, when it said
+    /// something. `StopReason` is coarser than the error behind it on purpose,
+    /// because the store only needs to know whether the list is usable — but
+    /// `SessionInvalid` covers both "log in again" and "the account has to be
+    /// verified", which are exit code 3 and exit code 4. Reconstructing the
+    /// code from the reason alone therefore answered 3 for a checkpoint, and
+    /// told an unattended operator to run `snob login`, which during the
+    /// cooldown a challenge causes stores a session without validating it and
+    /// prints "Session stored". `ListOutcome::stopped_by` already carried the
+    /// answer and this threw it away; the same response through
+    /// `snob followers` has always exited 4.
+    Incomplete(StopReason, Option<ExitCode>),
 }
 
 /// What a tick did.
@@ -448,7 +460,13 @@ impl TickReport {
             .iter()
             .find_map(|list| match list.skipped {
                 Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
-                Some(Skipped::Incomplete(reason)) => Some(ExitCode::from_stop_reason(reason)),
+                // What Instagram said beats what the store had to record, which
+                // is the rule `ListOutcome::stopped_by` exists for and the one
+                // `exit::from_stop_reason` names in its own doc: whichever of
+                // the two a command happens to read must not change the answer.
+                Some(Skipped::Incomplete(reason, said)) => {
+                    Some(said.unwrap_or_else(|| ExitCode::from_stop_reason(reason)))
+                }
                 _ => None,
             })
             .unwrap_or(ExitCode::Error)
@@ -490,7 +508,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         if app.cancel().is_canceled() {
             lists.push(TickList {
                 kind,
-                skipped: Some(Skipped::Incomplete(StopReason::Canceled)),
+                skipped: Some(Skipped::Incomplete(StopReason::Canceled, None)),
             });
             continue;
         }
@@ -518,7 +536,10 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
             Err(e) if ExitCode::from_chain(&e) == Some(ExitCode::RateLimited) => {
                 lists.push(TickList {
                     kind,
-                    skipped: Some(Skipped::Incomplete(StopReason::RateLimit)),
+                    skipped: Some(Skipped::Incomplete(
+                        StopReason::RateLimit,
+                        Some(ExitCode::RateLimited),
+                    )),
                 });
                 continue;
             }
@@ -568,7 +589,10 @@ fn refusal(outcome: &ListOutcome) -> Option<Skipped> {
         return Some(Skipped::NobodyLooked(outcome.provenance));
     }
     if !outcome.is_complete() {
-        return Some(Skipped::Incomplete(outcome.reason));
+        // `stopped_by` rather than the reason alone. It is `None` when nothing
+        // Instagram said stopped the walk — a `--max-pages` cut, say — and the
+        // reason is the whole answer there.
+        return Some(Skipped::Incomplete(outcome.reason, outcome.stopped_by));
     }
     None
 }
@@ -979,7 +1003,7 @@ mod tests {
             assert!(
                 matches!(
                     refusal(&outcome(Provenance::Walked, reason)),
-                    Some(Skipped::Incomplete(got)) if got == reason
+                    Some(Skipped::Incomplete(got, _)) if got == reason
                 ),
                 "a walk that ended {reason:?} was accepted as a basis for comparison"
             );
@@ -1016,7 +1040,10 @@ mod tests {
             requests: 1,
             lists: vec![TickList {
                 kind: ListKind::Followers,
-                skipped: Some(Skipped::Incomplete(StopReason::RateLimit)),
+                skipped: Some(Skipped::Incomplete(
+                    StopReason::RateLimit,
+                    Some(ExitCode::RateLimited),
+                )),
             }],
             committable: Vec::new(),
             at: 0,
@@ -1028,6 +1055,56 @@ mod tests {
         assert_eq!(
             tick.outcome(),
             ExitCode::from_stop_reason(StopReason::RateLimit)
+        );
+    }
+
+    /// And a checkpoint is reported as a checkpoint, not as "log in again".
+    ///
+    /// `StopReason::SessionInvalid` covers two different answers -- the session
+    /// has gone, and Instagram wants the account verified -- which are exit
+    /// code 3 and exit code 4. Rebuilding the code from the reason alone
+    /// therefore answered 3 for a challenge, and 3 sends an unattended operator
+    /// to `snob login`, which during the cooldown a challenge causes stores a
+    /// session without validating it and says "Session stored". The same
+    /// response through `snob followers` has always exited 4; `exit.rs` states
+    /// the invariant as "whichever of the two a command happens to read must
+    /// not change the answer".
+    #[test]
+    fn a_challenge_keeps_its_own_code_through_a_tick() {
+        let short = |said| TickReport {
+            report: WatchReport {
+                account_pk: 42,
+                username: None,
+                is_self: true,
+                followers: None,
+                following: None,
+                renamed: Vec::new(),
+            },
+            requests: 1,
+            lists: vec![TickList {
+                kind: ListKind::Followers,
+                skipped: Some(Skipped::Incomplete(StopReason::SessionInvalid, said)),
+            }],
+            committable: Vec::new(),
+            at: 0,
+            rename_cursor: None,
+            renames_sent: Vec::new(),
+        };
+
+        assert_eq!(
+            short(Some(ExitCode::Challenge)).outcome(),
+            ExitCode::Challenge,
+            "what Instagram said beats what the store had to record"
+        );
+        assert_eq!(
+            short(Some(ExitCode::NoSession)).outcome(),
+            ExitCode::NoSession,
+            "and the other half of the same reason still answers 3"
+        );
+        assert_eq!(
+            short(None).outcome(),
+            ExitCode::from_stop_reason(StopReason::SessionInvalid),
+            "with nothing said, the reason is the whole answer"
         );
     }
 }
