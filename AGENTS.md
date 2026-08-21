@@ -247,6 +247,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment`, over the interval each list covers |
 | Uninstalling leaves nothing behind | `AppPaths::owned_dirs`, the only list `purge` reads |
 | A directory too near the root is never deleted | `paths::is_safe_to_remove` |
+| The data directory is limited to this account, on both platforms | `paths::create_private_dir` — 0700 on Unix, and on Windows a DACL of its own with `PROTECTED_DACL_SECURITY_INFORMATION`, which is the flag that stops the profile's inherited entries applying. It used to do nothing at all on Windows and say in a comment that `%LOCALAPPDATA%` already limited access; on a machine whose profile ACL is not the default it does not, and the database is the whole follower history in the clear. A failure is `PathError::NotPrivate` rather than a warning, for the same reason the Unix half has always been an error |
 | A temporal diff never compares an incomplete capture, or one against itself | `watch::Basis::decide`, over ids read from `usable_snapshots` |
 | `snob watch diff` answers without recording the answer | `engine::watch::from_store` takes `&App`, and recording needs the `&mut Store` only `record_from_store` can reach |
 | A first run reports nothing rather than announcing the whole list as arrivals | `watch::Basis::Baseline`, which has no diff to take out of it |
@@ -679,15 +680,6 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **The Windows data directory has no DACL of its own.** `create_private_dir`
-  chmods 0700 on Unix and does nothing on Windows, on the assumption that
-  `%LOCALAPPDATA%` already limits access. On a machine with a non-default
-  profile ACL it does not, and the database — the whole follower history, in
-  the clear — is readable by other local accounts. `session.json` is
-  DPAPI-sealed, so this is about the database and the browser profile.
-  `SetNamedSecurityInfoW` with `PROTECTED_DACL_SECURITY_INFORMATION` was
-  verified working unprivileged. The defect is that the code asserts a property
-  it does not enforce.
 - **Ctrl+C during an in-flight request waits for the server.** Measured: a
   stop during a budget wait takes 1.13 s, and about nine interrupts in ten land
   there — but during a request the exit tracks the server's hold, up to

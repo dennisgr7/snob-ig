@@ -131,12 +131,17 @@ percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
+# `Win32_Security_Authorization` and `Win32_Storage_FileSystem` are the DACL the
+# data directory is given, so that a machine with a non-default profile ACL does
+# not leave the follower database readable by other local accounts;
+# `paths::create_private_dir` carries the reasoning.
+#
 # `Win32_System_Threading`, `Win32_System_Pipes`, `Win32_System_JobObjects` and
 # `Win32_Security` are the Windows half of launching the browser on a pipe:
 # `CreateProcessW` with the handle-inheritance blob `std::process::Command` does
 # not expose, and the job object that takes the browser down with this process
 # however this process dies.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Test-only
 wiremock = "0.6"
