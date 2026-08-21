@@ -277,6 +277,19 @@ points at.
 header, so the receiver can check it came from you. `snob watch setup` puts both
 in the keyring instead, which is what lets a systemd unit hold neither.
 
+Three more headers travel with every POST, and a receiver can route on them
+without parsing the body at all:
+
+| Header | What it is |
+|---|---|
+| `X-Snob-Event` | `watch.changes` or `watch.preflight` — the same value as `event` in the body. |
+| `X-Snob-Delivery` | The delivery id, and the same value as `run.id`. **The one to deduplicate on**: it stays the same across every retry of one report, so a receiver that has already acted on it can drop the second copy. |
+| `X-Snob-Attempt` | Which try this is, counting from 1. |
+
+Because those four are the protocol, snob refuses to send a `[webhook.headers]`
+entry or a `--header` that sets any name beginning `X-Snob-`: a configured copy
+would make the value ambiguous, and most frameworks join duplicates with `, `.
+
 Nothing is sent when nothing changed, so every message that arrives means
 something; `--heartbeat` sends one anyway, for when silence is the signal you
 are watching. A report that cannot be delivered is queued and retried, and it is
@@ -381,6 +394,7 @@ apart from "wait a while" without reading the message text.
 |---|---|
 | 0 | It worked. A list cut short by `--limit` or `--max-pages` is still a 0. |
 | 1 | It failed, with nothing more specific to say — including a result refused because a list came back incomplete. |
+| 2 | The command line could not be parsed. Nothing was done, and running it again unchanged will not help. |
 | 3 | No session stored, or the one there no longer works. Run `snob login`. |
 | 4 | Instagram wants the account verified. Open the address it prints. |
 | 5 | Instagram is throttling, or the account is in cooldown. Wait. |
