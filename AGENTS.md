@@ -13,9 +13,10 @@ longer does the job it was there to do.
 ## What this is
 
 `snob`, a terminal tool that tells you who does not follow you back on
-Instagram, and tracks changes to your followers and following over time. Single
-binary, no runtime. Windows and Linux on x86_64 and ARM64, macOS on Apple
-Silicon.
+Instagram, and tracks changes to your followers and following over time. It also
+follows and unfollows one account at a time, and shows and downloads the stories
+an account has up. Single binary, no runtime. Windows and Linux on x86_64 and
+ARM64, macOS on Apple Silicon.
 
 There is no official API for listing followers — Meta removed it in 2018 — so
 this uses the private web API with the user's own session cookie. That goes
@@ -44,8 +45,33 @@ re-litigation in a normal change.
 And the domain rules, which exist because breaking them puts a real account at
 risk:
 
-- **No write operations against Instagram.** `snob` only reads. No follow,
-  unfollow, block or remove-follower, ever.
+- **Two write operations exist, and no third one may be added.** `snob` may
+  follow an account and unfollow an account. That is the whole list. No block,
+  no remove-follower, no like, no comment, no message, and **nothing that marks
+  a story as seen** — which is a write dressed as a read, because it tells the
+  other person you looked.
+  This rule used to say that `snob` only reads, and it was right about the risk:
+  writing is what gets an account actioned, and the tool spent its first two
+  versions not doing any. The rule was lifted deliberately, for those two verbs
+  and no others, and what replaced it is not permission but a regime:
+  - **One account per invocation.** There is no bulk mode and there is no flag
+    that makes one. The pattern Instagram acts on is not the daily total but
+    the burst — a hundred unfollows in half an hour is actioned even when the
+    day's count is unremarkable — and the follow-then-unfollow churn that
+    `snob unfollowers` makes so easy to automate is the specific behavior its
+    detection was built for. Piping a list of names into a loop is the user's
+    business; handing them the loop is ours, and we do not.
+  - **Every write is paid for out of its own budget**, the `writes` bucket in
+    `rate_budget`, which is far slower than the one reads come out of. The
+    numbers and their sources are in `crates/snob-ig/src/pace.rs`.
+  - **Every write is confirmed before it is sent**, on standard error, with
+    `-y` as the way to answer in advance. Nobody loses a follow to a typo.
+  - **A `feedback_required` on a write is an action block**, not a throttle, and
+    it earns the twelve-hour cooldown rather than the two-hour one.
+  The enforcement is structural, not a promise: writing goes through
+  `IgClient::post`, which cannot be reached without paying the write budget, and
+  a test reads the source of all three crates to check that no `media/seen` call
+  has appeared anywhere.
 - **Never read or decrypt the user's browser cookie store.** Chrome and Edge on
   Windows have protected it with App-Bound Encryption since v127, and getting
   past that protection is what credential-stealing malware is built to do. This
@@ -280,6 +306,10 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A rename filed mid-comparison waits for the next window | `store::watch::renames_since` bounds above by the `head` the caller read first |
 | Everything a scheduled run needs is checked while somebody is there | `snob watch check`, through `engine::check` — which takes `&App`, so it cannot record, and walks no list |
 | Whether the monitor is working is an answer, not a reading | `watch_setup::health`, in `status`'s output and in its exit code |
+| A write is paid for out of the write budget, and there is no other way to send one | `Pacer::clear_to_send_write`, inside `IgClient::post`, which is the only function in the workspace that sends a method other than GET to Instagram |
+| A write is never replayed by a redirect | the POST client is built on `redirect::Policy::none()` — following a hop on a write means doing the thing twice, which is not what "follow the redirect" costs on a read |
+| A write without a CSRF token is refused before it is sent | `IgClient::post` returns `IgError::NoCsrfToken` on an absent token rather than sending a request that will fail, so a `--paste` session cannot spend budget discovering it cannot write |
+| Nothing tells anybody you looked at their story | `crates/snob-core/tests/no_seen.rs` reads the source of all three crates for `media/seen` and its spellings. There is no function to call, and the guard is there so that adding one is a test failure rather than a code review |
 
 ## Running headless
 
