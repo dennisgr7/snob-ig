@@ -240,6 +240,17 @@ And the corrections worth knowing about:
   PowerShell an unquoted one is eaten before the command runs, and the answer
   comes back about your own account with exit 0.
 - "Followed by @ana, @luis and @eva and 2 others" reads as one list now.
+- `snob whoami --json` answers with an object when no session is stored. It
+  printed nothing at all, while a session that had *died* produced a full
+  object with `alive: false` — so the two states share exit code 3 and one of
+  them handed a parser nothing to read.
+- Exit code 2 is documented. It is what any unparseable command line returns,
+  and it was in neither the help nor the README, so a script branching on the
+  documented set met an undocumented code on the commonest mistake there is.
+- The three `X-Snob-*` headers every POST carries are documented:
+  `X-Snob-Event` to route on, `X-Snob-Delivery` to deduplicate on — the same
+  value as `run.id`, and stable across every retry of one report — and
+  `X-Snob-Attempt`.
 
 ## 0.1.1 — 2026-08-05
 
