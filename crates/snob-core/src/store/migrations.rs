@@ -27,7 +27,7 @@ use std::sync::LazyLock;
 use rusqlite_migration::{M, Migrations};
 
 /// Every migration, in the order they are applied.
-const CHAIN: [&str; 10] = [
+const CHAIN: [&str; 11] = [
     include_str!("sql/001_initial.sql"),
     include_str!("sql/002_watch.sql"),
     include_str!("sql/003_deliveries.sql"),
@@ -38,6 +38,7 @@ const CHAIN: [&str; 10] = [
     include_str!("sql/008_watch_state.sql"),
     include_str!("sql/009_newest_run.sql"),
     include_str!("sql/010_drop_member_index.sql"),
+    include_str!("sql/011_newest_run_seeks.sql"),
 ];
 
 /// How many there are, which is what `user_version` counts up to.

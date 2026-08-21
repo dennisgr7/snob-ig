@@ -371,6 +371,46 @@ pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
     }
 }
 
+/// Retention for every command that is not the monitor, at most once a day.
+///
+/// `prune` had exactly one caller and it was `snob watch`. Somebody who never
+/// sets the monitor up therefore has no retention at all: every walk stores a
+/// capture, nothing ever expires one, and the database grows without end --
+/// modelled at 22 MB after a year of daily use against the ~8 MB plateau a
+/// monitor user settles at, and rising linearly after that.
+///
+/// **The gate is a stored timestamp rather than a flag**, so an ordinary
+/// invocation costs one `SELECT` on a table with one row and nothing else. It
+/// is checked here, in `App::open`, because that is the one moment every
+/// command passes through -- the same reasoning that already puts
+/// `refresh_user_agent` here.
+///
+/// The count of reports given up on is deliberately dropped. Outside the
+/// monitor there is nobody it would mean anything to: `snob followers` did not
+/// queue it and cannot say anything useful about it, and the monitor's own
+/// settle reports it the next time it runs.
+pub fn settle_daily(db: &snob_core::store::Store) {
+    const KEY: &str = "settled_at";
+    const A_DAY: i64 = 24 * 3_600;
+
+    let now = snob_core::store::now();
+    let last = snob_core::store::meta_get(db.conn(), KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    if now - last < A_DAY {
+        return;
+    }
+
+    let _ = settle(db, now);
+    if let Err(e) = snob_core::store::meta_set(db.conn(), KEY, &now.to_string()) {
+        // Not worth failing an ordinary command over. The worst case is that
+        // the sweep runs again on the next one.
+        tracing::debug!(error = %e, "when retention last ran could not be recorded");
+    }
+}
+
 /// The same, for a run that never got as far as opening an `App`.
 ///
 /// [`settle`] is the only caller of `store::prune`, and both of its call sites

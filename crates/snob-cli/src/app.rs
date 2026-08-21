@@ -208,6 +208,10 @@ impl App {
         };
 
         let db = Store::open(paths)?;
+        // Retention, for the commands that are not the monitor. At most once a
+        // day, and here because this is the only moment every command passes
+        // through -- the same reason the User-Agent refresh above is here.
+        crate::engine::watch::settle_daily(&db);
         let progress = Progress::new(with_progress);
         let cancel = interrupt::install();
 

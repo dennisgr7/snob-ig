@@ -16,7 +16,7 @@ pub mod watch;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::Migrations;
 use thiserror::Error;
 
@@ -182,6 +182,30 @@ fn migrate(conn: &mut Connection, migrations: &Migrations<'_>) -> Result<(), Sto
         tracing::debug!(error = %e, "the database could not be compacted after migrating");
     }
 
+    Ok(())
+}
+
+/// One remembered value, from the `meta` table.
+///
+/// The table has existed since the first migration and nothing had ever read
+/// or written it. It is for facts about the database itself rather than about
+/// an account -- the first of them being when retention last ran.
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
     Ok(())
 }
 
