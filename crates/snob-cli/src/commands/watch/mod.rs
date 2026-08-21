@@ -377,6 +377,9 @@ async fn open_and_run(
         crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
         return Ok(());
     };
+    // The monitor takes an answer in advance from `watch.toml`, never from a
+    // flag, so the refusal when nobody is at a terminal has to say so.
+    app.consent_comes_from_the_config();
 
     run_one(args, &mut app, watched, delivery).await
 }
@@ -1033,6 +1036,9 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
         // and it is not the only door that closes before `run_accounts`.
         return Ok(ExitCode::NoSession);
     };
+    // The monitor takes an answer in advance from `watch.toml`, never from a
+    // flag, so the refusal when nobody is at a terminal has to say so.
+    app.consent_comes_from_the_config();
 
     let watched = watched_from(args.target.clone(), configured.as_ref());
 

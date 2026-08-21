@@ -44,6 +44,23 @@ fn args(target: &str) -> ListArgs {
 /// without a request, so a request would be a connection refused rather than a
 /// quietly served page.
 async fn ask(args: &ListArgs, someone_is_there: bool) -> (anyhow::Result<()>, usize) {
+    ask_as(args, someone_is_there, false).await
+}
+
+/// The same question from the monitor, which takes its answer from the file
+/// rather than from a flag.
+async fn ask_as_the_monitor(
+    args: &ListArgs,
+    someone_is_there: bool,
+) -> (anyhow::Result<()>, usize) {
+    ask_as(args, someone_is_there, true).await
+}
+
+async fn ask_as(
+    args: &ListArgs,
+    someone_is_there: bool,
+    from_the_config: bool,
+) -> (anyhow::Result<()>, usize) {
     let server = MockServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
     let db = Store::open_at(&tmp.path().join("test.db")).unwrap();
@@ -62,6 +79,10 @@ async fn ask(args: &ListArgs, someone_is_there: bool) -> (anyhow::Result<()>, us
         },
     );
 
+    if from_the_config {
+        app.consent_comes_from_the_config();
+    }
+
     let result = engine::ask_consent_with(&mut app, args, someone_is_there).await;
     let spent = server.received_requests().await.unwrap().len();
     (result, spent)
@@ -79,6 +100,32 @@ async fn with_nobody_to_ask_a_named_account_is_refused_before_anything_is_spent(
     assert!(
         error.to_string().contains("-y"),
         "the refusal has to say how to run it unattended: {error}"
+    );
+    assert_eq!(spent, 0, "nothing may be spent on a run nobody authorized");
+}
+
+/// And the monitor is told the way the monitor takes an answer.
+///
+/// One sentence used to name `-y` for every caller, but `watch once` has no
+/// `-y` and the reasoning for that is written at `WatchOnceArgs`: consent
+/// handed over on a command line is consent from whoever wrote the cron entry.
+/// So the refusal sent the operator to `snob watch once someone -y`, which
+/// clap rejects with `error: unexpected argument` and exit 2 — advice that
+/// cannot be followed, on the one path where nobody is watching.
+#[tokio::test]
+async fn the_monitor_is_pointed_at_the_answer_it_can_actually_take() {
+    let (result, spent) = ask_as_the_monitor(&args("@ghost"), false).await;
+
+    let error = result.expect_err("an unanswerable question is not a yes");
+    let message = error.to_string();
+    assert_eq!(ExitCode::from_chain(&error), Some(ExitCode::Interrupted));
+    assert!(
+        message.contains("snob watch setup"),
+        "the monitor's answer is recorded once, in the file: {message}"
+    );
+    assert!(
+        !message.contains("-y"),
+        "`watch once` has no -y, so it must not be advertised: {message}"
     );
     assert_eq!(spent, 0, "nothing may be spent on a run nobody authorized");
 }
