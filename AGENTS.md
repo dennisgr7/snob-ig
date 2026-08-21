@@ -485,24 +485,40 @@ Every command works and has been exercised against the live API **except the
 three added with the write regime**, which are covered below. Two things are
 deliberately unfinished:
 
-- **`stories`, `follow` and `unfollow` have not been run against Instagram.**
-  They are tested against a mock server at every level the rest of the tool is —
-  the client, the command, and the binary through the sandbox seam — and that is
-  not the same thing. Three specific claims are unverified and each would be
-  found by one counted request:
-  - that `GET /api/v1/feed/reels_media/?reel_ids=` answers on
-    **`www.instagram.com`** with a web session. It is documented against
-    `i.instagram.com`, and the header of `client.rs` says why this crate does not
-    go there. If it does not answer, the fallback to try is
-    `GET /api/v1/feed/user/{pk}/reel_media/`; if neither answers, `stories` is
-    withdrawn rather than the client being moved to the other host.
-  - which of the two envelope shapes arrives. Both are read, so either is fine,
-    but nobody has seen which.
-  - that the two `friendships` writes take the form and headers the web client
-    sends. They were read off a browser's own requests rather than guessed, but
-    read is not sent.
+- **`snob stories` works and has been run against Instagram.**
+  `GET /api/v1/feed/reels_media/?reel_ids=` answers on **`www.instagram.com`**
+  with a web session — which was the open question, because every write-up
+  documents that path against `i.instagram.com` and the header of `client.rs`
+  says why this crate does not go there. Confirmed in August 2026 against a real
+  account with stories up: the items, their sizes, `taken_at` and `expiring_at`
+  all arrive, and the largest candidate is the one taken.
+- **`snob follow` and `snob unfollow` reach Instagram and do not work yet.**
+  Everything around the request is exercised and sound — the write budget, the
+  confirmation, the refusal without a CSRF token before anything is spent, the
+  refusal to follow a redirect — and the request itself is refused. Two
+  spellings were sent live and the relationship read back after each; neither
+  changed anything:
+  - `POST /api/v1/friendships/create/{pk}/` answers **200 with the web app's
+    HTML shell**, which is what that edge serves for a path its API router did
+    not accept. No status to classify and no message to read.
+  - `POST /web/friendships/{pk}/follow/`, the older web route the Python
+    clients use, answers **404**. It is gone.
 
-  Until those are answered, treat these three as written and not proven.
+  The one unexamined difference from what a browser sends is
+  `x-web-session-id`. It has not been added on a guess: inventing a header a
+  browser derives from its own session is the disguise the header rules exist
+  to avoid, and each failed write is a request that looks like probing.
+  **The next step is a capture of the real request from a logged-in browser**,
+  not another attempt. `IgClient::friendship` carries the same record.
+- **Some accounts cannot be resolved at all, and it is Instagram's fault.**
+  `web_profile_info` answers **400** for certain business accounts with
+  `Asset asset://laser.provider/ig_business_category_subvertical has been
+  deleted. You cannot use this schema` — Instagram failing to serialize its own
+  reply. It breaks every command that takes a username, `pfp` and `scan`
+  included, and it predates all of this. Confirmed live on `elrubiuswtf` in
+  August 2026, reproducible. `instantgram` hit the same wall in July 2026 and
+  worked around it with a search-endpoint fallback for username-to-id, which is
+  the shape a fix here would take.
 
 - **`commands::import`** reads Instagram's data export correctly and is tested,
   but is **not registered in `cli.rs`**. What is unsettled is not the parsing but

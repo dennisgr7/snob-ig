@@ -235,11 +235,12 @@ const INITIAL_CLAIM: &str = "0";
 
 /// The route through the site that a follow button was reached by.
 ///
-/// Sent because the web client sends it and its absence is the anomaly, not
-/// because anything here depends on it. It says: profile page, arrived at cold.
-/// It is a constant rather than assembled per request — assembling it would be
-/// inventing a browsing history we did not have, which is disguise, and this
-/// project does coherence instead.
+/// Sent because the web client is reported to send it, not because anything
+/// here depends on it. It says: profile page, arrived at cold. A constant
+/// rather than assembled per request — assembling it would be inventing a
+/// browsing history we did not have, which is disguise, and this project does
+/// coherence instead. See [`IgClient::friendship`] for what is unsettled about
+/// the request it goes in.
 const NAV_CHAIN: &str = "PolarisProfilePostsTabRoot:profilePage:1:via_cold_start";
 
 /// Where every client built after this call points, in a testing build.
@@ -566,11 +567,35 @@ impl IgClient {
 
     /// The body of both, because the two differ by one word in the path.
     ///
-    /// The form fields are the ones the web client sends. `container_module`
-    /// and `nav_chain` say which screen the button was on, and they are sent
-    /// because a browser sends them: this project's whole header and body
-    /// posture is coherence rather than disguise, and a POST that carries only
-    /// the account id is not a shape the site produces.
+    /// # This route is not settled, and neither candidate worked
+    ///
+    /// **Do not read the path below as verified.** Two spellings were sent live
+    /// against a real session in August 2026, and both failed. The relationship
+    /// was read back after each, and neither had changed anything — so what
+    /// follows is a record of two eliminated answers, not one accepted one.
+    ///
+    /// - `POST /api/v1/friendships/create/{pk}/`, with the form body below, is
+    ///   the spelling every write-up of this API gives and is what the current
+    ///   web client is reported to send. It answers **200 carrying the web
+    ///   app's HTML shell**: no status to classify, no message to read, and a
+    ///   parse failure as the only symptom. That is what `www.instagram.com`
+    ///   serves for a path its API router did not accept, so something about
+    ///   the request is being refused before it is a friendship request at all.
+    /// - `POST /web/friendships/{pk}/follow/`, the older web route that the
+    ///   Python web clients use, answers **404**. That one is simply gone.
+    ///
+    /// The unexamined difference between what was sent and what a browser sends
+    /// is `x-web-session-id`, which the write-up lists and this client does not
+    /// send. It is not added on a guess: inventing a header a browser derives
+    /// from its own session is the disguise this module's header rules exist to
+    /// avoid, and one more failed write is a request to Instagram that looks
+    /// like probing. **The next step is a capture of the real request**, not
+    /// another attempt.
+    ///
+    /// Until then `snob follow` and `snob unfollow` reach Instagram and fail,
+    /// which is why `AGENTS.md` lists them as written and not working. The
+    /// budget, the confirmation, the refusal without a token and the refusal to
+    /// follow a redirect are all exercised by that failure and are not in doubt.
     async fn friendship(
         &self,
         verb: &str,
@@ -578,7 +603,7 @@ impl IgClient {
         username: &str,
     ) -> Result<FriendshipStatus, IgError> {
         let id = pk.to_string();
-        let result: FriendshipResult = self
+        let answer: FriendshipResult = self
             .post(
                 &format!("/api/v1/friendships/{verb}/{pk}/"),
                 &[
@@ -593,7 +618,7 @@ impl IgClient {
                 },
             )
             .await?;
-        Ok(result.friendship_status.unwrap_or_default())
+        Ok(answer.status())
     }
 
     /// Downloads a public asset, such as a profile picture.
@@ -1680,10 +1705,25 @@ mod tests {
             .with_base_url(Url::parse(&server.uri()).unwrap())
     }
 
-    const FOLLOWED: &str = r#"{"status":"ok","friendship_status":{"following":true,"outgoing_request":false,"followed_by":false,"is_private":false}}"#;
+    /// What `/web/friendships/{pk}/follow/` really answers: one word.
+    const FOLLOWED: &str = r#"{"result":"following","status":"ok"}"#;
 
+    /// The mobile shape, which this endpoint does not send and the client reads
+    /// anyway. Instagram has been moving the web client onto the `/api/v1/`
+    /// routes everywhere else, and the day it moves this one the answer changes
+    /// shape without changing meaning.
+    const FOLLOWED_OBJECT: &str =
+        r#"{"status":"ok","friendship_status":{"following":true,"outgoing_request":false}}"#;
+
+    /// **The route is `/web/friendships/`, and that was settled by trying it.**
+    /// `/api/v1/friendships/create/` is what every write-up gives and is the
+    /// The request this client sends, asserted against what it is *meant* to
+    /// send rather than against what Instagram accepts — see
+    /// [`IgClient::friendship`], which records that neither candidate route has
+    /// worked live and why the next step is a capture rather than a guess. When
+    /// that capture lands, this test is the thing to correct first.
     #[tokio::test]
-    async fn a_follow_posts_the_form_the_web_client_sends() {
+    async fn a_follow_posts_the_form_this_client_is_built_to_send() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/friendships/create/7/"))
@@ -1695,11 +1735,43 @@ mod tests {
         assert!(status.following);
 
         let requests = server.received_requests().await.unwrap();
-        let sent = &requests[0];
-        let body = String::from_utf8_lossy(&sent.body);
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body);
         assert!(body.contains("user_id=7"), "{body}");
         assert!(body.contains("container_module=profile"), "{body}");
         assert!(body.contains("nav_chain="), "{body}");
+    }
+
+    /// Either answer shape means the same thing to the caller.
+    #[tokio::test]
+    async fn both_answer_shapes_read_the_same() {
+        for body in [FOLLOWED, FOLLOWED_OBJECT] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            let status = writer(&server).await.follow(7, "someone").await.unwrap();
+            assert!(status.following, "{body}");
+            assert!(!status.outgoing_request, "{body}");
+        }
+    }
+
+    /// A private account answers `requested`, and that is not a follow.
+    #[tokio::test]
+    async fn a_private_account_answers_that_it_was_asked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"result":"requested","status":"ok"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let status = writer(&server).await.follow(7, "someone").await.unwrap();
+        assert!(status.outgoing_request);
+        assert!(!status.following, "a request is not a follow");
     }
 
     /// The three headers a POST carries that a GET does not, plus the CSRF

@@ -182,16 +182,54 @@ where
     }
 }
 
-/// What Instagram answers to `friendships/create` and `friendships/destroy`.
+/// What Instagram answers to a follow or an unfollow.
 ///
-/// The interesting field is `outgoing_request`. Following a private account does
-/// not follow it — it asks — and the difference is the whole answer to "did that
-/// work?". Reporting a request as a follow would be the command lying about the
-/// one thing it was run to do.
+/// **Two shapes, because there are two of these endpoints and only one of them
+/// is reachable from the web.** `/web/friendships/{pk}/follow/` answers with a
+/// single word — `"following"`, `"requested"`, `"unfollowed"` — under `result`;
+/// the mobile `/api/v1/friendships/create/` answers with the whole
+/// `friendship_status` object. Both are read, so that this keeps working if
+/// Instagram moves the web client onto the other one, which is the direction it
+/// has been moving everything else.
+///
+/// The interesting distinction either way is **requested versus following**.
+/// Following a private account does not follow it — it asks — and reporting a
+/// request as a follow would be the command lying about the one thing it was
+/// run to do.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FriendshipResult {
     #[serde(default)]
     pub friendship_status: Option<FriendshipStatus>,
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+impl FriendshipResult {
+    /// The relationship as it stands now, whichever shape said so.
+    ///
+    /// The object wins when it is there, because it says more. The word is read
+    /// only as a fallback, and an unrecognized one produces the default — every
+    /// flag false — which the command reports as "Instagram accepted it but
+    /// nothing changed". That is the honest reading of a word nobody here knows:
+    /// better than guessing it meant success.
+    pub fn status(self) -> FriendshipStatus {
+        if let Some(status) = self.friendship_status {
+            return status;
+        }
+        match self.result.as_deref() {
+            Some("following") => FriendshipStatus {
+                following: true,
+                ..Default::default()
+            },
+            Some("requested") => FriendshipStatus {
+                outgoing_request: true,
+                ..Default::default()
+            },
+            // What an unfollow answers, and it is the default: not following,
+            // nothing outstanding.
+            _ => FriendshipStatus::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

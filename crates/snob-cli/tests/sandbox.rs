@@ -887,9 +887,9 @@ async fn a_confirmed_unfollow_sends_one_post() {
     let instagram = fake_instagram(3, 2).await;
     Mock::given(method("POST"))
         .and(path_regex(r"^/api/v1/friendships/destroy/\d+/$"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"status":"ok","friendship_status":{"following":false,"outgoing_request":false}}"#,
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
+        )
         .mount(&instagram)
         .await;
     // The profile has to say the relationship exists, or the command correctly
