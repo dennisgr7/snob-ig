@@ -73,6 +73,32 @@ pub fn plain(
     builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()
 }
 
+/// The same, for a destination that is only allowed to be plain `http://`
+/// **because it is on the user's own network** — and which therefore must not
+/// be sent through a proxy.
+///
+/// `webhook::check` permits an unencrypted address exactly when it is private,
+/// on the stated grounds that the traffic stays inside the user's own network.
+/// With `HTTP_PROXY` set in the environment that reasoning is void: hyper-util's
+/// matcher has no loopback exemption, so a POST to `http://127.0.0.1:8787/hook`
+/// goes to the proxy instead — in the clear, carrying the report, the
+/// `Authorization` header and the signature. That was reproduced against a
+/// recording proxy, not reasoned about.
+///
+/// Go's `ProxyFromEnvironment` never proxies loopback for the same reason, and
+/// this is narrower still: it is applied only where the private address is the
+/// whole justification for the request being unencrypted. A public `https://`
+/// receiver keeps honoring the environment, because somebody behind a mandatory
+/// proxy has no other route out.
+pub fn plain_direct(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+) -> reqwest::Result<reqwest::Client> {
+    builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+        .no_proxy()
+        .build()
+}
+
 /// Reads a response body, stopping at `cap`.
 ///
 /// The same reasoning as the reader in `client.rs`: `text()` buffers whatever

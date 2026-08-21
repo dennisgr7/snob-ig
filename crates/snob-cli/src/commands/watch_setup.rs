@@ -616,9 +616,14 @@ fn ask_webhook() -> Result<WebhookAnswers> {
         "Sign the body, so the receiver can check it came from here?",
         true,
     )? {
-        let value = ui::prompt_secret("A shared secret (anything long and random)")?;
-        if value.trim().is_empty() {
-            bail!("a signing secret cannot be empty");
+        let value = ui::prompt_secret("A shared secret (at least 32 characters, random)")?;
+        if value.trim().chars().count() < 32 {
+            // The same floor `--sign-with` applies, for the same reason, and
+            // said in the same place a person is standing. A short secret is
+            // guessable offline by anybody holding one signed report.
+            bail!(
+                "a signing secret has to be at least 32 characters. Generate one --                  \"openssl rand -hex 32\" -- rather than choosing one"
+            );
         }
         Some(Secret::new(value.to_string()))
     } else {
