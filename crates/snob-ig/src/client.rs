@@ -301,6 +301,13 @@ const INITIAL_CLAIM: &str = "0";
 /// action block, a challenge, a dead session, a cancellation. What is left is
 /// the shapes a bad `doc_id` actually takes — a 400 with a body that did not
 /// parse, or one that did and said nothing useful.
+/// **`NotFound` is in here and is not in `worth_a_second_route`**, twenty lines
+/// away, and the two are not contradicting each other. There, a 404 means the
+/// account does not exist and a second lookup would be a second request spent
+/// confirming it. Here, a 404 is one of the ways Instagram refuses an operation
+/// it no longer serves under that identifier, and the discovery walk costs it
+/// nothing: it reads the CDN, not the API, so a wrong guess is bytes rather
+/// than a request against the account's budget.
 fn worth_rediscovering(error: &IgError) -> bool {
     matches!(
         error,
@@ -864,6 +871,19 @@ impl IgClient {
     ///   [`IgClient::dressed`] for the half of that rule which lives on
     ///   the read side.
     /// - **It follows no redirect at all**, through [`IgClient::writer`].
+    /// - **It is not abandoned once it is in flight**, and that is the one
+    ///   place this program does not do what `AGENTS.md` says about Ctrl+C.
+    ///   Every read races the cancel token against the socket, because giving
+    ///   up on a read costs nothing: the answer was going to be thrown away.
+    ///   Giving up on a write costs the one thing worth having, which is
+    ///   knowing whether it happened — the request has already gone, Instagram
+    ///   may well act on it, and reporting "canceled" to somebody who is now
+    ///   following an account is worse than making them wait out the timeout.
+    ///
+    ///   The boundary is exact rather than convenient: `clear_to_send_write`
+    ///   reads the token before it reserves and again inside the wait, so a
+    ///   write is cancelable up to the moment it is sent and not after it. The
+    ///   uncancelable part is the part that must not be abandoned.
     /// - **It cannot be pointed anywhere.** It takes a
     ///   [`graphql::Mutation`], not a path, so the set of things this program
     ///   can write is the set of variants that enum has. It used to take a
