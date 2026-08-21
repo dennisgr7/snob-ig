@@ -191,7 +191,14 @@ fn system_locale() -> Option<String> {
 /// captures show a handful of fixed values that move when the bundle is
 /// rebuilt. It is the lowest-value header of the set and is sent only because
 /// the browser sends it.
-pub const ASBD_ID: &str = "198387";
+///
+/// **Updated from a capture rather than from a search.** Chrome 151 on
+/// instagram.com in August 2026 sends `359341`; the `198387` this held before
+/// is an older bundle's, and a value that stale is the kind of small
+/// inconsistency the header set exists to avoid. It moves when Instagram
+/// rebuilds, so it will go stale again — which is why it is worth a note that
+/// the way to refresh it is to look, not to guess.
+pub const ASBD_ID: &str = "359341";
 
 /// What the browser behind a User-Agent would say about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
