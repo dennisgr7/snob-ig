@@ -481,8 +481,28 @@ Two judgment calls worth understanding before touching them:
 
 ## State
 
-Every command works and has been exercised against the live API. Two things are
+Every command works and has been exercised against the live API **except the
+three added with the write regime**, which are covered below. Two things are
 deliberately unfinished:
+
+- **`stories`, `follow` and `unfollow` have not been run against Instagram.**
+  They are tested against a mock server at every level the rest of the tool is —
+  the client, the command, and the binary through the sandbox seam — and that is
+  not the same thing. Three specific claims are unverified and each would be
+  found by one counted request:
+  - that `GET /api/v1/feed/reels_media/?reel_ids=` answers on
+    **`www.instagram.com`** with a web session. It is documented against
+    `i.instagram.com`, and the header of `client.rs` says why this crate does not
+    go there. If it does not answer, the fallback to try is
+    `GET /api/v1/feed/user/{pk}/reel_media/`; if neither answers, `stories` is
+    withdrawn rather than the client being moved to the other host.
+  - which of the two envelope shapes arrives. Both are read, so either is fine,
+    but nobody has seen which.
+  - that the two `friendships` writes take the form and headers the web client
+    sends. They were read off a browser's own requests rather than guessed, but
+    read is not sent.
+
+  Until those are answered, treat these three as written and not proven.
 
 - **`commands::import`** reads Instagram's data export correctly and is tested,
   but is **not registered in `cli.rs`**. What is unsettled is not the parsing but
