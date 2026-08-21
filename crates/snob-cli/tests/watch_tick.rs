@@ -559,7 +559,10 @@ async fn a_canceled_run_does_not_walk_the_second_list() {
     assert!(
         matches!(
             following.skipped,
-            Some(Skipped::Incomplete(snob_core::model::StopReason::Canceled))
+            Some(Skipped::Incomplete(
+                snob_core::model::StopReason::Canceled,
+                _
+            ))
         ),
         "a list nobody looked at must be refused, not concluded from: {:?}",
         following.skipped

@@ -1407,7 +1407,7 @@ fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
         // The same half-sentence the summary uses for the same situation.
         // Writing a second one here is how two commands end up describing one
         // event in two ways.
-        Skipped::Incomplete(reason) => format!(
+        Skipped::Incomplete(reason, _) => format!(
             "the {kind} list could not be read in full ({}), so it was not compared: the \
              accounts missing from it would have been reported as people who left",
             report::why_incomplete(reason).unwrap_or("it stopped early")
@@ -1741,7 +1741,7 @@ fn account_json(user: &User) -> serde_json::Value {
 fn skipped_token(skipped: Skipped) -> &'static str {
     match skipped {
         Skipped::NobodyLooked(_) => "not_verified",
-        Skipped::Incomplete(_) => "incomplete",
+        Skipped::Incomplete(..) => "incomplete",
     }
 }
 
