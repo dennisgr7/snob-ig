@@ -202,7 +202,7 @@ async fn a_configured_header_is_sent() {
     );
 }
 
-/// A configured header snob also sends replaces snob's, rather than travelling
+/// A configured header snob also sends replaces snob's, rather than traveling
 /// beside it.
 ///
 /// Two rounds of getting this wrong. `RequestBuilder::header` appends, so a

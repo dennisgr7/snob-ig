@@ -21,7 +21,7 @@ static TOKEN: OnceLock<CancelToken> = OnceLock::new();
 /// process: it opens an `App` per tick — so that each tick picks up a rotated
 /// session and holds no SQLite connection while it sleeps — and the old
 /// behavior would have left one listener per tick alive, thousands of them
-/// after a week, with the signal going to whichever won the race and cancelling
+/// after a week, with the signal going to whichever won the race and canceling
 /// a token that nothing was watching. The walk would have carried on.
 pub fn install() -> CancelToken {
     TOKEN

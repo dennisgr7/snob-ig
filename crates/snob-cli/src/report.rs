@@ -58,7 +58,7 @@ pub const NO_RECORDED_CONSENT: &str =
 /// reprimand for doing something wrong.
 ///
 /// `.for_stderr()` on every styled label is not optional. Without it `console`
-/// decides on stdout's colour state, so the labels lose their colour when only
+/// decides on stdout's color state, so the labels lose their color when only
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
 pub fn print_error(error: &anyhow::Error) {

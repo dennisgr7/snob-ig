@@ -345,7 +345,7 @@ pub fn commit(
 /// Takes the store rather than the `App`, because that is all it touches — and
 /// because the one caller that most needs it has no session to build an `App`
 /// from. `snob watch once` on a machine whose session has gone returns before
-/// anything is opened, and that is exactly the run that leaves reports ageing
+/// anything is opened, and that is exactly the run that leaves reports aging
 /// past `MAX_AGE_SECS` with `status` promising the next one will try them.
 ///
 /// Answers with the number of reports the sweep gave up on, because that one

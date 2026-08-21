@@ -160,7 +160,7 @@ enum Which {
 /// Recognizes `followers.json`, `followers_1.json`, `following.json` and so on,
 /// wherever they sit in the archive.
 ///
-/// The numeric suffix is checked rather than assumed, so neighbours like
+/// The numeric suffix is checked rather than assumed, so neighbors like
 /// `follow_requests_sent.json` are not swept in — they hold different
 /// relationships and would corrupt every count.
 fn list_in(name: &str) -> Option<Which> {
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn it_recognizes_the_files_and_leaves_the_neighbours_alone() {
+    fn it_recognizes_the_files_and_leaves_the_neighbors_alone() {
         let followers = Some(Which::Followers);
         let following = Some(Which::Following);
         assert_eq!(

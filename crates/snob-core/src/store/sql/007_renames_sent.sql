@@ -45,5 +45,5 @@ CREATE TABLE watch_renames_sent (
 -- that was already treated as "scanned and announced up to here", and the
 -- reader keeps that meaning: a rename at or below the cursor is outside the
 -- window and is never read at all. So an installation upgrading has an empty
--- set and the same behaviour it had, and the set only starts filling for
+-- set and the same behavior it had, and the set only starts filling for
 -- windows that stay open from here.

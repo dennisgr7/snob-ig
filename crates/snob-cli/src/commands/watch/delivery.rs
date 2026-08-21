@@ -1186,7 +1186,7 @@ mod tests {
     ///
     /// The guard reads the **merged** list rather than the flags: looking only
     /// at `--header` meant a configured one and the keyring's one both
-    /// travelled, and the second was the secret `setup` had put away.
+    /// traveled, and the second was the secret `setup` had put away.
     #[test]
     fn a_configured_authorization_stops_the_stored_token_being_added() {
         let file = configured(

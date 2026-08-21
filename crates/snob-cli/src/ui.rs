@@ -368,7 +368,7 @@ mod tests {
         assert!(!can_mask(false, false));
     }
 
-    /// The library behaviour the gate exists for, asserted rather than assumed.
+    /// The library behavior the gate exists for, asserted rather than assumed.
     ///
     /// `Term::read_key` on a stream that is not a tty answers `Key::Unknown` at
     /// once: no error, no block, and forever. That is what turns `continue`

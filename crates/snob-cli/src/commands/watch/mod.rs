@@ -549,7 +549,7 @@ async fn run_accounts(
     // owed from earlier runs goes out here — including when no account had news
     // of its own, which is the common case and the one that used to leave the
     // queue untouched. A machine whose hourly run failed all day left rows
-    // ageing past `MAX_AGE_SECS`, where `due` no longer returns them and
+    // aging past `MAX_AGE_SECS`, where `due` no longer returns them and
     // `failed` — the only thing that expires one — is never reached, while
     // `status` went on promising the next run would try them.
     //
@@ -1021,7 +1021,7 @@ fn describe_schedule(when: &When, schedule: &Schedule, now: bool) -> String {
 async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Settled before anything can refuse. This mode had the settle below and the
     // scheduled one had none, and the two doors above them closed first in both:
-    // a session that has gone leaves owed reports ageing past `MAX_AGE_SECS`,
+    // a session that has gone leaves owed reports aging past `MAX_AGE_SECS`,
     // where `due` no longer returns them and `failed` — the only thing that
     // expires one — is never reached, while `status` goes on promising the next
     // run will try them. A webhook address `webhook::check` refuses does the
@@ -2465,7 +2465,7 @@ target = "acquaintance"
     /// `friend` found no answer, so a correctly configured, correctly consented
     /// service died at startup quoting a consent that is written in the file it
     /// had just read -- and it died before the first tick, so it looked like a
-    /// configuration error rather than a spelling one. The name also travelled
+    /// configuration error rather than a spelling one. The name also traveled
     /// on: `engine::check` sent it as `username=@friend` and called a working
     /// monitor broken.
     #[test]
@@ -2845,7 +2845,7 @@ consent = { agreed_at = 1700 }
     /// same way, in silence, with the banner announcing a default nobody chose.
     ///
     /// Every field is given a value nothing else here has, so a field that is
-    /// dropped fails and a field that is copied into its neighbour fails too --
+    /// dropped fails and a field that is copied into its neighbor fails too --
     /// `at` and `on` are both `Vec<String>` and `every` and `jitter` are both
     /// `Option<Duration>`, and a swap between either pair compiles.
     ///

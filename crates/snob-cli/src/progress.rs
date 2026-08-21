@@ -99,7 +99,7 @@ impl Progress {
     ///
     /// The number is deliberately **not** written into the message. It is read
     /// from the deadline by the style, on every redraw, so it counts down — the
-    /// old behaviour put the number in the text once and then left it there,
+    /// old behavior put the number in the text once and then left it there,
     /// which meant fifteen seconds of a bar insisting there were fifteen
     /// seconds left.
     ///

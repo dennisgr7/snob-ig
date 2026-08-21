@@ -342,7 +342,7 @@ pub fn check(webhook: &Webhook) -> Result<()> {
     // `Content-Type` is deliberately **not** here. Asking for
     // `application/json; charset=utf-8` is an ordinary thing to want, and `post`
     // now builds one map so the user's value replaces snob's rather than
-    // travelling beside it.
+    // traveling beside it.
     const FRAMING: [&str; 5] = [
         "content-length",
         "transfer-encoding",
@@ -806,7 +806,7 @@ mod tests {
         assert!(check(&hook).is_ok());
 
         // Including one snob also sends, now that `post` builds a single map and
-        // the user's value replaces snob's instead of travelling beside it.
+        // the user's value replaces snob's instead of traveling beside it.
         let mut hook = webhook("https://example.com/hook");
         hook.headers.push((
             "Content-Type".into(),

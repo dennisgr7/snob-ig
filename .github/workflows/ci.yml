@@ -138,7 +138,7 @@ jobs:
             runner: macos-latest
           # No x86_64-apple-darwin. The only runner that built it, macos-13,
           # was retired in December 2025, and a job asking for it does not
-          # fail: it sits queued with no runner until the run is cancelled.
+          # fail: it sits queued with no runner until the run is canceled.
           # `macos-15-intel` would still work, but it is the last Intel image
           # Actions will offer and it goes away in August 2027, so adding it
           # buys a target with a known expiry date. Apple stopped selling

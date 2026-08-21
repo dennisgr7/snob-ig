@@ -10,7 +10,7 @@
 //!
 //! Everything here is pure: lists in, changes out. No clock, no database, no
 //! network. The rules about *which* two captures may be compared live in
-//! [`Basis`], which is the part with the judgement in it and therefore the part
+//! [`Basis`], which is the part with the judgment in it and therefore the part
 //! that gets tested on its own.
 
 use crate::Pk;

@@ -127,7 +127,7 @@ const SAME_MOMENT_GAP_SECS: i64 = 15 * 60;
 /// bound refused precisely the pair that was most obviously one moment, and
 /// went on refusing it every time that pair was read back with `--cache`.
 ///
-/// It is not a licence, either. A walk that genuinely took an hour, crossed
+/// It is not a license, either. A walk that genuinely took an hour, crossed
 /// against a snapshot from two hours later, still has an hour of gap and is
 /// still refused.
 ///
@@ -258,7 +258,7 @@ mod tests {
     /// A long walk widens its own interval; it does not excuse a partner from
     /// hours later.
     #[test]
-    fn a_long_walk_is_not_a_licence_for_a_stale_partner() {
+    fn a_long_walk_is_not_a_license_for_a_stale_partner() {
         let hour_long = walked(Provenance::CacheFlag, 0, 3_600);
         let much_later = outcome(Provenance::CacheFlag, 10_000);
         assert!(check_same_moment(&hour_long, &much_later).is_err());

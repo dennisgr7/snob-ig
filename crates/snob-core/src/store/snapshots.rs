@@ -608,7 +608,7 @@ mod tests {
     /// They ask the same five conditions, and they were two hand-typed `WHERE`
     /// clauses forty lines apart. Now they are one string with one bound value
     /// between them, which makes the asymmetry easy to read and easy to
-    /// "simplify" away -- so it is written down here as behaviour rather than as
+    /// "simplify" away -- so it is written down here as behavior rather than as
     /// a comment.
     ///
     /// `resumable` counts this process's own claim as available, because
