@@ -57,8 +57,33 @@ rusqlite_migration = "2.6"
 fastrand = "2.5"
 chrono = "0.4"
 directories = "6"
-# Windows and Linux (zbus) come with the defaults; macOS has to be asked for
-keyring = { version = "4", features = ["apple-native-keyring-store"] }
+# `keyring-core` plus one store per platform, rather than the `keyring` crate
+# that used to wrap them. The keyring project split in 2026 and `keyring 4.x`
+# now calls itself sample code; what it does on each platform is one line
+# picking exactly these stores and handing them to `keyring_core::set_default_store`,
+# which is what `secrets::use_the_platform_store` does directly.
+#
+# Two things came with going direct, and the second is why it was worth doing.
+# `default-features = false` on the Windows store drops its `search` feature and
+# `regex` and `aho-corasick` with it -- 863,744 bytes, 11.4% of both Windows
+# binaries, for an API nothing here calls. And the store's `persistence`
+# modifier is a supported way to ask for `CRED_PERSIST_LOCAL_MACHINE`, which
+# `keyring`'s own `Entry` did not expose; see `secrets::entry_for` for what that
+# closes and for the experiment that showed the change is safe to ship.
+#
+# The target names are unchanged by construction: these are the same stores in
+# the same default configuration `keyring 4` was already building.
+keyring-core = "1"
+windows-native-keyring-store = { version = "1", default-features = false }
+# `keychain` is not a default: the crate refuses to compile on macOS without it
+# or `protected`, and `protected` is the one that needs a code-signed
+# application, which this is deliberately not. The `keyring` wrapper used to
+# turn this on for us, and dropping it dropped the feature with it -- caught by
+# cross-checking the target rather than by a macOS release failing.
+apple-native-keyring-store = { version = "1", default-features = false, features = ["keychain"] }
+# `crypto-rust` rather than the OpenSSL default, for the same reason the webhook
+# signs with RustCrypto: this project does not link a C crypto library.
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 comfy-table = "7"
 indicatif = "0.18"
 supports-hyperlinks = "3"

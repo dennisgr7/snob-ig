@@ -455,12 +455,25 @@ Two judgment calls worth understanding before touching them:
   process cannot reliably delete its own executable on Windows, and one that
   managed it would leave `winget` or `apt` reporting a version that is no longer
   installed. The command prints the path and stops there.
-- **The Windows credential is written as `CRED_PERSIST_ENTERPRISE`**, which
-  Microsoft documents as visible on other computers for accounts with roamable
-  state. `keyring`'s `Entry` does not expose the modifier that would make it
-  local, and reaching it means depending on `keyring-core` directly and keeping
-  its version in lockstep or the shared default store breaks at run time. The
-  reasoning, and what would have to change, is in `secrets.rs::entry_for`.
+- **The Windows credential is written as `CRED_PERSIST_LOCAL_MACHINE`**, so it
+  stays on the machine that created it rather than following the user around a
+  network with Credential Roaming on. Getting there meant dropping the
+  `keyring` wrapper for `keyring-core` and the platform stores it was already
+  choosing, which is where the `persistence` modifier lives. What had to be
+  answered first was whether an entry written the old way survives the change,
+  and it was answered against a real Credential Manager rather than reasoned
+  about: `CredReadW` is keyed on the target name and the credential type and
+  takes nothing else, so an Enterprise entry is found unchanged by a lookup
+  from a store configured for Local, and the next save rewrites that one record
+  in place — `Persist` 3 becomes 2, no second entry, nothing orphaned. Nobody
+  is logged out and no read-under-both-persistences path is needed. The target
+  names did not move either, because these are the same stores in the same
+  default configuration `keyring 4` was building. `secrets.rs::entry_for`
+  carries the experiment; `the_windows_credential_is_local_to_this_machine`
+  keeps the modifier from being silently mistyped. Going direct also dropped
+  `regex` and `aho-corasick` with the Windows store's `search` feature:
+  **821,248 bytes, 10.41% of the x86_64 Windows binary**, measured either side
+  of the change.
 - **There is no lease over `watch_marks`, and the upsert is unconditional.**
   `snapshots` has a whole lease because the database is shared between
   processes; the marks have none, while `compare` reads the mark minutes before
@@ -665,18 +678,6 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **`keyring-core` and the platform stores.** The keyring project split in
-  2026 and `keyring 4.x` now calls itself sample code, pointing applications at
-  `keyring-core` plus a store. Two things arrive together:
-  `windows-native-keyring-store` with `default-features = false` drops `regex`
-  and `aho-corasick` — 863,744 bytes, 11.4% of both Windows binaries, for a
-  search API nothing calls — and its `persistence` modifier gives
-  `CRED_PERSIST_LOCAL_MACHINE` through a supported interface, retiring the
-  roaming-credential exposure below. **One thing must be answered against a
-  real Credential Manager before shipping it**: an entry written as Enterprise
-  has to still be found by a lookup under Local on the same target name, or the
-  first save after an upgrade silently logs every existing user out. That is
-  why this did not go into 0.2.0.
 - **Redirect hops are followed without being paced or charged.** Fixed: a
   *refused* redirect no longer retries. Still owed: the hops that are followed
   go out unpaid, against the standing rule that every request is paid for. The
