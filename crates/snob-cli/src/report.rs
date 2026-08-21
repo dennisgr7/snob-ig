@@ -4,11 +4,45 @@
 //! between commands, and two copies of "run it again" that drifted apart would
 //! read as two different pieces of advice about the same situation.
 
-use snob_core::model::{ListKind, StopReason};
+use snob_core::model::{ListKind, StopReason, User, printable};
 
 use crate::engine::Provenance;
 
 use crate::exit::{ExitCode, ExitError};
+
+/// What a machine with no `watch.toml` is told, by both things that look.
+///
+/// `engine::check::without_a_session` decides it for `snob watch check` and
+/// `watch_setup::health` decides it for `snob watch status`, and the two spelled
+/// it out separately, character for character. It is the advice a newly
+/// installed tool gives, so it is the sentence somebody edits — and an edit to
+/// one copy leaves two probes a person runs one after the other saying different
+/// things about the same machine, each with a test asserting it is right.
+pub const NOTHING_CONFIGURED: &str =
+    "nothing is configured, so a bare \"snob watch\" has no schedule to run on";
+
+/// What a missing consent means for a run with nobody at the keyboard.
+///
+/// Two lines in `engine::check` describe this one condition — the account that
+/// was polled, and the account nothing was asked about because a cooldown was
+/// standing, whose sentence is this one with a parenthetical after it. It is the
+/// reason `snob watch` refuses to start at all, so it is worth exactly one
+/// wording.
+///
+/// What it deliberately does not do is say what to do about it.
+/// `commands::watch::refuse_unattended` is the sentence that names
+/// `snob watch setup`, and that is the refusal itself rather than a report about
+/// one.
+///
+/// A `const` and not a typed reason on `Checked`. The wording being decided
+/// inside `engine` is the architecture rule, and moving it out is the right
+/// shape — but `Checked::problem` is a pass-through for whatever the schedule
+/// parser, Instagram or the user's own server said, so a typed reason needs a
+/// free-string variant anyway and every consumer still handles one. That trade
+/// is worth revisiting the day `problem` stops carrying foreign text; it is not
+/// worth nine sentences and a byte-identity promise across two renderers today.
+pub const NO_RECORDED_CONSENT: &str =
+    "no recorded consent, so an unattended run will refuse to read it";
 
 /// Prints a failed run's error, as one message rather than as several.
 ///
@@ -28,18 +62,31 @@ use crate::exit::{ExitCode, ExitError};
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
 pub fn print_error(error: &anyhow::Error) {
+    eprint!("{}", rendered(error));
+}
+
+/// The block `print_error` writes, built rather than printed.
+///
+/// Separate so a test can read it. Printing was four `eprintln!` calls and one
+/// early `return`, and the `return` was the branch that skipped the filter:
+/// there is no way to catch that from outside the process, so the way to catch
+/// it is to have something to assert on.
+fn rendered(error: &anyhow::Error) -> String {
     let code = ExitCode::from_chain(error);
     if code == Some(ExitCode::Interrupted) {
-        eprintln!("{error}");
-        return;
+        // No label, so nothing to indent under — but the filter is not the
+        // label's business. It applies here for the same reason it applies
+        // below: the sentence names an account, and the name came from
+        // `watch.toml` or from a terminal, not from this program.
+        return format!("{}\n", filtered(&error.to_string(), "\n"));
     }
 
     let label = console::style("error:").red().bold().for_stderr();
-    eprintln!("{label} {}", indented(&error.to_string()));
+    let mut out = format!("{label} {}\n", indented(&error.to_string()));
 
     for cause in error.chain().skip(1) {
         let caused = console::style("caused by:").dim().for_stderr();
-        eprintln!("  {caused} {}", indented(&cause.to_string()));
+        out.push_str(&format!("  {caused} {}\n", indented(&cause.to_string())));
     }
 
     if let Some(hint) = error
@@ -48,8 +95,10 @@ pub fn print_error(error: &anyhow::Error) {
         .and_then(ExitError::hint)
     {
         let label = console::style("hint:").cyan().bold().for_stderr();
-        eprintln!("{label}  {}", indented(hint));
+        out.push_str(&format!("{label}  {}\n", indented(hint)));
     }
+
+    out
 }
 
 /// Lines after the first start under the label rather than at column zero.
@@ -58,8 +107,31 @@ pub fn print_error(error: &anyhow::Error) {
 /// these strings are the ones somebody put between sentences, and re-wrapping
 /// would eventually split a URL or `snob login --paste` across a line. The
 /// terminal already soft-wraps at the width it really has.
+///
 fn indented(text: &str) -> String {
-    text.replace('\n', "\n       ")
+    filtered(text, "\n       ")
+}
+
+/// The filter every string this module prints goes through, which makes it the
+/// boundary the rule asks for: a name is filtered before anything draws it,
+/// whoever it came from. Each of these messages is built by interpolating
+/// something into a sentence, and each interpolation was one more place to
+/// remember — `checked_url` and `Blocked::AccountUnknown` were both forgotten.
+///
+/// **Line by line, not over the whole string.** `printable` turns any
+/// whitespace into a space, newlines included, so filtering the text whole
+/// would collapse the deliberate paragraph breaks [`indented`] exists to lay
+/// out. Split first and the real breaks survive while an escape sequence
+/// injected into a name does not.
+///
+/// `join` is how the caller puts the lines back together: under the label for
+/// a reported failure, and with a bare newline where there is no label to
+/// indent under.
+fn filtered(text: &str, join: &str) -> String {
+    text.split('\n')
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join(join)
 }
 
 /// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
@@ -203,9 +275,16 @@ pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error 
         Blocked::RefreshWanted => {
             format!("the account is in cooldown until {when}; --refresh cannot walk until it lifts")
         }
+        // Filtered here rather than at the call site, so every caller of the
+        // variant gets it. `engine::cooldown` passes `target::clean`'s answer,
+        // which only strips a leading `@` — and that name reaches this without
+        // anybody typing it, because `Watched::list_args` puts the one from
+        // `watch.toml` straight into `ListArgs.target` and nothing validates a
+        // username there.
         Blocked::AccountUnknown(name) => format!(
-            "the account is in cooldown until {when}, and no list of @{name} is stored \
-             to serve in the meantime"
+            "the account is in cooldown until {when}, and no list of @{} is stored \
+             to serve in the meantime",
+            printable(name)
         ),
         Blocked::NothingStored(kind) => format!(
             "the account is in cooldown until {when}, and no complete snapshot of the \
@@ -285,7 +364,8 @@ pub fn requests(n: u32) -> String {
 /// Everything else is told by `resumable`, which the store answered rather than
 /// this module guessing from the reason. `Truncated` used to be treated as
 /// proof that nothing was left to continue from, and that is true of exactly
-/// one of the five ways it arrives: the reclassification `pager::verdict` makes
+/// one of the five ways it arrives: the reclassification `verify_completion`
+/// makes
 /// once pagination has already ended, where there is no cursor to save. The
 /// other four — the hard page cap, a cursor that came back unchanged, two empty
 /// pages, and several pages with nothing new — stop in the **middle** of the
@@ -328,10 +408,272 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
     }
 }
 
+/// Nothing stored to answer with, and `--cache` said not to look.
+///
+/// Two situations reach this: the account has never been seen at all, and the
+/// account is known but this list of it has never been walked. They get the
+/// same answer because there is one thing to do about either — and they were
+/// written out separately, character for character, in two functions of
+/// `engine`. Reword one and they become two explanations of one situation with
+/// nothing comparing them.
+///
+/// It carries the `hint:` its four siblings here carry. It gains no exit code:
+/// the `anyhow` fallback is already `Error`, and this is the shape that keeps
+/// the advice apart from what happened.
+pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Error,
+        format!("no {kind} list is stored, and --cache says not to look for one"),
+    )
+    .with_hint(format!("run \"snob {kind}\" once, or drop --cache"))
+    .into()
+}
+
+/// "pepito, carlos and 4 others", or `None` when there is nobody to name.
+///
+/// The cap is not about width. Past a handful the line stops being "people you
+/// know" and becomes a list, and a list is what the `friends` command is for.
+///
+/// It lives here rather than in `engine` because it is a finished English
+/// sentence: it prefixes each name with `@`, joins with commas, swaps the last
+/// separator for "and" and picks between "1 other" and "N others". Wording is
+/// what `report` holds and what `engine` does not, and the drift had already
+/// started — with the count as a separate clause the line read "@ana, @luis and
+/// @eva and 2 others", two lists stapled together, because only one of the two
+/// joins knew about the other. The count is the last item now.
+pub fn name_a_few(people: &[User], cap: usize) -> Option<String> {
+    // A cap of zero would name nobody and count everybody, which is not a
+    // sentence anyone wants to read. At least one name, always.
+    let shown = cap.max(1).min(people.len());
+    if shown == 0 {
+        return None;
+    }
+
+    // Filtered here rather than at each consumer: this line is the first thing
+    // `snob scan` prints, with no flag needed, and it also goes into the
+    // markdown summary, whose escaping is about table cells rather than about
+    // what a terminal obeys.
+    let mut parts: Vec<String> = people[..shown]
+        .iter()
+        .map(|u| format!("@{}", u.safe_username()))
+        .collect();
+    parts.extend(match people.len() - shown {
+        0 => None,
+        1 => Some("1 other".to_string()),
+        n => Some(format!("{n} others")),
+    });
+
+    Some(match parts.as_slice() {
+        [one] => one.clone(),
+        // The last one joins with "and" rather than a comma, because this is a
+        // sentence rather than a column.
+        [start @ .., last] => format!("{} and {last}", start.join(", ")),
+        [] => unreachable!("the empty case returned above"),
+    })
+}
+
+/// A schedule as clauses, ready to be joined into a sentence.
+///
+/// Two places read a schedule back to a person — the banner a run opens with,
+/// and the summary `status` and `setup` print — and both built these four
+/// clauses out of the same four fields, down to the quoting around the cron
+/// expression and the `printable` on each one. They disagreed only on how to
+/// name the cron clause, which is exactly the kind of drift that makes a reader
+/// wonder whether the two are describing the same thing.
+///
+/// The caller supplies the verb, because "Runs …" and "Running …" are the
+/// difference between a description and an announcement.
+pub fn schedule_clauses(
+    every: Option<std::time::Duration>,
+    on: &[String],
+    at: &[String],
+    cron: Option<&str>,
+) -> Vec<String> {
+    let mut clauses = Vec::new();
+    if let Some(every) = every {
+        clauses.push(format!("every {}", snob_core::duration::format(every)));
+    }
+    if !on.is_empty() {
+        clauses.push(format!("on {}", printable(&on.join(", "))));
+    }
+    if !at.is_empty() {
+        clauses.push(format!("at {}", printable(&at.join(", "))));
+    }
+    if let Some(cron) = cron {
+        clauses.push(format!("on the schedule \"{}\"", printable(cron)));
+    }
+    clauses
+}
+
+/// What the jitter does, or nothing at all when there is none.
+///
+/// **The wording is shared and the number is not.** The banner reports
+/// `Schedule::jitter()`, which is clamped to what the calendar can absorb; the
+/// summary reports what the file says. Those are two different facts about the
+/// same setting, and a reader comparing them is entitled to see both — so each
+/// caller passes its own.
+pub fn jitter_sentence(jitter: std::time::Duration) -> Option<String> {
+    (!jitter.is_zero()).then(|| {
+        format!(
+            "Each run is pushed up to {} later, so it does not land on the same second every \
+             time.",
+            snob_core::duration::format(jitter)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::ListOutcome;
+
+    /// Every string this module draws goes through the name filter, and the
+    /// paragraph breaks it lays out survive it.
+    ///
+    /// `printable` turns any whitespace into a space, newlines included, so
+    /// filtering a refusal whole would collapse the very structure `indented`
+    /// exists to produce. Line by line, both hold.
+    #[test]
+    fn the_layout_survives_the_filter_and_an_escape_sequence_does_not() {
+        let hostile = "first line\u{1b}[2K\u{1b}[A\nsecond line";
+        let out = indented(hostile);
+
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "{out:?} reaches a terminal"
+        );
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "the deliberate break between sentences is not the filter's business: {out:?}"
+        );
+        assert!(out.starts_with("first line"));
+        assert!(out.trim_end().ends_with("second line"));
+    }
+
+    fn people(names: &[&str]) -> Vec<User> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| User {
+                pk: i as u64 + 1,
+                username: (*name).into(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nobody_is_not_a_sentence() {
+        assert_eq!(name_a_few(&[], 3), None);
+    }
+
+    /// This line opens `snob scan` with no flag asked for, so a username is
+    /// the shortest route from somebody else's profile to the terminal.
+    #[test]
+    fn a_hostile_name_cannot_drive_the_terminal() {
+        let hostile = people(&["ana\u{1b}[2K", "lu\u{202e}is"]);
+        let line = name_a_few(&hostile, 3).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert_eq!(line, "@ana[2K and @luis");
+    }
+
+    #[test]
+    fn one_name_stands_alone() {
+        assert_eq!(name_a_few(&people(&["ana"]), 3).unwrap(), "@ana");
+    }
+
+    #[test]
+    fn the_last_one_joins_with_and() {
+        assert_eq!(
+            name_a_few(&people(&["ana", "luis"]), 3).unwrap(),
+            "@ana and @luis"
+        );
+        assert_eq!(
+            name_a_few(&people(&["ana", "luis", "eva"]), 3).unwrap(),
+            "@ana, @luis and @eva"
+        );
+    }
+
+    /// The count is the last item of the one list, not a second list after it.
+    #[test]
+    fn past_the_cap_the_rest_are_counted() {
+        let five = people(&["ana", "luis", "eva", "juan", "sara"]);
+        assert_eq!(
+            name_a_few(&five, 3).unwrap(),
+            "@ana, @luis, @eva and 2 others"
+        );
+        assert_eq!(
+            name_a_few(&five, 4).unwrap(),
+            "@ana, @luis, @eva, @juan and 1 other"
+        );
+        // Exactly at the cap nothing is left over to count.
+        assert_eq!(
+            name_a_few(&five, 5).unwrap(),
+            "@ana, @luis, @eva, @juan and @sara"
+        );
+    }
+
+    /// A run somebody stopped gets no label, and for a while that meant it got
+    /// no filter either: the branch printed the error and returned above
+    /// everything else. The refusal below is the one a scheduled run raises,
+    /// and the name in it comes from `watch.toml`, where nothing validates a
+    /// username.
+    #[test]
+    fn a_stopped_run_is_filtered_even_though_it_carries_no_label() {
+        let hostile = "gh\u{1b}[2K\u{1b}[A";
+        let error: anyhow::Error = ExitError::new(
+            ExitCode::Interrupted,
+            format!(
+                "reading @{hostile}'s lists needs confirmation, and a scheduled run has \
+                 nobody to ask.\nRun \"snob watch setup\" to answer it once."
+            ),
+        )
+        .into();
+
+        let out = rendered(&error);
+
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "{out:?} reaches a terminal"
+        );
+        assert!(out.contains("@gh"), "the name is still shown: {out}");
+        assert!(
+            !out.contains("error:"),
+            "stopping a run is not a failure to report: {out}"
+        );
+        // No label above it, so the second sentence stays at column zero.
+        let mut lines = out.lines();
+        assert!(lines.next().is_some_and(|l| l.starts_with("reading @gh")));
+        assert_eq!(
+            lines.next(),
+            Some("Run \"snob watch setup\" to answer it once.")
+        );
+        assert_eq!(lines.next(), None);
+    }
+
+    /// An account name reaches the cooldown refusal without anybody typing it:
+    /// `Watched::list_args` puts the one from `watch.toml` straight into
+    /// `ListArgs.target`, and nothing validates a username there.
+    #[test]
+    fn a_cooldown_refusal_cannot_be_made_to_erase_the_line_above_it() {
+        let name = "gh\u{1b}[2K\u{1b}[A";
+        let error = refuse_in_cooldown(1_000, Blocked::AccountUnknown(name));
+        let message = error.to_string();
+
+        assert!(
+            !message.chars().any(|c| c.is_control()),
+            "{message:?} is printed to a terminal"
+        );
+        assert!(
+            message.contains("@gh"),
+            "the name is still shown: {message}"
+        );
+    }
 
     /// A walk that stopped for `reason`, and what Instagram said about it when
     /// that is more specific than the reason.
@@ -343,6 +685,7 @@ mod tests {
             started_at: 0,
             taken_at: 0,
             account_pk: 1,
+            snapshot_id: 1,
             stopped_by,
             resumable: false,
         }
@@ -622,7 +965,7 @@ third",
 
     /// The reclassified truncation is the one that really has nothing left.
     ///
-    /// `pager::verdict` reaches it **after** the pagination has ended, so the
+    /// `verify_completion` reaches it **after** the pagination has ended, so the
     /// snapshot closes with no cursor and `snapshots::resumable` will not
     /// return a row without one. The four guards that stop in the middle of the
     /// pagination do leave one, which is why the reason alone cannot answer

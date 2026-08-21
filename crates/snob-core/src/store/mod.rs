@@ -6,10 +6,12 @@
 //! version of `rusqlite` we use.
 
 pub mod accounts;
+pub mod deliveries;
 pub mod migrations;
 pub mod rate_budget;
 pub mod snapshots;
 pub mod users;
+pub mod watch;
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +36,34 @@ pub enum StoreError {
          longer compatible.\nDelete that file and run the command again."
     )]
     OutdatedSchema { path: String },
+    /// The other direction, and the one that is reachable today.
+    ///
+    /// v0.1.1 is tagged and installed through Scoop and Homebrew with one
+    /// migration while this branch writes eight, so a downgrade -- or a
+    /// leftover `~/.cargo/bin/snob` earlier on the `PATH` -- meets a database
+    /// it cannot read. Without this the user gets
+    /// `rusqlite_migration`'s own wording, "Attempt to migrate a database with
+    /// a migration number that is too high", about a file they have no reason
+    /// to think is broken; the plausible response is deleting it, which throws
+    /// away every capture and every mark.
+    #[error(
+        "the database at {path} was written by a newer version of snob: it is at schema \
+         {found} and this build knows {known}.\nUpgrade snob, or point this one at a \
+         different data directory."
+    )]
+    SchemaFromNewerSnob {
+        path: String,
+        found: i64,
+        known: usize,
+    },
+    /// A page arrived for a walk this process no longer holds.
+    ///
+    /// Its own variant rather than a [`StoreError::Data`] string because it is
+    /// the one store error that is not a fault: another process decided this
+    /// walk had been abandoned and adopted it, and the honest response is to
+    /// stop rather than to write a second stream of pages into one capture.
+    #[error("another process took over this walk")]
+    ClaimTaken,
     #[error("{0}")]
     Data(String),
 }
@@ -80,6 +110,7 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
         reject_outdated_schema(&conn, path)?;
+        reject_newer_schema(&conn, path)?;
         migrate(&mut conn, &migrations::MIGRATIONS)?;
         Ok(Self { conn })
     }
@@ -192,6 +223,27 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
 /// The schema version is 1 in both, so the migration runner would consider it
 /// up to date and every query would then fail with a cryptic SQL error. The
 /// missing view is the cheapest tell.
+/// Refuses a database written by a **newer** build, before the migration runner
+/// says so in its own words.
+///
+/// `rusqlite_migration` answers "Attempt to migrate a database with a migration
+/// number that is too high", wrapped in "could not apply migrations", which
+/// reads as an internal fault in a library the user has never heard of. It is
+/// reachable with no hypothetical build at all: v0.1.1 ships one migration and
+/// this branch writes eight.
+fn reject_newer_schema(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let known = migrations::COUNT;
+    if found as usize > known {
+        return Err(StoreError::SchemaFromNewerSnob {
+            path: path.display().to_string(),
+            found,
+            known,
+        });
+    }
+    Ok(())
+}
+
 fn reject_outdated_schema(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {
@@ -383,5 +435,46 @@ mod tests {
         };
         assert!(matches!(error, StoreError::OutdatedSchema { .. }));
         assert!(error.to_string().contains("Delete that file"));
+    }
+
+    /// A database from a newer snob says so, rather than letting the migration
+    /// runner say it in its own words.
+    ///
+    /// Reachable with no hypothetical build: v0.1.1 is tagged and installed
+    /// through Scoop and Homebrew with one migration while this branch writes
+    /// eight, so a downgrade — or a leftover `~/.cargo/bin/snob` earlier on the
+    /// `PATH` — meets a file it cannot read. What came out was "could not apply
+    /// migrations: … Attempt to migrate a database with a migration number that
+    /// is too high", which reads as an internal fault in a library the user has
+    /// never heard of, about a file they have no reason to think is broken. The
+    /// plausible response is deleting it, and that throws away every capture and
+    /// every mark.
+    #[test]
+    fn a_database_from_a_newer_snob_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ahead.db");
+
+        // A real database, then wound forward the way a newer build would leave
+        // it. The view has to be there or the *older*-schema check fires first.
+        Store::open_at(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", (migrations::COUNT + 3) as i64)
+                .unwrap();
+        }
+
+        let Err(error) = Store::open_at(&path) else {
+            panic!("a database from a newer snob should be refused");
+        };
+        assert!(
+            matches!(error, StoreError::SchemaFromNewerSnob { .. }),
+            "{error}"
+        );
+        let said = error.to_string();
+        assert!(said.contains("newer version of snob"), "{said}");
+        assert!(
+            !said.contains("Delete"),
+            "deleting it throws away every capture: {said}"
+        );
     }
 }

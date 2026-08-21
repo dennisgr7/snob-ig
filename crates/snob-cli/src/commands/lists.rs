@@ -123,6 +123,7 @@ mod tests {
             started_at: 0,
             taken_at: 0,
             account_pk: 1,
+            snapshot_id: 1,
             stopped_by: None,
             resumable: false,
         }
@@ -151,6 +152,17 @@ mod tests {
             exit_code(&outcome(ResultSource::Fetched, StopReason::SessionInvalid)),
             ExitCode::NoSession
         );
+        // The two the README used to promise were a 0, on the strength of "a
+        // plain list prints what it got". It does print it, and it still exits
+        // with what stopped it — a wrapper written against that paragraph
+        // treated the documented truncation wall as a success.
+        for stopped in [StopReason::Truncated, StopReason::Network] {
+            assert_eq!(
+                exit_code(&outcome(ResultSource::Fetched, stopped)),
+                ExitCode::Error,
+                "{stopped:?} is not something the user asked for"
+            );
+        }
         // A stored list is a stored list, whatever ended the walk that made it.
         assert_eq!(
             exit_code(&outcome(ResultSource::Cached, StopReason::Completed)),

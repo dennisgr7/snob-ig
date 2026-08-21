@@ -48,22 +48,102 @@ impl Viewer {
     /// How to name this account to a person: `@someone`, or the id when the
     /// name has not been learned yet.
     pub fn label(&self) -> String {
-        match self.safe_username() {
-            Some(name) => format!("@{name}"),
-            None => format!("account {}", self.pk),
-        }
+        label(self.pk, self.username.as_deref())
     }
+}
+
+/// How to name any account to a person: `@someone`, or the id when the name has
+/// not been learned yet.
+///
+/// A free function because the rule was written out four times — here and three
+/// more in the monitor, which names accounts it never has a `Viewer` for. All
+/// four did call `printable`, so nothing went out unfiltered; four spellings of
+/// one rule is four places to forget it.
+pub fn label(pk: Pk, username: Option<&str>) -> String {
+    match username {
+        Some(name) => format!("@{}", snob_core::model::printable(name)),
+        None => format!("account {pk}"),
+    }
+}
+
+/// The same rule where the absent case means the viewer rather than an account
+/// whose name is not known yet.
+///
+/// [`label`] answers "which account is this" and falls back to an id; this
+/// answers "whose lists are we talking about" and falls back to "your account".
+/// Two different questions, which is why they are two functions — and it was
+/// written out three times: the banner a scheduled run opens with, the line
+/// `watch check` prints per account, and the context on a failed walk, that
+/// last one built inside `engine`, where wording does not belong.
+pub fn target_label(target: Option<&str>) -> String {
+    match target {
+        Some(name) => format!("@{}", snob_core::model::printable(name)),
+        None => "your account".to_string(),
+    }
+}
+
+/// The one place a [`Pacer`] is assembled.
+///
+/// Three things have to be true of every one of them and only this had them all:
+/// the store is opened first, because it creates the schema the budget then
+/// opens its own connection to; the process's cancellation token is attached, so
+/// Ctrl+C reaches a request waiting on the budget; and somebody is told when a
+/// wait is imposed, because a command that stops dead for twenty minutes with no
+/// explanation reads as a hang.
+///
+/// `login` and `whoami` each built their own instead — `Pacer::new(budget)` and
+/// nothing else — which is the rule about `commands` never assembling their own
+/// dependencies, and it cost exactly what that rule exists to prevent. `snob
+/// whoami` on a rationed bucket sat silent for as long as the debt lasted, and
+/// `login --browser` had already installed the interrupt handler by the time it
+/// reached the validating request, so the first Ctrl+C printed "Stopping and
+/// saving what has been fetched…" and changed nothing at all.
+///
+/// `announce` stays with the caller: what a wait looks like is presentation, and
+/// a progress bar is right for a walk while a line on standard error is right
+/// for a single request. The wiring is what is shared.
+pub fn pacer(
+    paths: &AppPaths,
+    announce: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+) -> Result<Pacer> {
+    // The store goes first: it is what creates the schema, and the budget opens
+    // its own connection to a file that has to have tables already.
+    Store::open(paths)?;
+    Ok(Pacer::new(Arc::new(SqliteRateBudget::open(paths)?))
+        .with_cancel(interrupt::install())
+        .announcing(announce))
+}
+
+/// How a run could have been given consent before it started.
+///
+/// The refusal printed when nobody is at a terminal names the way *this*
+/// command takes an answer in advance, and the two commands do not take it the
+/// same way. The list commands have `-y`. `snob watch once` deliberately does
+/// not — the reasoning is written at `WatchOnceArgs` in `cli.rs`, and it is
+/// that consent handed over on a command line is consent from whoever wrote
+/// the cron entry. One shared sentence named `-y` for both, so the monitor
+/// answered "there is no terminal to ask at" with advice that then failed to
+/// parse: `snob watch once someone -y` is `error: unexpected argument`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsentInAdvance {
+    /// `-y` on the command line.
+    #[default]
+    Flag,
+    /// An `[[account]]` in `watch.toml` carrying the answer somebody gave once,
+    /// which is what `snob watch setup` writes.
+    WatchConfig,
 }
 
 pub struct App {
     client: IgClient,
     db: Store,
     progress: Progress,
+    consent_in_advance: ConsentInAdvance,
     cancel: CancelToken,
     viewer: Viewer,
-    consented: bool,
-    /// The account this run is about, once something has worked it out, and the
-    /// request count at the moment it did.
+    consented: Option<String>,
+    /// What was asked for, what it resolved to, and the request count at the
+    /// moment it did.
     ///
     /// A crossing calls `engine::list` twice, and each call used to resolve from
     /// scratch: two identical `web_profile_info` requests about the same account
@@ -71,12 +151,31 @@ pub struct App {
     /// four, because resolving the name and polling the counters are separate
     /// requests there.
     ///
-    /// The count is what makes reuse safe. Anything that spends a request may
-    /// have changed the account — a walk, a retry, a `--refresh` — so the memo
-    /// is only good while `Pacer::spent()` has not moved. That is strictly
-    /// stronger than asking whether the previous list came from cache, and it
-    /// reuses the number AGENTS.md already names as the truth about requests.
-    resolved: Option<(target::Target, u32)>,
+    /// **The question is part of the key, not just the answer.** This used to
+    /// hold the target alone, which was indistinguishable from correct while
+    /// one `App` meant one account. `snob watch` broke that: it walks several
+    /// configured accounts through a single `App`, and the second account was
+    /// silently handed the first one's target — never resolved, never walked,
+    /// and its changes committed under the first account's marks. Keying on what
+    /// was asked makes reuse mean "the same question", which is what the memo
+    /// was always for.
+    ///
+    /// The count is what makes reuse safe in time. Anything that spends a
+    /// request may have changed the account — a walk, a retry, a `--refresh` —
+    /// so the memo is only good while `Pacer::spent()` has not moved. That is
+    /// strictly stronger than asking whether the previous list came from cache,
+    /// and it reuses the number AGENTS.md already names as the truth about
+    /// requests.
+    resolved: Option<Memo>,
+}
+
+/// One resolution, and the question it answers.
+struct Memo {
+    /// The `--target` this was resolved for, exactly as it was given. `None` is
+    /// the viewer's own account, which is a different question from any name.
+    asked: Option<String>,
+    target: target::Target,
+    spent: u32,
 }
 
 impl App {
@@ -108,15 +207,11 @@ impl App {
             username: session.username.clone(),
         };
 
-        // The store goes first: it is what creates the schema, and the budget
-        // opens its own connection to a file that has to have tables already.
         let db = Store::open(paths)?;
-        let budget = Arc::new(SqliteRateBudget::open(paths)?);
-
         let progress = Progress::new(with_progress);
         let cancel = interrupt::install();
 
-        let announce = {
+        let pacer = pacer(paths, {
             let progress = progress.clone();
             // `waiting` rather than `note`: the number counts down on the bar
             // instead of being frozen into the message at the moment the wait
@@ -124,11 +219,7 @@ impl App {
             Arc::new(move |waited: std::time::Duration| {
                 progress.waiting("the request budget is rationing", waited);
             })
-        };
-
-        let pacer = Pacer::new(budget)
-            .with_cancel(cancel.clone())
-            .announcing(announce);
+        })?;
 
         Ok(Some(Self {
             client: IgClient::new(session, pacer)?,
@@ -136,7 +227,8 @@ impl App {
             progress,
             cancel,
             viewer,
-            consented: false,
+            consented: None,
+            consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
         }))
     }
@@ -146,15 +238,23 @@ impl App {
     /// **Tests only.** It skips the signal handler and the progress bar, which
     /// are the two things a test has no use for and one of which would spawn a
     /// task per test.
+    /// The one thing it does **not** skip is how the cancellation is wired.
+    /// [`App::open`] hands one token to both the app and the client's pacer;
+    /// this used to build a second, unconnected one, so cancelling an `App` in
+    /// a test never reached a request. Every guard that stops a canceled run
+    /// spending was therefore unreachable from any test — which is how two of
+    /// them came to be missing.
     #[doc(hidden)]
     pub fn for_test(client: IgClient, db: Store, viewer: Viewer) -> Self {
+        let cancel = client.pacer().cancel_token().clone();
         Self {
             client,
             db,
             progress: Progress::new(false),
-            cancel: CancelToken::default(),
+            cancel,
             viewer,
-            consented: false,
+            consented: None,
+            consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
         }
     }
@@ -199,12 +299,43 @@ impl App {
     ///
     /// Only a real answer sets it. The cooldown path never asks, so it can
     /// never vouch for one.
-    pub fn has_consent(&self) -> bool {
+    ///
+    /// **The account is part of the key, not just the answer.** This was a bare
+    /// `bool`, which is indistinguishable from correct while one `App` means one
+    /// account — the very shape the `resolved` memo below records as having
+    /// already bitten here once, and been fixed by keying on the question.
+    /// `run_accounts` walks every configured account through one `App`, on
+    /// purpose ("One `App` for all of them"), so a yes about @alice let @bob's
+    /// followers *and* following be enumerated with no question printed.
+    ///
+    /// Compared case-insensitively, because Instagram treats two spellings that
+    /// differ only in case as one account, and one `Option` is enough because
+    /// the accounts of a run are ticked one after another.
+    pub fn has_consent(&self, asked: &str) -> bool {
         self.consented
+            .as_deref()
+            .is_some_and(|given| given.eq_ignore_ascii_case(asked))
     }
 
-    pub fn record_consent(&mut self) {
-        self.consented = true;
+    pub fn record_consent(&mut self, asked: &str) {
+        self.consented = Some(asked.to_string());
+    }
+
+    /// How this run could have been given consent before it started.
+    ///
+    /// Read only by the refusal in `engine::ask_consent_with`, which is shared
+    /// by every command that enumerates somebody else and therefore cannot know
+    /// on its own which of the two answers applies.
+    pub fn consent_in_advance(&self) -> ConsentInAdvance {
+        self.consent_in_advance
+    }
+
+    /// Said by the monitor's two walking entry points, and nothing else.
+    ///
+    /// One process is one command, so this is a property of the run rather
+    /// than of a call.
+    pub fn consent_comes_from_the_config(&mut self) {
+        self.consent_in_advance = ConsentInAdvance::WatchConfig;
     }
 
     /// The target this run already worked out, if anything did.
@@ -226,19 +357,31 @@ impl App {
     /// fine — the first list already passed it, and the account cannot have
     /// become private in between in a way that matters — but it is a skip, not
     /// an oversight.
-    pub fn resolved_target(&self) -> Option<target::Target> {
-        let (target, at) = self.resolved.as_ref()?;
-        let mut target = target.clone();
-        if *at != self.client.pacer().spent() {
+    /// What `asked` resolved to earlier in this run, if it was the same
+    /// question.
+    ///
+    /// Compared raw, on the string that was given. Two spellings of one account
+    /// simply miss the memo and resolve again, which costs a request; a memo
+    /// handed to the wrong account costs correctness, and that is not a trade.
+    pub fn resolved_target(&self, asked: Option<&str>) -> Option<target::Target> {
+        let memo = self.resolved.as_ref()?;
+        if memo.asked.as_deref() != asked {
+            return None;
+        }
+        let mut target = memo.target.clone();
+        if memo.spent != self.client.pacer().spent() {
             target.counters = None;
         }
         Some(target)
     }
 
-    /// Remembers what the run is about, stamped with what had been spent.
-    pub fn remember_target(&mut self, target: target::Target) {
-        let spent = self.client.pacer().spent();
-        self.resolved = Some((target, spent));
+    /// Remembers what a question resolved to, stamped with what had been spent.
+    pub fn remember_target(&mut self, asked: Option<&str>, target: target::Target) {
+        self.resolved = Some(Memo {
+            asked: asked.map(str::to_string),
+            target,
+            spent: self.client.pacer().spent(),
+        });
     }
 
     /// Adds the counters a poll just obtained, and re-stamps.
@@ -251,9 +394,9 @@ impl App {
     /// have moved.
     pub fn remember_counters(&mut self, counters: target::Counters) {
         let spent = self.client.pacer().spent();
-        if let Some((target, at)) = &mut self.resolved {
-            target.counters = Some(counters);
-            *at = spent;
+        if let Some(memo) = &mut self.resolved {
+            memo.target.counters = Some(counters);
+            memo.spent = spent;
         }
     }
 
@@ -266,7 +409,22 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::Viewer;
+    use super::{Viewer, target_label};
+
+    /// The three copies of this rule all called `printable`, and none of them
+    /// had anything watching that they did.
+    ///
+    /// Two of the three take the name from `watch.toml`, which validates a
+    /// username not at all, and one of those is the banner a scheduled service
+    /// opens with — the first thing a monitor ever prints.
+    #[test]
+    fn naming_a_target_takes_out_what_a_terminal_would_obey() {
+        let shown = target_label(Some("friend\u{1b}[2K"));
+        assert!(!shown.contains('\x1b'), "{shown:?}");
+        assert_eq!(shown, "@friend[2K");
+
+        assert_eq!(target_label(None), "your account");
+    }
 
     /// The name here came from Instagram — `whoami` writes it out of
     /// `resolve_username` — not from the command line, and it ends up as the

@@ -31,6 +31,50 @@ pub struct Cli {
     #[arg(long, global = true, display_order = 901)]
     pub verbose: bool,
 
+    /// Keep every file this run reads or writes under this directory
+    ///
+    /// A testing build only. Replaces the discovered data and configuration
+    /// directories, puts the session in a file inside it rather than in the
+    /// system keyring, **and gives the run a keyring namespace of its own** —
+    /// so a sandbox run cannot read, write or delete the real one. That is the
+    /// property [`Cli::ig_base_url`] leans on.
+    ///
+    /// All three, and the third is not decoration. The store reaches the
+    /// keyring whatever backend it is on, so with the real service name a
+    /// sandbox `login` deleted the developer's session and a sandbox that had
+    /// not logged in yet loaded the real cookie — which is the exact thing the
+    /// pairing below exists to prevent. `main::wiring` is where the namespace
+    /// is assigned and says the rest.
+    #[cfg(feature = "testing")]
+    #[arg(long, global = true, hide = true, display_order = 902)]
+    pub sandbox_root: Option<std::path::PathBuf>,
+
+    /// Ask this server instead of Instagram
+    ///
+    /// A testing build only, and it **requires `--sandbox-root`**. That is the
+    /// whole safety argument, and it is enforced by clap rather than described:
+    /// a redirected client can only ever carry a session out of a store inside
+    /// the sandbox root, so the session belonging to the person running this is
+    /// not reachable from a redirected run. Without that pairing the flag would
+    /// be a way to send a real session cookie to somebody else's server.
+    ///
+    /// Nothing about it is loopback-only, deliberately. `IgClient::is_live`
+    /// decides whether the pace is real by address, so a proxy on `127.0.0.1`
+    /// forwarding to Instagram would be a test server by address and Instagram
+    /// by content — a real account walked with no waits between pages. A
+    /// loopback restriction would look like the safe option and be the
+    /// dangerous one; an empty sandbox store is the thing that actually helps.
+    #[cfg(feature = "testing")]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        display_order = 903,
+        requires = "sandbox_root",
+        value_name = "URL"
+    )]
+    pub ig_base_url: Option<url::Url>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -56,6 +100,8 @@ it (\"@someone\"): on PowerShell an unquoted one is eaten by the shell.
 Exit codes:
   0   it worked; a list cut short by --limit or --max-pages is still a 0
   1   it failed, or a result was refused because a list came back incomplete
+  2   the command line could not be parsed; nothing was done, and running it
+      again unchanged will not help
   3   no session, or the stored one no longer works -- run \"snob login\"
   4   Instagram wants the account verified -- open the address it prints
   5   Instagram is throttling, or the account is in cooldown -- wait
@@ -107,6 +153,9 @@ pub enum Command {
 
     /// Download a profile picture in high resolution
     Pfp(PfpArgs),
+
+    /// Track an account over time and report what changed
+    Watch(WatchArgs),
     // `import dyi` is written and tested but not wired up here on purpose: the
     // reader works, and what is unfinished is the question of what an import
     // should be able to do once it is in. Leaving it out of the CLI keeps the
@@ -227,35 +276,219 @@ pub struct ListArgs {
     pub yes: bool,
 }
 
-/// Parses durations written like `30m`, `6h`, `2d`.
+/// Parses durations written like `30m`, `6h`, `2d`, `2w`.
+///
+/// A thin wrapper because clap wants this exact signature. The parser itself
+/// lives in `snob-core`: the monitor's schedule and its configuration file read
+/// the same durations, and a second copy that understood `w` while this one did
+/// not is how `--max-age 2w` comes to mean two seconds.
 fn duration(text: &str) -> Result<std::time::Duration, String> {
-    let text = text.trim();
-    let (number, factor) = match text.chars().last() {
-        Some('s') => (&text[..text.len() - 1], 1),
-        Some('m') => (&text[..text.len() - 1], 60),
-        Some('h') => (&text[..text.len() - 1], 3600),
-        Some('d') => (&text[..text.len() - 1], 86400),
-        // With no suffix, seconds are assumed.
-        Some(c) if c.is_ascii_digit() => (text, 1),
-        _ => {
-            return Err(format!(
-                "\"{text}\" is not a valid duration (try 30m, 6h or 2d)"
-            ));
-        }
-    };
+    snob_core::duration::parse(text)
+}
 
-    let value: u64 = number
-        .trim()
-        .parse()
-        .map_err(|_| format!("\"{text}\" is not a valid duration (try 30m, 6h or 2d)"))?;
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct WatchArgs {
+    /// Absent means "run on a schedule".
+    #[command(subcommand)]
+    pub command: Option<WatchCommand>,
 
-    // A number long enough to overflow is not a duration anyone means, and
-    // wrapping it would silently turn "never expire" into "expire at once".
-    let seconds = value
-        .checked_mul(factor)
-        .ok_or_else(|| format!("\"{text}\" is too long to be a duration"))?;
+    #[command(flatten)]
+    pub run: WatchRunArgs,
+}
 
-    Ok(std::time::Duration::from_secs(seconds))
+/// `snob watch` with no subcommand: stay up and run on a schedule.
+#[derive(Args, Debug, Default)]
+pub struct WatchRunArgs {
+    /// Account to watch. Defaults to your own.
+    pub target: Option<String>,
+
+    /// How often to run: 6h, 2d, 2w
+    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    pub every: Option<std::time::Duration>,
+
+    /// Times of day to run at: 09:00,21:00
+    #[arg(long, value_delimiter = ',', value_name = "HH:MM")]
+    pub at: Vec<String>,
+
+    /// Days to run on: mon,thu. Defaults to every day.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "DAYS",
+        conflicts_with = "cron"
+    )]
+    pub on: Vec<String>,
+
+    /// A five-field cron expression, for a schedule you already have written
+    #[arg(long, value_name = "EXPR", conflicts_with = "at")]
+    pub cron: Option<String>,
+
+    /// How far a run may be pushed later, so it does not land on the same
+    /// second every day. Worked out from the interval if not given; 0 turns it
+    /// off.
+    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    pub jitter: Option<std::time::Duration>,
+
+    /// Run once at start, then follow the schedule
+    #[arg(long)]
+    pub now: bool,
+
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
+    /// Emit one JSON object per run, on standard output
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
+}
+
+/// Where a report goes, shared by the scheduled run and `once`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct WebhookArgs {
+    /// POST each report to this address, as JSON
+    #[arg(long, value_name = "URL")]
+    pub webhook: Option<String>,
+
+    /// Header to send with it, repeatable: --header "Authorization: Bearer x"
+    // A literal token here ends up in the shell history and in `ps`. The help
+    // says so rather than the code refusing it: this is the shape that works in
+    // a systemd unit, where the value comes from an environment file.
+    #[arg(long, value_name = "NAME: VALUE")]
+    pub header: Vec<String>,
+
+    /// Sign the body with this secret, so the receiver can check it came from
+    /// here. Sent as an X-Snob-Signature header.
+    #[arg(long, value_name = "SECRET")]
+    pub sign_with: Option<String>,
+
+    /// Send a report even when nothing changed, so something watching for
+    /// silence can tell "nothing happened" from "it stopped running"
+    #[arg(long)]
+    pub heartbeat: bool,
+}
+
+/// The monitor.
+///
+/// Optional: `snob watch` with no subcommand is the scheduled run, taking its
+/// interval from the command line or from `watch.toml`. The subcommands are the
+/// things a person does by hand — look once, read the last diff, configure it,
+/// ask what it has been doing.
+#[derive(Subcommand, Debug)]
+pub enum WatchCommand {
+    /// What has changed since the last time the monitor reported
+    #[command(
+        after_help = "Reads what is already stored and spends no requests, so it costs nothing \
+                      to run as often as you like and it never moves the monitor on: ask twice \
+                      and you get the same answer.\n\n\
+                      With nothing walked yet there is nothing to compare against. Run \
+                      \"snob followers\" or \"snob following\" once first."
+    )]
+    Diff(WatchDiffArgs),
+
+    /// Look now, report what changed, and remember having reported it
+    #[command(
+        after_help = "One run of the monitor. Meant for cron, a systemd timer or Windows Task \
+                      Scheduler; \"snob watch\" with no subcommand schedules \
+                      itself instead.\n\n\
+                      It reads the account's counters and only walks a list if its counter moved, \
+                      so a run with nothing to report costs a single request. Unlike \"diff\", \
+                      this moves the monitor on: whatever it reports is not reported again.\n\n\
+                      The first run on an account has nothing to compare against, so it reports \
+                      nothing and says so."
+    )]
+    Once(WatchOnceArgs),
+
+    /// Write the configuration file, step by step
+    #[command(
+        after_help = "Asks how often to run, where to send the reports, and which accounts to \
+                      watch, then writes a file you can edit afterwards.\n\n\
+                      A token or a signing key goes into the system keyring, never into the \
+                      file: it sits at a guessable path and would end up in every backup of \
+                      your home directory. \"snob purge\" removes both."
+    )]
+    Setup(WatchSetupArgs),
+
+    /// Check the configuration would work, before it runs unattended
+    #[command(
+        after_help = "Everything a scheduled run needs, checked while somebody is still here to \
+                      fix it: the schedule through the evaluator that actually decides it, the \
+                      session, that each configured account resolves and may be read, and the \
+                      webhook — by posting one \"watch.preflight\" message to it.\n\n\
+                      It writes nothing and walks no list, and it exits non-zero when something \
+                      would stop a run, which is what makes it usable as a monitoring probe. \
+                      Poll it hourly rather than by the minute: every invocation is charged to \
+                      the same daily budget the walks draw on, and a probe that drains it \
+                      causes the condition it is watching for.\n\n\
+                      Cost: one request to check the session, one per configured account, and \
+                      one more while the session has not learned its own account's name — \
+                      which it does the first time \"snob whoami\" runs."
+    )]
+    Check(WatchCheckArgs),
+
+    /// What is configured, when it last ran, and what is still owed
+    Status(WatchStatusArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchCheckArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not post anything to the webhook
+    #[arg(long)]
+    pub no_webhook: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchSetupArgs {
+    /// Print what would be written and write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchStatusArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchDiffArgs {
+    /// Account to report on. Defaults to your own.
+    pub target: Option<String>,
+
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchOnceArgs {
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
+    /// Account to watch. Defaults to your own.
+    // No -y here, and deliberately. Consent to enumerate somebody else's lists
+    // is a thing a person gives, and an unattended run that could be handed one
+    // on the command line is one whose consent came from whoever wrote the cron
+    // entry. Reading another account needs a terminal to ask at, or an
+    // `[[account]]` in `watch.toml` carrying the answer somebody gave once,
+    // which is the only thing an unattended run accepts.
+    pub target: Option<String>,
+
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 #[derive(Args, Debug)]
@@ -307,22 +540,108 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// The sandbox flag cannot be given without the sandbox.
+    ///
+    /// This is the whole safety argument for `--ig-base-url` existing at all,
+    /// and it is enforced by clap rather than described in a comment: a
+    /// redirected client can only ever carry a session out of a store inside
+    /// the sandbox root, so the session belonging to the person running this is
+    /// not reachable from a redirected run. Alone, the flag would be a way to
+    /// send a live session cookie to somebody else's server.
+    ///
+    /// A testing build only. In a released one neither flag exists, which
+    /// `crates/snob-core/tests/sandbox.rs` reads the source to hold down.
+    #[cfg(feature = "testing")]
     #[test]
-    fn it_parses_the_usual_durations() {
-        use std::time::Duration;
-        assert_eq!(duration("30m").unwrap(), Duration::from_secs(1_800));
-        assert_eq!(duration("6h").unwrap(), Duration::from_secs(21_600));
-        assert_eq!(duration("2d").unwrap(), Duration::from_secs(172_800));
-        assert_eq!(duration("45s").unwrap(), Duration::from_secs(45));
-        assert_eq!(duration("90").unwrap(), Duration::from_secs(90));
-        assert_eq!(duration(" 6h ").unwrap(), Duration::from_secs(21_600));
+    fn a_redirected_run_cannot_reach_the_real_session() {
+        let refused =
+            Cli::try_parse_from(["snob", "--ig-base-url", "http://127.0.0.1:9/", "whoami"]);
+        assert!(
+            refused.is_err(),
+            "a base URL with no sandbox root would carry the stored session there"
+        );
+
+        let tmp = std::env::temp_dir();
+        let paired = Cli::try_parse_from([
+            "snob",
+            "--sandbox-root",
+            tmp.to_str().expect("the temporary directory has a name"),
+            "--ig-base-url",
+            "http://127.0.0.1:9/",
+            "whoami",
+        ])
+        .expect("the pair is what a sandbox run is");
+        assert_eq!(
+            paired.ig_base_url.map(|u| u.to_string()).as_deref(),
+            Some("http://127.0.0.1:9/")
+        );
+        assert_eq!(paired.sandbox_root.as_deref(), Some(tmp.as_path()));
+
+        // And a sandbox root on its own is fine: it is what drives everything
+        // that does not need Instagram at all.
+        assert!(
+            Cli::try_parse_from([
+                "snob",
+                "--sandbox-root",
+                tmp.to_str().expect("the temporary directory has a name"),
+                "watch",
+                "status",
+            ])
+            .is_ok()
+        );
     }
 
+    /// The one claim in the help that was not true, kept out.
+    ///
+    /// `snob watch check` charges 1 + N against the same GCRA budget the walks
+    /// draw on -- and `clear_to_send` charges at **reservation, before** the
+    /// owed sleep, so a probe that times out and is killed has already spent a
+    /// slot for a request that never went out. A one-minute blackbox probe on
+    /// two accounts is 4320 requests a day against a sustained ceiling of 2000;
+    /// once that is drained the budget owes about 43 seconds a request, which
+    /// is past every probe timeout. So the probe reports the monitor broken
+    /// while it is fine, and the budget it drained is the one the walk needed:
+    /// a probe that causes the condition it detects.
+    ///
+    /// The per-invocation cost was always stated. It was the safety claim above
+    /// it that was not, and this is what keeps it from coming back the next time
+    /// somebody tidies the paragraph.
     #[test]
-    fn it_rejects_what_is_not_a_duration() {
-        for bad in ["", "h", "six hours", "6x", "-3h", "6.5h"] {
-            assert!(duration(bad).is_err(), "\"{bad}\" should be rejected");
-        }
+    fn check_does_not_advertise_itself_as_free_to_poll() {
+        let watch = Cli::command()
+            .find_subcommand("watch")
+            .expect("watch is a subcommand")
+            .clone();
+        let help = watch
+            .find_subcommand("check")
+            .expect("check is a subcommand of watch")
+            .get_after_help()
+            .expect("check has an after_help")
+            .to_string();
+
+        assert!(
+            !help.contains("as often as you like"),
+            "every invocation is charged to the budget the walks need: {help}"
+        );
+        assert!(
+            help.contains("hourly"),
+            "and the help has to name an interval instead of taking it back: {help}"
+        );
+    }
+
+    /// What this wrapper actually adds: the error carries the text somebody
+    /// typed, so clap can say which value it was complaining about.
+    ///
+    /// The parsing itself moved to `snob_core::duration` and its tests went with
+    /// it; a verbatim copy of them stayed here for a while, testing the same
+    /// function twice and quietly implying there were two.
+    #[test]
+    fn a_duration_that_will_not_parse_is_refused_by_name() {
+        assert_eq!(
+            duration("6h").unwrap(),
+            std::time::Duration::from_secs(21_600)
+        );
+        assert!(duration("six hours").is_err());
     }
 
     #[test]

@@ -36,8 +36,19 @@ pub enum Session {
 /// copy is what stops them drifting into three different ways of saying it.
 pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Session> {
     // No bar when the answer comes out of storage: there is nothing to watch.
-    let with_progress = !args.no_progress && !args.cache;
+    open_with_progress(!args.no_progress && !args.cache, secrets, paths)
+}
 
+/// The same, for a command whose arguments are not [`ListArgs`].
+///
+/// Split out rather than copied so that the one sentence about there being no
+/// session, and the code that goes with it, stay in one place — which is the
+/// whole reason [`open`] exists.
+pub fn open_with_progress(
+    with_progress: bool,
+    secrets: &SecretStore,
+    paths: &AppPaths,
+) -> Result<Session> {
     match App::open(secrets, paths, with_progress)? {
         Some(app) => Ok(Session::Open(Box::new(app))),
         None => {

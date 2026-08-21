@@ -125,12 +125,7 @@ fn build_client(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, IgError> {
-    Ok(reqwest::Client::builder()
-        .user_agent(user_agent.to_string())
-        .redirect(redirect)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()?)
+    Ok(crate::http::builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()?)
 }
 
 /// Reads a response body, refusing one that will not fit.
@@ -138,7 +133,25 @@ fn build_client(
 /// `text()` would buffer whatever arrives, which lets the far end decide how
 /// much memory this process uses. Read in chunks so that a response with no
 /// `Content-Length` — which is most of them — is bounded too.
-async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<String, IgError> {
+async fn read_capped(response: reqwest::Response, cap: u64) -> Result<String, IgError> {
+    // Lossy rather than strict: a body that is not valid UTF-8 is not JSON
+    // either, and saying "could not parse" is more use than "invalid encoding".
+    Ok(String::from_utf8_lossy(&read_capped_bytes(response, cap).await?).into_owned())
+}
+
+/// The ceiling itself: refuse a declared length over it, and read in chunks so
+/// that a response without a `Content-Length` — which is most of them — is
+/// bounded too.
+///
+/// One copy for both callers. The API body and the CDN download had the same
+/// declared-length check, the same chunked read and the same `TooLarge` written
+/// out separately, and the CDN is the wrong one to leave behind at the next
+/// tightening: its URL comes out of Instagram's own answer, so it is the one
+/// place a response chooses where the next request goes.
+///
+/// `http::read_capped` stays where it is. Its doc names why it truncates rather
+/// than refusing, which is a different rule for a different reader.
+async fn read_capped_bytes(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8>, IgError> {
     let too_large = || IgError::TooLarge {
         limit: cap as usize,
     };
@@ -156,10 +169,7 @@ async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<String
         }
         bytes.extend_from_slice(&chunk);
     }
-
-    // Lossy rather than strict: a body that is not valid UTF-8 is not JSON
-    // either, and saying "could not parse" is more use than "invalid encoding".
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 /// Which side of the relationship is being requested.
@@ -209,8 +219,55 @@ pub struct IgClient {
 /// What a browser sends before the server has told it anything.
 const INITIAL_CLAIM: &str = "0";
 
+/// Where every client built after this call points, in a testing build.
+///
+/// **Compiled out of a release build entirely**, feature and all: a shipped
+/// binary has neither this function nor the flag that calls it, so there is no
+/// way to point it at another server and nothing to disable. That is what the
+/// whole Cargo feature buys over a hidden flag, and it is the reason it is a
+/// feature.
+///
+/// A process-global rather than an argument, which is normally the wrong answer
+/// and is the right one here. Three separate places build a client — `App`,
+/// `whoami`, and `login::validate`, which is in this crate and takes no path
+/// from the binary at all — so an argument would have to be threaded through
+/// five signatures that exist in the release build, to carry a value that never
+/// exists in it. It is set once from `main` before any client exists, and never
+/// again: [`OnceLock::set`] returns the value back on a second call rather than
+/// replacing it, so a run cannot be redirected halfway through.
+///
+/// It sets the **base URL**, not a "skip the pace" switch, which is the
+/// difference that matters. [`IgClient::is_live`] answers by address, so a
+/// client pointed here is genuinely not Instagram and turning the pace off is
+/// telling the truth. The failure that shape avoids is the one a loopback-only
+/// escape hatch would have created: a proxy on `127.0.0.1` forwarding to
+/// Instagram is a test server by address and Instagram by content, and the walk
+/// it produces is a real account read with no waits between pages.
+///
+/// The binary refuses `--ig-base-url` unless `--sandbox-root` is given too, so
+/// the session a redirected client carries comes out of a store inside that
+/// root. The stored session of the person running it is not reachable from
+/// here.
+#[cfg(feature = "testing")]
+static SANDBOX_BASE: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
+/// Points every client built from now on somewhere other than Instagram.
+///
+/// See [`SANDBOX_BASE`]. `Err` carries the base already set, on a second call.
+#[cfg(feature = "testing")]
+pub fn point_every_client_at(base: Url) -> Result<(), Url> {
+    SANDBOX_BASE.set(base)
+}
+
 impl IgClient {
     pub fn new(session: Session, pacer: Pacer) -> Result<Self, IgError> {
+        // Read here rather than at each call site, because `login::validate`
+        // builds a client inside this crate and never sees the binary's
+        // arguments. In a release build this line does not exist.
+        #[cfg(feature = "testing")]
+        if let Some(base) = SANDBOX_BASE.get() {
+            return Self::pointed_at(session, pacer, base.clone());
+        }
         Self::pointed_at(session, pacer, Url::parse(BASE_URL)?)
     }
 
@@ -290,6 +347,12 @@ impl IgClient {
     /// Rebuilds rather than assigns: both redirect policies are decided from
     /// the base URL when the client is made, so moving the field alone would
     /// leave them judging every hop against the wrong server.
+    ///
+    /// **This is also what turns the pace off**, through [`IgClient::is_live`],
+    /// so a consumer of this crate that pointed a client at a proxy would walk
+    /// Instagram with no waits between pages. `snob-cli` is the only consumer,
+    /// and it only does this in tests.
+    #[doc(hidden)]
     pub fn with_base_url(self, base: Url) -> Self {
         Self::pointed_at(self.session, self.pacer, base)
             .expect("rebuilding a client that already exists cannot fail")
@@ -301,6 +364,23 @@ impl IgClient {
 
     pub fn pacer(&self) -> &Pacer {
         &self.pacer
+    }
+
+    /// Whether this client is pointed at Instagram itself.
+    ///
+    /// What decides whether the pace is real: a walk against the live host pays
+    /// every wait between pages, and a walk against a mock server pays none.
+    ///
+    /// Asked of the base URL rather than set by a caller, and that is the whole
+    /// point. It used to be `ListWalker::without_sleeping()`, a `#[doc(hidden)]`
+    /// method — so "walk Instagram with no waits" was a thing anybody could ask
+    /// for, and the rule that a real account is never walked without the
+    /// limiter rested on nobody asking. A test server cannot be Instagram, and
+    /// Instagram cannot be a test server, so the question answers itself.
+    pub(crate) fn is_live(&self) -> bool {
+        static LIVE: std::sync::LazyLock<Url> =
+            std::sync::LazyLock::new(|| Url::parse(BASE_URL).expect("BASE_URL parses"));
+        same_origin(&self.base, &LIVE)
     }
 
     /// Checks the session works, with the cheapest request that exercises the
@@ -368,7 +448,7 @@ impl IgClient {
             .get(
                 "/api/v1/users/web_profile_info/",
                 &[("username", username)],
-                &format!("{username}/"),
+                &format!("{}/", snob_core::model::in_a_path(username)),
             )
             .await
             .map_err(|e| match e {
@@ -405,7 +485,7 @@ impl IgClient {
             &if username.is_empty() {
                 String::new()
             } else {
-                format!("{username}/{segment}/")
+                format!("{}/{segment}/", snob_core::model::in_a_path(username))
             },
         )
         .await
@@ -453,7 +533,20 @@ impl IgClient {
         // Deliberately not paced: the CDN is a different host with its own
         // limits, and charging a picture against Instagram's budget would make
         // the number mean two things at once.
-        let mut response = self.cdn()?.get(url).send().await?;
+        //
+        // `Accept-Encoding` is the browser's, for the same reason it is on the
+        // API request and not for a different one. This request sends no header
+        // of its own, so reqwest inserted the string it assembles from whichever
+        // decoders were compiled in — `zstd,gzip,deflate,br`, which no browser
+        // has ever sent — under a User-Agent that says Chrome. Everything else
+        // about this client is deliberately unlike the API one; this is not one
+        // of those things.
+        let response = self
+            .cdn()?
+            .get(url)
+            .header("Accept-Encoding", self.hints.accept_encoding)
+            .send()
+            .await?;
         let status = response.status();
 
         // Deliberately not `classify`: that reads Instagram's API vocabulary,
@@ -467,23 +560,7 @@ impl IgClient {
             });
         }
 
-        let too_large = || IgError::TooLarge { limit: cap };
-        if let Some(declared) = response.content_length()
-            && declared > cap as u64
-        {
-            return Err(too_large());
-        }
-
-        // Read in chunks rather than all at once: a response with no
-        // Content-Length would otherwise sail past the check above.
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if bytes.len() + chunk.len() > cap {
-                return Err(too_large());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        read_capped_bytes(response, cap as u64).await
     }
 
     /// One request to Instagram's API, with the headers a browser would send.
@@ -517,12 +594,13 @@ impl IgClient {
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
             .header("Accept", "*/*")
-            // Set here rather than left to the HTTP client, which builds its
-            // own from whichever decoders were compiled in and produces
-            // `zstd,gzip,deflate,br` — a fixed string, on every request, that
-            // no browser has ever sent. This is Chrome's, and every codec in
-            // it is one the client can actually decode.
-            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            // Computed from the User-Agent like the rest of the set rather
+            // than written out, because Chromium began offering `zstd` in the
+            // same release it began sending `Priority`: as a literal, a session
+            // created with an older Chrome omitted the one and offered the
+            // other. `client_hints::ACCEPT_ENCODING` carries the value, and why
+            // it is not left to the HTTP client to invent.
+            .header("Accept-Encoding", self.hints.accept_encoding)
             // The one header here that comes from the person rather than from
             // the User-Agent. Every browser sends it on every request.
             .header("Accept-Language", client_hints::accept_language())
@@ -531,7 +609,20 @@ impl IgClient {
             .header("Sec-Fetch-Site", "same-origin")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
-            .header("Referer", format!("{BASE_URL}/{referer}"))
+            // Built rather than interpolated. Every caller encodes the name it
+            // puts in here, so this cannot fail today — but a header value
+            // that will not build is not an error reqwest raises where it is
+            // made. It carries it to `send()`, where `?` classifies it as
+            // `Network`, whose reaction is `Retry`: the pager would send the
+            // same impossible request three more times, each one paid for by a
+            // budget that thinks it bought a request. The site's own address
+            // is a truthful referer, and a slightly less specific one costs
+            // nothing next to that.
+            .header(
+                "Referer",
+                reqwest::header::HeaderValue::try_from(format!("{BASE_URL}/{referer}"))
+                    .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(BASE_URL)),
+            )
             .header("Cookie", self.session.cookie_header().as_str());
 
         // Deliberately no `Origin`: the Fetch standard omits it on same-origin
@@ -561,7 +652,21 @@ impl IgClient {
         self.remember_claim(&response);
 
         let status = response.status();
-        let body = read_capped(response, MAX_BODY_BYTES).await?;
+
+        // The status is already in hand, and a body that will not read must not
+        // take it away. With `?` here, a 429 whose body died mid-stream became
+        // `IgError::Network` — whose reaction is `Retry` — so the walker fired
+        // three more requests into an endpoint that had just said no, and
+        // `classify_and_record`, the only caller of `cooldown_for` there is,
+        // never ran: nothing was written down and the next run knocked again.
+        // What Instagram said is the status; the body only refines it.
+        let body = match read_capped(response, MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(_) if !status.is_success() => {
+                return Err(self.classify_and_record(status.as_u16(), ""));
+            }
+            Err(e) => return Err(e),
+        };
 
         // A 200 can still be an error: Instagram returns `{"status":"fail"}`
         // with a 200 in some cases.
@@ -585,7 +690,10 @@ impl IgClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use snob_core::session::{Session, SessionOrigin};
+    use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -599,6 +707,182 @@ mod tests {
         IgClient::new(session, crate::pace::Pacer::unlimited())
             .unwrap()
             .with_base_url(Url::parse(&server.uri()).unwrap())
+    }
+
+    /// A budget that remembers what it was told to write down.
+    ///
+    /// The rule that a push-back puts the account in cooldown had no observer
+    /// anywhere in the workspace: every test that drove a throttling body
+    /// through a real client hung `Pacer::unlimited()` off it, whose
+    /// `start_cooldown` answers `Ok(0)` and forgets. The whole recording half of
+    /// [`IgClient::classify_and_record`] could be deleted and the suite stayed
+    /// green — on the one rule that decides whether the next run walks back into
+    /// an account Instagram has just flagged.
+    #[derive(Default)]
+    struct Recording {
+        started: std::sync::Mutex<Vec<(String, std::time::Duration)>>,
+    }
+
+    impl Recording {
+        fn calls(&self) -> Vec<(String, std::time::Duration)> {
+            self.started.lock().unwrap().clone()
+        }
+    }
+
+    impl snob_core::store::rate_budget::RateBudget for Recording {
+        fn reserve(&self) -> Result<std::time::Duration, RateBudgetError> {
+            Ok(std::time::Duration::ZERO)
+        }
+        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            Ok(None)
+        }
+        fn start_cooldown(
+            &self,
+            reason: &str,
+            minimum: std::time::Duration,
+        ) -> Result<i64, RateBudgetError> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((reason.to_string(), minimum));
+            Ok(0)
+        }
+    }
+
+    /// A client whose budget can be asked afterwards what it was told.
+    fn watching(base: &str) -> (IgClient, Arc<Recording>) {
+        let budget = Arc::new(Recording::default());
+        let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
+        let client = IgClient::new(
+            session,
+            crate::pace::Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>),
+        )
+        .unwrap()
+        .with_base_url(Url::parse(base).unwrap());
+        (client, budget)
+    }
+
+    async fn answering(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Every push-back is written down, with the length its own cause earns.
+    ///
+    /// `cooldown_for` is the table and it is tested on its own, but a table
+    /// nobody reads is not a rule. This drives the four causes through a real
+    /// request and asks the budget what arrived.
+    #[tokio::test]
+    async fn every_push_back_puts_the_account_in_cooldown() {
+        use crate::error::cooldown_for;
+
+        let cases = [
+            (429, "", IgError::RateLimited),
+            (
+                400,
+                r#"{"message":"","spam":true,"status":"fail"}"#,
+                IgError::RateLimited,
+            ),
+            (
+                400,
+                r#"{"message":"feedback_required","status":"fail"}"#,
+                IgError::FeedbackRequired,
+            ),
+            (
+                400,
+                r#"{"message":"challenge_required","status":"fail"}"#,
+                IgError::Challenge { url: None },
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let server = answering(status, body).await;
+            let (client, budget) = watching(&server.uri());
+            client.validate().await.unwrap_err();
+
+            let (reason, minimum) = cooldown_for(&expected).expect("this cause earns a cooldown");
+            assert_eq!(
+                budget.calls(),
+                vec![(reason.to_string(), minimum)],
+                "status {status} with body {body:?} should record one cooldown"
+            );
+        }
+    }
+
+    /// A dead session is not push-back, and must not put the account in
+    /// cooldown: logging in again is what fixes it, and a cooldown would refuse
+    /// the very command that fixes it.
+    #[tokio::test]
+    async fn a_dead_session_records_nothing() {
+        let server = answering(403, r#"{"message":"login_required","status":"fail"}"#).await;
+        let (client, budget) = watching(&server.uri());
+
+        let error = client.validate().await.unwrap_err();
+        assert!(matches!(error, IgError::SessionExpired));
+        assert!(budget.calls().is_empty());
+    }
+
+    /// A 429 whose body dies mid-stream is still a 429.
+    ///
+    /// The read used to be `read_capped(...).await?`, so the failure to read
+    /// replaced a status already in hand with `IgError::Network` — whose
+    /// reaction is `Retry`. The walker then fired three more requests into an
+    /// endpoint that had just said no, and `classify_and_record` never ran, so
+    /// nothing was written down either. Both halves of the rule went at once.
+    ///
+    /// Served from a raw socket rather than from `wiremock`, because what has to
+    /// happen is a body that stops arriving: the headers announce a length and
+    /// the connection closes before it is sent.
+    #[tokio::test]
+    async fn a_throttled_answer_with_a_body_that_dies_is_still_throttled() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // Drained first, or the close below races the request still being
+            // written and the failure lands on the send rather than on the read.
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while socket.read(&mut byte).unwrap_or(0) == 1 {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            // Announced as 4096 bytes, and then the connection goes away with
+            // none of them sent. The pause is what lets the head be delivered
+            // and the body read begin before that happens.
+            let _ =
+                socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4096\r\n\r\n");
+            let _ = socket.flush();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+
+        let (client, budget) = watching(&base);
+        let error = client.validate().await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            matches!(error, IgError::RateLimited),
+            "a body that would not read must not turn a 429 into a network error: {error:?}"
+        );
+        assert_eq!(error.reaction(), crate::error::Reaction::Cooldown);
+        assert_eq!(
+            budget.calls(),
+            vec![(
+                "rate_limit".to_string(),
+                snob_core::store::rate_budget::rate_limit_cooldown()
+            )]
+        );
     }
 
     /// A 200 whose body will not parse gets the same excerpt as every other
@@ -759,6 +1043,89 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "https://www.instagram.com/someone/followers/"
+        );
+    }
+
+    /// A name that cannot go in a header verbatim must still get an answer
+    /// about the name.
+    ///
+    /// `target::clean` strips a leading `@` and nothing else, and `watch.toml`
+    /// does not validate a username at all, so the referer is the one
+    /// name-in-a-URL in this crate that arrives as typed. Any byte below 0x20
+    /// makes the header unbuildable; reqwest holds that failure until `send()`,
+    /// where `?` reads it as `Network` — a *retryable* fault, so the pager
+    /// sends the same doomed request three more times and the pacer charges
+    /// for four requests that never left the machine. The name it was asking
+    /// about is never mentioned.
+    #[tokio::test]
+    async fn a_hostile_name_still_reaches_the_not_found_arm() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{"user":null}}"#))
+            .mount(&server)
+            .await;
+
+        let hostile = "gh\u{1b}[2K";
+        let error = client(&server)
+            .await
+            .web_profile_info(hostile)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, IgError::NotFound { what: Some(name) } if name == hostile),
+            "{error:?}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the request the budget paid for went out"
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://www.instagram.com/gh%1B%5B2K/",
+            "encoded, not filtered: a name with a character removed is a different account"
+        );
+    }
+
+    /// The net under the encoding above, reached the only way it can be: by
+    /// handing `get` a referer no caller builds any more.
+    ///
+    /// It matters because of what the alternative costs. A header that will not
+    /// build is not refused where it is written — reqwest carries it to
+    /// `send()`, `?` turns it into `Network`, and `Network`'s reaction is
+    /// `Retry`. Four requests charged to the budget, none of them sent, and the
+    /// answer says the network is at fault.
+    #[tokio::test]
+    async fn a_referer_that_will_not_build_falls_back_to_the_site() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let _: serde_json::Value = client(&server)
+            .await
+            .get("/api/v1/users/web_profile_info/", &[], "gh\u{1b}[2K/")
+            .await
+            .expect("a referer is not worth failing a request over");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BASE_URL,
+            "less specific, and still true"
         );
     }
 

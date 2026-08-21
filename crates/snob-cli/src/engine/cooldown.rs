@@ -146,6 +146,22 @@ mod tests {
     use super::*;
     use crate::exit::ExitCode;
 
+    /// The drift two stored lists may have between them, written out.
+    ///
+    /// Every other test refers to it by name, so it could be set to a day and
+    /// the suite would still pass — while two walks half a day apart were
+    /// crossed as though they described one moment, which is what invents an
+    /// arrival that never happened.
+    ///
+    /// Deliberately **not** asserted equal to `snapshots::RESUME_WINDOW_SECS`,
+    /// which it currently matches. The constant's own doc says they are two
+    /// questions and two numbers, and tying them together in a test is exactly
+    /// the quiet coupling it was split apart to prevent.
+    #[test]
+    fn the_gap_two_lists_may_have_is_the_documented_one() {
+        assert_eq!(SAME_MOMENT_GAP_SECS, 15 * 60);
+    }
+
     /// A stored row, which is what the outcomes under test are built from.
     fn stored(started_at: i64, taken_at: i64) -> snapshots::Snapshot {
         snapshots::Snapshot {
@@ -154,13 +170,9 @@ mod tests {
             kind: ListKind::Followers,
             started_at,
             taken_at: Some(taken_at),
-            complete: true,
             member_count: 0,
             declared_count: None,
-            pages: 0,
-            requests: 0,
             next_cursor: None,
-            resumes: 0,
         }
     }
 

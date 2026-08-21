@@ -171,19 +171,6 @@ impl IgError {
         matches!(self, Self::RateLimited | Self::Network(_))
     }
 
-    /// Whether it forces the whole run to stop rather than skipping one item.
-    /// Pushing on after one of these is exactly what triggers a block.
-    pub fn is_hard_stop(&self) -> bool {
-        matches!(
-            self,
-            Self::SessionExpired
-                | Self::UserAgentMismatch
-                | Self::Challenge { .. }
-                | Self::Checkpoint { .. }
-                | Self::FeedbackRequired
-        )
-    }
-
     /// Whether it invalidates the stored session, and so must not be persisted.
     pub fn invalidates_session(&self) -> bool {
         matches!(
@@ -366,7 +353,19 @@ fn checked_url(value: String) -> Option<String> {
 
     let parsed = url::Url::parse(&absolute).ok()?;
     let host = parsed.host_str()?;
-    (parsed.scheme() == "https" && CHALLENGE_HOSTS.contains(&host)).then_some(absolute)
+    // The **parsed** address is what comes back, not the string that was
+    // checked. They are not the same text: the parser skips interior tab,
+    // carriage return and newline and percent-encodes C0 controls in the path,
+    // so `/challenge/x\x1b[2K\x1b[A` and a host split by a newline both parse
+    // to `www.instagram.com`, pass this check, and used to be handed back with
+    // their control bytes intact — into a sentence that carries this program's
+    // authority, telling somebody to open a link. Erasing the lines above it
+    // and offering a different address is the whole attack, and it needs
+    // nothing more than a body.
+    //
+    // Beyond the injection: an address that was validated and an address that
+    // is displayed should not be able to differ at all.
+    (parsed.scheme() == "https" && CHALLENGE_HOSTS.contains(&host)).then(|| parsed.to_string())
 }
 
 #[cfg(test)]
@@ -391,7 +390,9 @@ mod tests {
     fn a_mismatched_user_agent() {
         let e = classify(401, r#"{"message":"useragent mismatch","status":"fail"}"#);
         assert!(matches!(e, IgError::UserAgentMismatch));
-        assert!(e.is_hard_stop());
+        // Through the function that decides it, rather than a predicate nothing
+        // consulted: `reaction` is what the retry loop asks.
+        assert_eq!(e.reaction(), Reaction::Abort);
     }
 
     /// Regression: during a walk, throttling is **never** retried, however
@@ -554,7 +555,7 @@ mod tests {
     fn feedback_required_stops_the_run() {
         let e = classify(400, r#"{"message":"feedback_required","status":"fail"}"#);
         assert!(matches!(e, IgError::FeedbackRequired));
-        assert!(e.is_hard_stop());
+        assert_eq!(e.reaction(), Reaction::Cooldown);
     }
 
     #[test]
@@ -600,6 +601,46 @@ mod tests {
                 assert!(body.contains("HTML"), "{body}");
             }
             other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    /// An address that passed the check cannot still be carrying what the check
+    /// was for.
+    ///
+    /// `checked_url` validated the parsed URL and returned the raw string, and
+    /// those are not the same text: the parser skips interior tab, CR and LF
+    /// and percent-encodes C0 controls in the path, so both of these reach
+    /// `www.instagram.com`, satisfy the host check, and used to come back with
+    /// their control bytes intact — into the one sentence that tells somebody
+    /// to open a link on this program's authority.
+    #[test]
+    fn an_offered_challenge_url_cannot_carry_control_characters() {
+        for hostile in [
+            // Written as the JSON escapes they arrive as: a raw control
+            // character inside a JSON string is not JSON, so a body carrying
+            // one never reaches this check at all. These do.
+            "/challenge/8166970138/kX2s7GUDNY/\\u001b[2K\\u001b[A",
+            "https://www.instagram.com\\u000a/challenge/x",
+            "https://www.\\u0009instagram.com/challenge/x",
+        ] {
+            let body = format!(
+                r#"{{"message":"challenge_required","challenge":{{"url":"{hostile}"}},"status":"fail"}}"#
+            );
+            let IgError::Challenge { url } = classify(400, &body) else {
+                panic!("expected a challenge for {hostile:?}");
+            };
+            let Some(url) = url else { continue };
+            assert!(
+                !url.chars().any(|c| c.is_control()),
+                "{url:?} was offered with control characters in it"
+            );
+            // And the whole rendered sentence, which is what reaches the
+            // terminal.
+            let message = IgError::Challenge { url: Some(url) }.to_string();
+            assert!(
+                !message.chars().any(|c| c.is_control()),
+                "{message:?} reaches a terminal"
+            );
         }
     }
 
