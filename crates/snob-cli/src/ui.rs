@@ -462,6 +462,9 @@ mod tests {
     }
 }
 
-/// The interactive story list. See its own header for why it is built on
-/// `console` rather than on a terminal-UI framework.
+/// Drawing and key-reading for the interactive story list. See its own header
+/// for what it costs against the terminal-UI framework it is not.
+pub mod browser;
+
+/// The interactive story list.
 pub mod stories;

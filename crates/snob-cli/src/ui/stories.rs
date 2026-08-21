@@ -1,37 +1,52 @@
 //! The interactive story list: arrow keys, Enter to look, D to keep.
 //!
-//! **Built on `console`, which is already in the tree, and not on a TUI
-//! framework.** `ratatui` and `crossterm` would be the obvious answer and are
-//! the wrong one here: this is one list, one highlighted row and five keys, and
-//! `ui.rs` next door already reads keys through `console::Term` for the login
-//! menu. The section of `AGENTS.md` that measures this binary in bytes argues
-//! about half a megabyte at a time; spending that on a widget toolkit for a
-//! list this program can draw in twenty lines would be the wrong trade in a
-//! project whose first rule is to prefer the option that adds nothing.
+//! **It draws with `console` and reads keys with `crossterm`**, and the split
+//! is the whole design. `console` is already here, it measures display columns
+//! and it knows what a terminal supports, so it keeps the drawing. Reading is
+//! the half it cannot do: `Term::read_key` has no timeout, reports no resize,
+//! parses no modified key and enables no bracketed paste -- and the last two of
+//! those were not gaps but defects, because `ESC[1;2D` from Shift+Left ended up
+//! reaching this list as a `D` and downloading a story. `ui::browser::input`
+//! has the details next to the code that closes them, and it costs no new crate
+//! on Windows or macOS, because `comfy-table` was compiling `crossterm` already.
 //!
-//! Everything is drawn on **standard error**. Standard output belongs to the
-//! listing, so `snob stories someone --interactive` can still be run beside a
-//! redirect without a full-screen interface landing in the file — and the same
-//! reasoning `ui::confirm` gives about asking questions on the right stream.
+//! What is deliberately not taken is the rest of a terminal-UI framework.
+//! `ratatui` answers the same problem for **106,496 bytes and 27 crates** in
+//! this binary, against **18,432 bytes and none**, and what the difference buys
+//! is a cell buffer and a layout solver that a list of rows of text does not
+//! use. AGENTS.md carries both numbers and the case that would reverse them.
 //!
-//! What it does **not** do is render the picture in the terminal. Instagram's
-//! own client does, and so does the project this design was studied against,
-//! through the kitty and sixel protocols. It is a real feature and it is a
-//! different one: it needs a terminal that speaks a protocol most do not, and
-//! the fallback is a block-character approximation of somebody's photograph.
-//! Handing the file to the viewer the user already has shows them the actual
-//! image, on every platform, for no dependencies.
+//! Everything is drawn on **standard error**, and the list stays inline rather
+//! than taking the alternate screen. Standard output belongs to the listing, so
+//! `snob stories someone --interactive` can still be run beside a redirect
+//! without a full-screen interface landing in the file -- the same reasoning
+//! `ui::confirm` gives about asking questions on the right stream. Inline
+//! rather than full-screen because the last thing this prints, `Saved
+//! ./someone-3.jpg`, is the answer the user came for, and the alternate screen
+//! takes it away on exit along with the terminal's own search and selection.
+//!
+//! What it does **not** do is render the picture in the terminal. That decision
+//! was re-examined in August 2026 against what terminals actually support now,
+//! and it survived; the numbers and the argument are in AGENTS.md so that it
+//! does not have to be re-examined every year.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use console::{Key, Term};
+use console::{Term, style};
 use snob_core::model::printable;
 use snob_core::paths::AppPaths;
 use snob_ig::client::IgClient;
 
 use crate::commands::stories::{Stories, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
+use crate::ui::browser::input::{Action, Next, Session, TICK, next, page};
+use crate::ui::browser::screen::Screen;
+use crate::ui::browser::viewport::Viewport;
+
+/// Rows the list gives up to everything that is not a story: the heading, the
+/// blank line under it, and the footer.
+const CHROME_ROWS: usize = 3;
 
 /// Drives the list until the user leaves it.
 ///
@@ -54,42 +69,37 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
 
     let scratch = Scratch::new(paths.story_scratch())?;
 
+    // Taken before the cursor is hidden and dropped after it is shown, so that
+    // an early return cannot leave a terminal in raw mode with no cursor.
+    let _session = Session::enter().map_err(|e| {
+        ExitError::new(
+            ExitCode::Error,
+            format!("the terminal would not go into raw mode: {e}"),
+        )
+        .with_hint("without one, use --download <number> or --all")
+    })?;
+
     let mut selected = 0usize;
     let mut opened: Vec<Option<PathBuf>> = vec![None; stories.items.len()];
     let mut note = String::new();
+    let mut screen = Screen::new();
+    let mut view = Viewport::new(1);
 
     term.hide_cursor().ok();
     let outcome = loop {
-        draw(&term, stories, selected, &note)?;
+        // Recomputed from the terminal's *current* size on every frame rather
+        // than updated when a resize is reported. Nothing is then ever laid out
+        // against a size that has gone, so a resize event that was coalesced,
+        // delivered late or missed entirely cannot leave the list wrong.
+        view.height = Screen::usable_rows(&term)
+            .saturating_sub(CHROME_ROWS)
+            .max(1);
+        view.follow(selected, stories.items.len());
+        screen.draw(&term, &frame(stories, selected, &view, &note, &term))?;
         note.clear();
 
-        // `read_key` on a stream that is not a terminal answers `Key::Unknown`
-        // immediately, which would spin this loop. The guard above is what
-        // stops that being reachable, and `Unknown` is treated as a key nobody
-        // pressed rather than as a reason to redraw for ever.
-        match term.read_key() {
-            Ok(Key::ArrowUp) | Ok(Key::Char('k')) => selected = selected.saturating_sub(1),
-            Ok(Key::ArrowDown) | Ok(Key::Char('j')) => {
-                selected = (selected + 1).min(stories.items.len() - 1);
-            }
-            Ok(Key::Enter) => {
-                note = match open(client, stories, selected, &scratch, &mut opened).await {
-                    Ok(path) => format!("Opened {}", path.display()),
-                    Err(e) => format!("Could not open it: {e}"),
-                };
-            }
-            Ok(Key::Char('d')) | Ok(Key::Char('D')) => {
-                note = match keep(client, stories, selected, &mut opened).await {
-                    Ok(path) => format!("Saved {}", path.display()),
-                    Err(e) => format!("Could not save it: {e}"),
-                };
-            }
-            Ok(Key::Escape) | Ok(Key::Char('q')) => break ExitCode::Ok,
-            // Ctrl+C inside a raw read does not raise a signal, so the handler
-            // installed for the rest of the program never sees it. Leaving is
-            // what it means here, and the exit code says who decided.
-            Ok(Key::CtrlC) => break ExitCode::Interrupted,
-            Ok(_) => {}
+        let event = match next(TICK) {
+            Ok(event) => event,
             // Said on the way out rather than written into `note`, which the
             // next redraw would have shown and there is no next redraw.
             Err(e) => {
@@ -100,38 +110,90 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
                 )
                 .into());
             }
+        };
+
+        let action = match event {
+            // Both mean the same thing here: go round, re-read the size, and
+            // draw. An unchanged frame writes nothing, so an idle browser
+            // waiting for a resize sends no bytes at all.
+            Next::Tick | Next::Resized => continue,
+            Next::Do(action) => action,
+        };
+
+        match action {
+            Action::Up => selected = selected.saturating_sub(1),
+            Action::Down => selected = (selected + 1).min(stories.items.len() - 1),
+            Action::PageUp => selected = selected.saturating_sub(page(&view)),
+            Action::PageDown => {
+                selected = (selected + page(&view)).min(stories.items.len() - 1);
+            }
+            Action::First => selected = 0,
+            Action::Last => selected = stories.items.len() - 1,
+            Action::Open => {
+                note = match open(client, stories, selected, &scratch, &mut opened).await {
+                    Ok(path) => format!("Opened {}", path.display()),
+                    Err(e) => format!("Could not open it: {e}"),
+                };
+            }
+            Action::Download => {
+                note = match keep(client, stories, selected, &mut opened).await {
+                    Ok(path) => format!("Saved {}", path.display()),
+                    Err(e) => format!("Could not save it: {e}"),
+                };
+            }
+            Action::Redraw => screen.invalidate(),
+            Action::Quit => break ExitCode::Ok,
+            // Raw mode is what makes this reachable. Outside it, Ctrl+C either
+            // raises `SIGINT` or fires the console control handler, and the
+            // browser never hears about it -- which is what used to happen, and
+            // what the arm this replaces claimed it was catching.
+            Action::Interrupt => break ExitCode::Interrupted,
+            Action::None => {}
         }
     };
+
+    screen.finish(&term).ok();
     term.show_cursor().ok();
-    term.write_line("").ok();
     Ok(outcome)
 }
 
-/// Redraws the whole list in place.
+/// Turns the list into the rows to draw, and touches no terminal.
 ///
-/// The whole thing every time rather than only the two rows that changed: the
-/// list is at most a couple of dozen lines, a terminal redraws that faster than
-/// anybody can press a key again, and partial redraws are how a list gets out
-/// of step with what is on screen.
-fn draw(term: &Term, stories: &Stories, selected: usize, note: &str) -> Result<()> {
-    // +3 for the heading, the blank line and the footer; +1 more when there is
-    // something to say. Clearing exactly what was written is what keeps this
-    // from scrolling the terminal away.
-    let drawn = stories.items.len() + 4;
-    term.clear_last_lines(drawn.min(term.size().0 as usize))
-        .ok();
+/// Plain `String`s rather than writes, so that the renderer can diff them and
+/// so that what a frame says is a value somebody could assert on. `term` is
+/// borrowed for one question -- whether there is color -- and for nothing else.
+fn frame(
+    stories: &Stories,
+    selected: usize,
+    view: &Viewport,
+    note: &str,
+    term: &Term,
+) -> Vec<String> {
+    let total = stories.items.len();
+    let mut rows = Vec::with_capacity(view.height + CHROME_ROWS);
 
-    term.write_line(&format!(
-        "Stories of @{} - {} up",
-        printable(&stories.username),
-        stories.items.len()
-    ))?;
-    term.write_line("")?;
+    // Only when some of the list is off screen. On a list that fits, a counter
+    // is one more thing to read that says nothing.
+    let position = if total > view.height {
+        format!("  [{}/{total}]", selected + 1)
+    } else {
+        String::new()
+    };
+    rows.push(format!(
+        "{}{}",
+        style(format!(
+            "Stories of @{} - {total} up",
+            printable(&stories.username)
+        ))
+        .bold(),
+        style(position).dim()
+    ));
+    rows.push(String::new());
 
-    for (index, story) in stories.items.iter().enumerate() {
-        let marker = if index == selected { ">" } else { " " };
-        term.write_line(&format!(
-            "{marker} {:>2}. {:<7} {}{}",
+    for index in view.range(total) {
+        let story = &stories.items[index];
+        let body = format!(
+            "{:>2}. {:<7} {}{}",
             index + 1,
             crate::commands::stories::kind_label(story),
             crate::commands::stories::posted_and_left(story),
@@ -148,16 +210,40 @@ fn draw(term: &Term, stories: &Stories, selected: usize, note: &str) -> Result<(
                         .join(" ")
                 )
             }
-        ))?;
+        );
+        let is_selected = index == selected;
+        // Two markers, and both earn their place. Reverse video is the one that
+        // is visible from across a desk, and it is reverse video rather than a
+        // color because there is no color that is legible on every background:
+        // the user already told their terminal what its foreground and
+        // background are, and this borrows them. The `>` is what is left when
+        // there is no styling at all, which `console` decides from `NO_COLOR`,
+        // `TERM` and whether anyone is attending.
+        let marker = if is_selected { ">" } else { " " };
+        let body = if is_selected && term.features().colors_supported() {
+            style(body).reverse().to_string()
+        } else {
+            body
+        };
+        rows.push(format!("{marker} {body}"));
     }
 
-    term.write_line("")?;
-    term.write_line(if note.is_empty() {
-        "up/down: move | enter: open | d: download | q: quit"
+    rows.push(if note.is_empty() {
+        let mut hint = String::from("up/down: move | enter: open | d: download | q: quit");
+        if view.more_above() || view.more_below(total) {
+            hint.push_str("   ");
+            hint.push(if view.more_above() { '\u{2191}' } else { ' ' });
+            hint.push(if view.more_below(total) {
+                '\u{2193}'
+            } else {
+                ' '
+            });
+        }
+        style(hint).dim().to_string()
     } else {
-        note
-    })?;
-    Ok(())
+        style(note.to_string()).yellow().to_string()
+    });
+    rows
 }
 
 /// Writes the story into the scratch directory and hands it to the system
