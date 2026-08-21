@@ -2,24 +2,24 @@
 class Snob < Formula
   desc "Instagram from the terminal: who does not follow you back"
   homepage "https://github.com/dennisgr7/snob-ig"
-  version "0.1.1"
+  version "0.2.0"
   license "MIT"
 
   on_macos do
     # There is no macOS Intel build; see the note in .github/workflows/ci.yml.
     depends_on arch: :arm64
-    url "https://github.com/dennisgr7/snob-ig/releases/download/v0.1.1/snob-v0.1.1-aarch64-apple-darwin.tar.gz"
-    sha256 "5d8cb6100b6accc8a913e4276742e4acd69fb8c1f058d0928e50c2feb8bd34e9"
+    url "https://github.com/dennisgr7/snob-ig/releases/download/v0.2.0/snob-v0.2.0-aarch64-apple-darwin.tar.gz"
+    sha256 "caad159dfd8c770ff0f5a3b06840876d652fc0a0e1ead67aee304fc800027a68"
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/dennisgr7/snob-ig/releases/download/v0.1.1/snob-v0.1.1-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "5951e4e912437f02a87b3639de9e7d16de4428ec4ef14e05fde8ea0fbf62150c"
+      url "https://github.com/dennisgr7/snob-ig/releases/download/v0.2.0/snob-v0.2.0-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "94a91754e7f1816a73692e997e6dbf6b38f5e99eb04b188f25fb3b51570f0a7a"
     end
     on_arm do
-      url "https://github.com/dennisgr7/snob-ig/releases/download/v0.1.1/snob-v0.1.1-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "c49d9f38dbed161f81139167d8eb5a1965cd3ee3041062b3d0d78253a103295b"
+      url "https://github.com/dennisgr7/snob-ig/releases/download/v0.2.0/snob-v0.2.0-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "7e758f6e7c67017478afab5bea61bc43b95aaba46521e00ae5167ee4fe5e6655"
     end
   end
 
