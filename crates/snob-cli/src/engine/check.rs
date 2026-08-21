@@ -22,13 +22,13 @@
 //! says, is `commands::watch::status`'s question.
 
 use snob_core::Pk;
-use snob_core::secrets::SecretStore;
-use snob_core::store::snapshots;
-use snob_core::store::watch as watch_store;
+use snob_store::secrets::SecretStore;
+use snob_store::store::snapshots;
+use snob_store::store::watch as watch_store;
 
 use crate::exit::ExitCode;
 use snob_core::watch::schedule::{self, Schedule};
-use snob_core::watch::config::WatchConfig;
+use snob_store::config::WatchConfig;
 
 use crate::app::App;
 
@@ -661,7 +661,7 @@ fn reported_baseline(
     app: &App,
     pk: Pk,
     kind: snob_core::model::ListKind,
-) -> Result<Option<i64>, snob_core::store::StoreError> {
+) -> Result<Option<i64>, snob_store::store::StoreError> {
     let Some(id) = watch_store::mark(app.db().conn(), pk, kind)?.and_then(|m| m.snapshot_id) else {
         return Ok(None);
     };
@@ -719,7 +719,7 @@ mod tests {
     /// `NotConfigured` warning does not cover it, because a file exists.
     #[test]
     fn a_schedule_the_scheduler_refuses_is_reported_rather_than_omitted() {
-        let configured = snob_core::watch::config::parse(
+        let configured = snob_store::config::parse(
             "schema = 1\nevery = \"5m\"\n",
             std::path::Path::new("watch.toml"),
         )

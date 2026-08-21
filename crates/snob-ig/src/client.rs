@@ -1676,8 +1676,8 @@ impl IgClient {
 mod tests {
     use std::sync::Arc;
 
+    use snob_core::budget::{RateBudget, RateBudgetError};
     use snob_core::session::{Session, SessionOrigin};
-    use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1713,7 +1713,7 @@ mod tests {
         }
     }
 
-    impl snob_core::store::rate_budget::RateBudget for Recording {
+    impl snob_core::budget::RateBudget for Recording {
         fn reserve(&self) -> Result<std::time::Duration, RateBudgetError> {
             Ok(std::time::Duration::ZERO)
         }
@@ -1877,7 +1877,7 @@ mod tests {
             budget.calls(),
             vec![(
                 "rate_limit".to_string(),
-                snob_core::store::rate_budget::rate_limit_cooldown()
+                snob_core::budget::rate_limit_cooldown()
             )]
         );
     }
@@ -2756,7 +2756,7 @@ mod tests {
         assert_eq!(recorded[0].0, "rate_limit");
         assert_eq!(
             recorded[0].1,
-            snob_core::store::rate_budget::rate_limit_cooldown(),
+            snob_core::budget::rate_limit_cooldown(),
             "the server's number reached the cooldown, and it must not"
         );
     }

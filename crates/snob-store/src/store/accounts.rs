@@ -3,8 +3,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, now, pk_to_sql};
-use crate::Pk;
-use crate::model::ListKind;
+use snob_core::Pk;
+use snob_core::model::ListKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -128,8 +128,8 @@ pub fn find(conn: &Connection, pk: Pk) -> Result<Option<Account>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::User;
     use crate::store::{Store, users};
+    use snob_core::model::User;
 
     fn with_account(db: &Store, pk: Pk) {
         users::upsert(

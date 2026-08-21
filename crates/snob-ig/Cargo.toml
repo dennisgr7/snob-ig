@@ -87,3 +87,6 @@ wiremock.workspace = true
 # and nothing else, so the log is the artifact under test -- reading the header
 # and throwing it away would pass any test written against behavior.
 tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

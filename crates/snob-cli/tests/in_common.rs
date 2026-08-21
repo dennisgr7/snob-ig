@@ -7,9 +7,9 @@
 
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::{Store, accounts, snapshots, users};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::{Store, accounts, snapshots, users};
 use url::Url;
 use wiremock::MockServer;
 

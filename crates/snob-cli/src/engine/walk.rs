@@ -7,9 +7,9 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, User};
-use snob_core::store::{now, snapshots};
 use snob_ig::pace::Pace;
 use snob_ig::pager::{ListRequest, ListWalker, WalkError};
+use snob_store::store::{now, snapshots};
 
 use crate::app::App;
 use crate::cli::ListArgs;

@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::Migrations;
 use thiserror::Error;
 
-use crate::Pk;
 use crate::paths::{AppPaths, PathError};
+use snob_core::Pk;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -68,15 +68,13 @@ pub enum StoreError {
     Data(String),
 }
 
-/// Current timestamp in seconds, the domain unit.
-pub fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
-/// Current timestamp in milliseconds, the rate-control unit.
-pub fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
+/// The clock, re-exported so the hundreds of `store::now()` call sites in this
+/// crate did not all have to move when it did.
+///
+/// It lives in `snob_core::clock` now: `snob-ig` reads one too, and reaching a
+/// clock through the module that opens SQLite was the same accidental edge the
+/// request budget's trait had.
+pub use snob_core::clock::{now, now_ms};
 
 /// SQLite only has signed 64-bit integers, and `rusqlite` stopped converting
 /// `u64` in 0.38. Instagram ids are at most thirteen digits, eight orders of

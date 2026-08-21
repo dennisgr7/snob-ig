@@ -15,9 +15,9 @@
 //! `engine::ask_consent_with` exists for.
 
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::Store;
 use url::Url;
 use wiremock::MockServer;
 
@@ -205,7 +205,7 @@ async fn a_yes_given_in_advance_needs_no_terminal() {
 #[tokio::test]
 async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
     use snob_core::model::{ListKind, StopReason, User};
-    use snob_core::store::{accounts, snapshots, users};
+    use snob_store::store::{accounts, snapshots, users};
 
     let server = MockServer::start().await;
     let tmp = tempfile::tempdir().unwrap();

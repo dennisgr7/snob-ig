@@ -51,8 +51,8 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::paths::{AppPaths, PathError};
-use crate::secret::Secret;
-use crate::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
+use snob_core::secret::Secret;
+use snob_core::session::{MAX_KEYRING_SECRET_BYTES, Session, keyring_bytes};
 
 /// Installs the platform's credential store, once per process.
 ///
@@ -957,6 +957,9 @@ mod dpapi {
         };
 
         if ok == 0 {
+            // SAFETY: reads the calling thread's own last-error value and takes
+            // no arguments. Read here rather than later because any further call
+            // would replace it.
             let code = unsafe { GetLastError() };
             return Err(SecretsError::Dpapi {
                 operation: if encrypt { "encrypt" } else { "decrypt" },
@@ -988,7 +991,7 @@ mod dpapi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionOrigin;
+    use snob_core::session::SessionOrigin;
 
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "71234567890%3AAbCdEfGhIjKl%3A20";

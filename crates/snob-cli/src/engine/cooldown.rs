@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, User};
-use snob_core::store::snapshots;
+use snob_store::store::snapshots;
 
 use crate::app::App;
 use crate::cli::ListArgs;
@@ -32,7 +32,7 @@ pub fn serve(
         None => app.viewer().pk,
         Some(typed) => {
             let username = target::clean(typed);
-            match snob_core::store::accounts::find_pk_by_username(app.db().conn(), username)? {
+            match snob_store::store::accounts::find_pk_by_username(app.db().conn(), username)? {
                 Some(pk) => pk,
                 None => {
                     return Err(report::refuse_in_cooldown(

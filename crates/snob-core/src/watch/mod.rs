@@ -7,7 +7,6 @@
 //! of the project already keeps between what a thing *is* and how it is
 //! presented.
 
-pub mod config;
 pub mod diff;
 pub mod schedule;
 pub mod sign;

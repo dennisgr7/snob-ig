@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use console::{Term, style};
 use snob_core::model::printable;
-use snob_core::paths::AppPaths;
 use snob_ig::client::IgClient;
+use snob_store::paths::AppPaths;
 
 use crate::commands::stories::{Stories, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
@@ -65,7 +65,7 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
     // Before this session's own directory is made, so that a run which never
     // gets that far still tidies up after the ones before it. See
     // `ABANDONED_AFTER`, and `AppPaths::story_scratch` for where these live.
-    snob_core::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
+    snob_store::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
 
     let scratch = Scratch::new(paths.story_scratch())?;
 
@@ -340,7 +340,7 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(dir: PathBuf) -> Result<Self> {
-        snob_core::paths::create_private_dir(&dir)
+        snob_store::paths::create_private_dir(&dir)
             .with_context(|| format!("could not create {}", dir.display()))?;
         Ok(Self(dir))
     }

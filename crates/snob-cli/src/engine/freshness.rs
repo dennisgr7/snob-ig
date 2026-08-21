@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, User};
-use snob_core::store::{accounts, now, snapshots};
+use snob_store::store::{accounts, now, snapshots};
 
 use crate::app::App;
 use crate::cli::ListArgs;

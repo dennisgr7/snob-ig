@@ -33,9 +33,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use snob_core::paths::AppPaths;
 use snob_ig::login::BrowserCookies;
 use snob_ig::pace::CancelToken;
+use snob_store::paths::AppPaths;
 
 use crate::browser::Browser;
 use crate::pipe::{BrowserProcess, PipeTransport};
@@ -173,7 +173,7 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     // `create_dir_all` would leave it at whatever the umask says.
     paths.ensure_dirs()?;
     let profile = paths.browser_profile();
-    snob_core::paths::create_private_dir(&profile)
+    snob_store::paths::create_private_dir(&profile)
         .with_context(|| format!("could not create {}", profile.display()))?;
     let profile = profile.as_path();
 

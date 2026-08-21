@@ -14,7 +14,21 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{StoreError, now_ms};
+use snob_core::budget::{RateBudget, RateBudgetError};
+use snob_core::clock::now_ms;
+
+use super::StoreError;
+
+/// A storage failure said in the budget's terms.
+///
+/// One line per fallible call, where a `?` used to convert on its own. The two
+/// `From` impls that did it are not writable any more: `RateBudgetError` lives in
+/// `snob_core::budget` and `rusqlite::Error` in rusqlite, so an impl here would
+/// be between two foreign types. What is lost is brevity; what is gained is that
+/// the crate boundary is visible at every place a storage failure crosses it.
+fn budget_err<E: std::fmt::Display>(e: E) -> RateBudgetError {
+    RateBudgetError(e.to_string())
+}
 use crate::paths::AppPaths;
 
 /// Bucket names, as stored in `rate_budget.bucket`.
@@ -105,21 +119,8 @@ const WRITE_EMISSION_MS: i64 = 900_000;
 const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 
 /// Slack before deciding the system clock has gone backwards.
+/// Slack before deciding the system clock has gone backwards.
 const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
-
-const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(2 * 3600);
-const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
-
-/// After Instagram asks for the account to be verified.
-///
-/// Deliberately much shorter than the other two, because it is the only one
-/// waiting does not fix: a challenge is cleared by the user opening the link,
-/// and the account is usable again the moment they do. Twelve hours would
-/// strand someone who cleared it in thirty seconds, and would do nothing extra
-/// about the case this exists for — a scheduled run knocking again on an
-/// account Instagram has just asked to verify itself. Half an hour stops the
-/// second without stranding the first, and repeats still escalate.
-const CHALLENGE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 
@@ -147,62 +148,6 @@ fn is_affirmative(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
-}
-
-/// How long to wait before firing a request.
-pub trait RateBudget: Send + Sync {
-    /// Reserves a request and returns how long to wait before sending it. Zero
-    /// means go ahead.
-    ///
-    /// The reservation is committed even if the request is never made:
-    /// overcharging is the safe direction to be wrong in.
-    fn reserve(&self) -> Result<Duration, RateBudgetError>;
-
-    /// Reserves a **write** — a follow or an unfollow — and returns how long to
-    /// wait before sending it.
-    ///
-    /// A write pays everything a read pays and then the write bucket on top, so
-    /// this can never come back with a shorter wait than [`Self::reserve`]
-    /// would have. That ordering is the whole point of it being a separate
-    /// method: a caller cannot reach the cheaper one by mistake, because
-    /// `IgClient::post` calls this one and `IgClient::get` calls the other, and
-    /// neither takes an argument that could pick the wrong one.
-    fn reserve_write(&self) -> Result<Duration, RateBudgetError>;
-
-    /// Until when the account is in cooldown, as an epoch in milliseconds.
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError>;
-
-    /// Puts the account in cooldown and returns until when.
-    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct RateBudgetError(pub String);
-
-impl From<StoreError> for RateBudgetError {
-    fn from(e: StoreError) -> Self {
-        Self(e.to_string())
-    }
-}
-
-impl From<rusqlite::Error> for RateBudgetError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self(e.to_string())
-    }
-}
-
-/// Cooldown length for each cause.
-pub fn rate_limit_cooldown() -> Duration {
-    RATE_LIMIT_COOLDOWN
-}
-
-pub fn action_block_cooldown() -> Duration {
-    ACTION_BLOCK_COOLDOWN
-}
-
-pub fn challenge_cooldown() -> Duration {
-    CHALLENGE_COOLDOWN
 }
 
 /// The core of the algorithm, isolated so it can be tested without a database.
@@ -279,7 +224,8 @@ impl SqliteRateBudget {
                 params![bucket],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?;
+            .optional()
+            .map_err(budget_err)?;
 
         let stored_tat = match row {
             // If the clock went backwards the stored instant means nothing any
@@ -304,7 +250,8 @@ impl SqliteRateBudget {
                  burst_ms = excluded.burst_ms,
                  updated_at_ms = excluded.updated_at_ms",
             params![bucket, new_tat, emission, burst, now],
-        )?;
+        )
+        .map_err(budget_err)?;
 
         Ok(wait)
     }
@@ -332,7 +279,9 @@ impl SqliteRateBudget {
         // busy_timeout can no longer help and it fails outright. Taking the
         // write lock up front makes the processes serialize.
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(budget_err)?;
 
         let pace_wait =
             Self::reserve_bucket(&tx, PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS, now)?;
@@ -344,7 +293,7 @@ impl SqliteRateBudget {
             0
         };
 
-        tx.commit()?;
+        tx.commit().map_err(budget_err)?;
 
         Ok(Duration::from_millis(
             pace_wait.max(daily_wait).max(write_wait).max(0) as u64,
@@ -374,7 +323,8 @@ impl RateBudget for SqliteRateBudget {
                 params![SESSION_SCOPE],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?;
+            .optional()
+            .map_err(budget_err)?;
 
         let now = now_ms();
         Ok(match row {
@@ -401,7 +351,9 @@ impl RateBudget for SqliteRateBudget {
         let base = minimum.as_millis() as i64;
 
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(budget_err)?;
 
         let previous: Option<(i64, i64, i64)> = tx
             .query_row(
@@ -409,7 +361,8 @@ impl RateBudget for SqliteRateBudget {
                 params![SESSION_SCOPE],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()?;
+            .optional()
+            .map_err(budget_err)?;
 
         // Reoffending within the next day doubles the penalty.
         let (length, strikes) = match previous {
@@ -433,31 +386,12 @@ impl RateBudget for SqliteRateBudget {
                  reason = excluded.reason,
                  strikes = excluded.strikes",
             params![SESSION_SCOPE, until, now, reason, strikes],
-        )?;
-        tx.commit()?;
+        )
+        .map_err(budget_err)?;
+        tx.commit().map_err(budget_err)?;
 
         tracing::warn!(reason, minutes = length / 60_000, "account in cooldown");
         Ok(until)
-    }
-}
-
-/// Grants everything and counts nothing. **Tests only**: using it against
-/// Instagram skips rate control entirely.
-#[doc(hidden)]
-pub struct UnlimitedRateBudget;
-
-impl RateBudget for UnlimitedRateBudget {
-    fn reserve(&self) -> Result<Duration, RateBudgetError> {
-        Ok(Duration::ZERO)
-    }
-    fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
-        Ok(Duration::ZERO)
-    }
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-        Ok(None)
-    }
-    fn start_cooldown(&self, _reason: &str, _minimum: Duration) -> Result<i64, RateBudgetError> {
-        Ok(0)
     }
 }
 
@@ -499,23 +433,6 @@ mod tests {
         assert_eq!(
             WRITE_BURST_MS, 1_800_000,
             "two emissions of tolerance, which lets three writes through and not four"
-        );
-    }
-
-    /// And the three cooldowns, for the same reason.
-    ///
-    /// `AGENTS.md` promises that an action block earns twelve hours rather than
-    /// the throttle's two. Both constants were referenced only by name, so both
-    /// could have become one second with the suite green and the promise would
-    /// have read exactly the same.
-    #[test]
-    fn the_cooldowns_are_the_documented_ones() {
-        assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(2 * 3600));
-        assert_eq!(ACTION_BLOCK_COOLDOWN, Duration::from_secs(12 * 3600));
-        assert_eq!(CHALLENGE_COOLDOWN, Duration::from_secs(30 * 60));
-        assert!(
-            ACTION_BLOCK_COOLDOWN > RATE_LIMIT_COOLDOWN,
-            "an action block is not a throttle and must not be treated as the lighter one"
         );
     }
 

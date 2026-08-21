@@ -10,9 +10,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, pk_from_sql, pk_to_sql};
-use crate::Pk;
-use crate::model::ListKind;
-use crate::watch::Rename;
+use snob_core::Pk;
+use snob_core::model::ListKind;
+use snob_core::watch::Rename;
 
 /// The receipt for one account and list: what was reported, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +126,7 @@ pub fn prune(conn: &Connection, now: i64) -> Result<Swept, StoreError> {
     // **The newest of each account is kept whatever its age**, like the newest
     // capture of each list above it. The comment here used to say nothing else
     // read them back, and that was false about this very module:
-    // `watch_setup::health` reads `last_runs` and decides from it whether the
+    // `watch::status::health` reads `last_runs` and decides from it whether the
     // monitor is working. So a monitor whose session expired went, after thirty
     // days, from "the last run ended in no_session" and exit 1 to "it has not
     // run yet" and exit 0 — a probe polling that exit code watches it turn
@@ -666,8 +666,8 @@ pub fn renames_since(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::User;
     use crate::store::{Store, accounts, snapshots, users};
+    use snob_core::model::User;
 
     /// The newest run of one account, read out of the answer the production
     /// code reads. `last_run` used to be a second query for this, with a row
@@ -703,7 +703,12 @@ mod tests {
         accounts::upsert(db.conn(), pk, true).unwrap();
         let opened = snapshots::begin(db.conn(), pk, ListKind::Followers, None).unwrap();
         snapshots::save_page(db, opened.id, members, None).unwrap();
-        snapshots::close(db.conn(), opened.id, crate::model::StopReason::Completed).unwrap();
+        snapshots::close(
+            db.conn(),
+            opened.id,
+            snob_core::model::StopReason::Completed,
+        )
+        .unwrap();
         opened.id
     }
 
@@ -1067,7 +1072,7 @@ mod tests {
     ///
     /// The delete was unqualified where every other rule in `prune` protects the
     /// newest row of its kind, and its comment said nothing else read the table
-    /// back — false about this very module, since `watch_setup::health` reads
+    /// back — false about this very module, since `watch::status::health` reads
     /// `last_runs` and decides from it whether the monitor is working. So a
     /// monitor whose session expired went, after thirty days, from "the last run
     /// ended in no_session" and exit 1 to "it has not run yet" and exit 0, and a
@@ -1182,7 +1187,12 @@ mod tests {
         users::ensure(db.conn(), 7).unwrap();
         let opened = snapshots::begin(db.conn(), 7, ListKind::Following, None).unwrap();
         snapshots::save_page(&mut db, opened.id, &[user(2, "two")], None).unwrap();
-        snapshots::close(db.conn(), opened.id, crate::model::StopReason::Completed).unwrap();
+        snapshots::close(
+            db.conn(),
+            opened.id,
+            snob_core::model::StopReason::Completed,
+        )
+        .unwrap();
 
         age(&db, followers, KEEP_FOR_SECS * 5);
         age(&db, opened.id, KEEP_FOR_SECS * 5);

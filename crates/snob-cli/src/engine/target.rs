@@ -9,7 +9,7 @@
 use anyhow::{Result, bail};
 use snob_core::Pk;
 use snob_core::model::{ListKind, printable};
-use snob_core::store::{accounts, users};
+use snob_store::store::{accounts, users};
 
 use crate::app::App;
 use crate::cli::ListArgs;

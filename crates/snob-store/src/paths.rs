@@ -621,6 +621,8 @@ mod windows_acl {
         unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
         let protected = control & SE_DACL_PROTECTED != 0;
 
+        // SAFETY: an out parameter of three integers, which `GetAclInformation`
+        // fills below; all-zero is a valid starting value for every one of them.
         let mut sizes: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: the ACL points into the descriptor, which is still alive.
         unsafe {
@@ -864,7 +866,7 @@ mod tests {
             // and missing from this list until it was: taking `self.config` out
             // of `owned_dirs` left `watch.toml` in the user's roaming profile
             // after `snob purge`, and nothing here noticed.
-            crate::watch::config::path(&paths),
+            crate::config::path(&paths),
         ] {
             assert!(
                 owned.iter().any(|dir| path.starts_with(dir)),

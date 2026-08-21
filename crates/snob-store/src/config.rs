@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::duration;
 use crate::paths::AppPaths;
+use snob_core::duration;
 
 /// What the file says.
 ///

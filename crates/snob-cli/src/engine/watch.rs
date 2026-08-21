@@ -16,8 +16,8 @@
 use anyhow::{Result, bail};
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason};
-use snob_core::store::{accounts, snapshots, users, watch as store};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
+use snob_store::store::{accounts, snapshots, users, watch as store};
 
 use crate::app::App;
 use crate::cli::ListArgs;
@@ -314,7 +314,7 @@ pub fn commit(
         &store::Run {
             account_pk: pk,
             started_at: at,
-            finished_at: Some(snob_core::store::now()),
+            finished_at: Some(snob_core::clock::now()),
             requests: tick.requests,
             outcome: Some(tick.outcome().as_str().to_string()),
             changes: tick.report.changes().len() as u32,
@@ -353,7 +353,7 @@ pub fn commit(
 /// moment anybody can be told. Everything else it did stays in a trace. It
 /// returns the count rather than printing it for the reason the module header
 /// gives -- `engine` says what happened and `commands` decides how it reads.
-pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
+pub fn settle(db: &snob_store::store::Store, at: i64) -> usize {
     match store::prune(db.conn(), at) {
         Ok(swept) => {
             if swept.captures > 0 {
@@ -389,12 +389,12 @@ pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
 /// monitor there is nobody it would mean anything to: `snob followers` did not
 /// queue it and cannot say anything useful about it, and the monitor's own
 /// settle reports it the next time it runs.
-pub fn settle_daily(db: &snob_core::store::Store) {
+pub fn settle_daily(db: &snob_store::store::Store) {
     const KEY: &str = "settled_at";
     const A_DAY: i64 = 24 * 3_600;
 
-    let now = snob_core::store::now();
-    let last = snob_core::store::meta_get(db.conn(), KEY)
+    let now = snob_core::clock::now();
+    let last = snob_store::store::meta_get(db.conn(), KEY)
         .ok()
         .flatten()
         .and_then(|v| v.parse::<i64>().ok())
@@ -404,7 +404,7 @@ pub fn settle_daily(db: &snob_core::store::Store) {
     }
 
     let _ = settle(db, now);
-    if let Err(e) = snob_core::store::meta_set(db.conn(), KEY, &now.to_string()) {
+    if let Err(e) = snob_store::store::meta_set(db.conn(), KEY, &now.to_string()) {
         // Not worth failing an ordinary command over. The worst case is that
         // the sweep runs again on the next one.
         tracing::debug!(error = %e, "when retention last ran could not be recorded");
@@ -433,8 +433,8 @@ pub fn settle_daily(db: &snob_core::store::Store) {
 /// Best-effort, like the rest of settling. A database that cannot be opened is
 /// the run's own problem a moment later, and it is not worth turning a refusal
 /// about a webhook into a different failure.
-pub fn settle_without_a_session(paths: &snob_core::paths::AppPaths, at: i64) -> usize {
-    match snob_core::store::Store::open(paths) {
+pub fn settle_without_a_session(paths: &snob_store::paths::AppPaths, at: i64) -> usize {
+    match snob_store::store::Store::open(paths) {
         Ok(db) => settle(&db, at),
         Err(e) => {
             tracing::warn!(error = %e, "the database could not be opened to settle it");
@@ -598,7 +598,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
     // commits this report writes the same two numbers the renames were read
     // against. Read again at commit time, a rename filed in between would be
     // marked as reported without having been.
-    let at = snob_core::store::now();
+    let at = snob_core::clock::now();
     let head = store::history_head(app.db().conn())?;
 
     // Nothing is written here. The marks and the cursor move in `commit`,
@@ -670,7 +670,7 @@ pub fn record_from_store(app: &mut App, typed: Option<&str>) -> Result<WatchRepo
         db,
         pk,
         &compared.marks,
-        snob_core::store::now(),
+        snob_core::clock::now(),
         compared.rename_cursor,
         &compared.renames_sent,
         None,

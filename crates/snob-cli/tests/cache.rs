@@ -5,9 +5,9 @@
 
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::Store;
 use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -474,7 +474,7 @@ async fn the_page_cap_leaves_the_list_marked_incomplete() {
 
     // And it is not available to compare against.
     assert!(
-        snob_core::store::snapshots::latest_complete(
+        snob_store::store::snapshots::latest_complete(
             open_db(tmp.path()).conn(),
             42,
             ListKind::Followers

@@ -7,8 +7,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, now, pk_from_sql, pk_to_sql};
-use crate::Pk;
-use crate::model::User;
+use snob_core::Pk;
+use snob_core::model::User;
 
 /// Records that an account exists, without claiming to know its name.
 ///

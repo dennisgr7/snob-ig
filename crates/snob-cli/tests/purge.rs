@@ -12,10 +12,10 @@
 use snob_cli::cli::PurgeArgs;
 use snob_cli::commands::purge;
 use snob_cli::exit::ExitCode;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
+use snob_store::store::Store;
 
 mod common;
 use common::{SID, UA};
@@ -288,7 +288,7 @@ fn a_typed_yes_needs_nobody_to_confirm_at() {
 #[test]
 fn purge_removes_the_monitors_secrets_with_no_session_stored() {
     use snob_core::secret::Secret;
-    use snob_core::secrets::Kind;
+    use snob_store::secrets::Kind;
 
     let (_tmp, paths, store, _keyring) = setup("monitor-secrets");
     let stored = [

@@ -19,7 +19,7 @@ pub mod watch;
 use anyhow::Result;
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::store::{accounts, snapshots, users};
+use snob_store::store::{accounts, snapshots, users};
 
 use crate::app::{App, ConsentInAdvance};
 use crate::cli::ListArgs;
@@ -317,14 +317,14 @@ async fn decide(
     }
     accounts::upsert(app.db().conn(), target.pk, target.is_self)?;
 
-    let stored = snob_core::store::snapshots::latest_complete(app.db().conn(), target.pk, kind)?;
+    let stored = snob_store::store::snapshots::latest_complete(app.db().conn(), target.pk, kind)?;
 
     if args.cache {
         let Some(snapshot) = stored else {
             return Err(crate::report::refuse_nothing_stored(kind));
         };
         return Ok((
-            snob_core::store::snapshots::members(app.db().conn(), snapshot.id)?,
+            snob_store::store::snapshots::members(app.db().conn(), snapshot.id)?,
             // `--cache` is a promise not to spend a request, so nothing here
             // checked whether the stored list is still true. That is exactly
             // what makes it unsafe to cross against another one.

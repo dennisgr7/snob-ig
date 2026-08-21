@@ -5,9 +5,9 @@
 
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::Store;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

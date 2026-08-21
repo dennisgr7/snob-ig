@@ -22,8 +22,8 @@
 use std::time::Duration;
 
 use snob_cli::{browser, cdp};
-use snob_core::paths::AppPaths;
 use snob_ig::pace::CancelToken;
+use snob_store::paths::AppPaths;
 
 /// The one thing that has to be true of the transport: a browser we started
 /// speaks the protocol over the pipe, and there is no port anywhere.

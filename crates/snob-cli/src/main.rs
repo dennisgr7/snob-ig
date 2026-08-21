@@ -5,8 +5,8 @@ use snob_cli::commands;
 use snob_cli::commands::sets::SetOp;
 use snob_cli::exit::ExitCode;
 use snob_core::model::ListKind;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 /// Two workers, always two, whatever the machine has.
 ///

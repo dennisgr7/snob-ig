@@ -25,6 +25,7 @@ testing = ["snob-ig/testing"]
 
 [dependencies]
 snob-core.workspace = true
+snob-store.workspace = true
 snob-ig.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -116,10 +117,5 @@ assets = [
     ["../../CHANGELOG.md", "usr/share/doc/snob/CHANGELOG.md", "644"],
 ]
 
-[lints.rust]
-# Linking this binary has made MSVC announce that it is creating an import
-# library, because a native dependency exports symbols. There is nothing to act
-# on, and it was the first thing printed on every build. Kept even though
-# Windows no longer links aws-lc: the message belongs to the linker, not to any
-# one dependency.
-linker_messages = "allow"
+[lints]
+workspace = true

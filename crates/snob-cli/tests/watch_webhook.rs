@@ -7,13 +7,13 @@
 
 use std::sync::Arc;
 
+use snob_core::budget::UnlimitedRateBudget;
 use snob_core::secret::Secret;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::rate_budget::UnlimitedRateBudget;
-use snob_core::store::{Store, deliveries};
 use snob_core::watch::sign;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::{Store, deliveries};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -346,8 +346,8 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let db = open_db(tmp.path());
     let app = app(&ig, db);
 
-    snob_core::store::users::ensure(app.db().conn(), 42).unwrap();
-    snob_core::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
+    snob_store::store::users::ensure(app.db().conn(), 42).unwrap();
+    snob_store::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
     // A moment the report is still young at. The queue refuses to hand back a
     // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
     // so a synthetic timestamp from 1970 would simply never be due.

@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use snob_core::store::rate_budget::{RateBudget, RateBudgetError, UnlimitedRateBudget};
+use snob_core::budget::{RateBudget, RateBudgetError, UnlimitedRateBudget};
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
-use snob_core::paths::AppPaths;
-use snob_core::store::Store;
-use snob_core::store::rate_budget::SqliteRateBudget;
+use snob_store::paths::AppPaths;
+use snob_store::store::Store;
+use snob_store::store::rate_budget::SqliteRateBudget;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -122,7 +122,7 @@ impl RateBudget for LateCooldown {
 
     fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
         let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok((seen >= self.calls_before).then(|| snob_core::store::now_ms() + 3_600_000))
+        Ok((seen >= self.calls_before).then(|| snob_core::clock::now_ms() + 3_600_000))
     }
 
     fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {

@@ -11,9 +11,9 @@
 
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::{Store, accounts, snapshots, users};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::{Store, accounts, snapshots, users};
 use url::Url;
 use wiremock::MockServer;
 
@@ -555,7 +555,7 @@ async fn an_unknown_account_is_refused_with_something_to_do_about_it() {
 /// closed, and every list it covered has a receipt from the same commit.
 #[tokio::test]
 async fn the_rename_cursor_moves_only_over_lists_a_mark_was_written_for() {
-    use snob_core::store::watch as watch_store;
+    use snob_store::store::watch as watch_store;
 
     let server = MockServer::start().await;
     let mut db = Store::in_memory().unwrap();

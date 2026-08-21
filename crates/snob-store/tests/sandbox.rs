@@ -27,6 +27,18 @@
 //! compiled, and `cfg!(feature = "testing")` inside the test is true in exactly
 //! the build where the answer does not matter.
 
+// **The repository-walking helpers, shared across the crate boundary.**
+//
+// `#[path]` rather than a copy: these three functions decide what "the source of
+// this repository" means, and the guards that read sources — the keyring rule
+// here, the language and story-view rules in `snob-core` — have to agree about
+// it exactly. Two copies would be two answers to "which files count", and the
+// one that drifted would be a guard quietly walking less than it says.
+//
+// A `snob-core` dev-dependency would be the tidy way and is worse: it would put
+// an edge from the storage crate back to the domain crate's *tests*, and the
+// file is 135 lines of `std::fs` with no dependencies of its own.
+#[path = "../../snob-core/tests/common/mod.rs"]
 mod common;
 use common::{relative, repo_root, source_files};
 

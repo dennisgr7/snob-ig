@@ -2585,6 +2585,7 @@ dependencies = [
  "serde_json",
  "snob-core",
  "snob-ig",
+ "snob-store",
  "supports-hyperlinks",
  "tempfile",
  "tokio",
@@ -2602,25 +2603,13 @@ dependencies = [
 name = "snob-core"
 version = "0.2.0"
 dependencies = [
- "apple-native-keyring-store",
- "base64 0.23.0",
  "chrono",
- "directories",
  "hmac",
- "keyring-core",
  "percent-encoding",
- "rusqlite",
- "rusqlite_migration",
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror 2.0.19",
- "toml",
- "tracing",
- "windows-native-keyring-store",
- "windows-sys 0.61.2",
- "zbus-secret-service-keyring-store",
  "zeroize",
 ]
 
@@ -2642,6 +2631,30 @@ dependencies = [
  "webpki-root-certs",
  "windows-sys 0.61.2",
  "wiremock",
+]
+
+[[package]]
+name = "snob-store"
+version = "0.2.0"
+dependencies = [
+ "apple-native-keyring-store",
+ "base64 0.23.0",
+ "chrono",
+ "directories",
+ "keyring-core",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "snob-core",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
+ "tracing",
+ "windows-native-keyring-store",
+ "windows-sys 0.61.2",
+ "zbus-secret-service-keyring-store",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/snob-ig", "crates/snob-core", "crates/snob-cli"]
+members = ["crates/snob-ig", "crates/snob-core", "crates/snob-store", "crates/snob-cli"]
 
 [workspace.package]
 version = "0.2.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/dennisgr7/snob-ig"
 
 [workspace.dependencies]
 snob-core = { path = "crates/snob-core" }
+snob-store = { path = "crates/snob-store" }
 snob-ig = { path = "crates/snob-ig" }
 
 anyhow = "1"

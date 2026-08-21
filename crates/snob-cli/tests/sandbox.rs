@@ -494,7 +494,7 @@ async fn the_scheduled_stream_is_one_json_line_a_tick() {
     let first = snob(tmp.path(), Some(&instagram), &["watch", "once"]);
     assert!(first.status.success(), "{}", stderr(&first));
     {
-        let db = snob_core::store::Store::open_at(&tmp.path().join("data").join("snob.db"))
+        let db = snob_store::store::Store::open_at(&tmp.path().join("data").join("snob.db"))
             .expect("the sandbox has a database by now");
         db.conn()
             .execute(
@@ -894,8 +894,8 @@ async fn a_write_nobody_could_confirm_is_not_made() {
 /// Written through the same `Store` the binary uses, so the row lands where the
 /// run will look for it rather than where the test thinks it should.
 fn remember_doc_ids(root: &Path) {
-    let paths = snob_core::paths::AppPaths::rooted_at(root);
-    let db = snob_core::store::Store::open(&paths).expect("the sandbox database opens");
+    let paths = snob_store::paths::AppPaths::rooted_at(root);
+    let db = snob_store::store::Store::open(&paths).expect("the sandbox database opens");
     for (name, id) in [
         ("usePolarisFollowMutation", "26508036048874888"),
         ("usePolarisUnfollowMutation", "27789106940691111"),

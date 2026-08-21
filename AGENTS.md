@@ -109,7 +109,7 @@ risk:
 - **No test may touch the real keyring.** It belongs to the operating system,
   not the process: a test deleting the real entry wipes the session of whoever
   is developing. Tests use their own service name via `SecretStore::with_service`,
-  and `crates/snob-core/tests/keyring.rs` reads the source of every crate to
+  and `crates/snob-store/tests/keyring.rs` reads the source of every crate to
   check that they do. It reads the source because it has to: an integration test
   compiles the library without `cfg(test)`, so a runtime assertion would be
   blind in exactly the files that matter most — and the guard this replaced
@@ -137,10 +137,10 @@ in the suite drives a library: `watch_tick.rs` runs the comparison through
 `WebhookClient`. Nothing ran `main` — not the dispatch, not `AppPaths::discover`,
 not the secret store choosing a backend, not the exit code a timer reads. The
 feature adds two flags for that and **a released binary contains neither them nor
-the code they reach**, which `crates/snob-core/tests/sandbox.rs` reads the source
+the code they reach**, which `crates/snob-store/tests/sandbox.rs` reads the source
 to hold down. `--sandbox-root` puts every file a run touches under one directory,
 forces the file backend, **and gives the run a keyring service name derived from
-that root** — `crates/snob-core/tests/keyring.rs`'s rule, applied to the binary.
+that root** — `crates/snob-store/tests/keyring.rs`'s rule, applied to the binary.
 The third of those is what actually separates a sandbox from the real
 credentials, and forcing the backend was mistaken for it for a while.
 `SecretStore` reaches the keyring on every backend and has to: `save` clears the
@@ -179,13 +179,32 @@ Ubuntu 22.04.
 
 ## Architecture
 
-Three crates:
+Four crates, and the line between the first two is the one worth knowing:
 
 | Crate | Responsibility |
 |---|---|
-| `snob-core` | Domain: models, sets, filters, SQLite storage, rate budget, secrets |
+| `snob-core` | Domain: models, sets, filters, the diff, the schedule, the webhook signature, the request-budget **interface**, and the clock. **No I/O** |
+| `snob-store` | Everything kept on the machine: the SQLite database and its migrations, the platform directories, the keyring, `watch.toml` |
 | `snob-ig` | Instagram's web API: endpoints, pagination, pacing, browser headers |
 | `snob-cli` | The `snob` binary, plus a library so commands can be tested |
+
+**`snob-ig` depends on `snob-core` and on nothing under it.** That is what the
+split is for. `snob-core` used to be both halves, so an HTTP client compiled
+SQLite, three keyring backends, `directories` and a TOML parser it never called
+— `cargo tree -i rusqlite` showed the edge — and a change to the database schema
+recompiled the Instagram client. The trait `RateBudget` was the specific cause:
+`Pacer` cannot be built without one, and it lived inside `store::rate_budget`
+next to its SQLite implementation. The port is `snob_core::budget` now and the
+adapter stayed behind.
+
+Two things it does **not** buy, written down so nobody reopens it expecting them.
+It is not a compile-time win: measured in this tree, touching
+`store/snapshots.rs` rebuilt all three crates in 6.22 s against 5.08 s for
+touching `report.rs` alone, because the dominant cost is `snob-cli` and that
+depends on both halves either way. And it costs one thing — `RateBudgetError`
+lives in `snob-core` while `rusqlite::Error` does not, so the two `From` impls
+that used to let a `?` convert on its own are not writable by either crate. The
+orphan rule is why `store::rate_budget::budget_err` exists.
 
 The tool is a session, a database and a request budget. Everything else is a way
 of asking those three something:
@@ -219,6 +238,19 @@ land in one place:
 - **`commands` never builds a client or opens a database.** It takes an `App`.
   A command that assembles its own dependencies can be handed a different budget
   than the rest, which is how rate control gets bypassed by accident.
+
+  **Three places do, and each says why at the line that does it.** They are
+  written down here because a rule with unlisted exceptions is a rule the next
+  reader stops believing:
+
+  - `whoami` builds an `IgClient` directly, because it reports on a session that
+    may be dead and `App::open` refuses to exist without a live one. It goes
+    through `app::pacer` for the budget, so the thing the rule protects — one
+    budget for the whole process — is not what is being skipped.
+  - `commands::watch`'s scheduled loop and `watch::status` call `Store::open`
+    directly. The loop does it so the SQLite connection is not held open across
+    a sleep that can be a day long; `status` does it because it answers without
+    a session at all, which is the case somebody runs it in.
 
 Every list, crossing and summary the tool prints comes out of `engine::list`.
 
@@ -300,7 +332,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
 | Narrowing the trust store cannot reach the user's webhook | the same shape, one field over: `http::builder` takes the trust as an argument and `plain`/`plain_direct` pass `Trust::Platform` with no parameter for anything else. A private CA in front of somebody's own receiver is legitimate, and the client that would be narrowed carries no session to protect |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
-| There is one spelling of each outcome token | `ExitCode::as_str`, with `from_token` derived from it over `ExitCode::ALL` rather than written as a second match. `watch_setup::health` matched the literals inline: respell one there and every recorded cooldown falls through to the failing arm, so `status` exits 1 for a monitor that will resume on its own — and the fixture those tests build their rows from spelled the same literals, so the suite would have moved with the defect |
+| There is one spelling of each outcome token | `ExitCode::as_str`, with `from_token` derived from it over `ExitCode::ALL` rather than written as a second match. `watch::status::health` matched the literals inline: respell one there and every recorded cooldown falls through to the failing arm, so `status` exits 1 for a monitor that will resume on its own — and the fixture those tests build their rows from spelled the same literals, so the suite would have moved with the defect |
 | A report is too old to be news in one place | `deliveries::still_news_after`, which `due`, `failed` and `expire_stale` all read. It was three hand-written comparisons and they disagreed at exactly a day: `due` handed the report out as news, `failed` gave up on it, and `prune` left it `pending` for ever |
 | The row retention keeps is the row `status` shows | the `newest_run` view: `prune` exempts what it selects and `last_runs` reads from it, so `started_at DESC, id DESC` cannot mean one thing in one place and another in the other. `started_at` is whole seconds and two runs of one account inside a second are reachable — `snob watch once` beside a scheduled tick consults no schedule and no gap — so a tie-break added to one site alone has `prune` delete the row `status` is displaying |
 | Every secret this tool stores is one `purge` removes | `secrets::Kind::ALL`, walked by `SecretStore::delete_all`, which `purge::execute` calls unconditionally — gating it on there being a session left the monitor's secrets behind after `logout`. `logout` calls `delete`, which takes the session and nothing else |
@@ -328,13 +360,14 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | The rename cursor moves only over what this run could read | `engine::watch::compare` advances it only when every list the account has a capture of was accounted for, baselines included |
 | A rename filed mid-comparison waits for the next window | `store::watch::renames_since` bounds above by the `head` the caller read first |
 | Everything a scheduled run needs is checked while somebody is there | `snob watch check`, through `engine::check` — which takes `&App`, so it cannot record, and walks no list |
-| Whether the monitor is working is an answer, not a reading | `watch_setup::health`, in `status`'s output and in its exit code |
+| Whether the monitor is working is an answer, not a reading | `watch::status::health`, in `status`'s output and in its exit code |
 | A write is paid for out of the write budget, and there is no other way to send one | `Pacer::clear_to_send_write`, inside `IgClient::post`, which is the only function in the workspace that sends a method other than GET to Instagram |
 | There are two writes, and a third one does not compile | `IgClient::post` takes a `graphql::Mutation`, not a path, so what this program can write is the set of variants that enum has — and `path`, `friendly_name` and `seed_doc_id` have no wildcard arm between them, so a new variant is a build error until somebody has written it into all three. `Mutation::ALL` and its test pin the quieter half: pointing a variant that already exists at a different operation |
+| **Nothing is spent while the account is in cooldown** | `Pacer::clear`, which reads `budget.cooldown()` before it reserves and answers `IgError::InCooldown`. Eight callers in `snob-cli` still gate explicitly, and should: they refuse before asking a person for consent, and they serve a stored list instead of failing, neither of which a backstop can do. But the rule used to live only in those eight, and `engine::check` — the one command written to be polled — was the ninth that forgot: it knocked on a door Instagram had just closed, once per configured account, at whatever interval the poller ran. `SqliteRateBudget::reserve` charges its buckets and has never read the `cooldowns` table, so before this the guarantee rested on every caller remembering. `SNOB_IGNORE_COOLDOWN` still lifts it, because the escape hatch is read inside `cooldown()` |
 | A write in flight is the one thing Ctrl+C does not abandon | `IgClient::post` sends and reads without racing the cancel token, unlike every read. Giving up on a read costs nothing; giving up on a write costs knowing whether it happened. `Pacer::clear_to_send_write` still reads the token before reserving and inside the wait, so a write is cancelable up to the moment it is sent and not after it |
 | A write is never replayed by a redirect | the POST client is built on `redirect::Policy::none()` — following a hop on a write means doing the thing twice, which is not what "follow the redirect" costs on a read |
 | A write without a CSRF token is refused before it is sent | `IgClient::post` returns `IgError::NoCsrfToken` on an absent token rather than sending a request that will fail, so a `--paste` session cannot spend budget discovering it cannot write |
-| Nothing tells anybody you looked at their story | The row above is what holds this: registering a view is a write, and there is no variant for one. `crates/snob-core/tests/no_seen.rs` is the backstop, reading all three crates for `media/seen` and its spellings — including the Relay operation the web client really sends, which a capture turned up in August 2026. It is a denylist and it says so: the identifier Instagram acts on is a `doc_id`, and no list of words contains a number |
+| Nothing tells anybody you looked at their story | The row above is what holds this: registering a view is a write, and there is no variant for one. `crates/snob-core/tests/no_seen.rs` is the backstop, reading all four crates for `media/seen` and its spellings — including the Relay operation the web client really sends, which a capture turned up in August 2026. It is a denylist and it says so: the identifier Instagram acts on is a `doc_id`, and no list of words contains a number |
 
 ## Running headless
 
@@ -895,7 +928,7 @@ is what meeting Instagram taught, including the parts that are still open:
 
     Two other tables are swept in the same call. The run log goes at thirty
     days, **except the newest row of each account, whatever its age** — that is
-    what `watch_setup::health` reads, and without the exemption a monitor whose
+    what `watch::status::health` reads, and without the exemption a monitor whose
     session expired would age out of "the last run ended in no_session" and exit
     1 into "it has not run yet" and exit 0, which is a probe going green while
     nothing was fixed. The outbox settles itself: `deliveries::expire_stale`
@@ -990,6 +1023,20 @@ by 58%, and quoting a standalone figure for anything else here would too.
 
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
+
+- **The crate split is not a build-time optimization, and reopening it as one
+  will disappoint.** Splitting `snob-store` out of `snob-core` was done for the
+  dependency graph — `snob-ig` no longer compiles SQLite, three keyring
+  backends, `directories` or a TOML parser — and the compile-time effect was
+  measured before and after in this tree: `touch crates/snob-store/src/store/snapshots.rs`
+  rebuilds all four crates in 6.22 s, against 5.08 s for `touch crates/snob-cli/src/report.rs`,
+  which rebuilds one. `cargo check` after the same touch is 1.93 s. The
+  difference the split can ever make is that ~1.1 s, because the dominant cost
+  is `snob-cli` — 26,324 lines, half the workspace — and it depends on both
+  halves whichever way they are arranged.
+
+  What would make a further split worth it is a **second consumer**: another
+  binary in this workspace, or publishing `snob-ig`. Neither exists.
 
 - **`Retry-After` is measured, not acted on.** `classify` takes a status and a
   body and never sees a header, so whether these endpoints send this at all has

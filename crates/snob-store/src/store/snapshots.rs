@@ -9,8 +9,8 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, StoreError, now, now_ms, pk_from_sql, pk_to_sql};
-use crate::Pk;
-use crate::model::{ListKind, StopReason, User};
+use snob_core::Pk;
+use snob_core::model::{ListKind, StopReason, User};
 
 /// How long an interrupted walk may still be resumed.
 ///

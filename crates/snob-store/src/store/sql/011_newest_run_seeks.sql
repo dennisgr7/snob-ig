@@ -1,7 +1,7 @@
 -- The same view, answered by seeking instead of by sorting the whole log.
 --
 -- `newest_run` is what `prune` exempts and what `watch status` and
--- `watch_setup::health` read, so it runs on every monitor tick. The window
+-- `watch::status::health` reads, so it runs on every monitor tick. The window
 -- function is the obvious way to write "the newest row per group" and it is the
 -- one shape SQLite cannot satisfy without materializing and sorting every row
 -- in `watch_runs`. Measured: 4,320 rows 5.83 ms, 50,000 rows 322.63 ms -- a log

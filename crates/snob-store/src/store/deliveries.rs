@@ -15,7 +15,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, pk_to_sql};
-use crate::Pk;
+use snob_core::Pk;
 
 /// How long to wait before the first retry. Each attempt doubles it.
 const FIRST_BACKOFF_SECS: i64 = 60;

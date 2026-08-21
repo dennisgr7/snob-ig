@@ -12,7 +12,7 @@
 use anyhow::Result;
 use snob_core::model::{ListKind, User};
 use snob_core::sets;
-use snob_core::store::snapshots;
+use snob_store::store::snapshots;
 
 use crate::app::App;
 
