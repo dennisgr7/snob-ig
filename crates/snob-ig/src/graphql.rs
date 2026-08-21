@@ -199,8 +199,19 @@ pub fn jazoest(fb_dtsg: &str) -> String {
 /// cannot be authorized.
 pub fn extract_tokens(html: &str) -> Option<PageTokens> {
     Some(PageTokens {
-        fb_dtsg: Secret::new(token_after(html, "DTSGInitData")?),
-        lsd: Secret::new(token_after(html, "LSD")?),
+        // **The opening bracket and the comma are part of the marker, not
+        // decoration.** `LSD` on its own is three characters, and the page has
+        // `LSDatabaseSingletonLazyWrapper` in it five times, in the module-name
+        // lists further down. Today the real entry comes first and the bare
+        // substring finds it -- by ordering, which is not a property anybody
+        // maintains. If that order ever flipped the answer would not be
+        // `None`: it would be whatever `"token":"` sat within five hundred
+        // bytes of the decoy, and a mutation sent with a good-looking wrong
+        // token is refused with a 400 that `worth_rediscovering` reads as a
+        // stale identifier -- so the recovery walk runs, seven megabytes off
+        // the CDN, and then spends a second write slot on the same wrong token.
+        fb_dtsg: Secret::new(token_after(html, r#"["DTSGInitData","#)?),
+        lsd: Secret::new(token_after(html, r#"["LSD","#)?),
     })
 }
 
@@ -211,13 +222,36 @@ pub fn extract_tokens(html: &str) -> Option<PageTokens> {
 /// `DTSGInitData` would happily return the `lsd` token further down as the
 /// `fb_dtsg`, and the request would fail in a way that pointed at the wrong
 /// thing.
+/// The largest index at or below `at` that a `&str` can be cut on.
+///
+/// **Both windows below are byte offsets applied to text that is not ASCII**,
+/// and slicing a `str` between the bytes of one character is a panic, not an
+/// error. The page is six hundred kilobytes of profile bootstrap full of names
+/// and biographies; the bundle is `from_utf8_lossy` of minified JavaScript,
+/// where every replacement character is three bytes wide, so a window edge
+/// landing mid-character there is ordinary rather than unlucky. Every fixture
+/// in this file was ASCII, so the suite could not see it, and `doc_id_in` --
+/// which is the recovery path -- would have panicked on the day it was needed.
+///
+/// `str::floor_char_boundary` would say this in one call and is not stable on
+/// the version this crate builds against. `error::body_excerpt` solves the same
+/// problem by counting characters instead; here the offsets have to stay bytes,
+/// because they are measured against `find`.
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
 fn token_after(html: &str, marker: &str) -> Option<String> {
     /// How far past the marker the token may be. In every capture it is within
     /// forty bytes; this is generous without being unbounded.
     const REACH: usize = 512;
 
     let at = html.find(marker)?;
-    let window = &html[at..html.len().min(at + REACH)];
+    let window = &html[at..floor_boundary(html, at + REACH)];
     let key = "\"token\":\"";
     let start = window.find(key)? + key.len();
     let end = window[start..].find('"')? + start;
@@ -253,8 +287,8 @@ pub fn doc_id_in(js: &str, friendly_name: &str) -> Option<String> {
 
     let quoted = format!("\"{friendly_name}\"");
     let at = js.find(&quoted)?;
-    let from = at.saturating_sub(REACH);
-    let to = js.len().min(at + quoted.len() + REACH);
+    let from = floor_boundary(js, at.saturating_sub(REACH));
+    let to = floor_boundary(js, at + quoted.len() + REACH);
     let window = &js[from..to];
     // Where the name sits inside the window. Both ends, because "nearest" is
     // the **gap** between the two spans and not the distance between their
@@ -455,6 +489,86 @@ mod tests {
     fn a_page_without_the_marker_does_not_borrow_the_next_token() {
         let logged_out = r#"["LSD",[],{"token":"onlythisone"}]"#;
         assert!(extract_tokens(logged_out).is_none());
+    }
+
+    /// **A decoy before the real entry must not win.**
+    ///
+    /// The test above covers the marker being *absent*. This covers it being
+    /// present twice, which is the case the real page is one reordering away
+    /// from: `LSDatabaseSingletonLazyWrapper` appears five times in a profile
+    /// page, and a bare three-character `LSD` search would have taken whatever
+    /// token sat near the first one it met.
+    #[test]
+    fn a_name_that_merely_starts_with_the_marker_is_not_the_marker() {
+        let page = concat!(
+            r#"["LSDatabaseSingletonLazyWrapper",[],{"token":"WRONG"},7],"#,
+            r#"["DTSGInitData",[],{"token":"dtsg"},1],"#,
+            r#"["LSD",[],{"token":"right"},2]"#
+        );
+        let tokens = extract_tokens(page).expect("both tokens are there");
+        assert_eq!(tokens.lsd.expose(), "right");
+        assert_eq!(tokens.fb_dtsg.expose(), "dtsg");
+    }
+
+    /// **A page with an accent in it must not end the process.**
+    ///
+    /// The window is a byte count and the page is UTF-8, so a character lying
+    /// across the far edge was a panic rather than a miss. Swept across the
+    /// edge rather than placed on it, because the arithmetic that decides
+    /// which byte the edge is on is the arithmetic under test.
+    #[test]
+    fn a_multi_byte_character_on_the_window_edge_is_not_a_panic() {
+        let marker = "[\"DTSGInitData\",";
+        // The marker is sixteen bytes and the reach is five hundred and
+        // twelve, so the edge falls on the character when the filler is around
+        // four hundred and ninety-five. Swept, not pinned, so the test does not
+        // depend on my arithmetic being right.
+        for filler in 490..500 {
+            let page = format!(
+                "{marker}{}\u{e9}[],{{\"token\":\"t\"}}][\"LSD\",[],{{\"token\":\"l\"}}]",
+                "x".repeat(filler)
+            );
+            // The answer may be `None` -- the token is past the reach at these
+            // lengths. What it may not be is an abort.
+            let _ = extract_tokens(&page);
+        }
+
+        // And with the character in the way but the token still inside, the
+        // token still comes out.
+        let near = format!("{marker}\u{e9}[],{{\"token\":\"t\"}}][\"LSD\",[],{{\"token\":\"l\"}}]");
+        let tokens = extract_tokens(&near).expect("both tokens are within reach");
+        assert_eq!(tokens.fb_dtsg.expose(), "t");
+        assert_eq!(tokens.lsd.expose(), "l");
+    }
+
+    /// The same hazard on the recovery path, where it matters more: the text is
+    /// `from_utf8_lossy` of a minified bundle, so it is dense with three-byte
+    /// replacement characters, and this is the code that only runs on the day a
+    /// `doc_id` has already rotated.
+    #[test]
+    fn a_lossy_bundle_does_not_panic_the_discovery_walk() {
+        let name = "\"usePolarisFollowMutation\"";
+        let tail = ",id:\"26508036048874888\"";
+
+        // Below the window: a replacement character where `at - 400` falls.
+        for pad in 394..404 {
+            let js = format!("\u{fffd}{}{name}{tail}", "y".repeat(pad));
+            assert_eq!(
+                doc_id_in(&js, "usePolarisFollowMutation").as_deref(),
+                Some("26508036048874888"),
+                "lower edge, pad {pad}"
+            );
+        }
+
+        // Above it: one where `at + len + 400` falls.
+        for pad in 370..382 {
+            let js = format!("{name}{tail}{}\u{fffd}", "z".repeat(pad));
+            assert_eq!(
+                doc_id_in(&js, "usePolarisFollowMutation").as_deref(),
+                Some("26508036048874888"),
+                "upper edge, pad {pad}"
+            );
+        }
     }
 
     /// Minified Relay, in both the orders the minifier produces.
