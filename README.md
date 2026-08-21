@@ -5,12 +5,21 @@ Instagram from the terminal.
 It walks your followers and your following, crosses them, and answers the
 questions the app will not: who does not follow you back, who you never followed
 back, and who you and somebody else both know. It can also pull a profile
-picture at full size.
+picture at full size, and show or save the stories an account has up.
+
+All of it is work you can already do by hand in the app, for as long as you have
+the patience: scroll two lists, compare them, long-press a picture. snob is the
+same work done in a terminal — quicker, scriptable, and with the answer in a
+format you can keep. It is the housekeeping the app has never put a button on,
+at the size one person's account actually is.
 
 One binary, no runtime, nothing to install alongside it. Windows and Linux on
 x86_64 and ARM64, macOS on Apple Silicon.
 
-**snob only ever reads.** It never follows, unfollows, blocks or removes anyone.
+**Almost all of snob reads.** It changes exactly two things, one account per
+command and after asking: `snob follow` and `snob unfollow`. It never blocks,
+never removes a follower, never likes, comments or messages, and never marks a
+story as seen.
 
 > **Early version.** Every command works and has been used against the real API.
 > Reading Instagram's own data export is planned and not built yet.
@@ -143,8 +152,9 @@ stored rather than from a request:
 snob scan someone
 ```
 
-Reading somebody else's lists costs their account nothing, but it is still
-somebody else's, so snob asks before it starts. `-y` answers in advance.
+Everything about somebody else is what their profile already shows to anyone
+signed in — snob only reads it faster. It is still their account rather than
+yours, so snob asks before it starts on one. `-y` answers in advance.
 
 ```bash
 snob pfp someone -o picture.jpg
@@ -161,16 +171,19 @@ has left. `--download 2` saves the second one, `--all` saves all of them, and
 `-i` opens a list you move through with the arrow keys — Enter opens the story
 in whatever you already open pictures and videos with, `D` keeps a copy.
 
-**None of that tells them you looked.** Instagram registers a view through a
-separate request; snob does not make it, has no code that could, and a test
-reads the whole source on every build to keep it that way.
+**Saving a story does not mark it as seen.** Instagram registers a view with a
+separate request, and that request is a write — so it falls under the two-write
+rule below, and there is no code here that could send it. A test reads the whole
+source on every build to keep it that way. It follows from snob being a
+downloader rather than a viewer: nothing you do here lands in somebody's viewer
+list, in either direction.
 
 ```bash
 snob unfollow someone
 ```
 
 One of the two things snob changes, and it asks first. The other is
-`snob follow`. One account per command — see [the risk](#the-risk-and-what-the-design-does-about-it)
+`snob follow`. One account per command — see [staying a light client](#staying-a-light-client)
 for why there is no bulk mode — and they need a session with a CSRF token,
 which `snob login --browser` picks up on its own. If you logged in by pasting,
 `snob login --paste --csrftoken <token>` is how to add it.
@@ -381,25 +394,29 @@ snob purge
 It shows you the list and asks before deleting anything. Then remove the binary
 however you installed it.
 
-## The risk, and what the design does about it
+## Staying a light client
 
 There is no official API for any of this — Meta removed the followers endpoint
-in 2018 — so snob uses the private web API with your own session. That goes
-against Instagram's Terms of Use, and the realistic consequence for an
-individual is a verification checkpoint on their account.
+in 2018 — so snob asks the same web API the instagram.com page in your browser
+asks, signed in as you. Automating that is outside Instagram's Terms of Use, as
+it is for every tool in this category, and the realistic consequence for one
+person reading their own lists is that Instagram asks the account to verify
+itself.
 
-Most of the design exists to make that unlikely:
+So most of the design goes into being an unremarkable client — one that asks for
+what it needs, at a rate the service can absorb, and stops the moment it is told
+to:
 
 - **It writes two things, and nothing else.** `snob follow` and `snob unfollow`,
   one account per command. No block, no remove-follower, no like, no comment,
   no message, and nothing that marks a story as seen. Both ask before they send,
   both come out of a budget of their own that allows one action every fifteen
   minutes and at most three in a row, and there is **no bulk mode and no flag
-  that makes one**. That is deliberate rather than unfinished: what Instagram
-  acts on is not the day's total but the burst, and the follow-then-unfollow
-  churn a tool like this makes easy to automate is the specific pattern its
-  detection was built for. Writing your own loop around it is your business;
-  shipping you the loop is not something snob will do.
+  that makes one**. That is deliberate rather than unfinished. What strains a
+  service is not the day's total but the burst — and the follow-then-unfollow
+  churn that automating a list makes easy is a growth-hacking trick, not
+  housekeeping, and not what this is for. Writing your own loop around it is
+  your business; shipping you the loop is not something snob will do.
 - **Requests are paced**, with the timings borrowed from
   [InstagramUnfollowers][iu], which has years of real use behind it, and only
   ever adjusted downwards. Nothing in snob can send a request without paying for
@@ -409,27 +426,31 @@ Most of the design exists to make that unlikely:
   retry loop: when a service says no, the answer is to stop asking, and pushing
   on is also how a momentary limit becomes a lasting one.
 - **Nothing is asked twice.** A recent list is reused from storage instead of
-  walked again, and an interrupted walk resumes rather than starting over.
+  walked again, and an interrupted walk resumes rather than starting over. The
+  cheapest request is the one that is never sent.
 - **The requests are well-formed.** The headers are derived from a browser
   actually installed on the machine, so they agree with each other instead of
-  describing something contradictory.
+  describing something that does not exist. snob does not dress itself up as a
+  browser; it just does not send a self-contradictory request.
 
-One part of this is not snob's to control, and it is the part that matters
-most. The single strongest signal Instagram has is **where the requests come
-from**: a home connection is treated very differently from a datacenter one,
-and the same endpoint that answers normally from a laptop can answer 429 on the
-very first request from a cloud address. So:
+One thing here is not snob's to control, and it decides more than any of the
+above: **where the requests come from**. Instagram serves a home connection and
+a datacenter one very differently, and the same endpoint that answers a laptop
+normally can answer 429 on the first request from a cloud address. That is a
+practical limit on where this runs usefully, so:
 
-- Run it from the connection you normally browse from.
-- A VPS, a VPN or a public proxy raises the odds of a checkpoint and can
-  shorten the life of the session. Running it in a homelab is supported and
-  works; it is not risk-free in the way running it on your own desktop is.
-- Try not to have the session in two places at once — snob on a server while
-  you browse Instagram at home is the kind of split Instagram notices.
+- Run it from the connection you normally browse from, and it behaves.
+- On a VPS, behind a VPN or through a public proxy, expect more throttling and
+  shorter-lived sessions. A homelab is supported and works well; a rented cloud
+  box often does not, and snob has no way around that and does not go looking
+  for one.
+- Keep one session in one place. Instagram treats an account that appears from
+  two networks at once as worth a second look, and it is not wrong to.
 
 None of that is a guarantee, and it is not offered as one. Walking a list of
-several thousand costs hundreds of requests however carefully they are spaced.
-Use it knowing that.
+several thousand costs hundreds of requests however carefully they are spaced,
+and that is real load on somebody else's service. Ask for it when you want the
+answer, not on a loop.
 
 ## Exit codes
 

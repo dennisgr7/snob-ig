@@ -1,4 +1,4 @@
-//! Client for Instagram's private API.
+//! Client for the web API that instagram.com itself uses.
 //!
 //! Read-only. This crate must never expose write operations (follow, unfollow,
 //! block, remove-follower): that is where the risk of an action block sits, and

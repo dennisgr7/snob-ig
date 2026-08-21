@@ -1,7 +1,8 @@
 //! Models of Instagram's responses.
 //!
-//! Everything but `pk` is optional on purpose. This is a private API with no
-//! contract: it adds and removes fields without notice, and one unexpected
+//! Everything but `pk` is optional on purpose. This is an undocumented API
+//! with no contract: it adds and removes fields without notice, and one
+//! unexpected
 //! `null` should not bring down a walk over two thousand accounts.
 
 use serde::Deserialize;

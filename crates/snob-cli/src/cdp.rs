@@ -9,11 +9,11 @@
 //! earlier.
 //!
 //! That boundary is deliberate, and it is where the project stops. Reading the
-//! real browser's store instead would mean defeating the encryption the
+//! real browser's store instead would mean going through the encryption the
 //! operating system put around it — on Windows, App-Bound Encryption since
-//! Chrome 127 — which is the business credential-stealing malware is in. There
-//! is no need to go anywhere near it: a profile of our own answers the same
-//! question, with the user's knowledge, and that is the route taken.
+//! Chrome 127 — and that protection is there on purpose. There is no need to go
+//! near it: a profile of our own answers the same question, with the user
+//! signing in themselves and watching it happen, and that is the route taken.
 //!
 //! `Storage.getCookies` is the method that matters, because it returns
 //! `HttpOnly` cookies too. `sessionid` is `HttpOnly`, which is also why no

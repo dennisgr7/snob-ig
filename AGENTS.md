@@ -18,11 +18,22 @@ follows and unfollows one account at a time, and shows and downloads the stories
 an account has up. Single binary, no runtime. Windows and Linux on x86_64 and
 ARM64, macOS on Apple Silicon.
 
+It is a convenience tool for a person's own account, signed in as themselves.
+Everything it shows is what the app already shows the same person, read faster
+and in a form they can keep: two lists crossed against each other, a picture at
+the size the CDN actually holds, what changed since last week. The app has never
+put a button on any of it. That gap is the whole reason the project exists, and
+it bounds the scope — one account, at human scale, doing by command what the
+person could do by scrolling.
+
 There is no official API for listing followers — Meta removed it in 2018 — so
-this uses the private web API with the user's own session cookie. That goes
-against Instagram's Terms of Use, and the realistic risk to a user is a
-verification checkpoint on their account. **The whole pacing design exists to
-lower that probability.** It is the reason for most of the rules below.
+this asks the same web API instagram.com asks, with the user's own session
+cookie. Automating that is outside Instagram's Terms of Use, as it is for every
+tool in this category, and the realistic outcome for a user is that Instagram
+asks their account to verify itself. **Most of the design goes into being a
+light, well-behaved client** — modest volume, honest requests, and an immediate
+stop when the service pushes back. That is the reason for most of the rules
+below.
 
 ## Rules
 
@@ -48,19 +59,21 @@ risk:
 - **Two write operations exist, and no third one may be added.** `snob` may
   follow an account and unfollow an account. That is the whole list. No block,
   no remove-follower, no like, no comment, no message, and **nothing that marks
-  a story as seen** — which is a write dressed as a read, because it tells the
-  other person you looked.
-  This rule used to say that `snob` only reads, and it was right about the risk:
-  writing is what gets an account actioned, and the tool spent its first two
-  versions not doing any. The rule was lifted deliberately, for those two verbs
+  a story as seen** — which is a write dressed as a read, because it puts the
+  user in somebody else's viewer list.
+  This rule used to say that `snob` only reads, and it was right about the
+  distinction: reading asks a service for what it already shows you, while
+  writing acts on your behalf, and the tool spent its first two versions doing
+  none of the second. The rule was lifted deliberately, for those two verbs
   and no others, and what replaced it is not permission but a regime:
   - **One account per invocation.** There is no bulk mode and there is no flag
-    that makes one. The pattern Instagram acts on is not the daily total but
-    the burst — a hundred unfollows in half an hour is actioned even when the
-    day's count is unremarkable — and the follow-then-unfollow churn that
-    `snob unfollowers` makes so easy to automate is the specific behavior its
-    detection was built for. Piping a list of names into a loop is the user's
-    business; handing them the loop is ours, and we do not.
+    that makes one. What strains a service is not the daily total but the burst
+    — a hundred unfollows in half an hour is a script however unremarkable the
+    day's count is — and the follow-then-unfollow churn that `snob unfollowers`
+    makes so easy to automate is a growth-hacking trick rather than
+    housekeeping, and outside what this tool is for. Piping a list of names into
+    a loop is the user's business; handing them the loop is ours, and we do
+    not.
   - **Every write is paid for out of its own budget**, the `writes` bucket in
     `rate_budget`, which is far slower than the one reads come out of. The
     numbers and their sources are in `crates/snob-ig/src/pace.rs`.
@@ -75,13 +88,14 @@ risk:
   a build error rather than a code review. A test reads the source of all three
   crates as a backstop, for the mistake that arrives before the request does.
 - **Never read or decrypt the user's browser cookie store.** Chrome and Edge on
-  Windows have protected it with App-Bound Encryption since v127, and getting
-  past that protection is what credential-stealing malware is built to do. This
-  project does not go there, and has no reason to. What is allowed, and is the
-  main route, is a browser **we launched against our own profile**, which the
-  user logs into themselves and which then hands the cookies over through its
-  debugging protocol. The boundary is whose profile it is and who hands the data
-  over, not whether the cookie happens to be encrypted.
+  Windows have protected it with App-Bound Encryption since v127. That
+  protection is there on purpose and this project stays on the outside of it,
+  which costs nothing because there is a legitimate route to the same cookie.
+  What is allowed, and is the main route, is a browser **we launched against our
+  own profile**, which the user logs into themselves in front of them and which
+  then hands the cookies over through its debugging protocol. The boundary is
+  whose profile it is and who hands the data over, not whether the cookie
+  happens to be encrypted.
 - **On the first 429, `spam:true`, `feedback_required` or `challenge_required`:
   hard stop.** No retry within that run, and the account goes into cooldown.
   When a service says no, the answer is to stop asking — and a retry loop is
@@ -170,7 +184,7 @@ Three crates:
 | Crate | Responsibility |
 |---|---|
 | `snob-core` | Domain: models, sets, filters, SQLite storage, rate budget, secrets |
-| `snob-ig` | Instagram's private API: endpoints, pagination, pacing, browser headers |
+| `snob-ig` | Instagram's web API: endpoints, pagination, pacing, browser headers |
 | `snob-cli` | The `snob` binary, plus a library so commands can be tested |
 
 The tool is a session, a database and a request budget. Everything else is a way
@@ -440,17 +454,18 @@ Two judgment calls worth understanding before touching them:
   Meta's Graph API platform limit for `graph.facebook.com` and is not evidence
   about these endpoints at all.
 - **The wire signature is chosen for portability, and is not to be tuned to
-  imitate anything** — the TLS handshake, the HTTP/2 SETTINGS and the header
-  order alike. The reason written here used to be that there is nothing to
-  imitate, because Chrome has randomized its ClientHello extension order since
-  v110. That premise is true and the conclusion stopped holding in 2023: JA4
-  sorts the extension list before hashing it, exactly so the shuffling changes
-  nothing. The reasons that do hold are that copying a browser's cryptographic
-  identity is detection evasion rather than honesty — and this tool exists to
-  lower a real account's risk, not to be harder to recognize as a program — Trying would mean
-  leaving `rustls`, and the clean static cross-compilation with it, and would
-  buy nothing — what determines whether Instagram throttles an account is, in
-  order, the address the requests come from, how many there are, and how fast.
+  resemble anything** — the TLS handshake, the HTTP/2 SETTINGS and the header
+  order alike. The reason written here used to be that there is nothing to copy,
+  because Chrome has randomized its ClientHello extension order since v110. That
+  premise is true and the conclusion stopped holding in 2023: JA4 sorts the
+  extension list before hashing it, exactly so the shuffling changes nothing. So
+  something copyable does exist, and the reasons not to copy it are these.
+  Adopting a browser's cryptographic identity would be a claim to be a browser,
+  which snob is not — the aim here is to ask honestly and lightly, not to pass
+  for something else. Trying would also mean leaving `rustls`, and the clean
+  static cross-compilation with it, and would buy nothing: what determines
+  whether Instagram throttles an account is, in order, the address the requests
+  come from, how many there are, and how fast.
   **One target picks a different backend, and that is purely a build concern**:
   Windows on ARM64 uses schannel, because neither of
   rustls's crypto providers builds there without LLVM — the pre-generated

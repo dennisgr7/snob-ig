@@ -74,8 +74,8 @@ const DAILY_BURST_MS: i64 = 86_400_000;
 /// implementation and this one has none. The public field reports for 2026 put
 /// an established account at 100 to 150 follow actions a day and a new account
 /// at 10 to 30, and they agree on something more useful than either figure:
-/// **what gets actioned is the burst, not the daily total.** A hundred
-/// unfollows inside half an hour is blocked on an account whose day's count
+/// **what a service reacts to is the burst, not the daily total.** A hundred
+/// unfollows inside half an hour is refused on an account whose day's count
 /// would have passed without comment. So the design target is not a daily
 /// ceiling at all — it is a floor under the gap between two writes, and ninety-
 /// six a day is what falls out of it rather than what was aimed at.
@@ -96,12 +96,12 @@ const WRITE_EMISSION_MS: i64 = 900_000;
 /// for the pace bucket. Written as three it would have allowed four, and the
 /// sentence above would have been wrong about the constant underneath it.
 ///
-/// Deliberately tight, and the reason is the shape of the risk rather than the
+/// Deliberately tight, and the reason is the shape of the thing rather than the
 /// size of it. Twenty was right for reads, where a burst is a walk going
-/// through pages of one list and looks like somebody scrolling. Three writes in
-/// a row is the most that looks like somebody changing their mind; the fourth
-/// starts to look like a script, which is the only thing being defended
-/// against here.
+/// through pages of one list, which is the cost of one question. Three writes in
+/// a row is about as many decisions as a person makes at a sitting; past that it
+/// is no longer somebody tidying their following list, which is the only use
+/// this budget is sized for.
 const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 
 /// Slack before deciding the system clock has gone backwards.
@@ -115,10 +115,10 @@ const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
 /// Deliberately much shorter than the other two, because it is the only one
 /// waiting does not fix: a challenge is cleared by the user opening the link,
 /// and the account is usable again the moment they do. Twelve hours would
-/// punish someone who cleared it in thirty seconds, and nothing would punish
-/// the case this exists for — a scheduled run knocking again on an account
-/// Instagram has just flagged. Half an hour stops the second without
-/// stranding the first, and repeats still escalate.
+/// strand someone who cleared it in thirty seconds, and would do nothing extra
+/// about the case this exists for — a scheduled run knocking again on an
+/// account Instagram has just asked to verify itself. Half an hour stops the
+/// second without stranding the first, and repeats still escalate.
 const CHALLENGE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;

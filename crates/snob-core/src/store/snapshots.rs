@@ -529,7 +529,8 @@ pub fn delete_partials(
 ) -> Result<usize, StoreError> {
     // Anything another process is actively writing to is left alone. This used
     // to delete every incomplete row, so one process starting a walk removed a
-    // walk another was in the middle of — the victim's next `save_page` then
+    // walk another was in the middle of — the interrupted walk's next
+    // `save_page` then
     // failed against a row that no longer existed, having spent its requests
     // for nothing.
     //

@@ -46,10 +46,10 @@ pub const MAX_INTERVAL_SECS: i64 = 366 * 24 * 3_600;
 
 /// How far past its due moment a run may be pushed.
 ///
-/// Not decoration. A walk that starts at exactly 09:00:00 every day is a
-/// pattern, and lowering the chance of a checkpoint is what the whole pacing
-/// design is for. Fifteen minutes, or a tenth of the interval when that is
-/// smaller, with a floor of one minute.
+/// Not decoration. Every unattended copy of this tool waking on the same round
+/// minute is a small synchronized spike on somebody else's service, and
+/// spreading the runs out costs the user nothing. Fifteen minutes, or a tenth
+/// of the interval when that is smaller, with a floor of one minute.
 fn default_jitter(every: Option<Duration>) -> Duration {
     let ceiling = Duration::from_secs(15 * 60);
     match every {

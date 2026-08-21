@@ -45,19 +45,19 @@
 //!
 //! The reason given for the first of those used to be that Chrome randomizes
 //! its ClientHello extension order, so there is nothing stable to copy. The
-//! premise is true and the conclusion has not held since 2023: JA4, which is
-//! what fingerprinting moved to, sorts the extension list before hashing it,
-//! precisely so that the shuffling changes nothing. There *is* something
-//! stable to copy. Three reasons that do hold, in the order they matter:
+//! premise is true and the conclusion has not held since 2023: JA4 sorts the
+//! extension list before hashing it, precisely so that the shuffling changes
+//! nothing. There *is* something stable to copy. Three reasons not to, in the
+//! order they matter:
 //!
-//! - **It is detection evasion, and that is not what this tool is for.**
-//!   Matching a browser's cryptographic identity is not making a request
-//!   honestly; it is making a program harder to recognize as a program. The
-//!   goal here is to lower the risk to a real account, not to be harder to
-//!   catch, and those two come apart exactly here.
-//! - Copying a handshake means leaving `rustls`, and with it the clean static
-//!   cross-compilation to five targets that is most of what "single binary, no
-//!   runtime" costs to keep.
+//! - **Copying a handshake is a claim to be a browser, and snob is not one.**
+//!   Sending headers that agree with each other is asking a question properly;
+//!   adopting somebody else's cryptographic identity is asserting something
+//!   untrue about who is asking. The line between those two is exactly here,
+//!   and this module stays on the near side of it.
+//! - It means leaving `rustls`, and with it the clean static cross-compilation
+//!   to five targets that is most of what "single binary, no runtime" costs to
+//!   keep.
 //! - It would buy nothing anyway. What decides whether Instagram throttles an
 //!   account is, in order, the address the requests come from, how many there
 //!   are, and how fast.

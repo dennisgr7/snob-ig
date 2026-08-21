@@ -1,6 +1,6 @@
 [package]
 name = "snob-ig"
-description = "Instagram private API client: endpoints, pagination and rate control"
+description = "Instagram web API client: endpoints, pagination and rate control"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

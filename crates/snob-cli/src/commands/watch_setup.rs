@@ -707,7 +707,8 @@ fn ask_accounts(webhook: Option<&str>) -> Result<Vec<(String, Option<i64>)>> {
 /// `profile_url`, out of `account_json` — to a third-party server on every run.
 /// Both prompts framed the question entirely as risk to the *user's own*
 /// account: heavier request, readier refusal. Neither mentioned the other
-/// person. The wizard makes it sharpest, because `ask_webhook` runs one line
+/// person, and `engine::ask_consent_with` now says whose list it is and where
+/// it lands. The wizard makes it sharpest, because `ask_webhook` runs one line
 /// above `ask_accounts` and the address is already in hand while the question is
 /// being asked — and `describe_config` then printed "Reports to https://…" and
 /// "Watches your account and 1 other" as two unrelated lines.
@@ -1625,7 +1626,8 @@ evry = \"6h\"
     /// profile URL -- to a third-party server on every run. Both prompts framed
     /// the question as risk to the user's own account and neither mentioned the
     /// other person; the wizard already holds the address when it asks, because
-    /// `ask_webhook` runs one line above `ask_accounts`.
+    /// `ask_webhook` runs one line above `ask_accounts`, so it is the one that
+    /// can name the destination as well as the person.
     #[test]
     fn the_consent_question_names_where_the_names_are_sent() {
         let asked = consent_question("friend", Some("https://n8n.local/webhook/snob"));

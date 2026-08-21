@@ -366,13 +366,15 @@ impl Surface<'_> {
             // the August 2026 capture**, `application/signed-exchange` and all.
             // It had been carrying a seventeen-space run in the middle of the
             // value, from a line continuation lost in an edit, and it went out
-            // that way on the token-harvest request before every write. No
+            // that way on the request that fetches the tokens before every
+            // write. No
             // browser sends that, and the test nearest to it asserted only
             // `starts_with("text/html")` -- a fixture that could not see the
             // defect it was standing next to.
             // **`concat!`, and that is not a style choice.** This value was
             // carrying a seventeen-space run in the middle of it, and it went
-            // out that way on the token-harvest request before every write.
+            // out that way on the request that fetches the tokens before
+            // every write.
             // The cause is `cargo fmt`: given a `\`-continued string literal
             // it joins the lines back together and materializes the
             // indentation as spaces inside the value. So the continuation form

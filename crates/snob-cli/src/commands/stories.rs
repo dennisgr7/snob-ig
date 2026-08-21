@@ -6,12 +6,13 @@
 //! budget. The same shape as `pfp`, for the same reasons, and like `pfp` it
 //! walks no list and stores no snapshot.
 //!
-//! **Nothing here tells the account you looked.** Instagram registers a view
-//! through a separate call that this project does not make and will not be
-//! given; `crates/snob-core/tests/no_seen.rs` reads the source of all three
-//! crates to keep it that way. That is a promise to the person whose story it
-//! is, and it is the one promise here that nobody running the tool would ever
-//! notice being broken.
+//! **Downloading a story does not mark it as seen.** Registering a view is a
+//! separate call, and a write — so it falls under the two-write rule and this
+//! project has no code that could send it; `crates/snob-core/tests/no_seen.rs`
+//! reads the source of all three crates to keep it that way. The consequence
+//! belongs to the person whose story it is, whose viewer list stays a record of
+//! people who opened it in the app, and it is the one property here that nobody
+//! running the tool would ever notice being broken.
 //!
 //! **It does not ask for consent, and that is deliberate.** The consent rule
 //! covers enumerating somebody — walking their followers, which is thousands of

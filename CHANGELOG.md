@@ -4,18 +4,20 @@
 
 **snob follows, unfollows, and shows you stories.** The first release that
 changes anything on Instagram at all, and the rule it replaces is worth reading
-before the features: `snob` used to write nothing, deliberately, because writing
-is what gets accounts actioned. That rule was lifted for two verbs and no
-others, and what took its place is a regime rather than permission.
+before the features: `snob` used to write nothing, deliberately, because a read
+tool asks a service for what it already shows you while a write tool acts on
+your behalf. That rule was lifted for two verbs and no others, and what took its
+place is a regime rather than permission.
 
 - **`snob follow` and `snob unfollow`**, one account per command. Both ask
   before they send; `-y` answers in advance. Both come out of a request budget
   of their own — one action every fifteen minutes, at most three in a row —
   which is separate from the one reads come out of, so an exhausted write budget
   never holds up a walk and a walk never spends a write. **There is no bulk
-  mode and no flag that makes one.** What Instagram acts on is the burst rather
-  than the daily total, and the follow-then-unfollow churn this tool makes easy
-  to automate is the pattern its detection exists for.
+  mode and no flag that makes one.** What strains a service is the burst rather
+  than the daily total, and the follow-then-unfollow churn that automating a
+  list makes easy is a growth-hacking trick rather than housekeeping, and
+  outside what this tool is for.
 - A write needs a session with a CSRF token. `snob login --browser` already
   captured one; a session created by pasting a sessionid does not have one, and
   the two commands now **refuse before spending anything** rather than finding

@@ -5,7 +5,8 @@
 //! *fewer* requests. **They are not changed without a documented reason** —
 //! each one carries below what it is for, and that is what stops a number being
 //! quietly tuned down until the tool is asking far more of Instagram's service
-//! than answering the question needs.
+//! than answering the question needs. Slower is always an acceptable answer
+//! here; faster has to be argued for, and so far never has been.
 //!
 //! Two limits on what that provenance covers, both worth knowing before
 //! leaning on it:
@@ -64,8 +65,9 @@
 //!   percentile 3.2 seconds: a browser bursts at page load and then sits while
 //!   somebody reads. A walk never sits.
 //! - Its **content** is wrong. Fifty-six distinct operations across half a
-//!   dozen surfaces, against one endpoint paged thousands of times — which is
-//!   the pattern enumeration limits are built for.
+//!   dozen surfaces, against one endpoint paged thousands of times — a browsing
+//!   session and a list walk are not the same load, and a rate taken from the
+//!   first says nothing about the second.
 //! - **Nothing in it was refused**, so it bounds nothing. The line is still
 //!   somewhere above the largest un-refused session anyone has recorded, which
 //!   is where it was before.

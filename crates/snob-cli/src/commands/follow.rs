@@ -7,15 +7,16 @@
 //!
 //! **One account per run, and there is no flag that changes it.** The reasoning
 //! is in `AGENTS.md` with the rest of the write regime, and the short version is
-//! that Instagram acts on bursts rather than on daily totals — so the shape of
+//! that a burst is what strains a service, not a daily total — so the shape of
 //! this command is the safeguard, not a limit inside it. Somebody determined to
 //! run it in a loop can write the loop; what this refuses to do is ship one.
 //!
-//! The other half of the design is that it asks first. A follow is not
-//! reversible in the way a read is: unfollowing afterwards does not undo the
-//! notification the other person already got, and following then unfollowing is
-//! the exact pattern Instagram's detection was built for. So the question is
-//! asked before the request, and `-y` is how a script answers it in advance.
+//! The other half of the design is that it asks first, because a follow reaches
+//! another person in a way a read never does. Unfollowing afterwards does not
+//! take back the notification they already got, and follow-then-unfollow churn
+//! is a growth-hacking trick rather than the housekeeping this tool is for. So
+//! the question is asked before the request, and `-y` is how a script answers it
+//! in advance.
 
 use anyhow::{Result, anyhow};
 use snob_core::model::printable;

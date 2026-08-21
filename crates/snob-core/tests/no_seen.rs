@@ -1,11 +1,12 @@
-//! Nothing in this tool tells anybody you looked at their story.
+//! Downloading a story never marks it as seen.
 //!
 //! `snob stories` reads a reel and downloads media from the CDN. Registering a
-//! view is a **separate** call — Instagram's own clients make it explicitly,
-//! which is why anonymous story viewers exist at all — and this project does
-//! not make it. That is a promise to the person whose story it is, not to the
-//! person running the tool, and it is the one promise here that nobody running
-//! the tool would ever notice being broken.
+//! view is a **separate** call that Instagram's own clients make explicitly,
+//! and this project makes no calls that write. The consequence belongs to the
+//! person whose story it is rather than to the person running the tool — their
+//! viewer list stays a record of people who opened the story in the app — and
+//! it is the one property here that nobody running the tool would ever notice
+//! being broken.
 //!
 //! It is easy to break by accident and impossible to see. Adding `media/seen`
 //! to the client is four lines that compile, pass every test, and read as an

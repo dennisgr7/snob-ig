@@ -428,7 +428,8 @@ pub async fn ask_consent_with(
     }
 
     app.warn(
-        "reading somebody else's lists is a heavier request than reading your own, \
+        "this reads a list that belongs to somebody else, and lands their followers \
+         in your local database. It is also a heavier request than reading your own, \
          and Instagram is readier to refuse it",
     );
     if !ui::confirm_off_thread(app.progress(), format!("Continue with {shown}?"), false).await? {
