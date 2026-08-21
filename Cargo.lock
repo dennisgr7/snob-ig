@@ -2533,6 +2533,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
  "windows-sys 0.61.2",
  "wiremock",
  "zeroize",
@@ -2580,6 +2581,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
  "windows-sys 0.61.2",
  "wiremock",
 ]

@@ -31,6 +31,40 @@ pub struct Cli {
     #[arg(long, global = true, display_order = 901)]
     pub verbose: bool,
 
+    /// Check Instagram's certificate against Mozilla's roots only
+    ///
+    /// Off by default, and that default is deliberate rather than lazy.
+    /// reqwest 0.13 made the platform verifier the default, so snob honors
+    /// whatever roots an administrator has installed — which is what makes it
+    /// work on a managed machine, and is also how a laptop carrying a
+    /// TLS-inspecting root lets that middlebox read the session in transit.
+    /// This ends the second at the cost of the first, which is a trade only the
+    /// person running it can make.
+    ///
+    /// It refuses on Windows for ARM64, where the TLS backend is schannel and
+    /// has no way to express "these roots and no others". A security flag that
+    /// silently does nothing is worse than one that is not offered.
+    ///
+    /// **Never applied to the webhook.** A private CA in front of somebody's
+    /// own receiver is legitimate, and `snob_ig::http::plain` has no argument
+    /// for this — the same shape that stops the session reaching a webhook.
+    #[arg(long, global = true, display_order = 904)]
+    pub strict_roots: bool,
+
+    /// Also trust the certificates in this PEM file
+    ///
+    /// The way back out of `--strict-roots`, and it requires it: on the
+    /// platform store there is nothing to add to, because whatever an
+    /// administrator installed is already trusted. Repeatable.
+    #[arg(
+        long,
+        global = true,
+        display_order = 905,
+        requires = "strict_roots",
+        value_name = "PEM"
+    )]
+    pub tls_extra_root: Vec<PathBuf>,
+
     /// Keep every file this run reads or writes under this directory
     ///
     /// A testing build only. Replaces the discovered data and configuration
@@ -694,5 +728,37 @@ mod tests {
     fn cache_and_refresh_are_mutually_exclusive() {
         let result = Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]);
         assert!(result.is_err());
+    }
+    /// `--tls-extra-root` only means something alongside `--strict-roots`.
+    ///
+    /// On the platform store there is nothing to add to: whatever an
+    /// administrator installed is already trusted, so a lone `--tls-extra-root`
+    /// would be a flag that reads a file and changes nothing. Enforced by clap
+    /// rather than described, the same way `--ig-base-url` is paired with
+    /// `--sandbox-root`.
+    #[test]
+    fn an_extra_root_needs_the_narrowing_it_widens() {
+        let alone = Cli::try_parse_from(["snob", "--tls-extra-root", "ca.pem", "whoami"]);
+        assert!(alone.is_err(), "it was accepted on its own");
+
+        let paired = Cli::try_parse_from([
+            "snob",
+            "--strict-roots",
+            "--tls-extra-root",
+            "ca.pem",
+            "whoami",
+        ])
+        .expect("together they are the way out of the narrowing");
+        assert!(paired.strict_roots);
+        assert_eq!(paired.tls_extra_root.len(), 1);
+
+        // And narrowing on its own is the ordinary case.
+        let narrow = Cli::try_parse_from(["snob", "--strict-roots", "whoami"]).unwrap();
+        assert!(narrow.strict_roots);
+        assert!(narrow.tls_extra_root.is_empty());
+
+        // Off unless asked, which is the default the audit settled on.
+        let plain = Cli::try_parse_from(["snob", "whoami"]).unwrap();
+        assert!(!plain.strict_roots);
     }
 }

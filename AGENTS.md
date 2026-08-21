@@ -255,6 +255,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A list nothing verified is neither compared nor marked | `engine::watch::refusal`, over `Provenance::describes_now` |
 | An unattended run reads a stranger's lists only on a recorded answer | `Watched::may_run_unattended`; `yes` is set only where a `Consent` exists |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session`, and `snob_ig::http::plain` has no argument for one |
+| Narrowing the trust store cannot reach the user's webhook | the same shape, one field over: `http::builder` takes the trust as an argument and `plain`/`plain_direct` pass `Trust::Platform` with no parameter for anything else. A private CA in front of somebody's own receiver is legitimate, and the client that would be narrowed carries no session to protect |
 | A report is never lost because its delivery failed | `store::watch::commit_report` — the queue row and the mark are one transaction, in that order |
 | There is one spelling of each outcome token | `ExitCode::as_str`, with `from_token` derived from it over `ExitCode::ALL` rather than written as a second match. `watch_setup::health` matched the literals inline: respell one there and every recorded cooldown falls through to the failing arm, so `status` exits 1 for a monitor that will resume on its own — and the fixture those tests build their rows from spelled the same literals, so the suite would have moved with the defect |
 | A report is too old to be news in one place | `deliveries::still_news_after`, which `due`, `failed` and `expire_stale` all read. It was three hand-written comparisons and they disagreed at exactly a day: `due` handed the report out as news, `failed` gave up on it, and `prune` left it `pending` for ever |
@@ -405,6 +406,24 @@ Two judgment calls worth understanding before touching them:
   session and one cache. The only thing the working directory decides is where
   an export lands without `-o`. The header of `paths.rs` says so; the tests fix
   it.
+- **The trust store is narrowed only when asked.** reqwest 0.13 made
+  `rustls-platform-verifier` the default, so the four rustls targets honor
+  enterprise roots — which is what makes snob work on a managed machine, and is
+  also how a laptop carrying a TLS-inspecting root lets that middlebox read the
+  session in transit. `--strict-roots` replaces the platform store with
+  Mozilla's published roots, and `--tls-extra-root` is the way back out for
+  somebody who needs one private CA and no others; clap requires the second to
+  come with the first, because on the platform store there is nothing to add to.
+  It is off by default deliberately: narrowing is the safer setting for somebody
+  being inspected and the broken one for somebody behind a corporate proxy, and
+  only the person running it knows which they are. It is **never** applied to
+  the webhook client, and that is structural rather than remembered — see the
+  rules table. On Windows for ARM64 the backend is schannel, which cannot
+  express "these roots and no others", so the flag is **refused** there rather
+  than accepted and ignored: a security option that silently does nothing is
+  worse than one that is not offered, because somebody believes it. Certificate
+  **pinning** stays rejected separately: Meta rotates leaves across issuers and
+  there is no fast update channel behind this binary.
 - **No biometric verification, on any platform.** Investigated in August 2026
   and rejected on the merits, not on difficulty. The principle: any prompt a
   local process of the same user can trigger, that same process can satisfy by
@@ -752,14 +771,6 @@ left in a report nobody can find, and in the order they are worth doing.
   to 14. It is a POST, which this project has never sent, and its page limit,
   response shape and throttle weighting are all unverified. Settle whether a
   non-mutating POST is inside the no-write rule before designing anything.
-- **Narrowing the trust store** is available and should be opt-in, not default.
-  reqwest 0.13 made `rustls-platform-verifier` the default, so the four rustls
-  targets now honor enterprise roots and a managed laptop with an inspection
-  root can read the session in transit. `tls_certs_only(webpki_root_certs)`
-  behind `--strict-roots`, with `--tls-extra-root` as the way out, and never on
-  the webhook client, where a private CA is legitimate. Certificate **pinning**
-  is separately rejected: Meta rotates leaves across issuers and there is no
-  fast update channel behind this binary.
 
 ## Known walls
 

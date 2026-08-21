@@ -49,6 +49,11 @@ reqwest = { version = "0.13", default-features = false, features = ["http2", "qu
 # Chrome does: Chrome puts the hybrid first and sends its share. Enabling it
 # costs about a kilobyte on the handshake.
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
+# Mozilla's published root certificates, in full X.509 form, for `--strict-roots`.
+# `webpki-roots` would not do: it publishes trust anchors, and `tls_certs_only`
+# takes certificates. Only compiled for the four rustls targets -- the schannel
+# one has no way to say "these roots and no others", and refuses the flag.
+webpki-root-certs = "1"
 clap = { version = "4", features = ["derive"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.

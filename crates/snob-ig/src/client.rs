@@ -117,7 +117,17 @@ fn build_client(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, IgError> {
-    Ok(crate::http::builder(user_agent, redirect, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()?)
+    // The trust store is read here rather than passed in, for the reason
+    // `http::TRUST` gives: `login::validate` builds a client inside this crate
+    // and never sees the binary's arguments.
+    Ok(crate::http::builder(
+        user_agent,
+        redirect,
+        CONNECT_TIMEOUT,
+        REQUEST_TIMEOUT,
+        &crate::http::chosen_trust(),
+    )?
+    .build()?)
 }
 
 /// Reads a response body, refusing one that will not fit.

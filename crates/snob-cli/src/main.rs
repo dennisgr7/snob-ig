@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use snob_cli::cli::{Cli, Command};
 use snob_cli::commands;
@@ -70,7 +71,57 @@ async fn main() -> std::process::ExitCode {
 /// impossible. The third element closes it: the sandbox gets a keyring
 /// namespace of its own, so every one of those operations lands on entries
 /// nothing outside the sandbox can see.
+/// Whether a file really holds PEM certificates.
+///
+/// **Emptiness is the case that matters**, and it is why this is not a bare
+/// `is_err()`. `from_pem_bundle` scans for BEGIN/END blocks and answers `Ok`
+/// with an empty list when there are none, so a text file, a DER file or a
+/// mistyped path that happened to exist was accepted in silence — and
+/// `tls_certs_only` would then be handed Mozilla's roots and nothing of the
+/// user's, which is the one outcome `--tls-extra-root` exists to prevent. It
+/// fails at the handshake, hours later, against Instagram and nowhere else.
+fn holds_a_certificate(pem: &[u8]) -> anyhow::Result<()> {
+    match snob_ig::http::reqwest::Certificate::from_pem_bundle(pem) {
+        Ok(found) if !found.is_empty() => Ok(()),
+        Ok(_) => anyhow::bail!("it holds no PEM certificates"),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+fn trust_from(cli: &Cli) -> anyhow::Result<snob_ig::http::Trust> {
+    if !cli.strict_roots {
+        return Ok(snob_ig::http::Trust::Platform);
+    }
+    if !snob_ig::http::CAN_NARROW {
+        anyhow::bail!(
+            "--strict-roots does nothing on this build, so it is refused rather than \
+             ignored.\n\
+             This is the Windows on ARM64 binary, which uses the operating system's TLS \
+             stack; that stack has no way to be told \"these roots and no others\"."
+        );
+    }
+
+    let mut extra = Vec::new();
+    for path in &cli.tls_extra_root {
+        // Read and checked here rather than at the first request, so a typo in
+        // a path is an error before anything has been walked -- and so the
+        // failure names the file rather than arriving as a handshake error
+        // hours later.
+        let pem =
+            std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+        holds_a_certificate(&pem)
+            .with_context(|| format!("{} is not usable as an extra root", path.display()))?;
+        extra.push(pem);
+    }
+    Ok(snob_ig::http::Trust::Narrow { extra })
+}
+
 fn wiring(cli: &Cli) -> anyhow::Result<(AppPaths, bool, Option<String>)> {
+    // Before any client exists, which is what `use_trust` requires: a run
+    // cannot change what it trusts halfway through.
+    let trust = trust_from(cli)?;
+    let _ = snob_ig::http::use_trust(trust);
+
     #[cfg(feature = "testing")]
     if let Some(root) = &cli.sandbox_root {
         if let Some(base) = cli.ig_base_url.clone() {
@@ -251,5 +302,44 @@ mod tests {
         let cli = Cli::try_parse_from(["snob", "whoami"]).expect("it parses");
         let (_, _, namespace) = wiring(&cli).expect("discovery works on a test machine");
         assert_eq!(namespace, None);
+    }
+    /// A file that holds no certificate is refused, and that is the case a bare
+    /// error check misses.
+    ///
+    /// `from_pem_bundle` looks for BEGIN/END blocks and answers `Ok` with an
+    /// empty list when it finds none, so plain text, a DER file, or a path that
+    /// happened to exist all passed. The narrowing would then hand
+    /// `tls_certs_only` Mozilla's roots and none of the user's -- the one
+    /// outcome the flag exists to prevent -- and it would fail at the handshake
+    /// against Instagram, hours later, and nowhere else.
+    ///
+    /// Checked against a real certificate rather than only against rejections,
+    /// because a predicate that refuses everything also passes the first half.
+    #[test]
+    fn an_extra_root_has_to_be_a_certificate() {
+        assert!(
+            holds_a_certificate(
+                b"not a certificate
+"
+            )
+            .is_err()
+        );
+        assert!(holds_a_certificate(b"").is_err());
+        assert!(
+            holds_a_certificate(
+                b"-----BEGIN CERTIFICATE-----
+not base64
+-----END CERTIFICATE-----
+"
+            )
+            .is_err(),
+            "a block that is not a certificate is not one"
+        );
+
+        // One of Mozilla's own, so the accepting half is exercised too.
+        let real = snob_ig::http::reqwest::Certificate::from_der(
+            &webpki_root_certs::TLS_SERVER_ROOT_CERTS[0],
+        );
+        assert!(real.is_ok(), "the bundled roots are certificates");
     }
 }

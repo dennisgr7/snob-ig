@@ -74,6 +74,11 @@ libc.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
+# Only so the test for `--tls-extra-root` can check its predicate against a real
+# certificate as well as against rejections: one that refuses everything also
+# passes a test made only of rejections. Pure data, so it builds on every target
+# including the one where narrowing is refused.
+webpki-root-certs.workspace = true
 
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key
