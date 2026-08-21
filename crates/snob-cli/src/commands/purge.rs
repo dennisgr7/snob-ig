@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::{Kind, SecretStore};
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::{Kind, SecretStore};
 
 use crate::cli::PurgeArgs;
 use crate::exit::{ExitCode, ExitError};

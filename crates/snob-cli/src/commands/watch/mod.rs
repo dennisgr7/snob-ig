@@ -22,14 +22,14 @@
 
 use anyhow::{Context, Result, bail};
 use snob_core::Pk;
-use snob_core::model::{ListKind, User, printable};
-use snob_core::paths::AppPaths;
+use snob_core::model::printable;
 use snob_core::secret::Secret;
-use snob_core::secrets::{Kind, SecretStore, Stored};
-use snob_core::store::{deliveries, watch::Queued};
-use snob_core::watch::config::{self, WatchConfig, WebhookConfig};
+use snob_core::watch::Changes;
 use snob_core::watch::schedule::{self, Due, Schedule, Weekday};
-use snob_core::watch::{Basis, Changes, ListDiff, Rename};
+use snob_store::config::{self, WatchConfig, WebhookConfig};
+use snob_store::paths::AppPaths;
+use snob_store::secrets::{Kind, SecretStore, Stored};
+use snob_store::store::{deliveries, watch::Queued};
 use url::Url;
 
 use crate::cli::{
@@ -37,8 +37,7 @@ use crate::cli::{
     WebhookArgs,
 };
 use crate::commands::common::{self, Session};
-use crate::engine::Provenance;
-use crate::engine::watch::{ListReport, Skipped, TickReport, WatchReport, Watched};
+use crate::engine::watch::{TickReport, Watched};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui;
@@ -47,13 +46,32 @@ use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
 pub(super) mod delivery;
 use delivery::{Delivery, deliver, delivery_from, drain, run_id};
 
+/// The two commands that are about the configuration rather than about a
+/// report. They were one file beside this one, `commands::watch_setup`, which
+/// made `snob watch setup` a sibling of `snob watch` in the source and a child
+/// of it everywhere else — and left them reaching back in through
+/// `super::watch::` for the seven helpers they share with this module.
+pub(super) mod setup;
+pub(super) mod status;
+
+/// A report said two ways. [`wire`] is what a receiver is sent and what a
+/// signature covers; [`say`] is what a person reads. They were four hundred and
+/// fifty lines apart in this file with the orchestration interleaved between
+/// them, so "does this change break somebody's integration" and "is this
+/// sentence right" were the same question about the same page.
+pub(super) mod say;
+pub(super) mod wire;
+
+use say::{describe, refusal_line, say_what_was_given_up};
+use wire::{as_json, check_json, failed_tick_json, json_line, payload, preflight_body, tick_json};
+
 pub async fn run(args: WatchArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     match args.command {
         Some(WatchCommand::Diff(args)) => diff(args, secrets, paths),
         Some(WatchCommand::Once(args)) => once(args, secrets, paths).await,
         Some(WatchCommand::Check(args)) => check(args, secrets, paths).await,
-        Some(WatchCommand::Setup(args)) => super::watch_setup::setup(args, secrets, paths).await,
-        Some(WatchCommand::Status(args)) => super::watch_setup::status(args, paths),
+        Some(WatchCommand::Setup(args)) => setup::setup(args, secrets, paths).await,
+        Some(WatchCommand::Status(args)) => status::status(args, paths),
         None => scheduled(args.run, secrets, paths).await,
     }
 }
@@ -73,7 +91,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // is the mode the README leads with, and it had no settle at all.
     say_what_was_given_up(crate::engine::watch::settle_without_a_session(
         paths,
-        snob_core::store::now(),
+        snob_core::clock::now(),
     ));
 
     // Read first, so the flags can override it. A flag beats the file because
@@ -105,7 +123,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
 
-    let mut last_run = seed_for(paths, &schedule, snob_core::store::now())?;
+    let mut last_run = seed_for(paths, &schedule, snob_core::clock::now())?;
 
     if args.now {
         // Run one, here, rather than by pretending nothing has ever run.
@@ -117,7 +135,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
         // means the run happens with no jitter, which is right — jitter exists
         // so a *schedule* does not land on the same second every day, and
         // delaying a run somebody just asked for would only look broken.
-        last_run = Some(snob_core::store::now());
+        last_run = Some(snob_core::clock::now());
         if let Err(e) = open_and_run(&args, &watched, delivery.as_ref(), &secrets, paths).await {
             report::print_error(&e);
         }
@@ -137,7 +155,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     let mut clock_was: Option<i64> = None;
 
     loop {
-        let now = snob_core::store::now();
+        let now = snob_core::clock::now();
 
         // A clock that moved by more than a nap did not tick: it was corrected,
         // or the machine was suspended. Either way the moment being waited for
@@ -288,8 +306,8 @@ const CLOCK_JUMP_SECS: i64 = 120;
 /// SQLite connection while it sleeps, so `snob purge` in another terminal is not
 /// blocked by a file this has open.
 fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
-    let store = snob_core::store::Store::open(paths)?;
-    Ok(snob_core::store::watch::last_started(store.conn())?)
+    let store = snob_store::store::Store::open(paths)?;
+    Ok(snob_store::store::watch::last_started(store.conn())?)
 }
 
 /// What the loop starts its clock from.
@@ -345,11 +363,11 @@ fn seed_for(paths: &AppPaths, schedule: &Schedule, now: i64) -> Result<Option<i6
         return Ok(None);
     };
 
-    let store = snob_core::store::Store::open(paths)?;
-    if let Some(seeded) = snob_core::store::watch::interval_seeded_at(store.conn())? {
+    let store = snob_store::store::Store::open(paths)?;
+    if let Some(seeded) = snob_store::store::watch::interval_seeded_at(store.conn())? {
         return Ok(Some(seeded));
     }
-    snob_core::store::watch::set_interval_seeded_at(store.conn(), invented)?;
+    snob_store::store::watch::set_interval_seeded_at(store.conn(), invented)?;
     Ok(Some(invented))
 }
 
@@ -379,7 +397,7 @@ async fn open_and_run(
         // log.
         say_what_was_given_up(crate::engine::watch::settle_without_a_session(
             paths,
-            snob_core::store::now(),
+            snob_core::clock::now(),
         ));
         return Ok(());
     };
@@ -531,7 +549,7 @@ async fn run_accounts(
                 // The moment is read once and given to both, so the row in the
                 // run log and the line in the stream name the same second and a
                 // reader can put them side by side.
-                let at = snob_core::store::now();
+                let at = snob_core::clock::now();
                 record_failed_run(app, account, &e, charged, at);
                 if printing.json {
                     // The stream gets a line for this interval too. Written
@@ -565,7 +583,7 @@ async fn run_accounts(
     }
     say_what_was_given_up(crate::engine::watch::settle(
         app.db(),
-        snob_core::store::now(),
+        snob_core::clock::now(),
     ));
 
     let (print_here, failed) = to_print_and_to_return(failures);
@@ -598,7 +616,7 @@ fn record_failed_run(
     at: i64,
 ) {
     let pk = match watched.name() {
-        Some(name) => snob_core::store::accounts::find_pk_by_username(
+        Some(name) => snob_store::store::accounts::find_pk_by_username(
             app.db().conn(),
             snob_core::model::printable(name).trim(),
         )
@@ -611,9 +629,9 @@ fn record_failed_run(
     };
 
     let outcome = ExitCode::from_chain(error).unwrap_or(ExitCode::Error);
-    let record = snob_core::store::watch::record_run(
+    let record = snob_store::store::watch::record_run(
         app.db().conn(),
-        &snob_core::store::watch::Run {
+        &snob_store::store::watch::Run {
             account_pk,
             started_at: at,
             finished_at: Some(at),
@@ -1029,7 +1047,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     // drift a third time.
     say_what_was_given_up(crate::engine::watch::settle_without_a_session(
         paths,
-        snob_core::store::now(),
+        snob_core::clock::now(),
     ));
 
     // Before the session is opened and long before a request is spent, so a
@@ -1063,7 +1081,7 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     // spent requests, and this is the mode somebody is watching.
     ui::info(&format!(
         "{} - {}",
-        report::stored_on(snob_core::store::now()),
+        report::stored_on(snob_core::clock::now()),
         report::requests(outcome.spent)
     ));
 
@@ -1117,7 +1135,7 @@ pub(super) async fn preflight(
     use crate::engine::check::{self, Verdict};
 
     let configured = config::load(paths)?;
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
 
     // Built the same way a run builds it, or this would be checking a schedule
     // nobody is on. A configuration with none at all is not an error here — it
@@ -1338,83 +1356,6 @@ pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<
     lines
 }
 
-fn check_json(report: &crate::engine::check::CheckReport) -> serde_json::Value {
-    use crate::engine::check::What;
-
-    serde_json::json!({
-        "verdict": report.verdict().as_str(),
-        "checks": report.checked.iter().map(|checked| {
-            let (what, detail) = match &checked.what {
-                What::NotConfigured => ("config", serde_json::json!(null)),
-                What::Schedule { next } => ("schedule", serde_json::json!({ "next": next })),
-                What::Session { viewer, backend } => (
-                    "session",
-                    serde_json::json!({ "viewer": viewer, "storage": backend }),
-                ),
-                What::Account { target, pk, followers, following, may_run_unattended } => (
-                    "account",
-                    serde_json::json!({
-                        "target": target,
-                        "pk": pk,
-                        "followers": followers,
-                        "following": following,
-                        "may_run_unattended": may_run_unattended,
-                    }),
-                ),
-                What::Webhook { destination, status, signed } => (
-                    "webhook",
-                    serde_json::json!({
-                        "destination": destination,
-                        "status": status,
-                        "signed": signed,
-                    }),
-                ),
-                What::Baseline { taken_at } => (
-                    "baseline",
-                    serde_json::json!({
-                        "lists": taken_at.iter()
-                            .map(|(kind, at)| serde_json::json!({ "kind": kind.as_str(), "taken_at": at }))
-                            .collect::<Vec<_>>(),
-                    }),
-                ),
-            };
-            serde_json::json!({
-                "what": what,
-                "verdict": checked.verdict.as_str(),
-                "detail": detail,
-                "problem": checked.problem,
-            })
-        }).collect::<Vec<_>>(),
-    })
-}
-
-/// Why a list was not compared, said in a sentence.
-///
-/// `engine` handed over what happened and nothing else; which words that
-/// deserves is this module's question, which is why the tokens are matched
-/// here rather than carried as strings.
-fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
-    match skipped {
-        Skipped::NobodyLooked(provenance) => format!(
-            "the {kind} list was served from storage and nothing checked whether it is still \
-             true{}, so it was not compared and the monitor did not move on",
-            match provenance {
-                Provenance::Cooldown => " (the account is in cooldown)",
-                Provenance::PollFailed => " (the check failed)",
-                _ => "",
-            }
-        ),
-        // The same half-sentence the summary uses for the same situation.
-        // Writing a second one here is how two commands end up describing one
-        // event in two ways.
-        Skipped::Incomplete(reason, _) => format!(
-            "the {kind} list could not be read in full ({}), so it was not compared: the \
-             accounts missing from it would have been reported as people who left",
-            report::why_incomplete(reason).unwrap_or("it stopped early")
-        ),
-    }
-}
-
 /// Shows what changed, and changes nothing.
 ///
 /// The marks are deliberately left where they are. This command is a question,
@@ -1441,575 +1382,14 @@ fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<E
     Ok(ExitCode::Ok)
 }
 
-/// The machine-readable answer.
-///
-/// Hand-built rather than derived from the report, because this is a contract
-/// with whatever is reading it and the struct behind it is not: renaming a
-/// field in `ListReport` must not silently rename a key here.
-fn as_json(report: &WatchReport) -> serde_json::Value {
-    serde_json::json!({
-        "account": {
-            "pk": report.account_pk,
-            // The true value, unfiltered. `printable` is for terminals; a
-            // machine format has to carry the name that identifies the account,
-            // and `serde_json` escapes what it emits. This is what the rest of
-            // the tool's JSON already does.
-            "username": report.username,
-            "is_self": report.is_self,
-        },
-        "lists": {
-            "followers": list_json(report.followers.as_ref()),
-            "following": list_json(report.following.as_ref()),
-        },
-        "changes": {
-            "followers": diff_json(report.followers.as_ref()),
-            "following": diff_json(report.following.as_ref()),
-            "renamed": report.renamed.iter().map(rename_json).collect::<Vec<_>>(),
-        },
-        "counts": {
-            "followers_gained": count(report.followers.as_ref(), |d| d.gained.len()),
-            "followers_lost":   count(report.followers.as_ref(), |d| d.lost.len()),
-            "following_gained": count(report.following.as_ref(), |d| d.gained.len()),
-            "following_lost":   count(report.following.as_ref(), |d| d.lost.len()),
-            "renamed": report.renamed.len(),
-        },
-    })
-}
-
-/// A tick's answer, which is the report plus what the run itself did.
-///
-/// `looked` is the field an automation branches on and the one that cannot be
-/// derived from the arrays: empty changes mean "nothing happened" when the run
-/// looked and "I could not see" when it did not, and something watching for
-/// silence reads those as the same thing.
-///
-/// **`schema` is here for the same reason it is on the wire.** The README's own
-/// recipe is `snob watch --json >> events.ndjson`, which makes this file a data
-/// feed with readers of its own, and it was the one output of the three with no
-/// version on it: a receiver could version-check a webhook body and a preflight
-/// and not the file it was told to append to. The number is the same one, and
-/// it moves with the same rule, because it describes the same report -- the two
-/// differ in what the run says about itself, not in what a change looks like.
-fn tick_json(tick: &TickReport) -> serde_json::Value {
-    let mut out = as_json(&tick.report);
-    out["schema"] = serde_json::json!(SCHEMA);
-    out["run"] = serde_json::json!({
-        "at": tick.at(),
-        "looked": tick.looked(),
-        "requests": tick.requests,
-        "lists": run_lists_json(tick),
-    });
-    out
-}
-
-/// Which lists this run read, and which it refused.
-///
-/// One builder for both streams. The webhook body used to say nothing about
-/// this at all: a list served during a cooldown, after a failed poll or cut
-/// short is dropped before the comparison, so it reaches [`payload`] as `None`
-/// and serializes to `null` — the same `null` an account with no capture of
-/// that list produces, with `counts.following_lost` at `0` either way. A run
-/// where the following walk met the truncation wall and a run where nothing
-/// happened were byte-identical, so `{{ $json.counts.following_lost > 0 }}`
-/// routed to "quiet" for as long as the wall lasted. The refusal was said out
-/// loud on standard error, where no receiver hears it.
-fn run_lists_json(tick: &TickReport) -> serde_json::Value {
-    tick.lists
-        .iter()
-        .map(|l| {
-            serde_json::json!({
-                "kind": l.kind.as_str(),
-                "skipped": l.skipped.map(skipped_token),
-            })
-        })
-        .collect::<Vec<_>>()
-        .into()
-}
-
-/// The line a tick that failed leaves in the stream.
-///
-/// Written after the `?` in `tick_one`, the JSON line was not written at all: a
-/// tick that could not resolve an account, or met a mid-walk cooldown, or could
-/// not read `history_head`, put its whole account on standard error as an
-/// English paragraph and left the file with no line for that interval. On a
-/// recipe the README offers as a complete way to use the tool.
-///
-/// It carries the same `run` object a successful line carries, so one reader
-/// can take `run.at` off every line without asking which kind it is, and
-/// `error` is what tells the two apart. `error.code` is the vocabulary of the
-/// README's exit table and of `watch_runs.outcome`, which is the field worth
-/// branching on; `error.message` is the chain, for a person reading the file.
-///
-/// The name and the message are the true values, unfiltered, for the reason
-/// `as_json` gives about a username: `printable` is for terminals, a machine
-/// format has to carry what identifies the account, and `serde_json` escapes
-/// what it emits. Everything drawn at a person still goes through
-/// `report::print_error`.
-fn failed_tick_json(
-    watched: &Watched,
-    error: &anyhow::Error,
-    at: i64,
-    requests: u32,
-) -> serde_json::Value {
-    serde_json::json!({
-        // The failure line carries it too. README says every message this tool
-        // emits carries `schema`, "including every line of the `--json`
-        // stream", and this was the one line without it — so a reader that
-        // branches on `msg["schema"] == 1`, which is what the version is for,
-        // threw on exactly the ticks it most needed to handle.
-        "schema": SCHEMA,
-        "account": {
-            "username": watched.name(),
-            "is_self": watched.name().is_none(),
-        },
-        "run": {
-            "at": at,
-            "looked": false,
-            "requests": requests,
-            "lists": [],
-        },
-        "error": {
-            "code": ExitCode::from_chain(error).unwrap_or(ExitCode::Error).as_str(),
-            "message": format!("{error:#}"),
-        },
-    })
-}
-
-/// One JSON line. One object, one line, in both modes.
-///
-/// `once` used to lay its object out to be read, on the grounds that somebody
-/// is looking at it — and that holds right up to the moment `watch.toml`
-/// carries a second `[[account]]`, which is what `snob watch setup` writes as
-/// soon as anybody answers yes to watching somebody else. `run_accounts` prints
-/// one object per account with nothing wrapping them, so two pretty-printed
-/// objects came out back to back: `json.load` stops at `Extra data`, and
-/// PowerShell's `ConvertFrom-Json` refuses it outright. The bytes were in no
-/// documented format at all — neither one document nor NDJSON — for the mode
-/// whose own help says it is meant for cron.
-///
-/// So the layout is not a mode's decision any more. `--json` is a stream of
-/// lines, which is what the CHANGELOG already promised and what
-/// `snob watch once --json >> events.ndjson` has to mean. What the two modes
-/// still differ on is whether a tick with no news is printed at all, and that
-/// is [`Printing::watching`], where it belongs.
-///
-/// The fallback is `Value::to_string` rather than a `?` because one call site
-/// is reached from the arm already handling a failure: a serializer error on a
-/// `Value` built here is not a second failure worth returning instead of the
-/// first.
-fn json_line(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
-}
-
-/// The version of the shape every message this tool emits has.
-///
-/// One number, in one place, because there are three emitters and they were
-/// three literals: the webhook body, the preflight, and the `--json` stream.
-/// Two spellings of one condition is how a receiver comes to be told a report
-/// is schema 1 and a preflight schema 2 for the same release, and this file
-/// already carries that lesson about `event`.
-///
-/// It moves when a field is removed or its meaning changes, and not when one is
-/// added: additive is what lets a receiver keep working, and `run.lists`
-/// arriving beside `counts` did not move it.
-const SCHEMA: u32 = 1;
-
-/// What goes on the wire.
-///
-/// A contract with whatever is on the other end, so it is built here by hand
-/// and asserted in a test: this is the one output of the tool that a stranger's
-/// automation branches on, and a field renamed by accident breaks a workflow
-/// somebody built months ago.
-///
-/// Four decisions worth knowing about, all of them about what an n8n node
-/// actually needs:
-///
-/// - **`counts` is separate from `changes`**, and redundant with the array
-///   lengths on purpose. `{{ $json.counts.followers_lost > 0 }}` is the
-///   condition people write, and it is far less fragile than an expression over
-///   `.length` on a field that may be absent.
-/// - **`schema` and `event` are at the top**, so fields can be added later
-///   without breaking anybody and a Switch node can tell a heartbeat from a
-///   report without looking inside.
-/// - **`looked` is not derivable from the arrays.** Empty changes mean "nothing
-///   happened" when the run could see and "I could not look" when it could not,
-///   and something watching for silence reads those as the same thing.
-/// - **`run.lists` is `looked` at the granularity a receiver needs.** `looked`
-///   is true when *either* list was read, so a run that walked followers and
-///   was refused following says `true` while `lists.following` is `null` and
-///   `counts.following_lost` is `0` — indistinguishable from a quiet run, and
-///   from an account with no following capture at all. The token is per list
-///   and additive, so `schema` stays 1. `lists.<kind>` deliberately stays
-///   `null` rather than becoming an object: a receiver testing it against
-///   `null` is the shape this shipped with, and there is no version to warn
-///   them by.
-fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_json::Value {
-    let report = &tick.report;
-    let changes = report.changes();
-
-    serde_json::json!({
-        "schema": SCHEMA,
-        "event": event,
-        "run": {
-            "id": run_id,
-            // The tick's own moment, not a third reading of the clock. It is
-            // what `commit_report` files the mark at and what the `--json` line
-            // carries, so one event has one time in all three places.
-            "at": tick.at(),
-            "looked": tick.looked(),
-            "requests": tick.requests,
-            "lists": run_lists_json(tick),
-            "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
-        },
-        "account": {
-            "pk": report.account_pk,
-            "username": report.username,
-            "is_self": report.is_self,
-        },
-        "lists": {
-            "followers": list_json(report.followers.as_ref()),
-            "following": list_json(report.following.as_ref()),
-        },
-        "counts": {
-            "followers_gained": changes.followers.gained.len(),
-            "followers_lost":   changes.followers.lost.len(),
-            "following_gained": changes.following.gained.len(),
-            "following_lost":   changes.following.lost.len(),
-            "renamed": changes.renamed.len(),
-            "total": changes.len(),
-        },
-        "events": {
-            // The accounts are the same `User` that `snob followers --format
-            // json` already emits, plus the address: whoever receives this is
-            // usually about to put it in a message, and rebuilding the URL at
-            // the other end is exactly where somebody pastes a name without
-            // encoding it.
-            "followers_gained": changes.followers.gained.iter().map(account_json).collect::<Vec<_>>(),
-            "followers_lost":   changes.followers.lost.iter().map(account_json).collect::<Vec<_>>(),
-            "following_gained": changes.following.gained.iter().map(account_json).collect::<Vec<_>>(),
-            "following_lost":   changes.following.lost.iter().map(account_json).collect::<Vec<_>>(),
-            "renamed": changes.renamed.iter().map(rename_json).collect::<Vec<_>>(),
-        },
-    })
-}
-
-/// What `snob watch check` posts.
-///
-/// The same skeleton [`payload`] uses, and it did not used to be. Three events
-/// exist; two go through `payload` and this one did not, so the preflight was
-/// the only message with no `schema` — the one a receiver cannot version-check
-/// — and it carried the id and the moment at the top level while every other
-/// message carries them under `run`. `webhook_of`'s own doc claimed "a receiver
-/// can branch on it exactly as it branches on the rest".
-///
-/// **Breaking**, for anybody reading `$json.run_id` or `$json.at` on a
-/// preflight, and bounded: a preflight is never queued, so no stored body has
-/// the old shape and there is nothing to migrate. `schema` stays 1 rather than
-/// becoming 2 — the preflight is joining the family, and bumping it would make
-/// every report receiver re-check a version over a message that did not change.
-///
-/// `looked`, `requests` and `lists` are deliberately absent: this run looked at
-/// nothing and spent nothing on the account, and a `false` there would read as
-/// a report that could not see rather than as a message that is not a report.
-/// The `note` says so in words, for whoever opens one by hand.
-fn preflight_body(run_id: &str, at: i64) -> serde_json::Value {
-    serde_json::json!({
-        "schema": SCHEMA,
-        "event": crate::engine::check::PREFLIGHT_EVENT,
-        "run": {
-            "id": run_id,
-            "at": at,
-            "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
-        },
-        "note": "snob watch check: this is not a report, and nothing is queued",
-    })
-}
-
-/// One account, as an automation wants it.
-fn account_json(user: &User) -> serde_json::Value {
-    let mut value = serde_json::to_value(user).unwrap_or(serde_json::Value::Null);
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "profile_url".to_string(),
-            serde_json::Value::String(user.profile_url()),
-        );
-    }
-    value
-}
-
-/// The stable name of why a list was left out.
-fn skipped_token(skipped: Skipped) -> &'static str {
-    match skipped {
-        Skipped::NobodyLooked(_) => "not_verified",
-        Skipped::Incomplete(..) => "incomplete",
-    }
-}
-
-fn count(report: Option<&ListReport>, of: impl Fn(&ListDiff) -> usize) -> usize {
-    report.map(|r| of(&r.diff)).unwrap_or_default()
-}
-
-fn list_json(report: Option<&ListReport>) -> serde_json::Value {
-    let Some(report) = report else {
-        return serde_json::Value::Null;
-    };
-    serde_json::json!({
-        // A stable token, so a caller can tell "nothing changed" from "this is
-        // the first look" without reading a sentence.
-        "basis": basis_token(report.basis),
-        "since": report.since,
-        "until": report.until,
-        "count": report.total,
-    })
-}
-
-fn diff_json(report: Option<&ListReport>) -> serde_json::Value {
-    let Some(report) = report else {
-        return serde_json::json!({ "gained": [], "lost": [] });
-    };
-    serde_json::json!({
-        "gained": report.diff.gained,
-        "lost": report.diff.lost,
-    })
-}
-
-fn rename_json(rename: &Rename) -> serde_json::Value {
-    serde_json::json!({
-        "pk": rename.pk,
-        "from": rename.from,
-        "to": rename.to,
-        "changed_at": rename.at,
-    })
-}
-
-/// The stable name of what a list's report is. Written out here rather than on
-/// [`Basis`] because it is vocabulary aimed at a caller, and the domain does
-/// not decide how it is spelled.
-fn basis_token(basis: Basis) -> &'static str {
-    match basis {
-        Basis::Baseline { .. } => "baseline",
-        Basis::Unchanged { .. } => "unchanged",
-        Basis::Compare { .. } => "compared",
-    }
-}
-
-/// The answer as a person reads it.
-///
-/// Says that reports were abandoned, because nothing else will.
-///
-/// The sweep marks a report `expired` once it is too old to be news, and that
-/// is the moment a set of arrivals and departures stops existing: `due` has
-/// already been refusing to hand it back, so the retry ladder never reaches the
-/// sentence in `send_one` that was written for exactly this. Until this line,
-/// the whole event was a row changing state in silence -- the run printed
-/// nothing, `status` counts only `pending` and so showed nothing, and the
-/// health verdict went from `warning` to `ok` at the instant the news was lost.
-fn say_what_was_given_up(given_up: usize) {
-    if given_up == 0 {
-        return;
-    }
-    let (subject, what) = if given_up == 1 {
-        ("report was", "what it said is")
-    } else {
-        ("reports were", "what they said is")
-    };
-    eprintln!(
-        "warning: {given_up} {subject} given up on for being too old to be news; \
-         {what} not reported a second time."
-    );
-}
-
-/// Returned as lines rather than printed, so a test can read them without
-/// capturing standard output.
-fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
-    let who = crate::app::label(report.account_pk, report.username.as_deref());
-
-    if !report.has_anything_stored() {
-        // A run in which every list was refused concluded nothing, and that is
-        // not the same as an account nothing has ever been walked for. It used
-        // to print "Nothing has been walked for @me yet -- run \"snob
-        // followers\" once" two lines above the warnings saying both lists had
-        // just been served from storage during a cooldown, with two complete
-        // captures on disk. The reason comes from the refusal lines the caller
-        // prints next, so this only has to stop claiming the opposite.
-        if refused {
-            return vec![format!("Nothing could be looked at for {who} this time.")];
-        }
-        return vec![format!(
-            "Nothing has been walked for {who} yet, so there is nothing to compare.\n\
-             Run \"snob followers\" once and this will have something to say from then on."
-        )];
-    }
-
-    // Said before anything else, because everything after it would otherwise
-    // read as "nothing happened" when what it means is "this is the first look".
-    let baselines: Vec<ListKind> = [report.followers.as_ref(), report.following.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter(|r| matches!(r.basis, Basis::Baseline { .. }))
-        .map(|r| r.kind)
-        .collect();
-
-    let mut lines = Vec::new();
-    if !baselines.is_empty() {
-        let which = baselines
-            .iter()
-            .map(|k| k.to_string())
-            .collect::<Vec<_>>()
-            .join(" and ");
-        // Both lists are the common case — a first look almost always finds
-        // two — so the sentence has to read for two as well as for one.
-        let (noun, verb) = if baselines.len() > 1 {
-            ("lists have", "them")
-        } else {
-            ("list has", "it")
-        };
-        lines.push(format!(
-            "The {which} {noun} never been reported on, so there is no earlier capture to \
-             compare {verb} against. The next run is the first that can say anything."
-        ));
-    }
-
-    let changes = report.changes();
-    if changes.is_empty() {
-        if baselines.is_empty() {
-            // **Say what was done, rather than asserting the negative.** Three
-            // different runs reached this one sentence and only one of them had
-            // earned it.
-            //
-            // A list whose counter had not moved is served from storage without
-            // being read, which is where nearly all of this tool's savings come
-            // from and is worth keeping — walking three hundred accounts costs
-            // fourteen requests and asking whether they changed costs one. But
-            // a counter cannot see a swap: one departure and one arrival leave
-            // it identical, and a rename does not move it at all. So a monitor
-            // ticking every half hour printed "nothing has changed" over and
-            // over, for up to the freshness window, while somebody had in fact
-            // left. Nothing is lost — the walk happens once the capture ages
-            // out and the comparison is against the last *reported* capture, so
-            // the departure is reported in full then — but for those hours the
-            // tool was stating a fact it had not checked.
-            //
-            // And a run where one list was refused and the other had no news
-            // printed it too, because the refusal branch above is gated on
-            // there being nothing stored at all and one surviving list gets
-            // past it. On an account permanently behind the truncation wall
-            // that is every run, about a list snob has never once read.
-            //
-            // The distinction is already in the domain type:
-            // `Basis::Unchanged` is documented as "this one did not have to
-            // look", against a `Compare` that read both and found nothing.
-            let nobody_looked = [report.followers.as_ref(), report.following.as_ref()]
-                .into_iter()
-                .flatten()
-                .all(|r| matches!(r.basis, Basis::Unchanged { .. }));
-
-            lines.push(format!(
-                "Nothing has changed for {who} since the last report."
-            ));
-            if refused {
-                lines.push(
-                    "One of the lists could not be read this time, so this speaks only for \
-                     the other one."
-                        .to_string(),
-                );
-            } else if nobody_looked {
-                lines.push(
-                    "Their counters had not moved, so the lists were not read again.".to_string(),
-                );
-            }
-            lines.push(since_line(report));
-        }
-        return lines;
-    }
-
-    lines.push(format!("Changes for {who}{}", period(report)));
-    lines.push(String::new());
-
-    for (kind, diff) in [
-        (ListKind::Followers, &changes.followers),
-        (ListKind::Following, &changes.following),
-    ] {
-        lines.extend(list_lines(kind, diff));
-    }
-
-    if !changes.renamed.is_empty() {
-        // The verb agrees, because one rename is the common case: it is what
-        // `once`, `diff` and the loop print most often, and the line above the
-        // names read "1 now go by another name". The baseline sentence a screen
-        // up already branches this way for the same reason.
-        let renamed = changes.renamed.len();
-        lines.push(format!(
-            "  {renamed} now {} by another name",
-            if renamed == 1 { "goes" } else { "go" }
-        ));
-        for r in &changes.renamed {
-            lines.push(format!(
-                "    @{} is now @{}",
-                printable(&r.from),
-                printable(&r.to)
-            ));
-        }
-    }
-
-    lines
-}
-
-fn list_lines(kind: ListKind, diff: &ListDiff) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (verb, who) in [("gained", &diff.gained), ("lost", &diff.lost)] {
-        if who.is_empty() {
-            continue;
-        }
-        lines.push(format!("  {kind} {verb}: {}", who.len()));
-        for user in who {
-            lines.push(format!("    {}", name_of(user)));
-        }
-    }
-    lines
-}
-
-/// A name as it is drawn, filtered because it came off Instagram.
-fn name_of(user: &User) -> String {
-    match user.full_name.as_deref().filter(|n| !n.trim().is_empty()) {
-        Some(full) => format!("@{} ({})", user.safe_username(), printable(full)),
-        None => format!("@{}", user.safe_username()),
-    }
-}
-
-/// " since 14/08 at 09:12", when there is a moment to name.
-fn period(report: &WatchReport) -> String {
-    match earliest_since(report) {
-        Some(since) => format!(" since {}", report::stored_on(since)),
-        None => String::new(),
-    }
-}
-
-fn since_line(report: &WatchReport) -> String {
-    match earliest_since(report) {
-        Some(since) => format!("The last report was on {}.", report::stored_on(since)),
-        None => "Nothing has been reported yet.".to_string(),
-    }
-}
-
-/// The older of the two receipts.
-///
-/// The two lists are marked apart and can be reported at different moments, so
-/// the interval the user is being shown starts at whichever was reported first
-/// — saying the later one would claim a window shorter than the one the numbers
-/// actually cover.
-fn earliest_since(report: &WatchReport) -> Option<i64> {
-    [report.followers.as_ref(), report.following.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.since)
-        .min()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::watch::TickList;
+
+    // Named here rather than at the top of the module: `wire` and `say` took
+    // the production uses of these with them, and an import kept alive only
+    // by `#[cfg(test)]` code is one `cargo check` reports as unused.
+    use snob_core::model::ListKind;
 
     /// What both halves of this module build their reports out of.
     ///
@@ -2020,6 +1400,9 @@ mod tests {
     /// module has any business with them.
     pub(super) mod fixtures {
         use super::*;
+        use crate::engine::watch::{ListReport, WatchReport};
+        use snob_core::model::User;
+        use snob_core::watch::{Basis, ListDiff, Rename};
 
         pub(in crate::commands::watch) const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
@@ -2079,9 +1462,9 @@ mod tests {
                 .unwrap()
                 .with_base_url(Url::parse(&server.uri()).unwrap());
 
-            let db = snob_core::store::Store::in_memory().unwrap();
-            snob_core::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
-            snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+            let db = snob_store::store::Store::in_memory().unwrap();
+            snob_store::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
+            snob_store::store::accounts::upsert(db.conn(), 42, true).unwrap();
 
             let app = crate::app::App::for_test(
                 client,
@@ -2113,7 +1496,7 @@ mod tests {
         }
     }
 
-    use fixtures::{app_posting_to, list, report_with, user, watch_toml};
+    use fixtures::{app_posting_to, user, watch_toml};
 
     /// An interval measures from the first start, not from this one.
     ///
@@ -2126,7 +1509,7 @@ mod tests {
     #[test]
     fn an_interval_measures_from_the_first_start_and_not_from_this_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
         let every = Schedule::every(std::time::Duration::from_secs(24 * 3_600)).unwrap();
 
         let first = seed_for(&paths, &every, 1_700_000_000).unwrap();
@@ -2145,7 +1528,7 @@ mod tests {
     #[test]
     fn a_calendar_is_not_seeded() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
+        let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
         let at_nine = Schedule::calendar(&[], &[schedule::parse_time("09:00").unwrap()]).unwrap();
 
         assert_eq!(seed_for(&paths, &at_nine, 1_700_000_000).unwrap(), None);
@@ -2176,8 +1559,8 @@ mod tests {
         let (mut app, _delivery) = app_posting_to(&server);
         // The account has to be known locally, or the foreign key has nothing
         // to point at — which is its own gap, written down at the call site.
-        snob_core::store::users::upsert(app.db().conn(), &user(99, "friend")).unwrap();
-        snob_core::store::accounts::upsert(app.db().conn(), 99, false).unwrap();
+        snob_store::store::users::upsert(app.db().conn(), &user(99, "friend")).unwrap();
+        snob_store::store::accounts::upsert(app.db().conn(), 99, false).unwrap();
 
         let watched = [Watched::consented(
             "friend".into(),
@@ -2197,7 +1580,7 @@ mod tests {
             outcome.spent
         );
 
-        let runs = snob_core::store::watch::last_runs(app.db().conn()).unwrap();
+        let runs = snob_store::store::watch::last_runs(app.db().conn()).unwrap();
         let recorded = runs
             .iter()
             .find(|r| r.account_pk == 99)
@@ -2302,10 +1685,10 @@ mod tests {
     /// A report queued longer ago than it can be news for, in a store at
     /// `paths`. Nothing but a settle can move it: `due` will not hand back an
     /// over-age row, and only a failed attempt expires one.
-    fn owed_long_ago(paths: &snob_core::paths::AppPaths, now: i64) -> i64 {
-        let db = snob_core::store::Store::open(paths).unwrap();
-        snob_core::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
-        snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+    fn owed_long_ago(paths: &snob_store::paths::AppPaths, now: i64) -> i64 {
+        let db = snob_store::store::Store::open(paths).unwrap();
+        snob_store::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
+        snob_store::store::accounts::upsert(db.conn(), 42, true).unwrap();
         deliveries::enqueue(
             db.conn(),
             "run-old",
@@ -2330,11 +1713,11 @@ mod tests {
     #[tokio::test]
     async fn a_scheduled_run_with_no_session_still_settles_the_queue() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
-        let now = snob_core::store::now();
+        let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
+        let now = snob_core::clock::now();
         let id = owed_long_ago(&paths, now);
 
-        let secrets = snob_core::secrets::SecretStore::new(paths.clone(), true)
+        let secrets = snob_store::secrets::SecretStore::new(paths.clone(), true)
             .with_service(&format!("snob-ig-test-settle-{}", std::process::id()));
         let args = WatchRunArgs {
             no_progress: true,
@@ -2345,7 +1728,7 @@ mod tests {
             .await
             .expect("no session is not a failure; the loop keeps going");
 
-        let db = snob_core::store::Store::open(&paths).unwrap();
+        let db = snob_store::store::Store::open(&paths).unwrap();
         assert_eq!(
             deliveries::state(db.conn(), id).unwrap().as_deref(),
             Some("expired"),
@@ -2366,11 +1749,11 @@ mod tests {
     #[tokio::test]
     async fn a_webhook_the_run_refuses_still_lets_the_queue_settle() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = snob_core::paths::AppPaths::rooted_at(tmp.path());
-        let now = snob_core::store::now();
+        let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
+        let now = snob_core::clock::now();
         let id = owed_long_ago(&paths, now);
 
-        let secrets = snob_core::secrets::SecretStore::new(paths.clone(), true)
+        let secrets = snob_store::secrets::SecretStore::new(paths.clone(), true)
             .with_service(&format!("snob-ig-test-refused-{}", std::process::id()));
         let args = WatchOnceArgs {
             delivery: crate::cli::WebhookArgs {
@@ -2390,7 +1773,7 @@ mod tests {
             "that header is part of what snob sends, so the address is refused"
         );
 
-        let db = snob_core::store::Store::open(&paths).unwrap();
+        let db = snob_store::store::Store::open(&paths).unwrap();
         assert_eq!(
             deliveries::state(db.conn(), id).unwrap().as_deref(),
             Some("expired"),
@@ -2549,57 +1932,6 @@ consent = { agreed_at = 1700 }
         assert_eq!(watched[0].name(), None);
     }
 
-    /// Not posting is not the same as having nowhere to post.
-    ///
-    /// With `--no-webhook` no entry was pushed at all, so `check --json` had no
-    /// webhook object and the terminal no webhook line -- indistinguishable from
-    /// a machine with no `[webhook]` in its file. That is the flag somebody uses
-    /// to check everything else without disturbing a receiver, so it is exactly
-    /// when the question "is a receiver configured?" is being asked. The address
-    /// and every configured header have been through `webhook::check` by then,
-    /// so there is a validation that passed to report rather than nothing.
-    #[test]
-    fn not_posting_is_not_the_same_as_having_nowhere_to_post() {
-        use crate::engine::check::{CheckReport, Verdict, What};
-
-        const WHERE_TO: &str = "https://n8n.local/webhook/snob";
-
-        let checked =
-            not_posted(Some((WHERE_TO, true)), true).expect("the address was checked and not used");
-        assert!(
-            matches!(&checked.what, What::Webhook { destination, status: None, signed: true }
-                if destination == WHERE_TO),
-            "the address it did not post to is the answer: {:?}",
-            checked.what
-        );
-        assert_eq!(checked.verdict, Verdict::Ok);
-        assert!(
-            checked
-                .problem
-                .as_deref()
-                .is_some_and(|p| p.contains("--no-webhook")),
-            "and the line has to say why nothing was posted: {:?}",
-            checked.problem
-        );
-
-        // A run that is going to post reports what came back instead, and an
-        // address nobody configured has nothing to say either way.
-        assert!(not_posted(Some((WHERE_TO, true)), false).is_none());
-        assert!(not_posted(None, true).is_none());
-
-        // The whole point is that it reaches both readers.
-        let report = CheckReport {
-            checked: vec![checked],
-        };
-        assert!(
-            describe_check(&report)
-                .iter()
-                .any(|l| l.contains("webhook")),
-            "a probe cannot tell a receiver that was not posted to from no receiver"
-        );
-        assert_eq!(check_json(&report)["checks"][0]["what"], "webhook");
-    }
-
     /// `snob watch once` watches what the file says to watch.
     ///
     /// It read `watch.toml` for the webhook address and then built the watched
@@ -2628,13 +1960,13 @@ consent = { agreed_at = 1700 }
             jitter: None,
             webhook: None,
             accounts: vec![
-                snob_core::watch::config::AccountConfig {
+                snob_store::config::AccountConfig {
                     target: "self".to_string(),
                     consent: None,
                 },
-                snob_core::watch::config::AccountConfig {
+                snob_store::config::AccountConfig {
                     target: "friend".to_string(),
-                    consent: Some(snob_core::watch::config::ConsentConfig {
+                    consent: Some(snob_store::config::ConsentConfig {
                         agreed_at: 1_700_000_000,
                     }),
                 },
@@ -2900,254 +2232,6 @@ consent = { agreed_at = 1700 }
         assert_eq!(when_from(&WatchRunArgs::default(), None), When::default());
     }
 
-    /// Somebody who has never run the tool is told to run it, not told that
-    /// nothing changed — which would be true and useless.
-    #[test]
-    fn an_account_with_nothing_stored_is_told_what_to_run() {
-        let lines = describe(&report_with(None, vec![]), false);
-        assert!(lines.join("\n").contains("snob followers"), "{lines:?}");
-    }
-
-    /// A run that could not look at either list is not an account nothing has
-    /// been walked for.
-    ///
-    /// Both are "no report to show", and they were printed the same way — so a
-    /// tick during a cooldown, with two complete captures on disk, said "Nothing
-    /// has been walked for @me yet" and told the reader to run `snob followers`,
-    /// two lines above the warnings saying both lists had just been served from
-    /// storage.
-    #[test]
-    fn a_run_that_could_not_look_does_not_claim_the_account_is_unknown() {
-        let lines = describe(&report_with(None, vec![]), true).join("\n");
-        assert!(!lines.contains("snob followers"), "{lines}");
-        assert!(lines.contains("could be looked at"), "{lines}");
-    }
-
-    /// The worst thing this feature could print. A first look has no earlier
-    /// capture, so it must say so rather than report an empty diff as calm.
-    #[test]
-    fn a_first_look_says_so_instead_of_saying_nothing_changed() {
-        let lines = describe(
-            &report_with(
-                Some(list(
-                    Basis::Baseline { snapshot_id: 1 },
-                    ListDiff::default(),
-                    None,
-                )),
-                vec![],
-            ),
-            false,
-        );
-        let text = lines.join("\n");
-        assert!(text.contains("never been reported"), "{text}");
-        assert!(
-            !text.contains("Nothing has changed"),
-            "a baseline is not a quiet account: {text}"
-        );
-    }
-
-    /// A first look almost always finds both lists, so the common case is the
-    /// plural one — and it read "the followers and following list has" until
-    /// somebody ran it.
-    #[test]
-    fn a_first_look_at_both_lists_says_so_in_the_plural() {
-        let baseline = |kind| ListReport {
-            kind,
-            basis: Basis::Baseline { snapshot_id: 1 },
-            since: None,
-            until: 2_000,
-            diff: ListDiff::default(),
-            total: 309,
-        };
-        let report = WatchReport {
-            account_pk: 42,
-            username: Some("me".into()),
-            is_self: true,
-            followers: Some(baseline(ListKind::Followers)),
-            following: Some(baseline(ListKind::Following)),
-            renamed: vec![],
-        };
-
-        let text = describe(&report, false).join("\n");
-        assert!(text.contains("lists have never been reported"), "{text}");
-        assert!(!text.contains("list has never"), "{text}");
-    }
-
-    /// A run that did not read the lists must not assert that nothing changed.
-    ///
-    /// `Basis::Unchanged` is documented as "this one did not have to look": the
-    /// counter had not moved, so the stored capture was served without being
-    /// re-read. A counter cannot see a swap — one departure and one arrival
-    /// leave it identical — so a monitor printed "nothing has changed" for
-    /// hours while somebody had left. The saving is right and stays; the
-    /// unhedged sentence was not.
-    #[test]
-    fn a_run_that_did_not_look_says_so() {
-        let unread = describe(
-            &report_with(
-                Some(list(
-                    Basis::Unchanged { snapshot_id: 7 },
-                    ListDiff::default(),
-                    Some(1_000),
-                )),
-                vec![],
-            ),
-            false,
-        )
-        .join("\n");
-        assert!(
-            unread.contains("were not read again"),
-            "a counter poll is not a look: {unread}"
-        );
-
-        // And a run that really did read both and found nothing keeps the
-        // plain sentence, because there it is true.
-        let read = describe(
-            &report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    ListDiff::default(),
-                    Some(1_000),
-                )),
-                vec![],
-            ),
-            false,
-        )
-        .join("\n");
-        assert!(read.contains("Nothing has changed"), "{read}");
-        assert!(
-            !read.contains("were not read again"),
-            "this one did look: {read}"
-        );
-
-        // A refused list is a third case, and it used to print the same
-        // sentence as the other two: the refusal branch is reached only when
-        // *nothing* is stored, so one surviving list got past it.
-        let partial = describe(
-            &report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    ListDiff::default(),
-                    Some(1_000),
-                )),
-                vec![],
-            ),
-            true,
-        )
-        .join("\n");
-        assert!(
-            partial.contains("could not be read this time"),
-            "a refused list must not be reported as quiet: {partial}"
-        );
-    }
-
-    #[test]
-    fn an_arrival_and_a_departure_are_both_named() {
-        let diff = ListDiff {
-            gained: vec![user(1, "arrived")],
-            lost: vec![user(2, "left")],
-        };
-        let lines = describe(
-            &report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    diff,
-                    Some(1_000),
-                )),
-                vec![],
-            ),
-            false,
-        );
-
-        let text = lines.join("\n");
-        assert!(text.contains("@arrived"), "{text}");
-        assert!(text.contains("@left"), "{text}");
-        assert!(text.contains("followers gained: 1"), "{text}");
-        assert!(text.contains("followers lost: 1"), "{text}");
-    }
-
-    /// A rename on its own is news. It used to be possible for the empty-diff
-    /// check to swallow a run whose only change was somebody's name.
-    #[test]
-    fn a_rename_on_its_own_is_still_reported() {
-        let lines = describe(
-            &report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    ListDiff::default(),
-                    Some(1_000),
-                )),
-                vec![Rename {
-                    pk: 7,
-                    history_id: 7,
-                    from: "before".into(),
-                    to: "after".into(),
-                    at: 1_500,
-                }],
-            ),
-            false,
-        );
-
-        let text = lines.join("\n");
-        assert!(text.contains("@before is now @after"), "{text}");
-        assert!(!text.contains("Nothing has changed"), "{text}");
-    }
-
-    /// And one rename is counted as one.
-    ///
-    /// The test above builds exactly one `Rename` and asserts only the line
-    /// *below* the count, so it passes with that line deleted and passed with it
-    /// reading "1 now go by another name". One is the common case here: it is
-    /// what `once`, `diff` and the loop print most often.
-    #[test]
-    fn one_rename_is_counted_as_one() {
-        let renamed = |names: &[(&str, &str)]| {
-            describe(
-                &report_with(
-                    Some(list(
-                        Basis::Compare {
-                            before: 1,
-                            after: 2,
-                        },
-                        ListDiff::default(),
-                        Some(1_000),
-                    )),
-                    names
-                        .iter()
-                        .enumerate()
-                        .map(|(n, (from, to))| Rename {
-                            pk: n as Pk,
-                            history_id: n as i64,
-                            from: (*from).into(),
-                            to: (*to).into(),
-                            at: 1_500,
-                        })
-                        .collect(),
-                ),
-                false,
-            )
-            .join("\n")
-        };
-
-        let one = renamed(&[("before", "after")]);
-        assert!(one.contains("1 now goes by another name"), "{one}");
-
-        let two = renamed(&[("before", "after"), ("other", "later")]);
-        assert!(two.contains("2 now go by another name"), "{two}");
-    }
-
     /// The monitor's own sentence about its gaps reads as a sentence for one.
     ///
     /// One format string with no branch and `1` an ordinary value in it: "1
@@ -3177,457 +2261,54 @@ consent = { agreed_at = 1700 }
         }
     }
 
-    /// The tokens are what a caller branches on, so they are asserted rather
-    /// than left to whatever the enum happens to be called.
+    /// Not posting is not the same as having nowhere to post.
+    ///
+    /// With `--no-webhook` no entry was pushed at all, so `check --json` had no
+    /// webhook object and the terminal no webhook line -- indistinguishable from
+    /// a machine with no `[webhook]` in its file. That is the flag somebody uses
+    /// to check everything else without disturbing a receiver, so it is exactly
+    /// when the question "is a receiver configured?" is being asked. The address
+    /// and every configured header have been through `webhook::check` by then,
+    /// so there is a validation that passed to report rather than nothing.
     #[test]
-    fn the_json_carries_stable_tokens_for_each_basis() {
-        for (basis, token) in [
-            (Basis::Baseline { snapshot_id: 1 }, "baseline"),
-            (Basis::Unchanged { snapshot_id: 1 }, "unchanged"),
-            (
-                Basis::Compare {
-                    before: 1,
-                    after: 2,
-                },
-                "compared",
-            ),
-        ] {
-            assert_eq!(basis_token(basis), token);
-        }
-    }
+    fn not_posting_is_not_the_same_as_having_nowhere_to_post() {
+        use crate::engine::check::{CheckReport, Verdict, What};
 
-    /// The README publishes the body, so it has to be the body.
-    ///
-    /// The example was the **stdout** shape minus its lists: `run` carried
-    /// `looked` and `requests` and neither `id` nor `at`. Those are the two
-    /// fields the surrounding prose depends on — the id is what "queued and
-    /// retried", at-least-once and `X-Snob-Delivery` are all about, and the
-    /// moment is the only timestamp in the message — so a receiver written from
-    /// the document had neither. `counts` showed three of six keys, and nothing
-    /// marked the object as abbreviated.
-    ///
-    /// It compares keys and not values, because the block is an example and
-    /// abbreviates the arrays. What it may not do is name a key the payload does
-    /// not emit, or leave one out of `run` — which is the object the drift
-    /// happened in.
-    ///
-    /// The version inside `tool` is deliberately not asserted: doing that makes
-    /// every release a README edit.
-    #[test]
-    fn the_readme_publishes_the_body_that_goes_out() {
-        // Walks up from this crate until a `Cargo.lock` shows up, the way the
-        // source-reading guards in `snob-core` do, and answers nothing from a
-        // packaged build where there is no repository to read.
-        let Some(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .find(|d| d.join("Cargo.lock").is_file())
-        else {
-            return;
-        };
+        const WHERE_TO: &str = "https://n8n.local/webhook/snob";
 
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert_eq!(
-            readme.matches("```json").count(),
-            1,
-            "the payload is the only JSON block, and this test takes the first"
-        );
-        let block = readme
-            .split("```json")
-            .nth(1)
-            .and_then(|rest| rest.split("```").next())
-            .expect("the README shows the payload");
-        let published: serde_json::Value =
-            serde_json::from_str(block).expect("the README's example has to be JSON");
-
-        let real = payload(
-            &TickReport::for_test(report_with(None, vec![]), 14, 1_700_000_000),
-            "run-1",
-            "watch.changes",
-        );
-
-        let keys = |value: &serde_json::Value| {
-            let mut names: Vec<String> = value
-                .as_object()
-                .map(|o| o.keys().cloned().collect())
-                .unwrap_or_default();
-            names.sort();
-            names
-        };
-        assert_eq!(
-            keys(&published["run"]),
-            keys(&real["run"]),
-            "the `run` object is published in full or not at all"
-        );
-
-        // One direction only: the example abbreviates, and it is allowed to.
-        // What it may not do is publish a field nothing sends.
-        fn only_real_keys(published: &serde_json::Value, real: &serde_json::Value, path: &str) {
-            let (Some(published), Some(real)) = (published.as_object(), real.as_object()) else {
-                return;
-            };
-            for (key, value) in published {
-                let here = format!("{path}.{key}");
-                let counterpart = real.get(key).unwrap_or_else(|| {
-                    panic!("the README publishes \"{here}\", which is not sent")
-                });
-                only_real_keys(value, counterpart, &here);
-            }
-        }
-        only_real_keys(&published, &real, "");
-    }
-
-    /// Every message this tool emits can be version-checked, and the two that
-    /// go to a receiver put the id and the moment in the same place.
-    ///
-    /// Three emitters exist and they were three literal `1`s and, for a while,
-    /// two shapes. The preflight was the only body with no `schema` at all —
-    /// the one message a receiver cannot version-check — with `run_id` and `at`
-    /// at the top level while the other two carried them under `run`;
-    /// `webhook_of`'s doc claimed the opposite in as many words.
-    ///
-    /// The `--json` stream was the third, and it had no version either. The
-    /// README's own recipe is `snob watch --json >> events.ndjson`, which makes
-    /// that file a data feed with readers of its own, so a receiver could
-    /// version-check a webhook body and a preflight and not the file it was told
-    /// to append to. It carries no `run.id`, and that is right rather than an
-    /// omission: an id exists to deduplicate an at-least-once delivery, and a
-    /// line written once to a local file is not one.
-    #[test]
-    fn every_message_carries_the_schema() {
-        let report = payload(
-            &TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000),
-            "run-1",
-            "watch.changes",
-        );
-        let preflight = preflight_body("run-2", 1_700_000_000);
-        let streamed = tick_json(&TickReport::for_test(
-            report_with(None, vec![]),
-            0,
-            1_700_000_000,
-        ));
-
-        for (which, message) in [
-            ("report", &report),
-            ("preflight", &preflight),
-            ("stream line", &streamed),
-        ] {
-            assert_eq!(message["schema"], 1, "{which} cannot be version-checked");
-            assert_eq!(
-                message["run"]["at"], 1_700_000_000,
-                "{which} does not say when"
-            );
-            assert!(
-                message.get("at").is_none(),
-                "{which} still has the moment at the top level"
-            );
-        }
-
-        for (which, message) in [("report", &report), ("preflight", &preflight)] {
-            assert!(
-                message["event"].as_str().is_some(),
-                "{which} has nothing for a Switch node to read"
-            );
-            assert!(
-                message["run"]["id"].as_str().is_some(),
-                "{which} does not say which run it is"
-            );
-            assert!(
-                message.get("run_id").is_none(),
-                "{which} still has the id at the top level"
-            );
-        }
-
-        // And the name is one constant, so the header and the body cannot come
-        // to disagree the way they did over heartbeats.
-        assert_eq!(preflight["event"], crate::engine::check::PREFLIGHT_EVENT);
-    }
-
-    /// A refused list is not a quiet one, and the body has to say which it was.
-    ///
-    /// `tick` drops a list it could not verify before the comparison, so it
-    /// reaches `payload` as `None` and `list_json` turns it into `null` — the
-    /// same `null` an account with no capture of that list produces, with
-    /// `counts.following_lost` at `0` in both. The two bodies were byte
-    /// identical, so `{{ $json.counts.following_lost > 0 }}` routed a run that
-    /// could not see to "nothing happened" for as long as the wall lasted, and
-    /// the only place the refusal was said out loud was standard error.
-    ///
-    /// `run.looked` cannot resolve it, and it is asserted equal here to say so:
-    /// it is `any`, not `all`, so a run that read followers and was refused
-    /// following reports `true`. Which list is the question.
-    #[test]
-    fn a_refused_list_is_not_reported_as_a_quiet_one() {
-        let body = |skipped| {
-            let mut tick = TickReport::for_test(
-                report_with(
-                    Some(list(
-                        Basis::Compare {
-                            before: 1,
-                            after: 2,
-                        },
-                        ListDiff {
-                            gained: vec![user(1, "arrived")],
-                            lost: vec![],
-                        },
-                        Some(1_000),
-                    )),
-                    vec![],
-                ),
-                7,
-                1_700_000_000,
-            );
-            tick.lists = vec![
-                TickList {
-                    kind: ListKind::Followers,
-                    skipped: None,
-                },
-                TickList {
-                    kind: ListKind::Following,
-                    skipped,
-                },
-            ];
-            payload(&tick, "run-1", "watch.changes")
-        };
-
-        let refused = body(Some(Skipped::NobodyLooked(Provenance::PollFailed)));
-        let read = body(None);
-
-        // Everything a receiver had to go on before, and it is the same in
-        // both: the arrays cannot tell them apart and neither can the counts.
-        assert_eq!(refused["lists"], read["lists"]);
-        assert_eq!(refused["counts"], read["counts"]);
-        assert_eq!(
-            refused["run"]["looked"], read["run"]["looked"],
-            "`looked` is `any`, so it says `true` for both"
-        );
-
-        assert_ne!(
-            refused["run"]["lists"], read["run"]["lists"],
-            "a receiver has no field to read the refusal from"
-        );
-        assert_eq!(refused["run"]["lists"][1]["kind"], "following");
-        assert_eq!(refused["run"]["lists"][1]["skipped"], "not_verified");
-        assert_eq!(
-            read["run"]["lists"][1]["skipped"],
-            serde_json::Value::Null,
-            "a list that was read carries no refusal"
-        );
-    }
-
-    /// An event line says when it happened.
-    ///
-    /// The README puts `snob watch --json >> events.ndjson` forward as a
-    /// complete way to use the tool, and the line carried no time of its own.
-    /// The only epoch fields belonged to the lists — the mark's moment and the
-    /// capture's — and they go away with the list when it is refused. One 429
-    /// opens a cooldown, both lists are served from storage for the next half
-    /// hour, and every line in that window is byte-identical while the wire
-    /// bodies for the same ticks differ at `run.at`. A file like that cannot be
-    /// queried by time, windowed or deduplicated.
-    #[test]
-    fn an_event_line_says_when_it_happened() {
-        let quiet_run_at = |at| {
-            let mut tick = TickReport::for_test(report_with(None, vec![]), 0, at);
-            tick.lists = vec![TickList {
-                kind: ListKind::Followers,
-                skipped: Some(Skipped::NobodyLooked(Provenance::Cooldown)),
-            }];
-            tick_json(&tick)
-        };
-
-        let first = quiet_run_at(1_700_000_000);
-        let second = quiet_run_at(1_700_021_600);
-
-        assert_eq!(first["run"]["at"], 1_700_000_000);
-        assert_ne!(
-            first, second,
-            "six hours apart and the same bytes: nothing in the file can date a run"
-        );
-
-        // The moment is the tick's own, so the file and whatever the webhook
-        // delivered can be joined on it.
-        let tick = TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000);
-        assert_eq!(
-            tick_json(&tick)["run"]["at"],
-            payload(&tick, "run-1", "watch.changes")["run"]["at"],
-            "one event, one moment"
-        );
-    }
-
-    /// A failed tick leaves a line in the stream.
-    ///
-    /// The JSON line is written after the `?` in `tick_one`, so a tick that
-    /// failed printed nothing on standard output at all — @friend goes private,
-    /// or DNS goes away for a named target, and `events.ndjson` simply has no
-    /// line for that interval. The failure went to standard error as an English
-    /// `error:` / `caused by:` / `hint:` paragraph, which is the one shape a
-    /// consumer of the file is not reading.
-    ///
-    /// The line has to be readable by the same reader the successful lines
-    /// have, which is why `run` is the same object. `error` is what tells them
-    /// apart, and a successful line must not have one.
-    #[test]
-    fn a_failed_tick_leaves_a_line_in_the_stream() {
-        let error = anyhow::anyhow!("@friend's account is private");
-        let line = failed_tick_json(
-            &Watched::consented("friend".into(), crate::engine::watch::Consent),
-            &error,
-            1_700_000_000,
-            1,
-        );
-
-        assert_eq!(
-            line["run"]["at"], 1_700_000_000,
-            "the gap in the file has to be datable, which is the whole of it"
-        );
-        assert_eq!(line["run"]["looked"], false);
-        assert_eq!(line["run"]["requests"], 1, "the poll was charged");
-        assert_eq!(line["account"]["username"], "friend");
-        assert_eq!(
-            line["error"]["code"], "error",
-            "the vocabulary of the exit table, not free text"
-        );
-
-        // And the two kinds of line are told apart by the field itself, not by
-        // what is missing from the rest of the object.
-        let ok = tick_json(&TickReport::for_test(
-            report_with(None, vec![]),
-            0,
-            1_700_000_000,
-        ));
+        let checked =
+            not_posted(Some((WHERE_TO, true)), true).expect("the address was checked and not used");
         assert!(
-            ok.get("error").is_none(),
-            "a run that worked must not look like one that failed"
+            matches!(&checked.what, What::Webhook { destination, status: None, signed: true }
+                if destination == WHERE_TO),
+            "the address it did not post to is the answer: {:?}",
+            checked.what
         );
-
-        // One object, one line, in both modes. `run_accounts` prints one per
-        // account with nothing wrapping them, so a line laid out over several
-        // of them stops parsing the moment a second account is watched.
-        assert!(!json_line(&line).contains('\n'));
+        assert_eq!(checked.verdict, Verdict::Ok);
         assert!(
-            !json_line(&ok).contains('\n'),
-            "the successful line is a line too"
-        );
-    }
-
-    /// The shape a stranger's automation branches on, pinned to a literal.
-    ///
-    /// This is the one output of the tool that somebody else's workflow reads,
-    /// and a key renamed by accident breaks something built months ago with no
-    /// error anywhere. Comparing against a literal means a change to the
-    /// contract has to be a change somebody made on purpose.
-    ///
-    /// Both of the fields that move in production are arguments here: `run.id`
-    /// is random and `run.at` is the tick's own moment, so the literal can
-    /// carry them rather than the comparison having to skip them.
-    #[test]
-    fn the_payload_has_the_shape_a_receiver_was_promised() {
-        let tick = TickReport::for_test(
-            report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    ListDiff {
-                        gained: vec![user(1, "arrived")],
-                        lost: vec![user(2, "left")],
-                    },
-                    Some(1_000),
-                )),
-                vec![Rename {
-                    pk: 7,
-                    history_id: 7,
-                    from: "before".into(),
-                    to: "after".into(),
-                    at: 1_500,
-                }],
-            ),
-            14,
-            1_700_000_000,
+            checked
+                .problem
+                .as_deref()
+                .is_some_and(|p| p.contains("--no-webhook")),
+            "and the line has to say why nothing was posted: {:?}",
+            checked.problem
         );
 
-        let payload = payload(&tick, "run-1", "watch.changes");
+        // A run that is going to post reports what came back instead, and an
+        // address nobody configured has nothing to say either way.
+        assert!(not_posted(Some((WHERE_TO, true)), false).is_none());
+        assert!(not_posted(None, true).is_none());
 
-        assert_eq!(
-            payload,
-            serde_json::json!({
-                "schema": 1,
-                "event": "watch.changes",
-                "run": {
-                    "id": "run-1",
-                    "at": 1_700_000_000,
-                    "looked": false,
-                    "requests": 14,
-                    "lists": [],
-                    "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
-                },
-                "account": { "pk": 42, "username": "me", "is_self": true },
-                "lists": {
-                    "followers": {
-                        "basis": "compared",
-                        "since": 1_000,
-                        "until": 2_000,
-                        "count": 10,
-                    },
-                    "following": null,
-                },
-                "counts": {
-                    "followers_gained": 1,
-                    "followers_lost": 1,
-                    "following_gained": 0,
-                    "following_lost": 0,
-                    "renamed": 1,
-                    "total": 3,
-                },
-                "events": {
-                    "followers_gained": [{
-                        "pk": 1,
-                        "username": "arrived",
-                        "profile_url": "https://www.instagram.com/arrived/",
-                    }],
-                    "followers_lost": [{
-                        "pk": 2,
-                        "username": "left",
-                        "profile_url": "https://www.instagram.com/left/",
-                    }],
-                    "following_gained": [],
-                    "following_lost": [],
-                    "renamed": [{
-                        "pk": 7,
-                        "from": "before",
-                        "to": "after",
-                        "changed_at": 1_500,
-                    }],
-                },
-            })
-        );
-    }
-
-    /// A control character in a name reaches a terminal through this command
-    /// like any other, so it goes through the same filter.
-    #[test]
-    fn a_name_is_filtered_before_it_is_drawn() {
-        let lines = describe(
-            &report_with(
-                Some(list(
-                    Basis::Compare {
-                        before: 1,
-                        after: 2,
-                    },
-                    ListDiff {
-                        gained: vec![user(1, "bad\u{202e}name")],
-                        lost: vec![],
-                    },
-                    Some(1_000),
-                )),
-                vec![],
-            ),
-            false,
-        );
+        // The whole point is that it reaches both readers.
+        let report = CheckReport {
+            checked: vec![checked],
+        };
         assert!(
-            !lines.join("\n").contains('\u{202e}'),
-            "a bidi override reached the terminal"
+            describe_check(&report)
+                .iter()
+                .any(|l| l.contains("webhook")),
+            "a probe cannot tell a receiver that was not posted to from no receiver"
         );
+        assert_eq!(check_json(&report)["checks"][0]["what"], "webhook");
     }
 }

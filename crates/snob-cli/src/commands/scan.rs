@@ -14,8 +14,8 @@ use anyhow::Result;
 use snob_core::Pk;
 use snob_core::filters::Filter;
 use snob_core::model::{ListKind, User, printable};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::cli::{Format, ListArgs};
 use crate::commands::common::{self, Destination, Session};
@@ -134,7 +134,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // opening line could name accounts unfollowed months ago while reading
     // exactly like one worked out this minute.
     let max_age = i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX);
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     let stale = found.as_ref().is_some_and(|f| !f.is_current(max_age, now));
     let followed_by = found.filter(|_| !stale);
 

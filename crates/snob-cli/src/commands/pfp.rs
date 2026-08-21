@@ -9,9 +9,9 @@
 
 use anyhow::{Result, anyhow};
 use snob_core::model::printable;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::app::App;
 use crate::cli::PfpArgs;
@@ -220,8 +220,8 @@ impl Source {
 
 #[cfg(test)]
 mod tests {
+    use snob_core::budget::{RateBudget, RateBudgetError};
     use snob_core::session::{Session, SessionOrigin};
-    use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
     use snob_ig::pace::Pacer;
     use url::Url;
     use wiremock::matchers::{method, path, query_param};

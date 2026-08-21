@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::cli::ListArgs;
 use crate::commands::common::{self, Session};

@@ -7,11 +7,11 @@
 //! that there was nowhere to put the result.
 
 use anyhow::{Result, bail};
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::{Backend, SecretStore};
 use snob_core::session::Session;
 use snob_ig::login::{self, ValidationOutcome};
 use snob_ig::pace::{CancelToken, Pacer};
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::{Backend, SecretStore};
 
 use crate::cli::LoginArgs;
 use crate::exit::ExitCode;

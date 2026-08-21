@@ -333,7 +333,7 @@ pub(super) async fn deliver(
     // the signal and "quiet" has to be told from "stopped".
     let body = match delivery.and_then(|d| event_for(&changes, d.heartbeat)) {
         Some(event) => {
-            let run_id = run_id(snob_core::store::now(), tick.report.account_pk);
+            let run_id = run_id(snob_core::clock::now(), tick.report.account_pk);
             // Serialized once, here, and stored as the string that goes on the
             // wire. `serde_json` may render one value two ways, and the
             // signature covers bytes — so a retry that rendered it again could
@@ -398,7 +398,7 @@ async fn send_one(
     body: &str,
     attempt: i64,
 ) {
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     let outcome = delivery
         .client
         .post(body, event_of(body), run_id, attempt)
@@ -546,7 +546,7 @@ fn event_of(body: &str) -> &str {
 /// which is `exit(130)`. Nothing is gained by finishing: the rows stay pending
 /// and the next run drains them, which is the whole point of the queue.
 pub(super) async fn drain(app: &crate::app::App, delivery: &Delivery) {
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT, &delivery.destination) {
         Ok(owed) => owed,
         Err(e) => {
@@ -601,6 +601,7 @@ pub(super) fn run_id(now: i64, account_pk: Pk) -> String {
 mod tests {
     use super::*;
     use crate::commands::watch::tests::fixtures::{app_posting_to, list, report_with, user};
+    use snob_core::watch::{Basis, ListDiff};
 
     /// Two workflows on one host are two addresses.
     ///
@@ -721,7 +722,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
-        let now = snob_core::store::now();
+        let now = snob_core::clock::now();
         owe(&app, &delivery, 2, now);
 
         drain(&app, &delivery).await;
@@ -740,7 +741,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
-        let now = snob_core::store::now();
+        let now = snob_core::clock::now();
         // A literal count and a literal ceiling, not `DRAIN_LIMIT + 5` and
         // `DRAIN_LIMIT`: a test written in terms of the constant it is checking
         // passes whatever that constant becomes, which is exactly how this
@@ -794,7 +795,7 @@ mod tests {
             "run-1",
             42,
             "{}",
-            snob_core::store::now(),
+            snob_core::clock::now(),
             Some(&delivery.destination),
         )
         .unwrap();
@@ -834,7 +835,7 @@ mod tests {
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
         let owed = 5;
-        owe(&app, &delivery, owed, snob_core::store::now());
+        owe(&app, &delivery, owed, snob_core::clock::now());
 
         app.cancel().cancel();
         drain(&app, &delivery).await;
@@ -869,7 +870,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (mut app, delivery) = app_posting_to(&server);
-        owe(&app, &delivery, 1, snob_core::store::now());
+        owe(&app, &delivery, 1, snob_core::clock::now());
 
         let args = WatchRunArgs {
             no_progress: true,

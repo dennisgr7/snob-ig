@@ -20,11 +20,11 @@
 
 use anyhow::{Result, anyhow};
 use snob_core::model::printable;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
 use snob_ig::graphql::DocIds;
 use snob_ig::model::FriendshipStatus;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::app::App;
 use crate::cli::FollowArgs;
@@ -225,7 +225,7 @@ async fn send(
 /// failing a follow over, and neither is worth a message the user cannot act
 /// on.
 struct RememberedIds<'a> {
-    db: &'a snob_core::store::Store,
+    db: &'a snob_store::store::Store,
 }
 
 impl DocIds for RememberedIds<'_> {

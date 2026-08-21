@@ -1,7 +1,7 @@
 use anyhow::Result;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::cli::WhoamiArgs;
 use crate::exit::ExitCode;

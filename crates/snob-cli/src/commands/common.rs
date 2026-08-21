@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use snob_core::filters::{Attribute, Filter, parse_username_list};
 use snob_core::model::{ListKind, User};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::app::App;
 use crate::cli::{Attr, Format, ListArgs};

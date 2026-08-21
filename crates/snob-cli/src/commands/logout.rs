@@ -1,6 +1,6 @@
 use anyhow::Result;
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::SecretStore;
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::SecretStore;
 
 use crate::cli::LogoutArgs;
 use crate::exit::ExitCode;

@@ -10,5 +10,4 @@ pub mod scan;
 pub mod sets;
 pub mod stories;
 pub mod watch;
-pub mod watch_setup;
 pub mod whoami;

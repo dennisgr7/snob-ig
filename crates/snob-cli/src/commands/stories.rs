@@ -26,10 +26,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{Attribute as Style, Cell, ContentArrangement, Table, presets};
 use snob_core::model::printable;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
 use snob_ig::model::{ReelItem, largest};
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::app::App;
 use crate::cli::{Format, StoriesArgs, StoryFormat};
