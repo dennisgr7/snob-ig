@@ -1321,7 +1321,14 @@ fn describe_config(config: &WatchConfig) -> Vec<String> {
 
     match &config.webhook {
         Some(webhook) => {
-            lines.push(format!("Reports to {}", printable(&webhook.url)));
+            // Redacted, not just filtered. `webhook::check` refuses an address
+            // carrying a password and its comment says why: it "would be
+            // echoed by `status`". This is `status`, and it echoed it.
+            let address = url::Url::parse(&webhook.url).map_or_else(
+                |_| webhook.url.clone(),
+                |u| crate::watch::webhook::shown(&u),
+            );
+            lines.push(format!("Reports to {}", printable(&address)));
             if webhook.heartbeat {
                 lines.push("Sends a report even when nothing changed".to_string());
             }

@@ -129,6 +129,11 @@ fn plan(
         None => args.webhook.is_none(),
     };
 
+    // Every message below names the address, and the address may carry a
+    // password: `check` refuses one, but these are built before it runs, so a
+    // refusal that printed the secret three times first is not a refusal.
+    let shown = crate::watch::webhook::shown(&url);
+
     /// Names the origin a stored credential belongs to, for a warning about
     /// not sending it. "the configuration" when the file has no usable address
     /// to name — which is one of the ways the guard used to fall open, so the
@@ -153,7 +158,7 @@ fn plan(
         .unwrap_or_default();
     if !same_destination && from_file.is_some_and(|w| !w.headers.is_empty()) {
         warnings.push(format!(
-            "{url} is not the address in the configuration, so the headers configured there are \
+            "{shown} is not the address in the configuration, so the headers configured there are \
              not sent with it. Pass what this one needs with --header."
         ));
     }
@@ -185,7 +190,7 @@ fn plan(
             headers.push(("Authorization".to_string(), token.expose().to_string()));
         } else {
             warnings.push(format!(
-                "the stored token was set up for {}, so it is not sent to {url}. Pass one with \
+                "the stored token was set up for {}, so it is not sent to {shown}. Pass one with \
                  --header \"Authorization: ...\" if this address needs it.",
                 configured_for(configured_origin.as_ref()),
             ));
@@ -218,7 +223,7 @@ fn plan(
         None => {
             if stored_key.is_some() {
                 warnings.push(format!(
-                    "the stored signing key was set up for {}, so the report sent to {url} is \
+                    "the stored signing key was set up for {}, so the report sent to {shown} is \
                      not signed. Pass one with --sign-with if this address checks the signature.",
                     configured_for(configured_origin.as_ref()),
                 ));
