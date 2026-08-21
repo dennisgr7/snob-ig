@@ -256,6 +256,28 @@ fn describe(status: reqwest::StatusCode, body: &str) -> String {
 /// Checked when the address is given rather than at the first run, so a service
 /// that would have been shouting a token into the open fails at the moment
 /// somebody can still read the message.
+/// The address as it may be shown to a person or written to a log.
+///
+/// Userinfo cleared. `check` refuses an address that carries a password and
+/// says why -- "it would be echoed by `status` and written into the log of an
+/// unattended service by the refusal below" -- and neither half of that was
+/// prevented: `describe_config` printed the address verbatim and exited 0, and
+/// on the run path `plan`'s warnings are built before `check` is reached, so a
+/// `--webhook` carrying a password was echoed up to three times and only then
+/// refused. A refusal that prints the secret is not a refusal.
+///
+/// The host and path are kept, because which address was meant is the whole
+/// content of every one of those messages.
+pub fn shown(url: &Url) -> String {
+    let mut clean = url.clone();
+    // Both calls fail only on a URL that cannot have a host -- `mailto:`, say --
+    // which `check` refuses anyway. Nothing is lost by leaving the address as
+    // it was in that case: there is no userinfo to clear.
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.to_string()
+}
+
 pub fn check(webhook: &Webhook) -> Result<()> {
     // A password in the address is a credential in a plain-text file, which is
     // the one thing `watch.toml` promises not to hold — and `reqwest` turns it
@@ -270,6 +292,22 @@ pub fn check(webhook: &Webhook) -> Result<()> {
         );
     }
 
+    // Before the scheme, because it is a property of the destination and not of
+    // the transport. Every spelling of it lived inside `is_private`, which is
+    // consulted only on the `http` arm -- so `http://169.254.169.254/hook` was
+    // refused with a paragraph explaining why, and the `https://` spelling of
+    // the same address went straight through. No cloud serves its metadata
+    // endpoint over TLS today, so nothing is known to have been reachable that
+    // way; the guard was simply attached to the wrong thing.
+    if is_the_metadata_service(&webhook.url) {
+        bail!(
+            "{} is the cloud instance metadata service, which answers to anything that can \
+             reach it and hands back the machine's own credentials. snob will not post \
+             to it over any scheme.",
+            shown(&webhook.url)
+        );
+    }
+
     match webhook.url.scheme() {
         "https" => {}
         "http" if is_private(&webhook.url) => {}
@@ -278,7 +316,7 @@ pub fn check(webhook: &Webhook) -> Result<()> {
              The report carries account names, and any header you configured -- a token, \
              usually -- travels with it in the clear. Use https, or an address on your own \
              network.",
-            webhook.url
+            shown(&webhook.url)
         ),
         other => bail!("\"{other}\" is not an address this can post to; use https"),
     }
@@ -400,7 +438,13 @@ fn is_private(url: &Url) -> bool {
             // `is_unique_local` and `is_unicast_link_local` are still unstable,
             // so the prefixes are matched directly: fc00::/7 and fe80::/10.
             let first = v6.segments()[0];
-            v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            // `is_unspecified` for the same reason `is_private_v4` has it:
+            // `[::]` is what `0.0.0.0` is, and one was accepted while the other
+            // was refused.
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
         }
         Some(url::Host::Domain(host)) => {
             // One trailing dot is the fully-qualified form of the same name,
@@ -420,6 +464,35 @@ fn is_private(url: &Url) -> bool {
                 || host.ends_with(".local")
                 || host.ends_with(".internal")
                 || host.ends_with(".home.arpa")
+        }
+        None => false,
+    }
+}
+
+/// Whether an address is the cloud instance metadata service, however spelled.
+///
+/// The one destination refused outright rather than by scheme. It answers to
+/// anything that can reach it, with no authentication of any kind, and what it
+/// answers with is the machine's own role credentials — so a webhook pointed
+/// at it is not a delivery, it is a request the user did not mean to make.
+///
+/// Collected here from the three places that each knew one spelling. Every one
+/// of them sat inside `is_private`, which the scheme match only consults for
+/// `http`, so the whole guard was reachable only from the arm it was not
+/// really about.
+fn is_the_metadata_service(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => v4 == METADATA_V4,
+        Some(url::Host::Ipv6(v6)) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4 == METADATA_V4;
+            }
+            METADATA_V6.contains(&v6)
+        }
+        Some(url::Host::Domain(host)) => {
+            let host = host.to_ascii_lowercase();
+            let host = host.strip_suffix('.').unwrap_or(&host);
+            METADATA_HOSTS.contains(&host)
         }
         None => false,
     }
@@ -450,12 +523,19 @@ const METADATA_V6: [std::net::Ipv6Addr; 2] = [
 /// `0.0.0.0` is treated as loopback: it means "this host" and nothing routes to
 /// it, so refusing it only made the local case harder to write.
 fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
-    const METADATA: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
-    if v4 == METADATA {
+    if v4 == METADATA_V4 {
         return false;
     }
     v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
 }
+
+/// The cloud instance metadata endpoint, on every provider that has one.
+///
+/// Named once, because three separate places knew it: this file's `http` arm,
+/// the IPv6 pair, and the hostnames. It is still excluded from `is_private_v4`
+/// as well as refused outright by [`is_the_metadata_service`] — belt and
+/// braces on the address whose whole risk is being reachable by accident.
+const METADATA_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
 
 #[cfg(test)]
 mod tests {
@@ -500,6 +580,64 @@ mod tests {
         assert!(check(&webhook("http://169.254.169.254/hook")).is_err());
         // The rest of the range is still fine.
         assert!(check(&webhook("http://169.254.4.4/hook")).is_ok());
+    }
+
+    /// And over https as well, because it is the destination that is refused.
+    ///
+    /// The check lived inside `is_private`, which the scheme match consults
+    /// only on the `http` arm. So every spelling was refused with a paragraph
+    /// explaining why over plain http, and accepted over TLS.
+    #[test]
+    fn the_metadata_endpoint_is_refused_whatever_the_scheme() {
+        for url in [
+            "https://169.254.169.254/hook",
+            "https://metadata.google.internal/hook",
+            "https://metadata/hook",
+            "https://[fd00:ec2::254]/hook",
+            "https://[::ffff:169.254.169.254]/hook",
+            "http://169.254.169.254/hook",
+        ] {
+            assert!(
+                check(&webhook(url)).is_err(),
+                "{url} answers with the machine's own credentials"
+            );
+        }
+    }
+
+    /// A password in the address is refused, and the refusal does not repeat it.
+    ///
+    /// `check`'s own comment gives the reason the address must not be echoed:
+    /// it "would be echoed by `status` and written into the log of an
+    /// unattended service by the refusal below". The refusal below was doing
+    /// exactly that.
+    #[test]
+    fn a_refusal_does_not_print_the_credential_it_is_refusing() {
+        let error = check(&webhook("https://alice:hunter2@example.test/hook"))
+            .expect_err("userinfo is refused")
+            .to_string();
+        assert!(!error.contains("hunter2"), "{error}");
+
+        // And the same for the address a scheme refusal names.
+        let plain = check(&webhook("http://alice:hunter2@example.test/hook"))
+            .expect_err("plain http to a public host is refused")
+            .to_string();
+        assert!(!plain.contains("hunter2"), "{plain}");
+    }
+
+    /// Cleared, not replaced: which address was meant is the content of every
+    /// message that names one.
+    #[test]
+    fn the_shown_address_keeps_everything_but_the_credential() {
+        let shown = shown(&Url::parse("https://alice:hunter2@host.test/hook?x=1").unwrap());
+        assert_eq!(shown, "https://host.test/hook?x=1");
+    }
+
+    /// `[::]` is what `0.0.0.0` is, and one was accepted while the other was
+    /// refused.
+    #[test]
+    fn the_unspecified_address_is_this_host_in_both_families() {
+        assert!(check(&webhook("http://0.0.0.0:8787/hook")).is_ok());
+        assert!(check(&webhook("http://[::]:8787/hook")).is_ok());
     }
 
     /// And by every spelling, not only the one nobody types.
