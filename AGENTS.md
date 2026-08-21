@@ -661,6 +661,12 @@ is what meeting Instagram taught, including the parts that are still open:
   `x-web-session-id` was the one unexamined difference at the time, and the
   capture below settles it: a browser does not send it on `/api/graphql` at
   all, so the question is moot rather than answered.
+
+  Run again in August 2026 after the Relay headers were added — one counted
+  follow and one counted unfollow against a real account, each announcing its
+  operation in `X-FB-Friendly-Name` and carrying `X-FB-LSD`. Both were accepted,
+  and neither drew a push-back of any kind, so the load headers next to
+  `Retry-After` are still unobserved under refusal.
 - **A real browser session has been recorded and compared against this code**,
   August 2026: 251 seconds, 1890 requests, over the DevTools Protocol, driven
   by hand through login, profiles, stories, follow, unfollow, block, unblock
