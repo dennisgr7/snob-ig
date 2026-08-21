@@ -532,10 +532,7 @@ async fn run_accounts(
                     // after the `?` in `tick_one`, there was none: the failure
                     // went to standard error as prose and `events.ndjson` had
                     // nothing at all for that run.
-                    println!(
-                        "{}",
-                        json_line(&failed_tick_json(account, &e, at, charged), printing)
-                    );
+                    println!("{}", json_line(&failed_tick_json(account, &e, at, charged)));
                 }
                 failures.push(e);
             }
@@ -673,7 +670,7 @@ async fn tick_one(
     let tick = tick?;
 
     if printing.json {
-        println!("{}", json_line(&tick_json(&tick), printing));
+        println!("{}", json_line(&tick_json(&tick)));
     } else if printing.watching || !tick.report.changes().is_empty() {
         for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             println!("{line}");
@@ -1543,6 +1540,12 @@ fn failed_tick_json(
     requests: u32,
 ) -> serde_json::Value {
     serde_json::json!({
+        // The failure line carries it too. README says every message this tool
+        // emits carries `schema`, "including every line of the `--json`
+        // stream", and this was the one line without it — so a reader that
+        // branches on `msg["schema"] == 1`, which is what the version is for,
+        // threw on exactly the ticks it most needed to handle.
+        "schema": SCHEMA,
         "account": {
             "username": watched.name(),
             "is_self": watched.name().is_none(),
@@ -1560,20 +1563,30 @@ fn failed_tick_json(
     })
 }
 
-/// One JSON line, laid out the way this mode lays them out.
+/// One JSON line. One object, one line, in both modes.
 ///
-/// `once` is looked at while it runs and lays its object out to be read; the
-/// scheduled mode writes one line down a pipe. That was decided in two places,
-/// and the second of them is reached from the arm that is already handling a
-/// failure — which is why the fallback is `Value::to_string` rather than a `?`:
-/// a serializer error on a `Value` built here is not a second failure worth
-/// returning instead of the first.
-fn json_line(value: &serde_json::Value, printing: Printing) -> String {
-    if printing.watching {
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-    } else {
-        value.to_string()
-    }
+/// `once` used to lay its object out to be read, on the grounds that somebody
+/// is looking at it — and that holds right up to the moment `watch.toml`
+/// carries a second `[[account]]`, which is what `snob watch setup` writes as
+/// soon as anybody answers yes to watching somebody else. `run_accounts` prints
+/// one object per account with nothing wrapping them, so two pretty-printed
+/// objects came out back to back: `json.load` stops at `Extra data`, and
+/// PowerShell's `ConvertFrom-Json` refuses it outright. The bytes were in no
+/// documented format at all — neither one document nor NDJSON — for the mode
+/// whose own help says it is meant for cron.
+///
+/// So the layout is not a mode's decision any more. `--json` is a stream of
+/// lines, which is what the CHANGELOG already promised and what
+/// `snob watch once --json >> events.ndjson` has to mean. What the two modes
+/// still differ on is whether a tick with no news is printed at all, and that
+/// is [`Printing::watching`], where it belongs.
+///
+/// The fallback is `Value::to_string` rather than a `?` because one call site
+/// is reached from the arm already handling a failure: a serializer error on a
+/// `Value` built here is not a second failure worth returning instead of the
+/// first.
+fn json_line(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 /// The version of the shape every message this tool emits has.
@@ -1824,9 +1837,51 @@ fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
     let changes = report.changes();
     if changes.is_empty() {
         if baselines.is_empty() {
+            // **Say what was done, rather than asserting the negative.** Three
+            // different runs reached this one sentence and only one of them had
+            // earned it.
+            //
+            // A list whose counter had not moved is served from storage without
+            // being read, which is where nearly all of this tool's savings come
+            // from and is worth keeping — walking three hundred accounts costs
+            // fourteen requests and asking whether they changed costs one. But
+            // a counter cannot see a swap: one departure and one arrival leave
+            // it identical, and a rename does not move it at all. So a monitor
+            // ticking every half hour printed "nothing has changed" over and
+            // over, for up to the freshness window, while somebody had in fact
+            // left. Nothing is lost — the walk happens once the capture ages
+            // out and the comparison is against the last *reported* capture, so
+            // the departure is reported in full then — but for those hours the
+            // tool was stating a fact it had not checked.
+            //
+            // And a run where one list was refused and the other had no news
+            // printed it too, because the refusal branch above is gated on
+            // there being nothing stored at all and one surviving list gets
+            // past it. On an account permanently behind the truncation wall
+            // that is every run, about a list snob has never once read.
+            //
+            // The distinction is already in the domain type:
+            // `Basis::Unchanged` is documented as "this one did not have to
+            // look", against a `Compare` that read both and found nothing.
+            let nobody_looked = [report.followers.as_ref(), report.following.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|r| matches!(r.basis, Basis::Unchanged { .. }));
+
             lines.push(format!(
                 "Nothing has changed for {who} since the last report."
             ));
+            if refused {
+                lines.push(
+                    "One of the lists could not be read this time, so this speaks only for \
+                     the other one."
+                        .to_string(),
+                );
+            } else if nobody_looked {
+                lines.push(
+                    "Their counters had not moved, so the lists were not read again.".to_string(),
+                );
+            }
             lines.push(since_line(report));
         }
         return lines;
@@ -2882,6 +2937,80 @@ consent = { agreed_at = 1700 }
         assert!(!text.contains("list has never"), "{text}");
     }
 
+    /// A run that did not read the lists must not assert that nothing changed.
+    ///
+    /// `Basis::Unchanged` is documented as "this one did not have to look": the
+    /// counter had not moved, so the stored capture was served without being
+    /// re-read. A counter cannot see a swap — one departure and one arrival
+    /// leave it identical — so a monitor printed "nothing has changed" for
+    /// hours while somebody had left. The saving is right and stays; the
+    /// unhedged sentence was not.
+    #[test]
+    fn a_run_that_did_not_look_says_so() {
+        let unread = describe(
+            &report_with(
+                Some(list(
+                    Basis::Unchanged { snapshot_id: 7 },
+                    ListDiff::default(),
+                    Some(1_000),
+                )),
+                vec![],
+            ),
+            false,
+        )
+        .join("\n");
+        assert!(
+            unread.contains("were not read again"),
+            "a counter poll is not a look: {unread}"
+        );
+
+        // And a run that really did read both and found nothing keeps the
+        // plain sentence, because there it is true.
+        let read = describe(
+            &report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    ListDiff::default(),
+                    Some(1_000),
+                )),
+                vec![],
+            ),
+            false,
+        )
+        .join("\n");
+        assert!(read.contains("Nothing has changed"), "{read}");
+        assert!(
+            !read.contains("were not read again"),
+            "this one did look: {read}"
+        );
+
+        // A refused list is a third case, and it used to print the same
+        // sentence as the other two: the refusal branch is reached only when
+        // *nothing* is stored, so one surviving list got past it.
+        let partial = describe(
+            &report_with(
+                Some(list(
+                    Basis::Compare {
+                        before: 1,
+                        after: 2,
+                    },
+                    ListDiff::default(),
+                    Some(1_000),
+                )),
+                vec![],
+            ),
+            true,
+        )
+        .join("\n");
+        assert!(
+            partial.contains("could not be read this time"),
+            "a refused list must not be reported as quiet: {partial}"
+        );
+    }
+
     #[test]
     fn an_arrival_and_a_departure_are_both_named() {
         let diff = ListDiff {
@@ -3335,9 +3464,14 @@ consent = { agreed_at = 1700 }
             "a run that worked must not look like one that failed"
         );
 
-        // Both modes lay a line out the way they lay the successful ones out.
-        assert!(!json_line(&line, Printing::unattended(true)).contains('\n'));
-        assert!(json_line(&line, Printing::watched(true)).contains('\n'));
+        // One object, one line, in both modes. `run_accounts` prints one per
+        // account with nothing wrapping them, so a line laid out over several
+        // of them stops parsing the moment a second account is watched.
+        assert!(!json_line(&line).contains('\n'));
+        assert!(
+            !json_line(&ok).contains('\n'),
+            "the successful line is a line too"
+        );
     }
 
     /// The shape a stranger's automation branches on, pinned to a literal.
