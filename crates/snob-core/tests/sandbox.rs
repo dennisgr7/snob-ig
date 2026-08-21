@@ -16,9 +16,11 @@
 //!
 //! **What it checks**: every mention of the seam — the two flag fields, the
 //! function that redirects a client, and the static behind it — has a
-//! `#[cfg(feature = "testing")]` within a few lines above it. Test files are
-//! skipped, because a test is already the feature's own build, and so is this
-//! file, which names all four in the sentence you are reading.
+//! `#[cfg(feature = "testing")]` above it **with no blank line in between**,
+//! which is what makes the guard the item's own rather than the previous
+//! item's. Test files are skipped, because a test is already the feature's own
+//! build, and so is this file, which names all four in the sentence you are
+//! reading.
 //!
 //! It is a source check and not a runtime one for the same reason
 //! `tests/keyring.rs` is: a test binary cannot see how another crate was
@@ -42,14 +44,6 @@ const SEAM: [&str; 5] = [
     "--ig-base-url",
 ];
 
-/// How far above a mention the guard may sit.
-///
-/// A field carries its doc comment between the `#[cfg]` and the name, and those
-/// doc comments are long here on purpose — the argument for the pairing is
-/// written into them. Forty lines covers the longest of them with room, and it
-/// is still far too short to reach the previous item's guard by accident.
-const REACH: usize = 40;
-
 #[test]
 fn the_sandbox_seam_stays_behind_its_feature() {
     let Some(root) = repo_root() else {
@@ -69,26 +63,7 @@ fn the_sandbox_seam_stays_behind_its_feature() {
         let Ok(contents) = std::fs::read_to_string(&file) else {
             continue;
         };
-        let lines: Vec<&str> = contents.lines().collect();
-
-        for (number, line) in lines.iter().enumerate() {
-            // Not a mention: the `#[cfg]` itself, and the comment prose that
-            // explains the seam, which names the flags on purpose.
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if !SEAM.iter().any(|name| line.contains(name)) {
-                continue;
-            }
-
-            let from = number.saturating_sub(REACH);
-            let guarded = lines[from..=number]
-                .iter()
-                .any(|above| above.contains("#[cfg(feature = \"testing\")]"));
-            if !guarded {
-                violations.push(format!("{relative}:{}: {}", number + 1, line.trim()));
-            }
-        }
+        violations.extend(unguarded_in(&relative, &contents));
     }
 
     assert!(
@@ -99,35 +74,127 @@ fn the_sandbox_seam_stays_behind_its_feature() {
     );
 }
 
+/// The walk, over one file's text, so a test can hand it a fixture.
+///
+/// Split out for the reason `tests/keyring.rs` gives about its own: a guard
+/// that walks the tree and finds nothing looks exactly like a guard that walks
+/// nothing, so the matcher has to be drivable over text written here.
+///
+/// **The search upward stops at a blank line, and that is the whole of the
+/// rule.** It used to count a fixed forty lines and stop there, which does not
+/// respect where one item ends and the next begins — and the two flags sit
+/// twenty-eight lines apart in `cli.rs`, well inside any reach large enough to
+/// clear a long doc comment. So `sandbox_root`'s `#[cfg]` was answering for
+/// `ig_base_url`, and deleting the only line keeping `--ig-base-url` out of a
+/// released binary left this test green. An item carries its attributes and
+/// doc comment directly above it with no blank line between; the blank line
+/// before the next item's doc comment is the boundary, and it needs no
+/// constant to describe it.
+fn unguarded_in(relative: &str, contents: &str) -> Vec<String> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut violations = Vec::new();
+
+    for (number, line) in lines.iter().enumerate() {
+        // In `src/`, everything after the first `#[cfg(test)]` is test code and
+        // is not in a released binary either — the same halving `keyring.rs`
+        // does, and needed here for the same reason: `cli.rs` parses both flags
+        // in its own unit tests, which is exactly where they should be parsed.
+        // The old fixed reach passed those by accident rather than by rule.
+        if is_a_test_gate(line) {
+            break;
+        }
+
+        // Not a mention: the `#[cfg]` itself, and the comment prose that
+        // explains the seam, which names the flags on purpose.
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        if !SEAM.iter().any(|name| line.contains(name)) {
+            continue;
+        }
+
+        let mut guarded = false;
+        for above in lines[..=number].iter().rev() {
+            if above.trim().is_empty() {
+                break; // the previous item's guard is not this item's guard
+            }
+            if is_the_feature_gate(above) {
+                guarded = true;
+                break;
+            }
+        }
+        if !guarded {
+            violations.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+        }
+    }
+
+    violations
+}
+
+/// Whether a line is a `cfg` that carries this feature.
+///
+/// Matched by its two parts rather than as one literal, because the gate is
+/// written more than one way: `main.rs`'s own tests are behind
+/// `#[cfg(all(test, feature = "testing"))]`, and a literal comparison calls
+/// that unguarded.
+fn is_the_feature_gate(line: &str) -> bool {
+    line.contains("#[cfg(") && line.contains("feature = \"testing\"")
+}
+
+/// Whether a line opens a module a release build does not compile.
+///
+/// `#[cfg(test)]` and `#[cfg(all(test, ...))]` both. Matched on `test` as a
+/// bare predicate rather than on the whole attribute, so the longer spelling
+/// `main.rs` uses is recognised as the same thing.
+fn is_a_test_gate(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("#[cfg(") && (line.contains("(test)") || line.contains("(test,"))
+}
+
 /// And the guard can see a breach, which is the half a guard usually cannot
 /// prove about itself.
 ///
-/// `tests/keyring.rs` records the same problem in its own header: a check that
-/// walks source and finds nothing is indistinguishable from a check that walks
-/// nothing. This drives the matcher over two lines written here rather than
-/// over the tree.
+/// The last two cases are the defect this replaced: a guard belonging to the
+/// item above, reached across the blank line that separates them.
 #[test]
 fn the_guard_would_notice_an_unguarded_flag() {
-    let guarded = [
-        "#[cfg(feature = \"testing\")]",
-        "    pub ig_base_url: bool,",
-    ];
-    let bare = [
-        "    /// Ask this server instead",
-        "    pub ig_base_url: bool,",
-    ];
+    let guarded = "\
+#[cfg(feature = \"testing\")]
+#[arg(long, global = true)]
+pub ig_base_url: Option<Url>,
+";
+    let bare = "\
+/// Ask this server instead
+pub ig_base_url: Option<Url>,
+";
+    let gate_with_test = "\
+#[cfg(all(test, feature = \"testing\"))]
+fn only_a_test_reaches(cli: &Cli) -> bool { cli.ig_base_url.is_some() }
+";
+    let borrowed_from_the_item_above = "\
+#[cfg(feature = \"testing\")]
+pub sandbox_root: Option<PathBuf>,
 
-    let breached = |lines: &[&str; 2]| {
-        let last = lines[1];
-        SEAM.iter().any(|name| last.contains(name))
-            && !lines
-                .iter()
-                .any(|l| l.contains("#[cfg(feature = \"testing\")]"))
-    };
+/// Ask this server instead of Instagram
+pub ig_base_url: Option<Url>,
+";
 
-    assert!(!breached(&guarded), "a guarded field is not a breach");
     assert!(
-        breached(&bare),
+        unguarded_in("x.rs", guarded).is_empty(),
+        "a guarded field is not a breach"
+    );
+    assert_eq!(
+        unguarded_in("x.rs", bare).len(),
+        1,
         "an unguarded one is, and this has to see it"
+    );
+    assert!(
+        unguarded_in("x.rs", gate_with_test).is_empty(),
+        "`all(test, feature = ...)` is the same gate spelled longer"
+    );
+    assert_eq!(
+        unguarded_in("x.rs", borrowed_from_the_item_above),
+        vec!["x.rs:5: pub ig_base_url: Option<Url>,".to_string()],
+        "the guard above the blank line belongs to the field above it"
     );
 }
