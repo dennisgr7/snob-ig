@@ -335,13 +335,27 @@ pub fn commit(
 /// from. `snob watch once` on a machine whose session has gone returns before
 /// anything is opened, and that is exactly the run that leaves reports ageing
 /// past `MAX_AGE_SECS` with `status` promising the next one will try them.
-pub fn settle(db: &snob_core::store::Store, at: i64) {
+///
+/// Answers with the number of reports the sweep gave up on, because that one
+/// is not housekeeping: the change it carried is gone, and this is the last
+/// moment anybody can be told. Everything else it did stays in a trace. It
+/// returns the count rather than printing it for the reason the module header
+/// gives -- `engine` says what happened and `commands` decides how it reads.
+pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
     match store::prune(db.conn(), at) {
-        Ok(removed) if removed > 0 => {
-            tracing::debug!(removed, "expired what nothing needs any more");
+        Ok(swept) => {
+            if swept.captures > 0 {
+                tracing::debug!(
+                    removed = swept.captures,
+                    "expired what nothing needs any more"
+                );
+            }
+            swept.given_up
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "old captures could not be expired"),
+        Err(e) => {
+            tracing::warn!(error = %e, "old captures could not be expired");
+            0
+        }
     }
 }
 
@@ -367,10 +381,13 @@ pub fn settle(db: &snob_core::store::Store, at: i64) {
 /// Best-effort, like the rest of settling. A database that cannot be opened is
 /// the run's own problem a moment later, and it is not worth turning a refusal
 /// about a webhook into a different failure.
-pub fn settle_without_a_session(paths: &snob_core::paths::AppPaths, at: i64) {
+pub fn settle_without_a_session(paths: &snob_core::paths::AppPaths, at: i64) -> usize {
     match snob_core::store::Store::open(paths) {
         Ok(db) => settle(&db, at),
-        Err(e) => tracing::warn!(error = %e, "the database could not be opened to settle it"),
+        Err(e) => {
+            tracing::warn!(error = %e, "the database could not be opened to settle it");
+            0
+        }
     }
 }
 

@@ -345,6 +345,13 @@ pub struct Owed {
     /// else posts to that address they expire where they are — which is worth
     /// saying separately rather than counting in with the rest.
     pub elsewhere: usize,
+    /// Reports nothing will ever deliver, because they grew too old to be news.
+    ///
+    /// Not owed — the opposite: owing has ended. It is here because `status` is
+    /// where somebody goes to ask what became of a report, and this is the one
+    /// answer it could not give. Kept for `KEEP_SETTLED_FOR_SECS`, which is how
+    /// long the row survives `forget_settled`.
+    pub given_up: usize,
 }
 
 /// What is queued, for `snob watch status` to report.
@@ -364,18 +371,29 @@ pub struct Owed {
 /// filtering it out here would print 0 while rows sit in the table — the same
 /// failure this exists to fix, in the other direction.
 pub fn owed(conn: &Connection, destination: Option<&str>) -> Result<Owed, StoreError> {
-    let (waiting, elsewhere): (i64, i64) = conn.query_row(
+    // The third count reads a **settled** row, which is why the `state` test
+    // moved out of the `WHERE` and into the filters. Counting only `pending`
+    // meant the one outcome worth telling somebody about was the one nothing
+    // could see: a report given up on left `pending` and became invisible in
+    // the same statement, so `status` went quiet and the health verdict went
+    // from `warning` to `ok` at exactly the moment the change was thrown away.
+    // `forget_settled` takes the row after `KEEP_SETTLED_FOR_SECS`, which is
+    // the window this has to say it in.
+    let (waiting, elsewhere, given_up): (i64, i64, i64) = conn.query_row(
         "SELECT
-           count(*) FILTER (WHERE ?1 IS NOT NULL AND (destination IS NULL OR destination = ?1)),
-           count(*) FILTER (WHERE ?1 IS NULL OR (destination IS NOT NULL AND destination <> ?1))
-         FROM watch_deliveries
-         WHERE state = 'pending'",
+           count(*) FILTER (WHERE state = 'pending'
+             AND ?1 IS NOT NULL AND (destination IS NULL OR destination = ?1)),
+           count(*) FILTER (WHERE state = 'pending'
+             AND (?1 IS NULL OR (destination IS NOT NULL AND destination <> ?1))),
+           count(*) FILTER (WHERE state = 'expired')
+         FROM watch_deliveries",
         params![destination],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     Ok(Owed {
         waiting: waiting as usize,
         elsewhere: elsewhere as usize,
+        given_up: given_up as usize,
     })
 }
 
@@ -729,7 +747,8 @@ mod tests {
             here,
             Owed {
                 waiting: 2,
-                elsewhere: 1
+                elsewhere: 1,
+                given_up: 0
             },
             "the row for {HERE} and the one with no address are owed here; the other is not"
         );
@@ -747,12 +766,42 @@ mod tests {
             owed(db.conn(), None).unwrap(),
             Owed {
                 waiting: 0,
-                elsewhere: 3
+                elsewhere: 3,
+                given_up: 0
             }
         );
 
         // However it is split, nothing falls out of the total.
         assert_eq!(here.waiting + here.elsewhere, pending(db.conn()).unwrap());
+    }
+
+    /// A report nothing will ever deliver has to be visible for as long as the
+    /// row survives.
+    ///
+    /// `owed` counted `state = 'pending'` alone, so a row stopped being counted
+    /// at the instant it stopped being deliverable: `status` went quiet and the
+    /// health verdict went from `warning` to `ok` at exactly the moment the
+    /// change was thrown away. `expire_stale` marks rather than deletes for
+    /// this, and until now nothing read the mark.
+    #[test]
+    fn a_report_given_up_on_is_still_counted_while_the_row_is_kept() {
+        let db = store();
+        enqueue(db.conn(), "old", ME, "{}", 1_000, Some(HERE)).unwrap();
+
+        let before = owed(db.conn(), Some(HERE)).unwrap();
+        assert_eq!(before.waiting, 1);
+        assert_eq!(before.given_up, 0);
+
+        // Far enough past the age bound that it is no longer news.
+        let much_later = 1_000 + MAX_AGE_SECS + 1;
+        assert_eq!(expire_stale(db.conn(), much_later).unwrap(), 1);
+
+        let after = owed(db.conn(), Some(HERE)).unwrap();
+        assert_eq!(after.waiting, 0, "it is not owed any more");
+        assert_eq!(
+            after.given_up, 1,
+            "and that is exactly when somebody has to be told"
+        );
     }
 
     /// A day old is one answer, not three.

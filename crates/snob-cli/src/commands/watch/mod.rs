@@ -71,7 +71,10 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // is the only caller of `store::prune` — so a service that dies at startup
     // on a hand-edited file expires nothing for as long as nobody notices. This
     // is the mode the README leads with, and it had no settle at all.
-    crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
+    say_what_was_given_up(crate::engine::watch::settle_without_a_session(
+        paths,
+        snob_core::store::now(),
+    ));
 
     // Read first, so the flags can override it. A flag beats the file because
     // somebody typing one is saying something about this run in particular.
@@ -374,7 +377,10 @@ async fn open_and_run(
         // nothing here, a machine that ran for a week with no session expired
         // nothing at all — not the owed reports, not old captures, not the run
         // log.
-        crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
+        say_what_was_given_up(crate::engine::watch::settle_without_a_session(
+            paths,
+            snob_core::store::now(),
+        ));
         return Ok(());
     };
     // The monitor takes an answer in advance from `watch.toml`, never from a
@@ -557,7 +563,10 @@ async fn run_accounts(
     {
         drain(app, delivery).await;
     }
-    crate::engine::watch::settle(app.db(), snob_core::store::now());
+    say_what_was_given_up(crate::engine::watch::settle(
+        app.db(),
+        snob_core::store::now(),
+    ));
 
     let (print_here, failed) = to_print_and_to_return(failures);
     for earlier in print_here {
@@ -1018,7 +1027,10 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     // run will try them. A webhook address `webhook::check` refuses does the
     // same thing one line earlier. One call, above both, so the pair cannot
     // drift a third time.
-    crate::engine::watch::settle_without_a_session(paths, snob_core::store::now());
+    say_what_was_given_up(crate::engine::watch::settle_without_a_session(
+        paths,
+        snob_core::store::now(),
+    ));
 
     // Before the session is opened and long before a request is spent, so a
     // webhook address that could never work costs nothing to find out about.
@@ -1783,6 +1795,30 @@ fn basis_token(basis: Basis) -> &'static str {
 
 /// The answer as a person reads it.
 ///
+/// Says that reports were abandoned, because nothing else will.
+///
+/// The sweep marks a report `expired` once it is too old to be news, and that
+/// is the moment a set of arrivals and departures stops existing: `due` has
+/// already been refusing to hand it back, so the retry ladder never reaches the
+/// sentence in `send_one` that was written for exactly this. Until this line,
+/// the whole event was a row changing state in silence -- the run printed
+/// nothing, `status` counts only `pending` and so showed nothing, and the
+/// health verdict went from `warning` to `ok` at the instant the news was lost.
+fn say_what_was_given_up(given_up: usize) {
+    if given_up == 0 {
+        return;
+    }
+    let (subject, what) = if given_up == 1 {
+        ("report was", "what it said is")
+    } else {
+        ("reports were", "what they said is")
+    };
+    eprintln!(
+        "warning: {given_up} {subject} given up on for being too old to be news; \
+         {what} not reported a second time."
+    );
+}
+
 /// Returned as lines rather than printed, so a test can read them without
 /// capturing standard output.
 fn describe(report: &WatchReport, refused: bool) -> Vec<String> {

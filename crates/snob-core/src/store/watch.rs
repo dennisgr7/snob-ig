@@ -53,6 +53,20 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
 /// somebody wants to look back. Thirty days is enough to look back over.
 const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
 
+/// What one sweep of the retention rules settled.
+///
+/// Two numbers rather than one, because they are read by different people.
+/// `captures` is housekeeping and belongs in a trace. `given_up` is a report
+/// that will never be delivered now — the change it carried is gone, and the
+/// run it happens inside is the last moment anybody can be told.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Swept {
+    /// Captures deleted because nothing needs them any more.
+    pub captures: usize,
+    /// Reports abandoned because they grew too old to be news.
+    pub given_up: usize,
+}
+
 /// Removes captures nothing needs any more.
 ///
 /// Three things are kept whatever their age, and each is load-bearing:
@@ -70,7 +84,7 @@ const KEEP_FOR_SECS: i64 = 30 * 24 * 3_600;
 /// `secure_delete` is on for the whole connection — `store::configure` says it
 /// is there for "whatever the monitor ends up expiring", which is this — so the
 /// rows go rather than being unlinked with their contents still readable.
-pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+pub fn prune(conn: &Connection, now: i64) -> Result<Swept, StoreError> {
     let cutoff = now - KEEP_FOR_SECS;
 
     let removed = conn.execute(
@@ -95,7 +109,14 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
     // are written where the rest of them are. Written out here as well, the age
     // bound ended up spelled three times and disagreeing at exactly a day: `due`
     // handed the report out, `failed` gave up on it, and this left it pending.
-    super::deliveries::expire_stale(conn, now)?;
+    // The count comes back out, because it is the one thing this sweep does
+    // that somebody has to be told about. `expire_stale` marks the row rather
+    // than deleting it, so `status` can still say what became of it — but the
+    // moment it fires a set of arrivals and departures has been thrown away
+    // for good, and the only trace was a row quietly turning `expired`: the
+    // run said nothing, and the health verdict went from `warning` to `ok` at
+    // exactly the moment the news was lost.
+    let given_up = super::deliveries::expire_stale(conn, now)?;
     super::deliveries::forget_settled(conn, now)?;
 
     // Runs are a log, and `--every 30m` over three accounts writes some fifty
@@ -123,7 +144,10 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize, StoreError> {
         params![now - KEEP_RUNS_FOR_SECS],
     )?;
 
-    Ok(removed)
+    Ok(Swept {
+        captures: removed,
+        given_up,
+    })
 }
 
 /// How long the run log is kept. **Thirty days**: long enough for `status` to
@@ -1113,7 +1137,7 @@ mod tests {
         let newer = account_with_capture(&mut db, 7, &[user(1, "one")]);
         age(&db, old, KEEP_FOR_SECS + 1);
 
-        assert_eq!(prune(db.conn(), crate::store::now()).unwrap(), 1);
+        assert_eq!(prune(db.conn(), crate::store::now()).unwrap().captures, 1);
         assert!(snapshots::find_usable(db.conn(), old).unwrap().is_none());
         assert!(snapshots::find_usable(db.conn(), newer).unwrap().is_some());
 
@@ -1163,7 +1187,7 @@ mod tests {
         age(&db, followers, KEEP_FOR_SECS * 5);
         age(&db, opened.id, KEEP_FOR_SECS * 5);
 
-        assert_eq!(prune(db.conn(), crate::store::now()).unwrap(), 0);
+        assert_eq!(prune(db.conn(), crate::store::now()).unwrap().captures, 0);
         assert!(
             snapshots::find_usable(db.conn(), followers)
                 .unwrap()
