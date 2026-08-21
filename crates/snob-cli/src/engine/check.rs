@@ -19,7 +19,7 @@
 //! webhook is not an Instagram request at all.
 //!
 //! It returns facts. Which of them is worth a red line, and what the sentence
-//! says, is `commands::watch_setup`'s question.
+//! says, is `commands::watch::status`'s question.
 
 use snob_core::Pk;
 use snob_core::secrets::SecretStore;
@@ -27,8 +27,8 @@ use snob_core::store::snapshots;
 use snob_core::store::watch as watch_store;
 
 use crate::exit::ExitCode;
-use snob_core::watch::config::WatchConfig;
 use snob_core::watch::schedule::{self, Schedule};
+use snob_core::watch::config::WatchConfig;
 
 use crate::app::App;
 
@@ -246,11 +246,17 @@ pub async fn with_a_session(
     report: &mut CheckReport,
 ) {
     // **Nothing is spent during a cooldown**, and this is the one request path
-    // in the tool that did not say so. `Pacer::clear_to_send` charges the
-    // budget but never reads the `cooldowns` table — every other caller gates
-    // explicitly — so a command built to be polled was knocking on a door
+    // in the tool that did not say so. `Pacer::clear_to_send` charged the
+    // budget without ever reading the `cooldowns` table — every other caller
+    // gated explicitly — so a command built to be polled was knocking on a door
     // Instagram had just closed, once per configured account, on whatever
     // interval a monitoring system polls at.
+    //
+    // `Pacer::clear` reads the table now, so this gate is no longer the only
+    // thing standing here. It stays because the two answer differently and this
+    // one is the answer a person wants: the backstop refuses with an error, and
+    // what somebody running `check` needs is the line below — a warning that
+    // says how long is left and lets the rest of the report be produced.
     //
     // Reported rather than skipped in silence: a cooldown is exactly the sort
     // of thing somebody running `check` wants to be told about, and it lifts on

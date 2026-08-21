@@ -36,7 +36,7 @@ impl ExitCode {
     /// write.
     ///
     /// The other direction of [`ExitCode::as_str`], and it exists because
-    /// `watch_runs.outcome` is read back. `watch_setup::health` matched the
+    /// `watch_runs.outcome` is read back. `watch::status::health` matched the
     /// literals `"ok"`, `"rate_limited"` and `"interrupted"` inline — which is
     /// precisely what `as_str`'s own doc says this vocabulary exists to stop.
     /// Respell one there and every recorded cooldown falls through to the
@@ -84,7 +84,14 @@ impl ExitCode {
         match e {
             IgError::SessionExpired | IgError::UserAgentMismatch => Self::NoSession,
             IgError::Challenge { .. } | IgError::Checkpoint { .. } => Self::Challenge,
-            IgError::RateLimited | IgError::FeedbackRequired => Self::RateLimited,
+            // `InCooldown` is the backstop in `Pacer::clear` answering, and it
+            // exits the same way the eight explicit gates do. They all reach
+            // this code through `report::refuse_in_cooldown` and its neighbors;
+            // a run that got past them and was stopped here is the same outcome
+            // and must not be told apart by a script reading the code.
+            IgError::RateLimited | IgError::FeedbackRequired | IgError::InCooldown { .. } => {
+                Self::RateLimited
+            }
             // Ctrl+C during the budget's owed wait comes back through the
             // client rather than through the token, so it arrives here as an
             // error — and it is still the user stopping. Without this arm it
@@ -193,7 +200,7 @@ mod tests {
     /// The token a code writes is the token that reads back as that code.
     ///
     /// `as_str` exists "so nothing has to invent tokens inline"; `from_token` is
-    /// the direction that was missing, and `watch_setup::health` had invented
+    /// the direction that was missing, and `watch::status::health` had invented
     /// three literals for want of it. Walked over `ALL` and counted, because a
     /// variant dropped from that list quietly narrows every caller that walks it
     /// -- and this is the caller where it is cheapest to notice.

@@ -89,7 +89,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use snob_core::store::rate_budget::RateBudget;
+use snob_core::budget::RateBudget;
 
 /// Request cadence during a walk.
 #[derive(Debug, Clone, Copy)]
@@ -253,7 +253,7 @@ impl Pacer {
     /// Instagram skips rate control entirely.
     #[doc(hidden)]
     pub fn unlimited() -> Self {
-        Self::new(Arc::new(snob_core::store::rate_budget::UnlimitedRateBudget))
+        Self::new(Arc::new(snob_core::budget::UnlimitedRateBudget))
     }
 
     pub fn cancel_token(&self) -> &CancelToken {
@@ -290,9 +290,25 @@ impl Pacer {
     }
 
     /// The same, for a follow or an unfollow. See
-    /// [`snob_core::store::rate_budget::RateBudget::reserve_write`].
+    /// [`snob_core::budget::RateBudget::reserve_write`].
     async fn reserve_write(&self) -> Result<Duration, crate::error::IgError> {
         self.charge(true).await
+    }
+
+    /// Reads the cooldown off the async worker, for the reason [`Self::reserve`]
+    /// gives about the one below it.
+    ///
+    /// The same database, the same five-second busy timeout, and now the same
+    /// position: before every single request. [`Pacer::cooldown`] stays
+    /// synchronous because its callers are gates in `snob-cli` that run once,
+    /// with nothing else on the runtime waiting — this one runs in the hot path,
+    /// where a blocked worker is the Ctrl+C that does nothing.
+    async fn cooldown_off_thread(&self) -> Result<Option<i64>, crate::error::IgError> {
+        let budget = Arc::clone(&self.budget);
+        tokio::task::spawn_blocking(move || budget.cooldown())
+            .await
+            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
     async fn charge(&self, write: bool) -> Result<Duration, crate::error::IgError> {
@@ -343,6 +359,32 @@ impl Pacer {
     async fn clear(&self, write: bool) -> Result<(), crate::error::IgError> {
         if self.cancel.is_canceled() {
             return Err(crate::error::IgError::Canceled);
+        }
+
+        // **Nothing is spent during a cooldown**, and until this line that was
+        // the caller's business to remember. The budget charges its buckets
+        // without ever reading the `cooldowns` table, so the rule held only
+        // because every caller asked first — and one did not. `engine::check`
+        // was written to be polled by a monitoring system, and it knocked on a
+        // door Instagram had just closed, once per configured account, at
+        // whatever interval the poller ran at. The gate added there fixed that
+        // one; this is what stops the next.
+        //
+        // Here for the same reason the cancellation above is here: this is the
+        // one place every request passes through, so a caller that forgets can
+        // no longer spend. The explicit gates stay. They do two things a
+        // backstop cannot — refuse before asking the user for consent, and serve
+        // a stored list instead of failing — and this is the net underneath
+        // them, not their replacement.
+        //
+        // `SNOB_IGNORE_COOLDOWN` needed no thought: the escape hatch is read
+        // inside `SqliteRateBudget::cooldown`, so it answers `None` here exactly
+        // as it does at every other gate.
+        //
+        // Before the reservation, like the cancel: a refusal that charges for
+        // itself helps nobody.
+        if let Some(until_ms) = self.cooldown_off_thread().await? {
+            return Err(crate::error::IgError::InCooldown { until_ms });
         }
 
         let owed = if write {
@@ -540,5 +582,79 @@ mod tests {
             1,
             "a request that is refused is not charged for"
         );
+    }
+
+    use snob_core::budget::RateBudgetError;
+
+    /// A budget that is in cooldown and counts every reservation it is asked
+    /// for, so a test can assert that it was asked for none.
+    struct Cooling {
+        until_ms: i64,
+        reserved: AtomicU32,
+    }
+
+    impl RateBudget for Cooling {
+        fn reserve(&self) -> Result<Duration, RateBudgetError> {
+            self.reserved.fetch_add(1, Ordering::Relaxed);
+            Ok(Duration::ZERO)
+        }
+
+        fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+            self.reserved.fetch_add(1, Ordering::Relaxed);
+            Ok(Duration::ZERO)
+        }
+
+        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            Ok(Some(self.until_ms))
+        }
+
+        fn start_cooldown(
+            &self,
+            _reason: &str,
+            _minimum: Duration,
+        ) -> Result<i64, RateBudgetError> {
+            Ok(self.until_ms)
+        }
+    }
+
+    /// Nothing is spent during a cooldown, whoever asks and whether or not they
+    /// remembered to check first.
+    ///
+    /// This is the backstop rather than the gates: every caller in `snob-cli`
+    /// asks `Pacer::cooldown` before it gets here, and one of them — the command
+    /// written to be polled by a monitoring system — did not, and spent a
+    /// request per configured account per poll against a door that was shut. The
+    /// budget charges its buckets without ever reading the `cooldowns` table, so
+    /// until `clear` read it the rule lived in eight places and held in seven.
+    #[tokio::test]
+    async fn nothing_is_cleared_to_send_during_a_cooldown() {
+        let until_ms = 1_722_700_000_000;
+        let budget = Arc::new(Cooling {
+            until_ms,
+            reserved: AtomicU32::new(0),
+        });
+        let pacer = Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>);
+
+        let error = pacer.clear_to_send().await.unwrap_err();
+        assert!(
+            matches!(error, crate::error::IgError::InCooldown { until_ms: u } if u == until_ms),
+            "a read during a cooldown answers InCooldown, carrying when it lifts: {error:?}"
+        );
+
+        // A write pays out of a second bucket, so it gets its own arm here: a
+        // backstop that covered only reads would leave the one request class
+        // that earns the twelve-hour cooldown uncovered.
+        let error = pacer.clear_to_send_write().await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::IgError::InCooldown { until_ms: u } if u == until_ms
+        ));
+
+        assert_eq!(
+            budget.reserved.load(Ordering::Relaxed),
+            0,
+            "the refusal comes before the reservation, so neither bucket was charged"
+        );
+        assert_eq!(pacer.spent(), 0, "and nothing refused is reported as spent");
     }
 }

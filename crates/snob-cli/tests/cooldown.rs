@@ -8,15 +8,14 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use snob_core::store::rate_budget::{RateBudget, RateBudgetError, UnlimitedRateBudget};
 use snob_core::model::ListKind;
-use snob_core::paths::AppPaths;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
-use snob_core::store::rate_budget::{
-    RateBudget, RateBudgetError, SqliteRateBudget, UnlimitedRateBudget,
-};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_core::paths::AppPaths;
+use snob_core::store::Store;
+use snob_core::store::rate_budget::SqliteRateBudget;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -347,8 +346,17 @@ async fn a_cooldown_landing_after_the_poll_still_exits_throttled() {
     let tmp = tempfile::tempdir().unwrap();
     let _schema = Store::open(&AppPaths::rooted_at(tmp.path())).unwrap();
 
-    // Visible only at the third look: entry check, pre-poll check, walker.
-    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(2));
+    // Visible only at the fourth look: entry check, pre-poll check, **the
+    // pacer's own**, walker.
+    //
+    // The third of those is the backstop in `Pacer::clear`, which reads the
+    // cooldown before every request rather than trusting the caller to have
+    // asked. It moved this ordinal by one and nothing else: with `after(2)` the
+    // pacer saw the cooldown first and the poll never went out, which is a
+    // better outcome and a different test. This one is about the walk stopping
+    // after a request that had already left, so the fixture has to let that
+    // request leave.
+    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(3));
     let error = execute_with(&server, reopen(tmp.path()), budget.clone(), &args())
         .await
         .unwrap_err();

@@ -204,23 +204,31 @@ impl<'a> ListWalker<'a> {
             //
             // `check_cooldown` above answers for the moment the walk started,
             // and this loop is the longest unbroken run of requests the tool
-            // produces. Nothing else re-reads the table on the way through:
-            // `Pacer::clear_to_send` consults the cancel token and the budget,
-            // and `SqliteRateBudget::reserve` touches `rate_budget` alone. So a
-            // cooldown another process writes while this walk is in flight is
-            // invisible to it — `snob whoami` in a second terminal drawing a
-            // 429 stops *that* process and leaves this one paging into a door
-            // Instagram has just closed. The database is shared per user, which
-            // is what makes that an ordinary Tuesday rather than a corner case.
+            // produces. A cooldown another process writes while this walk is in
+            // flight was invisible to it — `snob whoami` in a second terminal
+            // drawing a 429 stops *that* process and leaves this one paging into
+            // a door Instagram has just closed. The database is shared per user,
+            // which is what makes that an ordinary Tuesday rather than a corner
+            // case.
             //
             // It does not self-limit either, unless the push-back happens to
             // cover `/api/v1/friendships/` as well: an endpoint-specific
             // throttle leaves this walk answering normally to the end.
             //
+            // **`Pacer::clear` now reads the table too**, so this is no longer
+            // the only thing standing between a walk and a cooldown it did not
+            // open. It is still worth its place, and the reason is the next
+            // paragraph: the two stop the walk by different routes and only one
+            // of them is this one.
+            //
             // `break` rather than `Err`, so the partial keeps its cursor and
             // stays resumable — `verify_completion` passes a non-`Completed`
-            // reason through untouched. One local SQLite read against a wait of
-            // at least 1.5 s per page.
+            // reason through untouched. The backstop answers `Err`, which lands
+            // in `stop_reason_for` and also breaks with `RateLimit` carrying
+            // `state.cursor`, so nothing is lost either way; what this buys is
+            // catching the cooldown *between* pages, before the next request has
+            // been reserved at all. One local SQLite read against a wait of at
+            // least 1.5 s per page.
             if self
                 .client
                 .pacer()
@@ -308,7 +316,7 @@ impl<'a> ListWalker<'a> {
     fn check_cooldown(&self) -> Result<(), WalkError> {
         let until = self.client.pacer().cooldown().map_err(WalkError::Budget)?;
         if let Some(until_ms) = until {
-            let remaining_ms = until_ms - snob_core::store::now_ms();
+            let remaining_ms = until_ms - snob_core::clock::now_ms();
             return Err(WalkError::Cooldown {
                 until_ms,
                 remaining_ms,
@@ -382,6 +390,17 @@ impl<'a> ListWalker<'a> {
                 // client rather than through the token, and it is still the
                 // user stopping rather than anything going wrong.
                 IgError::Canceled => StopReason::Canceled,
+                // The backstop in `Pacer::clear` refusing, which is throttling
+                // and not a network failure however it arrives. Its reaction is
+                // `Abort` — retrying a wait measured in hours is the one thing
+                // that must not happen — so without this arm it fell to the line
+                // below and the walk reported `Network`. That is the same defect
+                // twice over: the mid-walk check a few hundred lines up breaks
+                // with `RateLimit` for the identical condition, and
+                // `ExitCode::from_stop_reason` turns `Network` into a plain
+                // failure while `from_ig_error` says `RateLimited` — and those
+                // two are documented to agree.
+                IgError::InCooldown { .. } => StopReason::RateLimit,
                 _ => StopReason::Network,
             },
         };
@@ -1172,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cooldown_prevents_starting() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         struct InCooldown;
         impl RateBudget for InCooldown {
@@ -1183,7 +1202,7 @@ mod tests {
                 self.reserve()
             }
             fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-                Ok(Some(snob_core::store::now_ms() + 3_600_000))
+                Ok(Some(snob_core::clock::now_ms() + 3_600_000))
             }
             fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
                 Ok(0)
@@ -1220,13 +1239,23 @@ mod tests {
     /// `MAX_PAGES_WITHOUT_NEW` would end the walk on its own and prove nothing.
     #[tokio::test]
     async fn a_cooldown_written_mid_walk_stops_the_walk() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         /// Answers `None` until the walk is under way, then `Some` — the shape
         /// of another process writing the row while this one pages.
+        ///
+        /// **Three asks, not two, and the third one is the pacer's.** The walk
+        /// consults the table at the entry check and once per iteration, and
+        /// since the backstop went into `Pacer::clear` it is consulted again
+        /// before every request. At two the cooldown became visible during the
+        /// first page's reservation, so the walk stopped with nothing read and
+        /// no cursor — which is the backstop working, and a different test from
+        /// this one. `pace.rs` covers that. This one is about the check between
+        /// pages, where the walk `break`s instead of erroring and the partial
+        /// stays resumable, so the fixture has to let a page through first.
         #[derive(Default)]
-        struct CooldownAfterTwo(std::sync::atomic::AtomicUsize);
-        impl RateBudget for CooldownAfterTwo {
+        struct CooldownAfterThree(std::sync::atomic::AtomicUsize);
+        impl RateBudget for CooldownAfterThree {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 Ok(Duration::ZERO)
             }
@@ -1235,7 +1264,7 @@ mod tests {
             }
             fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
                 let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok((asked >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+                Ok((asked >= 3).then(|| snob_core::clock::now_ms() + 7_200_000))
             }
             fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
                 Ok(0)
@@ -1252,7 +1281,7 @@ mod tests {
 
         let client = client_with(
             &server,
-            Pacer::new(std::sync::Arc::new(CooldownAfterTwo::default())),
+            Pacer::new(std::sync::Arc::new(CooldownAfterThree::default())),
         );
         let walker = ListWalker::new(&client);
         let summary = walker
@@ -1279,7 +1308,7 @@ mod tests {
     /// page without the walker having to remember to.
     #[tokio::test]
     async fn every_page_is_charged_to_the_budget() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         #[derive(Default)]
         struct Counting(std::sync::atomic::AtomicUsize);

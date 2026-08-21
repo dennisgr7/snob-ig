@@ -13,7 +13,7 @@ use crate::exit::{ExitCode, ExitError};
 /// What a machine with no `watch.toml` is told, by both things that look.
 ///
 /// `engine::check::without_a_session` decides it for `snob watch check` and
-/// `watch_setup::health` decides it for `snob watch status`, and the two spelled
+/// `watch::status::health` decides it for `snob watch status`, and the two spelled
 /// it out separately, character for character. It is the advice a newly
 /// installed tool gives, so it is the sentence somebody edits — and an edit to
 /// one copy leaves two probes a person runs one after the other saying different
@@ -96,6 +96,23 @@ fn rendered(error: &anyhow::Error) -> String {
     {
         let label = console::style("hint:").cyan().bold().for_stderr();
         out.push_str(&format!("{label}  {}\n", indented(hint)));
+    }
+
+    // The backstop in `Pacer::clear` answers with the epoch and no wording,
+    // because when a cooldown lifts is a date and `snob-ig` has no business
+    // formatting one. Said here so the last resort tells a person the same thing
+    // the eight gates in front of it tell them; every path anybody really
+    // reaches names the date itself, so this fires only when one of them was
+    // forgotten — which is exactly when the person reading needs it most.
+    if let Some(snob_ig::error::IgError::InCooldown { until_ms }) = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>())
+    {
+        let label = console::style("hint:").cyan().bold().for_stderr();
+        out.push_str(&format!(
+            "{label}  {}\n",
+            indented(&format!("it lifts {}", cooldown_ends_at(*until_ms)))
+        ));
     }
 
     out

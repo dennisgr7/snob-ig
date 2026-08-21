@@ -27,6 +27,26 @@ pub enum IgError {
     #[error("Instagram is throttling requests; this needs a wait before retrying")]
     RateLimited,
 
+    /// The account is already in cooldown, so this request was never sent.
+    ///
+    /// **Not [`IgError::RateLimited`], and the difference is which direction it
+    /// travels.** `RateLimited` comes back *from* Instagram and is what opens a
+    /// cooldown; this one is read *out of* the store before anything goes on the
+    /// wire, and closes one that is already open. Sharing a variant would have
+    /// made `classify_and_record` record a second cooldown for a push-back that
+    /// never happened.
+    ///
+    /// It carries the epoch and no wording. When a cooldown lifts is a date, and
+    /// dates are formatted in `snob-cli` — this crate has no clock and no
+    /// business having one.
+    ///
+    /// `reaction` answers `Abort` for it through the fallback arm, which is
+    /// right and worth saying out loud: retrying is the one thing that must not
+    /// happen, because the wait is measured in hours and every attempt would be
+    /// charged.
+    #[error("the account is in cooldown, so nothing may be spent until it lifts")]
+    InCooldown { until_ms: i64 },
+
     #[error("Instagram has temporarily blocked this action")]
     FeedbackRequired,
 
@@ -130,9 +150,7 @@ fn missing_message(what: &Option<String>) -> String {
 /// single-request command reaching it directly. Two copies of this table is one
 /// copy too many — the second would be the one passing a length of zero.
 pub fn cooldown_for(error: &IgError) -> Option<(&'static str, std::time::Duration)> {
-    use snob_core::store::rate_budget::{
-        action_block_cooldown, challenge_cooldown, rate_limit_cooldown,
-    };
+    use snob_core::budget::{action_block_cooldown, challenge_cooldown, rate_limit_cooldown};
 
     match error {
         IgError::FeedbackRequired => Some(("feedback_required", action_block_cooldown())),
