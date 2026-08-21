@@ -19,30 +19,30 @@
 //! `HttpOnly` cookies too. `sessionid` is `HttpOnly`, which is also why no
 //! console snippet can ever read it.
 //!
-//! What this costs, stated plainly: while the login is in progress the browser
-//! is listening on a loopback port, and that port has no authentication —
-//! anything else running on the machine can ask it for the same cookies. The
-//! port number is random and the window closes as soon as the session is
-//! captured, but on a machine shared with people you do not trust, `--paste`
-//! is the safer way in.
+//! **The protocol travels on a pipe, not on a port**, and that is the whole of
+//! what [`crate::pipe`] is for. It used to be `--remote-debugging-port=0`, and
+//! the cost of that was demonstrated rather than argued: a second local process
+//! read the port out of `DevToolsActivePort`, called `/json/version` with no
+//! credential, and got this session cookie back from `Storage.getCookies`.
+//! Loopback carries no per-user access control, so that was every account on
+//! the machine. Two anonymous pipes have no address, so there is nothing for a
+//! second process to connect to.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use snob_core::paths::AppPaths;
 use snob_ig::login::BrowserCookies;
 use snob_ig::pace::CancelToken;
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::browser::Browser;
+use crate::pipe::{BrowserProcess, PipeTransport};
 
-/// How long to wait for the browser to write its debugging endpoint. It is the
-/// first thing it does, so this only ever runs out when it did not start.
+/// How long to wait for the browser to answer its first command. Opening the
+/// pipe is the first thing it does, so this only ever runs out when it did not
+/// start.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for someone to finish logging in. Generous on purpose:
@@ -51,6 +51,13 @@ pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Gap between cookie checks.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Gap between looks at the pipe while waiting for the browser to come up.
+///
+/// Short, because the other thing this wait watches is the process: Chrome's
+/// profile singleton exits within a second, and the whole point of noticing
+/// that is not to sit out the startup timeout first.
+const POLL_FOR_READY: Duration = Duration::from_millis(100);
 
 /// How long a single protocol command may take.
 ///
@@ -61,15 +68,22 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 const LOGIN_URL: &str = "https://www.instagram.com/accounts/login/";
 
-/// A browser we started. Killed when dropped, so an early exit — a failed
-/// connection, an error — takes it down without having to remember to.
+/// A browser we started, and the pipe the protocol travels on.
 ///
-/// Dropping is not enough on its own for the two ways out that skip
-/// destructors: the release profile aborts on panic, and a second Ctrl+C exits
-/// the process outright. Those go through [`kill_launched`].
+/// Killed when dropped, so an early exit — a failed handshake, an error —
+/// takes it down without having to remember to.
+///
+/// Dropping is not enough on its own for the three ways out that skip
+/// destructors: the release profile aborts on panic, a second Ctrl+C exits the
+/// process outright, and nothing at all runs when this process is killed from
+/// outside. The first two go through [`kill_launched`]; the third is what the
+/// job object in [`crate::pipe`] is for, and it is the only one of the three
+/// that no code of ours can reach.
 pub struct Launched {
-    child: tokio::process::Child,
-    endpoint: String,
+    process: BrowserProcess,
+    transport: PipeTransport,
+    /// Only to name it in a message when the browser leaves early.
+    profile: PathBuf,
 }
 
 /// Forgets the pid when the browser goes.
@@ -163,102 +177,43 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
         .with_context(|| format!("could not create {}", profile.display()))?;
     let profile = profile.as_path();
 
-    // Written by the browser at startup. A stale one from a previous run would
-    // be read as this run's endpoint and point at a port nobody is listening on.
-    let active_port = profile.join("DevToolsActivePort");
-    let _ = std::fs::remove_file(&active_port);
+    // A leftover from when this listened on a port. Removed rather than
+    // ignored: a file named `DevToolsActivePort` sitting in snob's profile is
+    // exactly the thing the reader of this code will go looking for to decide
+    // whether a port is open, and finding a stale one would answer wrongly.
+    let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
 
-    let mut child = tokio::process::Command::new(&browser.path)
-        .arg(format!("--user-data-dir={}", profile.display()))
-        // Port 0 means "pick a free one and write it down", which avoids both
-        // colliding with something already on 9222 and handing a fixed port to
-        // anything else on this machine.
-        .arg("--remote-debugging-port=0")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-features=Translate")
-        .arg(LOGIN_URL)
-        // Chrome narrates to stderr: the debugging endpoint, GCM registration
-        // failures, a TensorFlow notice. None of it is ours and all of it lands
-        // in the middle of our own instructions.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+    let arguments = vec![
+        format!("--user-data-dir={}", profile.display()),
+        // The protocol on two inherited pipes rather than on a loopback
+        // socket. Nothing else on this machine can reach it, because there is
+        // no address for it to reach.
+        "--remote-debugging-pipe".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-features=Translate".to_string(),
+        LOGIN_URL.to_string(),
+    ];
+
+    // Chrome narrates to standard error: GCM registration failures, a
+    // TensorFlow notice. None of it is ours and all of it lands in the middle
+    // of our own instructions, so `pipe::spawn` gives it nowhere to go.
+    let (process, transport) = crate::pipe::spawn(&browser.path, &arguments)
         .with_context(|| format!("could not start {}", browser.name))?;
 
-    LAUNCHED_PID.store(
-        child.id().unwrap_or(0),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    LAUNCHED_PID.store(process.id(), std::sync::atomic::Ordering::Relaxed);
     kill_on_panic();
 
-    // From here on the pid must not outlive the process it names: a stale one
-    // would make a later `kill_launched` shoot at whatever has since been given
-    // that number. Every way out of this function clears it except the one that
-    // hands the browser over to `Launched`.
-    let endpoint = match wait_for_endpoint(&active_port, &mut child, profile, cancel).await {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            kill_launched();
-            return Err(e);
-        }
-    };
-    Ok(Launched { child, endpoint })
-}
-
-/// Both waits below are the same shape, and every one of their endings matters:
-/// found, the browser exited, gave up, ran out of time. They are written out
-/// rather than shared because an async closure holding the connection across
-/// the await does not survive the borrow checker, and eight duplicated lines
-/// are a better price than the contortion that would.
-///
-/// Reads the endpoint the browser wrote: the port on the first line and the
-/// path to the browser-level target on the second.
-async fn wait_for_endpoint(
-    active_port: &Path,
-    child: &mut tokio::process::Child,
-    profile: &Path,
-    cancel: &CancelToken,
-) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-
-    loop {
-        if cancel.is_canceled() {
-            bail!("canceled");
-        }
-        // The file first, then the child: a browser that wrote its endpoint and
-        // then exited still handed us a usable one.
-        if let Ok(text) = std::fs::read_to_string(active_port)
-            && let Some((port, path)) = parse_endpoint(&text)
-        {
-            return Ok(format!("ws://127.0.0.1:{port}{path}"));
-        }
-        // Chrome's profile singleton makes this ordinary rather than exotic: a
-        // second `snob login --browser` hands its command line to the instance
-        // already holding the profile and exits within a second. Watching only
-        // the port file meant waiting the full thirty seconds and then blaming
-        // the debugging port, which is the wrong problem — and holding a dead
-        // pid the whole time, which is what the comment above `LAUNCHED_PID`
-        // warns about.
-        if let Ok(Some(status)) = child.try_wait() {
-            // `try_wait` is what reaps the child, so this is the moment the
-            // number becomes reusable. Clearing it here also makes the
-            // `kill_launched()` in the caller's error arm a deliberate no-op
-            // rather than a shot at a stranger.
-            LAUNCHED_PID.store(0, std::sync::atomic::Ordering::Relaxed);
-            bail!("{}", died_early(status.code(), profile));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "the browser did not open its debugging port within {} seconds",
-                STARTUP_TIMEOUT.as_secs()
-            );
-        }
-        if cancel.sleep_or_cancel(Duration::from_millis(100)).await {
-            bail!("canceled");
-        }
+    if cancel.is_canceled() {
+        kill_launched();
+        bail!("canceled");
     }
+
+    Ok(Launched {
+        process,
+        transport,
+        profile: profile.to_path_buf(),
+    })
 }
 
 /// What to say when the browser started and stopped again.
@@ -290,40 +245,76 @@ fn died_early(code: Option<i32>, profile: &Path) -> String {
     }
 }
 
-/// The file holds the port and the target path on two lines. It is written in
-/// two steps, so a half-written one has to read as "not ready" rather than as
-/// an endpoint.
-fn parse_endpoint(text: &str) -> Option<(u16, String)> {
-    let mut lines = text.lines();
-    let port: u16 = lines.next()?.trim().parse().ok()?;
-    let path = lines.next()?.trim();
-    if port == 0 || !path.starts_with('/') {
-        return None;
-    }
-    Some((port, path.to_string()))
-}
-
 /// An open DevTools connection, and the browser on the other end of it.
 ///
 /// The two travel together because neither is useful alone: the connection is
 /// what asks the browser to leave, and the browser is what has to be killed if
 /// it will not.
 pub struct Cdp {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     launched: Launched,
     next_id: u64,
 }
 
 impl Cdp {
-    pub async fn connect(launched: Launched) -> Result<Self> {
-        let (socket, _) = tokio_tungstenite::connect_async(&launched.endpoint)
-            .await
-            .context("could not connect to the browser's debugging port")?;
-        Ok(Self {
-            socket,
+    /// Takes a started browser and waits until it answers.
+    ///
+    /// There is no connecting to do any more — the pipe was opened before the
+    /// browser existed — so what this waits for is the browser reaching the
+    /// point of reading it. **The wait watches the process as well as the
+    /// pipe**, and that is not tidiness: Chrome's profile singleton makes a
+    /// second `snob login --browser` hand its command line to the instance
+    /// already holding the profile and exit within a second, and watching only
+    /// the pipe meant waiting the full thirty seconds and then blaming the
+    /// debugging transport, which is the wrong problem.
+    pub async fn connect(launched: Launched, cancel: &CancelToken) -> Result<Self> {
+        let mut cdp = Self {
             launched,
             next_id: 1,
-        })
+        };
+        match cdp.wait_until_ready(cancel).await {
+            Ok(()) => Ok(cdp),
+            Err(e) => {
+                // The browser is taken down here rather than left for whoever
+                // forgets; `Launched` clears the pid on the way out.
+                kill_launched();
+                Err(e)
+            }
+        }
+    }
+
+    async fn wait_until_ready(&mut self, cancel: &CancelToken) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send("Browser.getVersion", json!({}), id).await?;
+
+        loop {
+            if cancel.is_canceled() {
+                bail!("canceled");
+            }
+            // The browser leaving is an answer too, and a faster one than the
+            // deadline.
+            if let Ok(Some(ended)) = self.launched.process.try_wait() {
+                bail!("{}", died_early(ended.code, &self.launched.profile));
+            }
+            match tokio::time::timeout(POLL_FOR_READY, self.launched.transport.recv()).await {
+                Ok(Some(message)) => {
+                    if reply_to(id, &message).is_some() {
+                        return Ok(());
+                    }
+                }
+                // The pipe closed. The process check at the top of the next
+                // turn is what says why, so this only has to not spin.
+                Ok(None) => tokio::time::sleep(POLL_FOR_READY).await,
+                Err(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "the browser did not answer its debugging pipe within {} seconds",
+                    STARTUP_TIMEOUT.as_secs()
+                );
+            }
+        }
     }
 
     /// Closes the browser politely, so the profile is not left looking like it
@@ -334,9 +325,24 @@ impl Cdp {
         let _ = self.call("Browser.close", json!({})).await;
         // It was asked to leave; this makes sure it did. `Launched` clears the
         // pid on the way out, so nothing here has to remember to.
-        let child = &mut self.launched.child;
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        let _ = child.start_kill();
+        if self
+            .launched
+            .process
+            .wait_up_to(Duration::from_secs(5))
+            .await
+            .is_none()
+        {
+            self.launched.process.kill();
+        }
+    }
+
+    async fn send(&mut self, method: &str, params: Value, id: u64) -> Result<()> {
+        let request = json!({ "id": id, "method": method, "params": params });
+        self.launched
+            .transport
+            .send(request.to_string().into_bytes())
+            .await
+            .with_context(|| format!("could not send {method} to the browser"))
     }
 
     /// Sends one command and waits for the answer with its id.
@@ -353,33 +359,30 @@ impl Cdp {
     async fn call_forever(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
+        self.send(method, params, id).await?;
 
-        let request = json!({ "id": id, "method": method, "params": params });
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .await
-            .with_context(|| format!("could not send {method} to the browser"))?;
-
-        while let Some(message) = self.socket.next().await {
-            let message = message.context("the connection to the browser broke")?;
-            let Message::Text(text) = message else {
+        while let Some(message) = self.launched.transport.recv().await {
+            let Some(reply) = reply_to(id, &message) else {
                 continue;
             };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
+            if let Some(error) = reply.get("error") {
                 bail!("the browser refused {method}: {error}");
             }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
         }
 
         Err(anyhow!(
             "the browser closed the connection before answering {method}"
         ))
+    }
+
+    /// The browser's process id.
+    ///
+    /// Only so a test can ask the operating system what that process is
+    /// listening on. Nothing in the program needs it: `kill_launched` reads the
+    /// global, because it runs where this value cannot be reached.
+    pub fn browser_pid(&self) -> u32 {
+        self.launched.process.id()
     }
 
     /// The exact User-Agent this browser sends.
@@ -406,6 +409,18 @@ impl Cdp {
             .unwrap_or_default();
         Ok(collect(cookies))
     }
+}
+
+/// One protocol message, if it is the reply to `id`.
+///
+/// Split out because two places need it, and because it is what stands between
+/// a browser's chatter and a command's answer: events carry no `id`, and
+/// replies to commands nobody is waiting for any more carry somebody else's.
+/// A message that is not JSON at all is not a reply either — the transport
+/// hands over bytes and says nothing about what is in them.
+fn reply_to(id: u64, message: &[u8]) -> Option<Value> {
+    let value: Value = serde_json::from_slice(message).ok()?;
+    (value.get("id").and_then(Value::as_u64) == Some(id)).then_some(value)
 }
 
 /// Picks the Instagram cookies out of everything the browser holds.
@@ -495,23 +510,28 @@ mod tests {
         assert!(!said.contains("already open"), "{said}");
     }
 
+    /// The reply to a command is told from everything else the browser says.
+    ///
+    /// Over a WebSocket this was a library's problem. Over a pipe it is ours,
+    /// and it is the piece that decides whether a login reads the cookies or
+    /// hangs: the browser emits events nobody subscribed to, and an event
+    /// carries no `id` at all.
     #[test]
-    fn it_reads_the_two_line_endpoint() {
-        let (port, path) = parse_endpoint("54321\n/devtools/browser/abc-123\n").unwrap();
-        assert_eq!(port, 54321);
-        assert_eq!(path, "/devtools/browser/abc-123");
+    fn only_the_reply_with_our_id_counts() {
+        assert!(reply_to(7, br#"{"id":7,"result":{"ok":true}}"#).is_some());
+        assert!(reply_to(7, br#"{"id":8,"result":{}}"#).is_none());
+        assert!(reply_to(7, br#"{"method":"Target.targetCreated","params":{}}"#).is_none());
+        assert!(reply_to(7, b"not json at all").is_none());
+        assert!(reply_to(7, b"").is_none());
     }
 
-    /// The file is written in two steps. Catching it half-written must read as
-    /// "not ready yet", not as an endpoint on a port nobody is listening on.
+    /// A refusal is carried back rather than read as an answer, and an id that
+    /// arrived as a string is not our id.
     #[test]
-    fn a_half_written_file_is_not_an_endpoint() {
-        assert!(parse_endpoint("54321").is_none());
-        assert!(parse_endpoint("").is_none());
-        assert!(parse_endpoint("54321\n").is_none());
-        assert!(parse_endpoint("0\n/devtools/browser/abc").is_none());
-        assert!(parse_endpoint("not-a-port\n/devtools/browser/abc").is_none());
-        assert!(parse_endpoint("54321\ndevtools-without-a-slash").is_none());
+    fn a_refusal_is_still_the_reply_it_answers() {
+        let refused = reply_to(3, br#"{"id":3,"error":{"code":-32601}}"#).unwrap();
+        assert!(refused.get("error").is_some());
+        assert!(reply_to(3, br#"{"id":"3","result":{}}"#).is_none());
     }
 
     fn cookie(name: &str, value: &str, domain: &str) -> Value {

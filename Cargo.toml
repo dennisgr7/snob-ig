@@ -73,10 +73,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = { version = "0.12", default-features = false }
 console = "0.16"
 url = "2"
-# Talking to a browser we launched, over the DevTools protocol. Loopback only,
-# so no TLS stack is pulled in: `connect` alone speaks ws:// and nothing more.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Talking to a browser we launched, over the DevTools protocol. It used to be
+# `tokio-tungstenite` and `futures-util` over a loopback WebSocket; the protocol
+# now travels on two inherited pipes instead, which has no address for anything
+# else on the machine to connect to, and framing NUL-separated JSON needs no
+# library. `crates/snob-cli/src/pipe.rs` carries the reasoning and the cost.
+#
+# Only for the Unix half of that: `dup2` in a `pre_exec` hook is what puts the
+# two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
+# no such crate -- it goes through `windows-sys`, which is already here.
+libc = "0.2"
 base64 = "0.23"
 # Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
 # backends are optional features and stay off, which is what makes these build
@@ -100,7 +106,12 @@ percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization"] }
+# `Win32_System_Threading`, `Win32_System_Pipes`, `Win32_System_JobObjects` and
+# `Win32_Security` are the Windows half of launching the browser on a pipe:
+# `CreateProcessW` with the handle-inheritance blob `std::process::Command` does
+# not expose, and the job object that takes the browser down with this process
+# however this process dies.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Test-only
 wiremock = "0.6"

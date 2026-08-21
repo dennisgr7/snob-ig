@@ -40,8 +40,6 @@ comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
 rust_xlsxwriter.workspace = true
 zip.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -62,6 +60,16 @@ fastrand.workspace = true
 # from a domain -- the string form keeps the brackets the syntax requires, so
 # `[::1]` does not parse as an address.
 url.workspace = true
+
+# Launching the browser with the debugging protocol on a pipe. Windows needs the
+# handle-inheritance blob and the job object; Unix needs `dup2`. Neither is
+# reachable through `std::process::Command`, and the reasoning is in
+# `src/pipe.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

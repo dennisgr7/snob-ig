@@ -238,6 +238,8 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A name is filtered before anything draws it, whoever it came from | `model::printable`, reached through `User::safe_username` / `safe_full_name`, `Viewer::safe_username`, `app::target_label`, `error::body_excerpt`, `error::missing_message`, `target::label` and `scan::summary_target` — and, for everything a failure prints, through `report::filtered`, which every branch of `print_error` goes through including the one that carries no label. Where a name came from decides whether it can be *trusted*, not whether a control character in it reaches a terminal — so the typed ones go through it too. `printable` covers the invisibles that are `Cf` **and** the four Hangul fillers, which are ordinary letters by category and blank by rendering |
 | A name inside a URL or a header is encoded, never filtered | `model::in_a_path`, used by `User::profile_url` and by the `Referer` the Instagram client sends — filtering removes characters, and a name with one removed is the address of a different account. A header value cannot hold a byte below 0x20 at all, so an unencoded name there produces no request rather than a wrong one, and reqwest reports that as `Network`, which the pager retries |
 | A panic takes the launched browser with it | `cdp::kill_on_panic` |
+| The login browser's debugging protocol has no address | `pipe::spawn`, which starts it with `--remote-debugging-pipe` on two inherited descriptors. There is no port to guess and no `DevToolsActivePort` to read, which is what the demonstrated read of the session cookie needed |
+| The launched browser dies with this process however this process dies | the job object in `pipe::spawn`, carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The child is created suspended and joined to the job before it is resumed, so it never exists outside one — and this is the only one of the three exits that no code of ours can reach, because nothing runs when snob is killed from outside |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` — and takes its waits from `IgClient::is_live`, so "walk Instagram with no pauses" is not a thing a caller can ask for |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret`, the type of every credential field |
 | A session is never reported gone unless it went | `SecretStore::delete`, which carries the keyring's own answer back |
@@ -419,6 +421,29 @@ Two judgment calls worth understanding before touching them:
   the escalated length rather than at its own. `SNOB_IGNORE_COOLDOWN` exists for
   the person who is certain, and stays undocumented so it is not the first thing
   reached for.
+- **The login browser is talked to over a pipe, and there is no debugging
+  port.** It used to be `--remote-debugging-port=0`, and what that cost was
+  demonstrated rather than argued: a second local process read the port out of
+  `DevToolsActivePort`, called `/json/version` with no credential at all, and
+  got the session cookie back from `Storage.getCookies` — `httpOnly` is a rule
+  for page scripts and means nothing to the protocol itself. Loopback sockets
+  carry no per-user access control, so that was every account on the machine
+  for as long as the window was open. `--remote-debugging-pipe` moves the same
+  protocol onto two anonymous descriptors that only this process and the
+  browser hold, and an address nobody can name is not one anybody can connect
+  to. The price is that `std::process::Command` cannot start that browser:
+  Chromium reads descriptor 3 and writes descriptor 4, and on Windows it
+  reaches them through `_get_osfhandle`, which only answers if the C runtime
+  found them in the handle-inheritance blob the parent passed in
+  `STARTUPINFO.lpReserved2` — a structure no Windows header describes and
+  `Command` does not expose. So the launch goes through `CreateProcessW`
+  directly, with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so that those two
+  descriptors are the only handles inherited; on Unix the same idea is two
+  `dup2` calls in a `pre_exec` hook. It retired `tokio-tungstenite` and
+  `futures-util`, because NUL-separated JSON needs no library. The reasoning
+  and the layout are in `crates/snob-cli/src/pipe.rs`; `tests/browser_pipe.rs`
+  holds it down against a real browser, and skips rather than fails where none
+  is installed.
 - **`snob purge` deletes the stored data and not the binary.** No package
   manager can do the first half: `winget uninstall`, `brew uninstall` and
   `apt remove` take away files the package owns, and the session, the database
@@ -640,18 +665,6 @@ Windows build does not, so it is not comparable.
 Found by an audit in August 2026, with numbers. Written down here rather than
 left in a report nobody can find, and in the order they are worth doing.
 
-- **`login --browser` leaves an unauthenticated debugging port open**, on
-  loopback, for up to `LOGIN_TIMEOUT`. Demonstrated end to end: a second local
-  process read the port from `DevToolsActivePort`, called `/json/version` with
-  no credential, and got the session cookie back from `Storage.getCookies`
-  despite `httpOnly`. Loopback sockets have no per-user access control, so this
-  is every account on the machine. `--remote-debugging-pipe` is the fix and it
-  was demonstrated working on Windows — the platform is not the obstacle;
-  `std::process::Command` is, because it does not expose the `lpReserved2`
-  handle-inheritance blob. Roughly 250 lines of unsafe plus a Unix path, and it
-  retires `tokio-tungstenite` and `futures-util`. Pair it with a job object
-  carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which also covers the case no
-  handler can catch: snob killed from outside, browser and port left running.
 - **`keyring-core` and the platform stores.** The keyring project split in
   2026 and `keyring 4.x` now calls itself sample code, pointing applications at
   `keyring-core` plus a store. Two things arrive together:
