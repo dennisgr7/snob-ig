@@ -133,6 +133,21 @@ impl Store {
     pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
+
+    /// One remembered fact, by name. See [`meta_get`].
+    ///
+    /// Here as well as free-standing so that a caller with a `Store` does not
+    /// need `rusqlite` in its own manifest to reach the `meta` table. `snob-cli`
+    /// is that caller, and adding a database crate to it for two lines would put
+    /// the connection type in a place that has no business naming it.
+    pub fn remembered(&self, key: &str) -> Result<Option<String>, StoreError> {
+        meta_get(&self.conn, key)
+    }
+
+    /// Writes one. See [`meta_set`].
+    pub fn remember(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        meta_set(&self.conn, key, value)
+    }
 }
 
 /// Runs the migration chain with foreign keys out of the way.

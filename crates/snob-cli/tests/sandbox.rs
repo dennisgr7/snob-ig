@@ -880,13 +880,49 @@ async fn a_write_nobody_could_confirm_is_not_made() {
     );
 }
 
+/// Puts the mutation ids in the sandbox's database, as a machine that has
+/// already discovered them would have.
+///
+/// **Discovery cannot be exercised here and that is deliberate.** It walks
+/// `static.cdninstagram.com`, and the host is fixed in `graphql::bundles_in`
+/// rather than taken from the page — the property that makes walking a
+/// document's URLs safe at all, and therefore one that cannot be pointed at a
+/// mock server without giving it up. The walk's two halves are pure functions
+/// with tests of their own; what this file exercises is the request built from
+/// what they found.
+///
+/// Written through the same `Store` the binary uses, so the row lands where the
+/// run will look for it rather than where the test thinks it should.
+fn remember_doc_ids(root: &Path) {
+    let paths = snob_core::paths::AppPaths::rooted_at(root);
+    let db = snob_core::store::Store::open(&paths).expect("the sandbox database opens");
+    for (name, id) in [
+        ("usePolarisFollowMutation", "26508036048874888"),
+        ("usePolarisUnfollowMutation", "27789106940691111"),
+    ] {
+        db.remember(&format!("graphql.doc_id.{name}"), id)
+            .expect("the sandbox database is writable");
+    }
+}
+
 /// A confirmed unfollow sends one POST, to the right path, with the token.
 #[tokio::test]
 async fn a_confirmed_unfollow_sends_one_post() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
+    // The page that hands out the tokens a mutation needs, and the mutation.
+    Mock::given(method("GET"))
+        .and(url_path("/someone/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<html>{"define":[["DTSGInitData",[],{"token":"DTSG"},1],
+               ["LSD",[],{"token":"LSD"},2]]}
+               <script src="https://static.cdninstagram.com/rsrc.php/v4/a.js"></script></html>"#,
+        ))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
     Mock::given(method("POST"))
-        .and(path_regex(r"^/web/friendships/\d+/unfollow/$"))
+        .and(url_path("/api/graphql"))
         .respond_with(
             ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
         )
@@ -907,6 +943,7 @@ async fn a_confirmed_unfollow_sends_one_post() {
         .mount(&instagram)
         .await;
     log_in_writing(tmp.path(), &instagram);
+    remember_doc_ids(tmp.path());
 
     let out = snob(tmp.path(), Some(&instagram), &["unfollow", "someone", "-y"]);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
@@ -917,14 +954,20 @@ async fn a_confirmed_unfollow_sends_one_post() {
         .filter(|r| r.method == wiremock::http::Method::POST)
         .collect();
     assert_eq!(writes.len(), 1, "one account, one write");
-    assert_eq!(writes[0].url.path(), "/web/friendships/9001/unfollow/");
+    assert_eq!(writes[0].url.path(), "/api/graphql");
     assert_eq!(
         writes[0].headers.get("x-csrftoken").unwrap(),
         "SANDBOXTOKEN"
     );
-    // The account is named by the path. This route takes no body, and the
-    // fields the /api/v1/ one wants belong to the /api/v1/ one.
-    assert!(writes[0].body.is_empty());
+    let sent = String::from_utf8_lossy(&writes[0].body);
+    assert!(
+        sent.contains("fb_api_req_friendly_name=usePolarisUnfollowMutation"),
+        "{sent}"
+    );
+    // The tokens really came off the page the run fetched, rather than from
+    // anywhere else.
+    assert!(sent.contains("fb_dtsg=DTSG"), "{sent}");
+    assert!(sent.contains("target_user_id"), "{sent}");
 }
 
 /// A relationship that already holds costs no request at all, which matters

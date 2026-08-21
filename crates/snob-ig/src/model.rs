@@ -202,6 +202,29 @@ pub struct FriendshipResult {
     pub friendship_status: Option<FriendshipStatus>,
     #[serde(default)]
     pub result: Option<String>,
+    /// The GraphQL envelope, which is the one that actually arrives.
+    ///
+    /// **Reading it was the last thing to get right, and getting it wrong was
+    /// invisible from the request's side.** The mutation succeeded — the
+    /// account really was followed, confirmed by reading the relationship back
+    /// — and this said "Instagram accepted the request, but @nasa is still not
+    /// followed", because none of the shapes below were the shape that came.
+    /// A command that does the thing and then reports that it did not is worse
+    /// than one that fails.
+    #[serde(default)]
+    pub data: Option<MutationData>,
+}
+
+/// `{"data":{"xdt_create_friendship":{"friendship_status":{…}}}}`.
+///
+/// One field per verb, both optional, because a response carries whichever one
+/// it is answering about.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MutationData {
+    #[serde(default)]
+    pub xdt_create_friendship: Option<Box<FriendshipResult>>,
+    #[serde(default)]
+    pub xdt_destroy_friendship: Option<Box<FriendshipResult>>,
 }
 
 impl FriendshipResult {
@@ -213,6 +236,14 @@ impl FriendshipResult {
     /// nothing changed". That is the honest reading of a word nobody here knows:
     /// better than guessing it meant success.
     pub fn status(self) -> FriendshipStatus {
+        // The envelope first, because it is the one Instagram actually sends
+        // today and the two flatter shapes are what it used to.
+        if let Some(inner) = self
+            .data
+            .and_then(|d| d.xdt_create_friendship.or(d.xdt_destroy_friendship))
+        {
+            return inner.status();
+        }
         if let Some(status) = self.friendship_status {
             return status;
         }

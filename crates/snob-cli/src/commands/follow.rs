@@ -22,6 +22,7 @@ use snob_core::model::printable;
 use snob_core::paths::AppPaths;
 use snob_core::secrets::SecretStore;
 use snob_ig::client::IgClient;
+use snob_ig::graphql::DocIds;
 use snob_ig::model::FriendshipStatus;
 
 use crate::app::App;
@@ -160,7 +161,8 @@ pub async fn run(
         return Ok(ExitCode::Interrupted);
     }
 
-    let status = send(app.client(), verb, profile.id, &profile.username).await?;
+    let ids = RememberedIds { db: app.db() };
+    let status = send(app.client(), verb, profile.id, &profile.username, &ids).await?;
     ui::info(&outcome(verb, &status, &name));
     Ok(ExitCode::Ok)
 }
@@ -201,11 +203,47 @@ async fn send(
     verb: Verb,
     pk: snob_core::Pk,
     username: &str,
+    ids: &dyn DocIds,
 ) -> Result<FriendshipStatus> {
     Ok(match verb {
-        Verb::Follow => client.follow(pk, username).await?,
-        Verb::Unfollow => client.unfollow(pk, username).await?,
+        Verb::Follow => client.follow(pk, username, ids).await?,
+        Verb::Unfollow => client.unfollow(pk, username, ids).await?,
     })
+}
+
+/// The mutation ids, remembered in the `meta` table between runs.
+///
+/// **Discovery is what makes a rotated id fix itself, and caching is what makes
+/// discovery affordable.** Finding one means fetching JavaScript bundles until
+/// a mutation turns up in one, and those are megabytes; once per rotation is
+/// nothing, once per follow would be absurd.
+///
+/// Failures are swallowed on both sides, and the same reasoning applies to
+/// each: a read that fails means discovery runs, which is slow and correct, and
+/// a write that fails means the next run discovers again. Neither is worth
+/// failing a follow over, and neither is worth a message the user cannot act
+/// on.
+struct RememberedIds<'a> {
+    db: &'a snob_core::store::Store,
+}
+
+impl DocIds for RememberedIds<'_> {
+    fn get(&self, friendly_name: &str) -> Option<String> {
+        self.db.remembered(&key(friendly_name)).ok().flatten()
+    }
+
+    fn put(&self, friendly_name: &str, doc_id: &str) {
+        if let Err(e) = self.db.remember(&key(friendly_name), doc_id) {
+            tracing::debug!(error = %e, "the mutation id could not be remembered");
+        }
+    }
+}
+
+/// Namespaced, because `meta` holds facts about the database and these are
+/// facts about Instagram. Keyed by the mutation's own name so that a renamed
+/// operation gets a new key rather than a stale value under an old one.
+fn key(friendly_name: &str) -> String {
+    format!("graphql.doc_id.{friendly_name}")
 }
 
 /// What actually happened, as Instagram describes it afterwards.

@@ -34,12 +34,45 @@
 //! the page that would have used it means the rotation fixes itself.
 //!
 //! What is deliberately **not** sent is the telemetry the browser attaches —
-//! `__dyn`, `__csr`, `__hsdp`, `__hblp`, `__sjsp` and their neighbours. Those
+//! `__dyn`, `__csr`, `__hsdp`, `__hblp`, `__sjsp` and their neighbors. Those
 //! are Relay's record of what the page had already loaded, they are kilobytes
 //! long, and inventing them would be describing a browsing session that did not
 //! happen. This project sends what it can say truthfully.
 
 use snob_core::secret::Secret;
+
+/// What a run already knows about the mutation identifiers.
+///
+/// **Discovery has to be cached or it is unaffordable.** Finding a `doc_id`
+/// means fetching JavaScript bundles until one contains the mutation, and those
+/// are megabytes. Once per rotation is fine; once per follow is not.
+///
+/// A trait rather than a field, because the thing that remembers is the
+/// database and this crate does not open one. `snob-cli` implements it over the
+/// `meta` table; the tests implement it over a `HashMap`.
+///
+/// **Deliberately not `Send + Sync`.** The obvious bound would not compile
+/// against the one implementation that matters: `rusqlite::Connection` is
+/// neither, by design, because a SQLite connection belongs to one thread. It is
+/// not needed either — the cache is consulted on the task that is already
+/// making the request, and never moved.
+pub trait DocIds {
+    fn get(&self, friendly_name: &str) -> Option<String>;
+    fn put(&self, friendly_name: &str, doc_id: &str);
+}
+
+/// A cache that forgets immediately.
+///
+/// For a caller with nothing to remember with — and for the tests, where
+/// discovery running every time is the point rather than a cost.
+pub struct NoDocIds;
+
+impl DocIds for NoDocIds {
+    fn get(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn put(&self, _: &str, _: &str) {}
+}
 
 /// The two tokens a page hands out, which together authorize a mutation.
 ///
@@ -68,6 +101,39 @@ impl Mutation {
         match self {
             Self::Follow => "usePolarisFollowMutation",
             Self::Unfollow => "usePolarisUnfollowMutation",
+        }
+    }
+
+    /// The identifier as it was on the day this was captured.
+    ///
+    /// # Why there is a written-down value here at all
+    ///
+    /// The intention was to discover it every time and never write one down,
+    /// because a constant stops working the day Instagram rebuilds. **That
+    /// turned out not to be buildable, and the attempt is worth recording so
+    /// nobody spends the afternoon again.**
+    ///
+    /// A profile page names around four hundred and forty JavaScript bundles.
+    /// The mutation is in none of them: it lives in a chunk the client loads on
+    /// demand once the profile route has mounted, and the loader builds that
+    /// URL from a manifest that is not resolvable by reading the page. Measured
+    /// in August 2026 against the real logged-in page — sixty bundles opened,
+    /// about seven megabytes, no match; and against the logged-out one, the
+    /// same. What the page *does* carry is the two tokens, which is why those
+    /// are still read rather than stored.
+    ///
+    /// So the value below is a seed, and it is treated the way `ASBD_ID` is:
+    /// captured on a date, from a real request, with the way to refresh it
+    /// written next to it. The recovery path is not a rebuild — it is
+    /// [`crate::client::IgClient::doc_id_for`] trying the discovery walk when
+    /// the seed is refused, and failing that, an error that tells the user
+    /// where to look. Both are worth more than a silent stop.
+    ///
+    /// Captured 21 August 2026, Chrome 151, from `POST /api/graphql`.
+    pub fn seed_doc_id(self) -> &'static str {
+        match self {
+            Self::Follow => "26508036048874888",
+            Self::Unfollow => "27789106940691111",
         }
     }
 }
@@ -208,6 +274,91 @@ pub fn variables(target_pk: snob_core::Pk) -> String {
 
 const NAV_CHAIN: &str = "PolarisProfilePostsTabRoot:profilePage:1:via_cold_start";
 
+/// Every JavaScript bundle a page pulls in, in the order it names them.
+///
+/// The `doc_id` lives in one of these and there is no way to know which without
+/// looking, so the caller walks them. **The order matters and it is the page's,
+/// not ours**: a page lists the chunk that its own route needs, and that is the
+/// one holding the profile page's mutations, so walking in order finds it
+/// early rather than after megabytes of unrelated code.
+///
+/// Only the script host is accepted. A page's HTML is full of URLs, some of
+/// them from places this tool has no business fetching from, and the one thing
+/// that makes walking them safe is that the host is fixed here rather than
+/// taken from the document.
+/// **Most of them arrive with their slashes escaped**, and missing that was
+/// worth six URLs out of four hundred and thirty-seven. A page names a handful
+/// of bundles in `<script src>` attributes, where the URL is written plainly,
+/// and every other one inside a JSON string in the bootstrap payload, where it
+/// is `https:\/\/static.cdninstagram.com\/rsrc.php\/…`. Reading only the plain
+/// ones looks like it works — the list is not empty — and finds one and a half
+/// per cent of what is there.
+pub fn bundles_in(html: &str) -> Vec<String> {
+    const HOST: &str = "static.cdninstagram.com";
+
+    let mut found: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(at) = rest.find(HOST) {
+        // Back up over the scheme, which is `https://` or `https:\/\/`.
+        let line_start = rest[..at].rfind("https:").filter(|s| at - s <= 10);
+        let from = &rest[line_start.unwrap_or(at)..];
+        // A URL ends at the first character that cannot be in one. A backslash
+        // can, here, because it is the escape in front of a slash — so it is
+        // not a terminator and is unescaped below instead.
+        let end = from
+            .find(|c: char| c == '"' || c == '\'' || c == '<' || c == ')' || c.is_whitespace())
+            .unwrap_or(from.len());
+        // **The whole prefix, unescaped, and anchored at the start.** Matching
+        // the host as a substring is what let `static.cdninstagram.com.evil.example`
+        // through when the escaped form was added; the test below is the one
+        // that caught it. The trailing slash is what makes the host the host
+        // rather than a prefix of a longer one.
+        const PREFIX: &str = "https://static.cdninstagram.com/";
+        let url = from[..end].replace("\\/", "/");
+        if url.starts_with(PREFIX) && url.ends_with(".js") && !found.contains(&url) {
+            found.push(url);
+        }
+        rest = &rest[at + HOST.len()..];
+    }
+    found
+}
+
+/// The form body of a mutation.
+///
+/// Ordered the way the browser orders it, which costs nothing and means a
+/// capture of ours and a capture of the site's line up when somebody compares
+/// them.
+///
+/// `__user=0` is not a mistake: the real request sends exactly that even when
+/// logged in, which is worth a note because it looks like a bug every time
+/// somebody reads it.
+pub fn mutation_body(
+    tokens: &PageTokens,
+    mutation: Mutation,
+    doc_id: &str,
+    target_pk: snob_core::Pk,
+) -> Vec<(String, String)> {
+    let fb_dtsg = tokens.fb_dtsg.expose().to_string();
+    let jazoest = jazoest(&fb_dtsg);
+    vec![
+        ("__d".into(), "www".into()),
+        ("__user".into(), "0".into()),
+        ("__a".into(), "1".into()),
+        ("__comet_req".into(), "7".into()),
+        ("fb_dtsg".into(), fb_dtsg),
+        ("jazoest".into(), jazoest),
+        ("lsd".into(), tokens.lsd.expose().to_string()),
+        ("fb_api_caller_class".into(), "RelayModern".into()),
+        (
+            "fb_api_req_friendly_name".into(),
+            mutation.friendly_name().into(),
+        ),
+        ("server_timestamps".into(), "true".into()),
+        ("variables".into(), variables(target_pk)),
+        ("doc_id".into(), doc_id.into()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +439,103 @@ mod tests {
     fn a_short_number_is_not_mistaken_for_an_id() {
         let js = r#"{id:"7",name:"usePolarisFollowMutation"}"#;
         assert!(doc_id_in(js, "usePolarisFollowMutation").is_none());
+    }
+
+    #[test]
+    fn the_bundles_come_out_in_the_order_the_page_names_them() {
+        let html = concat!(
+            r#"<script src="https://static.cdninstagram.com/rsrc.php/v4/yD/r/first.js"></script>"#,
+            r#"<link href="https://static.cdninstagram.com/rsrc.php/v4/yE/r/second.js">"#
+        );
+        let found = bundles_in(html);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].ends_with("first.js"));
+        assert!(found[1].ends_with("second.js"));
+    }
+
+    /// **The escaped form is most of them.** A page writes a handful plainly in
+    /// `<script src>` and every other one inside a JSON string, where the
+    /// slashes are escaped. Reading only the plain ones looks like it works and
+    /// finds one and a half per cent of what is there — measured on a real
+    /// profile page: six out of four hundred and thirty-seven.
+    #[test]
+    fn a_bundle_written_inside_a_json_string_is_found_too() {
+        let html = r#"{"src":"https:\/\/static.cdninstagram.com\/rsrc.php\/v4\/lazy.js","c":1}"#;
+        let found = bundles_in(html);
+        assert_eq!(
+            found,
+            vec!["https://static.cdninstagram.com/rsrc.php/v4/lazy.js"],
+            "the escaped form has to be unescaped, not skipped"
+        );
+    }
+
+    /// A page names the same bundle in more than one place. Fetching it twice
+    /// is two requests for one answer.
+    #[test]
+    fn a_bundle_named_twice_is_fetched_once() {
+        let once = "https://static.cdninstagram.com/rsrc.php/v4/a.js";
+        let html = format!(r#"<script src="{once}"></script><script src="{once}"></script>"#);
+        assert_eq!(bundles_in(&html).len(), 1);
+    }
+
+    /// **Only Instagram's script host.** A page is full of URLs and some of
+    /// them point at places this tool has no business fetching from; the host
+    /// is fixed in the code rather than read out of the document, which is what
+    /// makes walking the list safe.
+    #[test]
+    fn a_script_somewhere_else_is_not_walked() {
+        let html = r#"<script src="https://evil.example/rsrc.php/x.js"></script>
+                      <script src="https://static.cdninstagram.com.evil.example/a.js"></script>"#;
+        assert!(bundles_in(html).is_empty());
+    }
+
+    /// Things that are not JavaScript are not JavaScript.
+    #[test]
+    fn only_scripts_are_walked() {
+        let html = r#"<img src="https://static.cdninstagram.com/rsrc.php/v4/logo.png">"#;
+        assert!(bundles_in(html).is_empty());
+    }
+
+    #[test]
+    fn the_body_carries_what_the_site_carries() {
+        let tokens = PageTokens {
+            fb_dtsg: Secret::new("TOKEN".to_string()),
+            lsd: Secret::new("LSD".to_string()),
+        };
+        let body = mutation_body(&tokens, Mutation::Unfollow, "27789106940691111", 7);
+        let field = |name: &str| {
+            body.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            field("fb_api_req_friendly_name"),
+            "usePolarisUnfollowMutation"
+        );
+        assert_eq!(field("doc_id"), "27789106940691111");
+        assert_eq!(field("fb_dtsg"), "TOKEN");
+        // Derived, not fetched, and derived from the token beside it.
+        assert_eq!(field("jazoest"), jazoest("TOKEN"));
+        assert!(field("variables").contains(r#""target_user_id":"7""#));
+    }
+
+    /// **The telemetry the browser attaches is not sent.** It is Relay's record
+    /// of what the page had already loaded; inventing it would describe a
+    /// browsing session that did not happen, and it is kilobytes long.
+    #[test]
+    fn no_relay_telemetry_is_invented() {
+        let tokens = PageTokens {
+            fb_dtsg: Secret::new("TOKEN".to_string()),
+            lsd: Secret::new("LSD".to_string()),
+        };
+        let body = mutation_body(&tokens, Mutation::Follow, "1", 7);
+        for invented in ["__dyn", "__csr", "__hsdp", "__hblp", "__sjsp", "__spin_t"] {
+            assert!(
+                !body.iter().any(|(k, _)| k == invented),
+                "{invented} was made up"
+            );
+        }
     }
 
     #[test]

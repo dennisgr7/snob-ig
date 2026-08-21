@@ -45,6 +45,19 @@ pub enum IgError {
     #[error("could not consult the request budget: {0}")]
     Budget(String),
 
+    /// The mutation's identifier could not be found in Instagram's own code.
+    ///
+    /// Instagram rotates these, and this crate reads the current one out of the
+    /// page rather than pinning it — so this arrives when the *shape* changed
+    /// rather than the value: the operation was renamed, or the code stopped
+    /// carrying the two together. It is worth its own variant because there is
+    /// nothing the user can do about it and the message has to say so.
+    #[error(
+        "Instagram's page no longer carries the identifier for {name}, so this cannot be sent. \
+         That is a change on their side, and nothing here can work around it."
+    )]
+    MutationNotFound { name: &'static str },
+
     /// The stored session carries no `csrftoken`, so it cannot write.
     ///
     /// Reads do not need one, which is why a session that cannot write is a

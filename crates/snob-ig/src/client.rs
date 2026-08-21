@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::client_hints::{self, ClientHints};
 use crate::error::{IgError, classify, declares_failure};
+use crate::graphql;
 use crate::model::{
     FriendshipResult, FriendshipStatus, FriendshipsPage, Identity, Reel, ReelsMedia, UserInfo,
     UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
@@ -233,32 +234,71 @@ pub struct IgClient {
 /// What a browser sends before the server has told it anything.
 const INITIAL_CLAIM: &str = "0";
 
+/// Whether a refused mutation is worth spending a discovery walk on.
+///
+/// **Narrow on purpose.** A rotated identifier and a throttled account both
+/// come back as a refusal, and walking megabytes of JavaScript at an account
+/// Instagram has just said no to is the opposite of what the pacing rules are
+/// for. So everything that means "stop asking" is excluded: a push-back, an
+/// action block, a challenge, a dead session, a cancellation. What is left is
+/// the shapes a bad `doc_id` actually takes — a 400 with a body that did not
+/// parse, or one that did and said nothing useful.
+fn worth_rediscovering(error: &IgError) -> bool {
+    matches!(
+        error,
+        IgError::Decode(_) | IgError::Unexpected { .. } | IgError::NotFound { .. }
+    )
+}
+
 /// Which of the two things a browser does on instagram.com a request is.
 ///
-/// **They do not carry the same headers, and sending the wrong set is not a
-/// cosmetic mismatch — it changes which handler answers.** This was found the
-/// hard way: `POST /web/friendships/{pk}/follow/` with the app's headers
-/// answers 404, and the same route is what the browser really uses.
+/// **They do not carry the same headers, and the difference is not cosmetic —
+/// it changes which handler answers.** Learned the hard way while finding the
+/// write path: `POST /web/friendships/{pk}/follow/` sent with the app's headers
+/// answers 404, which reads exactly like the route having been removed. It had
+/// been, as it turned out, but that took a third attempt to establish rather
+/// than the second.
 ///
-/// - [`Surface::App`] is the single-page application talking to `/api/v1/`.
-///   It announces itself with `X-IG-App-ID`, `X-ASBD-ID`, `X-IG-WWW-Claim` and
-///   `X-Requested-With`, and without the first of those those routes answer 403
-///   even with a good session. Every read this tool makes is one of these.
-/// - [`Surface::Page`] is an ordinary `fetch()` from the page, to the older
-///   `/web/` routes. It sends **none** of those four: the browser adds only
-///   what it always adds, plus whatever the call asked for. Reference:
-///   `davidarroyo1234/InstagramUnfollowers`, which is the project this tool's
-///   pacing is copied from and which does this every day —
-///   `fetch(url, { headers: { "content-type": ..., "x-csrftoken": ... } })`
-///   and nothing else.
+/// - [`Surface::App`] is the single-page application talking to `/api/v1/` and
+///   `/api/graphql`. It announces itself with `X-IG-App-ID`, `X-ASBD-ID`,
+///   `X-IG-WWW-Claim` and `X-Requested-With`, and without the first of those
+///   the API routes answer 403 even with a good session. Every read this tool
+///   makes is one of these, and so is the write.
+/// - [`Surface::Document`] is the browser **navigating** to a page, which is
+///   how the two tokens a mutation needs are obtained. It is not an XHR at all:
+///   it asks for HTML, it says `Sec-Fetch-Mode: navigate` and
+///   `Sec-Fetch-Dest: document`, and it announces none of the app headers,
+///   because at that moment there is no app yet — the page is what loads it.
 ///
-/// So "coherence" here means per request rather than per client. Sending one
-/// superset of headers everywhere would be a shape no browser produces on
-/// either route.
+/// So coherence here is per request rather than per client. One superset of
+/// headers sent everywhere is a shape no browser produces anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     App,
-    Page,
+    Document,
+}
+
+impl Surface {
+    /// What this kind of request says it will accept.
+    fn accept(self) -> &'static str {
+        match self {
+            // `*/*`, not `application/json`: that is what `fetch()` sends when
+            // the page does not set one, and no browser sends the latter here.
+            Self::App => "*/*",
+            Self::Document => {
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,                 image/webp,image/apng,*/*;q=0.8"
+            }
+        }
+    }
+
+    /// The `Sec-Fetch-Mode` and `Sec-Fetch-Dest` pair, which Instagram answers
+    /// `Vary` on and which therefore decides what comes back.
+    fn fetch_mode(self) -> (&'static str, &'static str) {
+        match self {
+            Self::App => ("cors", "empty"),
+            Self::Document => ("navigate", "document"),
+        }
+    }
 }
 
 /// Where every client built after this call points, in a testing build.
@@ -574,60 +614,169 @@ impl IgClient {
     }
 
     /// Follows an account. **A write.** See [`IgClient::post`].
-    pub async fn follow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
-        self.friendship("follow", pk, username).await
+    pub async fn follow(
+        &self,
+        pk: Pk,
+        username: &str,
+        ids: &dyn graphql::DocIds,
+    ) -> Result<FriendshipStatus, IgError> {
+        self.friendship(graphql::Mutation::Follow, pk, username, ids)
+            .await
     }
 
     /// Unfollows an account. **A write.** See [`IgClient::post`].
-    pub async fn unfollow(&self, pk: Pk, username: &str) -> Result<FriendshipStatus, IgError> {
-        self.friendship("unfollow", pk, username).await
-    }
-
-    /// The body of both, because the two differ by one word in the path.
-    ///
-    /// # Which route, and why it took three attempts to find out
-    ///
-    /// `POST /web/friendships/{pk}/{follow|unfollow}/`, with **no body** and
-    /// with [`Surface::Page`] headers. Both halves of that were established by
-    /// sending the alternatives live in August 2026 and reading the
-    /// relationship back afterwards:
-    ///
-    /// - `POST /api/v1/friendships/create/{pk}/` — the spelling every write-up
-    ///   of this API gives — answers **200 carrying the web app's HTML shell**.
-    ///   No status to classify, no message to read, and a parse failure as the
-    ///   only symptom. That is the mobile app's route; `www.instagram.com` does
-    ///   not serve it.
-    /// - The same `/web/` route below, sent with [`Surface::App`] headers,
-    ///   answers **404**. The route was right and the headers were wrong, which
-    ///   is the failure that looks most like the route being gone — and is why
-    ///   the first reading of that 404 was that it had been removed.
-    ///
-    /// What settled it is `davidarroyo1234/InstagramUnfollowers`, the project
-    /// this tool's pacing is copied from, which unfollows from inside the page
-    /// with `content-type` and `x-csrftoken` and **nothing else**. No
-    /// `X-IG-App-ID`. That is what [`Surface`] exists to express.
-    ///
-    /// The body is empty, which is what that project sends and what the route
-    /// takes. The `container_module`/`nav_chain`/`user_id` triple belongs to
-    /// the `/api/v1/` request and is not sent here: it would be inventing a
-    /// shape no browser produces.
-    async fn friendship(
+    pub async fn unfollow(
         &self,
-        verb: &str,
         pk: Pk,
         username: &str,
+        ids: &dyn graphql::DocIds,
     ) -> Result<FriendshipStatus, IgError> {
+        self.friendship(graphql::Mutation::Unfollow, pk, username, ids)
+            .await
+    }
+
+    /// The `doc_id` of a mutation, out of the cache or out of the page's own
+    /// JavaScript.
+    ///
+    /// The walk goes through the **CDN client**, which is the right one twice
+    /// over: those bundles really are on the CDN, and that client carries no
+    /// cookie and no app id -- a public script has no business being fetched
+    /// with a session attached. It also means they are not charged against
+    /// Instagram's request budget, for the reason [`IgClient::download`]
+    /// already gives about pictures.
+    ///
+    /// `html` is the page already fetched for the tokens, so the list of
+    /// bundles costs nothing extra, and its order is the page's own -- which
+    /// puts the chunk its route needs near the front.
+    async fn doc_id_for(
+        &self,
+        mutation: graphql::Mutation,
+        html: &str,
+        ids: &dyn graphql::DocIds,
+    ) -> Result<String, IgError> {
+        /// One bundle. Instagram's largest is around five megabytes; twelve is
+        /// a ceiling rather than a target, and it is here for the reason every
+        /// other ceiling in this file is.
+        const MAX_BUNDLE_BYTES: usize = 12 * 1024 * 1024;
+        /// How many to open before giving up.
+        ///
+        /// **A page names around four hundred and forty of these**, so this is
+        /// a real bound rather than a formality: the walk is bytes off the CDN
+        /// and minutes of wall clock, and it happens once per rotation because
+        /// the answer is cached. Sixty is roughly seven megabytes, measured.
+        /// Past that the answer is more likely to be that the shape changed
+        /// than that the right chunk is one further along.
+        const MOST_BUNDLES: usize = 60;
+
+        let name = mutation.friendly_name();
+
+        for url in graphql::bundles_in(html).into_iter().take(MOST_BUNDLES) {
+            let Ok(bytes) = self.download_capped(&url, MAX_BUNDLE_BYTES).await else {
+                // A bundle that will not come down is not the end of the
+                // search: there are others, and the next may hold it.
+                continue;
+            };
+            if let Some(id) = graphql::doc_id_in(&String::from_utf8_lossy(&bytes), name) {
+                tracing::debug!(name, %url, "found the mutation id");
+                ids.put(name, &id);
+                return Ok(id);
+            }
+        }
+
+        Err(IgError::MutationNotFound { name })
+    }
+
+    /// The body of both, because the two differ by one word.
+    ///
+    /// # Which request, and why it took three attempts to find out
+    ///
+    /// `POST /api/graphql`, naming the mutation. Settled by capturing the real
+    /// web client in August 2026 -- see [`crate::graphql`], which carries the
+    /// finding and the two routes that were sent live first and changed
+    /// nothing.
+    ///
+    /// Two requests, and both are paid for: the page that hands out the tokens,
+    /// and the mutation. The page is the expensive one at around six hundred
+    /// kilobytes, and it is why there is no bulk mode to be tempted by even if
+    /// the rule allowed one.
+    ///
+    /// The profile fetched is **the target's**, which is the page a browser
+    /// would have been on when the button was pressed. Any logged-in page would
+    /// hand out the same tokens, so this is coherence rather than necessity --
+    /// but a request whose `Referer` names a page nobody loaded is the kind of
+    /// small incoherence the rest of this module exists to avoid.
+    async fn friendship(
+        &self,
+        mutation: graphql::Mutation,
+        pk: Pk,
+        username: &str,
+        ids: &dyn graphql::DocIds,
+    ) -> Result<FriendshipStatus, IgError> {
+        // **Before the page.** `post` refuses without a CSRF token too, but by
+        // then the expensive half has been spent: a profile page is around six
+        // hundred kilobytes and a paid-for request. A session that cannot write
+        // is the common case — every `snob login --paste` without `--csrftoken`
+        // produces one — so this is the ordinary path, not the odd one.
+        if self.session.csrftoken.is_none() {
+            return Err(IgError::NoCsrfToken);
+        }
+
+        let referer = if username.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", snob_core::model::in_a_path(username))
+        };
+
+        let html = self.page(&format!("/{referer}")).await?;
+        // A logged-out page renders too, and it has no tokens in it. Saying so
+        // here is better than sending a mutation that cannot be authorized and
+        // reading whatever Instagram says about it.
+        let tokens = graphql::extract_tokens(&html).ok_or(IgError::SessionExpired)?;
+
+        // What is known, and otherwise what was captured.
+        // [`graphql::Mutation::seed_doc_id`] explains why there is a captured
+        // value at all, and why discovery is the recovery rather than the way in.
+        let name = mutation.friendly_name();
+        let doc_id = ids
+            .get(name)
+            .unwrap_or_else(|| mutation.seed_doc_id().to_string());
+
+        match self.mutate(mutation, &tokens, &doc_id, pk, &referer).await {
+            Ok(status) => Ok(status),
+            // **The recovery path.** A rotated identifier is refused, and the
+            // refusal looks like several other things — so rather than trying
+            // to read Instagram's mind, the walk runs and is worth something
+            // only if it comes back with a *different* answer. It costs
+            // megabytes off the CDN, which is why it is here and not on the way
+            // in, and the original error is what the user hears if it fails.
+            Err(first) if worth_rediscovering(&first) => {
+                let Ok(found) = self.doc_id_for(mutation, &html, ids).await else {
+                    return Err(first);
+                };
+                if found == doc_id {
+                    return Err(first);
+                }
+                tracing::debug!(name, "the stored identifier was stale; trying the new one");
+                self.mutate(mutation, &tokens, &found, pk, &referer).await
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// One attempt at the mutation.
+    async fn mutate(
+        &self,
+        mutation: graphql::Mutation,
+        tokens: &graphql::PageTokens,
+        doc_id: &str,
+        pk: Pk,
+        referer: &str,
+    ) -> Result<FriendshipStatus, IgError> {
+        let body = graphql::mutation_body(tokens, mutation, doc_id, pk);
+        let form: Vec<(&str, &str)> = body.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
         let answer: FriendshipResult = self
-            .post(
-                &format!("/web/friendships/{pk}/{verb}/"),
-                &[],
-                &if username.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", snob_core::model::in_a_path(username))
-                },
-                Surface::Page,
-            )
+            .post("/api/graphql", &form, referer, Surface::App)
             .await?;
         Ok(answer.status())
     }
@@ -732,13 +881,49 @@ impl IgClient {
         query: &[(&str, &str)],
         referer: &str,
     ) -> Result<T, IgError> {
+        let (status, body) = self.get_body(path, query, referer, Surface::App).await?;
+        self.decode(status, &body)
+    }
+
+    /// A page, as HTML, exactly as a browser navigating to it would get it.
+    ///
+    /// The one reader here that does not want JSON. It exists because the two
+    /// tokens a mutation needs — `fb_dtsg` and `lsd` — are only ever handed out
+    /// inside a rendered page; see [`crate::graphql`].
+    ///
+    /// It costs a request like everything else, and it is a **large** one: a
+    /// profile page is around six hundred kilobytes of bootstrapped Relay
+    /// state. That is why the caller caches what it finds rather than reading
+    /// the page per write.
+    pub async fn page(&self, path: &str) -> Result<String, IgError> {
+        let (status, body) = self.get_body(path, &[], "", Surface::Document).await?;
+        if !status.is_success() {
+            return Err(self.classify_and_record(status.as_u16(), &body));
+        }
+        Ok(body)
+    }
+
+    /// The request and the answer, without deciding what the answer means.
+    ///
+    /// Split out of [`Self::get`] when the page reader arrived: a page is not
+    /// JSON, so it cannot go through `decode`, but it must go through
+    /// everything before it — the budget, the headers, the claim, and the rule
+    /// that a body which will not read does not take the status away with it.
+    /// Two copies of that sequence is how one of them ends up not paying.
+    async fn get_body(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        referer: &str,
+        style: Surface,
+    ) -> Result<(reqwest::StatusCode, String), IgError> {
         let url = self.base.join(path)?;
         tracing::debug!(%url, "GET");
 
         // Paid for before it is sent, and there is no way in that skips this.
         self.pacer.clear_to_send().await?;
 
-        let request = self.browser_headers(self.api.get(url).query(query), referer, Surface::App);
+        let request = self.browser_headers(self.api.get(url).query(query), referer, style);
 
         let response = request.send().await?;
         self.remember_claim(&response);
@@ -760,7 +945,7 @@ impl IgClient {
             Err(e) => return Err(e),
         };
 
-        self.decode(status, &body)
+        Ok((status, body))
     }
 
     /// The headers every request to Instagram carries, in one place.
@@ -797,9 +982,9 @@ impl IgClient {
         }
 
         let mut request = request
-            // `*/*`, not `application/json`: that is what `fetch()` sends when
-            // the page does not set one, and no browser sends the latter here.
-            .header("Accept", "*/*")
+            // Not a literal: a navigation asks for HTML and an XHR asks for
+            // anything, and Instagram answers `Vary` on the pair below.
+            .header("Accept", style.accept())
             // Computed from the User-Agent like the rest of the set rather
             // than written out, because Chromium began offering `zstd` in the
             // same release it began sending `Priority`: as a literal, a session
@@ -813,8 +998,8 @@ impl IgClient {
             // Instagram answers `Vary` on the first two, which is it saying
             // its reply depends on them.
             .header("Sec-Fetch-Site", "same-origin")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", style.fetch_mode().0)
+            .header("Sec-Fetch-Dest", style.fetch_mode().1)
             // Built rather than interpolated. Every caller encodes the name it
             // puts in here, so this cannot fail today — but a header value
             // that will not build is not an error reqwest raises where it is
@@ -1729,8 +1914,58 @@ mod tests {
             .with_base_url(Url::parse(&server.uri()).unwrap())
     }
 
-    /// What `/web/friendships/{pk}/follow/` really answers: one word.
+    /// A page that hands out both tokens, which is what a logged-in one does.
+    const LOGGED_IN_PAGE: &str = r#"<html><script>
+        {"define":[["DTSGInitData",[],{"token":"DTSG-TOKEN"},258],
+                   ["LSD",[],{"token":"LSD-TOKEN"},323]]}
+        </script></html>"#;
+
+    /// A cache that already knows the ids.
+    ///
+    /// **Every write test uses this, and that is a decision worth naming.**
+    /// Discovery walks `static.cdninstagram.com`, and the host is fixed in
+    /// `graphql::bundles_in` rather than taken from the document — which is the
+    /// property that makes walking a page's URLs safe, and which therefore
+    /// cannot be pointed at a mock server. Weakening it so a test could reach it
+    /// would be trading the guard for the coverage. The walk's two halves are
+    /// pure functions and are tested directly in `graphql`; what is exercised
+    /// here is everything around them.
+    struct Known;
+
+    impl graphql::DocIds for Known {
+        fn get(&self, name: &str) -> Option<String> {
+            Some(match name {
+                "usePolarisFollowMutation" => "26508036048874888".into(),
+                _ => "27789106940691111".into(),
+            })
+        }
+        fn put(&self, _: &str, _: &str) {}
+    }
+
+    /// A server that answers the page and the mutation, which is the pair every
+    /// write needs.
+    async fn instagram_that_takes_a_write(body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGGED_IN_PAGE))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// What the mutation answers.
     const FOLLOWED: &str = r#"{"result":"following","status":"ok"}"#;
+
+    /// **What the mutation really answers**, captured live. Everything else in
+    /// this file was right and this was the last thing wrong: the follow
+    /// happened and the command said it had not, because the envelope was not
+    /// one of the shapes being read.
+    const FOLLOWED_GRAPHQL: &str = r#"{"data":{"xdt_create_friendship":{"friendship_status":{"following":true,"outgoing_request":false}}}}"#;
 
     /// The mobile shape, which this endpoint does not send and the client reads
     /// anyway. Instagram has been moving the web client onto the `/api/v1/`
@@ -1739,113 +1974,113 @@ mod tests {
     const FOLLOWED_OBJECT: &str =
         r#"{"status":"ok","friendship_status":{"following":true,"outgoing_request":false}}"#;
 
-    /// **The route is `/web/friendships/`, and that was settled by trying it.**
-    /// `/api/v1/friendships/create/` is what every write-up gives and is the
-    /// The request this client sends, asserted against what it is *meant* to
-    /// The route and the shape, which took three live attempts to settle — see
-    /// [`IgClient::friendship`] for what the other two were.
+    /// **The request goes to `/api/graphql` and names the mutation**, which is
+    /// what the real client does and what three live attempts established — see
+    /// [`crate::graphql`] for the two that were sent first and changed nothing.
     #[tokio::test]
-    async fn a_follow_goes_to_the_page_route_with_no_body() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/web/friendships/7/follow/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
-            .mount(&server)
-            .await;
+    async fn a_follow_names_the_mutation_with_the_id_it_was_given() {
+        let server = instagram_that_takes_a_write(FOLLOWED).await;
 
-        let status = writer(&server).await.follow(7, "someone").await.unwrap();
+        let status = writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap();
         assert!(status.following);
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
+        let write = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("the mutation");
+        assert_eq!(write.url.path(), "/api/graphql");
+
+        let body = String::from_utf8_lossy(&write.body);
         assert!(
-            requests[0].body.is_empty(),
-            "this route takes no body; the /api/v1/ form fields belong to that one"
+            body.contains("fb_api_req_friendly_name=usePolarisFollowMutation"),
+            "{body}"
+        );
+        assert!(body.contains("doc_id=26508036048874888"), "{body}");
+        assert!(body.contains("fb_dtsg=DTSG-TOKEN"), "{body}");
+        assert!(body.contains("lsd=LSD-TOKEN"), "{body}");
+        // The account, percent-encoded inside the variables object.
+        assert!(body.contains("target_user_id"), "{body}");
+    }
+
+    /// **A page and a mutation, and both are paid for.** The page is the
+    /// expensive half and it is why there is no bulk mode to be tempted by.
+    #[tokio::test]
+    async fn a_write_costs_a_page_and_a_mutation() {
+        let server = instagram_that_takes_a_write(FOLLOWED).await;
+        writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        // And the page asked for is the target's, which is where a browser
+        // would have been standing.
+        let page = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("the page");
+        assert_eq!(page.url.path(), "/someone/");
+    }
+
+    /// A page with no tokens is a logged-out page, and saying so beats sending
+    /// a mutation that cannot be authorized and reading whatever comes back.
+    #[tokio::test]
+    async fn a_logged_out_page_is_reported_as_a_dead_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>log in</html>"))
+            .mount(&server)
+            .await;
+
+        let error = writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IgError::SessionExpired), "{error:?}");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method == wiremock::http::Method::GET),
+            "nothing may be sent without the tokens to authorize it"
         );
     }
 
     /// Either answer shape means the same thing to the caller.
     #[tokio::test]
     async fn both_answer_shapes_read_the_same() {
-        for body in [FOLLOWED, FOLLOWED_OBJECT] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body))
-                .mount(&server)
-                .await;
-            let status = writer(&server).await.follow(7, "someone").await.unwrap();
+        for body in [FOLLOWED, FOLLOWED_OBJECT, FOLLOWED_GRAPHQL] {
+            let server = instagram_that_takes_a_write(body).await;
+            let status = writer(&server)
+                .await
+                .follow(7, "someone", &Known)
+                .await
+                .unwrap();
             assert!(status.following, "{body}");
             assert!(!status.outgoing_request, "{body}");
         }
     }
 
-    /// **The four headers that say "I am the app" are not sent to the page's
-    /// own routes**, and that is not a style preference: sent with them, this
-    /// exact route answers 404, which reads as the route having been removed
-    /// and cost two live attempts to tell apart. The read path must keep them,
-    /// so both halves are asserted here together.
-    #[tokio::test]
-    async fn a_page_route_does_not_claim_to_be_the_app() {
-        const APP_ONLY: [&str; 4] = [
-            "x-ig-app-id",
-            "x-asbd-id",
-            "x-ig-www-claim",
-            "x-requested-with",
-        ];
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"users":[]}"#))
-            .mount(&server)
-            .await;
-
-        let client = writer(&server).await;
-        client.follow(7, "someone").await.unwrap();
-        client.validate().await.unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        let write = requests
-            .iter()
-            .find(|r| r.method == wiremock::http::Method::POST)
-            .expect("the write");
-        let read = requests
-            .iter()
-            .find(|r| r.method == wiremock::http::Method::GET)
-            .expect("the read");
-
-        for header in APP_ONLY {
-            assert!(
-                !write.headers.contains_key(header),
-                "a /web/ route was told {header}, which makes it answer 404"
-            );
-            assert!(
-                read.headers.contains_key(header),
-                "an /api/v1/ route needs {header} and did not get it"
-            );
-        }
-        // What the page's own fetch does send, and all it sends.
-        assert!(write.headers.contains_key("x-csrftoken"));
-        assert!(write.headers.contains_key("content-type"));
-        assert!(write.headers.contains_key("cookie"));
-    }
-
     /// A private account answers `requested`, and that is not a follow.
     #[tokio::test]
     async fn a_private_account_answers_that_it_was_asked() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(r#"{"result":"requested","status":"ok"}"#),
-            )
-            .mount(&server)
-            .await;
+        let server = instagram_that_takes_a_write(r#"{"result":"requested","status":"ok"}"#).await;
 
-        let status = writer(&server).await.follow(7, "someone").await.unwrap();
+        let status = writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap();
         assert!(status.outgoing_request);
         assert!(!status.following, "a request is not a follow");
     }
@@ -1854,16 +2089,19 @@ mod tests {
     /// token, which a GET carries too but a write cannot go without.
     #[tokio::test]
     async fn a_write_carries_origin_a_content_type_and_the_csrf_token() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FOLLOWED))
-            .mount(&server)
-            .await;
-
-        writer(&server).await.follow(7, "someone").await.unwrap();
+        let server = instagram_that_takes_a_write(FOLLOWED).await;
+        writer(&server)
+            .await
+            .follow(7, "someone", &Known)
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        let headers = &requests[0].headers;
+        let headers = &requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("the mutation")
+            .headers;
         assert_eq!(
             headers.get("origin").unwrap(),
             server.uri().trim_end_matches('/'),
@@ -1897,7 +2135,7 @@ mod tests {
         // `client` builds a pasted session, which has no token.
         let error = client(&server)
             .await
-            .follow(7, "someone")
+            .follow(7, "someone", &graphql::NoDocIds)
             .await
             .unwrap_err();
         assert!(matches!(error, IgError::NoCsrfToken), "{error:?}");
@@ -1913,18 +2151,19 @@ mod tests {
     #[tokio::test]
     async fn a_redirected_write_is_not_replayed() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGGED_IN_PAGE))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
-            .and(path("/web/friendships/7/unfollow/"))
-            .respond_with(
-                ResponseTemplate::new(307)
-                    .insert_header("location", "/web/friendships/7/unfollow/"),
-            )
+            .and(path("/api/graphql"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/api/graphql"))
             .mount(&server)
             .await;
 
         let error = writer(&server)
             .await
-            .unfollow(7, "someone")
+            .unfollow(7, "someone", &Known)
             .await
             .unwrap_err();
         assert!(
@@ -1932,7 +2171,13 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(
-            server.received_requests().await.unwrap().len(),
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == wiremock::http::Method::POST)
+                .count(),
             1,
             "the write must have been sent exactly once"
         );
@@ -1948,16 +2193,21 @@ mod tests {
             // No `spam` field: that one short-circuits to `RateLimited` before
             // the message is read, and what is under test here is the action
             // block, which carries the longer cooldown.
+            .and(path("/api/graphql"))
             .respond_with(
                 ResponseTemplate::new(400)
                     .set_body_string(r#"{"message":"feedback_required","status":"fail"}"#),
             )
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LOGGED_IN_PAGE))
+            .mount(&server)
+            .await;
 
         let (client, budget) = watching_as(&server.uri(), true);
 
-        let error = client.follow(7, "someone").await.unwrap_err();
+        let error = client.follow(7, "someone", &Known).await.unwrap_err();
         assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
         assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
     }
