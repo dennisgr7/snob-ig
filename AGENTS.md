@@ -364,6 +364,32 @@ Two judgment calls worth understanding before touching them:
 
 ## Settled, so nobody re-opens them
 
+- **`friendships/show_many` is not going to be used, and the reason is
+  structural rather than cautious.** It would take a 1000/500 crossing from 52
+  requests to 14, which is a real saving in the direction this project's pacing
+  has only ever moved. It is still a no, on three grounds in increasing order of
+  weight:
+  - Its page limit, response shape and throttle weighting are all unverified, so
+    the 52-to-14 is an estimate. "Request pacing is not changed without a
+    documented reason" and an estimate is not one.
+  - It is a POST, and **in this codebase POST means write**. `IgClient::post` is
+    the one function that sends anything other than a GET, and it is where the
+    write budget is paid, the CSRF token is required and the redirect policy
+    refuses to replay. A non-mutating POST would have to either go through that
+    door — paying a fifteen-minute write slot to read a page of relationships,
+    which exhausts the write budget doing reads — or around it, which means a
+    second POST path that pays nothing.
+  - And that second option is the one that matters. What makes the write regime
+    checkable is that it is one door with one guard: `AGENTS.md` can promise
+    that every write is paid for and confirmed, and a reader can verify it by
+    reading one function. A read-only POST removes that invariant in exchange
+    for requests on a crossing that is already inside the budget. The invariant
+    is worth more.
+
+  If it is ever reopened, the thing that would change the answer is not a
+  measurement of the saving but a way to keep "one door" true — and the honest
+  version of that is a separate function with its own name, its own budget line
+  and its own row in the table below, not a flag on the existing one.
 - **The arithmetic holds**: `unfollowers + friends` is everyone you follow, and
   `fans + friends` everyone who follows you. A test asserts it.
 - **If the list being crossed against is incomplete, no result is given.** In
@@ -913,10 +939,6 @@ left in a report nobody can find, and in the order they are worth doing.
   in which of its two forms — seconds or an HTTP date. Until somebody has, there
   is nothing here to implement, which is why it is parsed into nothing and kept
   as the string that was sent.
-- **`friendships/show_many`** would take a 1000/500 crossing from 52 requests
-  to 14. It is a POST, which this project has never sent, and its page limit,
-  response shape and throttle weighting are all unverified. Settle whether a
-  non-mutating POST is inside the no-write rule before designing anything.
 
 ## Known walls
 
