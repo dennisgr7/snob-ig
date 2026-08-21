@@ -66,6 +66,21 @@ const PRIORITY_SINCE_CHROMIUM: u32 = 123;
 /// urgency, and incremental delivery.
 pub const FETCH_PRIORITY: &str = "u=1, i";
 
+/// And what it sends on a top-level navigation, which is the highest urgency
+/// there is: nothing on the page can start until the document arrives.
+///
+/// Split from the constant above because they are different requests, and the
+/// name of that one says so -- it is what Chromium sends **on a fetch**, and it
+/// was going out on the page fetch in `IgClient::page`, which is a navigation.
+///
+/// **Not read off the August 2026 capture.** That capture kept the headers the
+/// page set rather than the ones the network stack added, and `Priority` is one
+/// of the latter, so no value for it survived. This is the urgency RFC 9218
+/// describes for a main-frame document and that Chromium sends for one. It is
+/// written down here rather than assumed, so that the next capture -- one taken
+/// with the wire headers included -- has something to confirm or correct.
+pub const NAVIGATION_PRIORITY: &str = "u=0, i";
+
 /// From which Chromium offers `zstd` in `Accept-Encoding`.
 ///
 /// The same release as [`PRIORITY_SINCE_CHROMIUM`], and a constant of its own on

@@ -301,19 +301,31 @@ fn worth_rediscovering(error: &IgError) -> bool {
 ///
 /// So coherence here is per request rather than per client. One superset of
 /// headers sent everywhere is a shape no browser produces anywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Surface {
+#[derive(Debug, Clone, Copy)]
+enum Surface<'a> {
     App,
     Document,
+    /// The app again, but talking to Relay rather than to `/api/v1/`.
+    ///
+    /// It carries values rather than being a third marker, because the two
+    /// headers that tell it apart are per request: the operation's name, and
+    /// the page-scoped `lsd`. Both are already in hand at the call site and
+    /// both already travel in the body, so putting them in the headers too is
+    /// saying the same true thing in the second place the site says it -- not
+    /// a disguise, which is what the header rule in `AGENTS.md` forbids.
+    Relay {
+        friendly_name: &'a str,
+        lsd: &'a str,
+    },
 }
 
-impl Surface {
+impl Surface<'_> {
     /// What this kind of request says it will accept.
     fn accept(self) -> &'static str {
         match self {
             // `*/*`, not `application/json`: that is what `fetch()` sends when
             // the page does not set one, and no browser sends the latter here.
-            Self::App => "*/*",
+            Self::App | Self::Relay { .. } => "*/*",
             Self::Document => {
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,                 image/webp,image/apng,*/*;q=0.8"
             }
@@ -324,8 +336,31 @@ impl Surface {
     /// `Vary` on and which therefore decides what comes back.
     fn fetch_mode(self) -> (&'static str, &'static str) {
         match self {
-            Self::App => ("cors", "empty"),
+            Self::App | Self::Relay { .. } => ("cors", "empty"),
             Self::Document => ("navigate", "document"),
+        }
+    }
+
+    /// Whether there is an app behind this request to announce.
+    ///
+    /// False for a navigation, and that is the whole of the distinction: at the
+    /// moment a page is fetched there is no app yet, because the page is what
+    /// loads it.
+    fn announces_the_app(self) -> bool {
+        !matches!(self, Self::Document)
+    }
+
+    /// How urgently the browser wants it.
+    ///
+    /// A navigation is `u=0`: nothing on the page can start until the document
+    /// lands. Everything else is a fetch at the default urgency. This was one
+    /// header applied to both until the surfaces were separated -- and the
+    /// constant's own name said `FETCH` while it went out on the page fetch,
+    /// which is a navigation.
+    fn priority(self) -> &'static str {
+        match self {
+            Self::Document => client_hints::NAVIGATION_PRIORITY,
+            _ => client_hints::FETCH_PRIORITY,
         }
     }
 }
@@ -819,7 +854,7 @@ impl IgClient {
         write: graphql::Mutation,
         form: &[(&str, &str)],
         referer: &str,
-        style: Surface,
+        style: Surface<'_>,
     ) -> Result<T, IgError> {
         // Before the budget is charged, so that a session which cannot write
         // does not spend a slot discovering it. The token itself is put on the
@@ -1060,7 +1095,17 @@ impl IgClient {
         let body = graphql::mutation_body(tokens, mutation, doc_id, pk);
         let form: Vec<(&str, &str)> = body.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let answer: FriendshipResult = self.post(mutation, &form, referer, Surface::App).await?;
+        let answer: FriendshipResult = self
+            .post(
+                mutation,
+                &form,
+                referer,
+                Surface::Relay {
+                    friendly_name: mutation.friendly_name(),
+                    lsd: tokens.lsd.expose(),
+                },
+            )
+            .await?;
         Ok(answer.status())
     }
 
@@ -1211,7 +1256,7 @@ impl IgClient {
         path: &str,
         query: &[(&str, &str)],
         referer: &str,
-        style: Surface,
+        style: Surface<'_>,
     ) -> Result<Answer, IgError> {
         let mut url = self.base.join(path)?;
         let mut query: Option<&[(&str, &str)]> = Some(query);
@@ -1394,7 +1439,7 @@ impl IgClient {
         url: &Url,
         query: Option<&[(&str, &str)]>,
         referer: &str,
-        style: Surface,
+        style: Surface<'_>,
     ) -> reqwest::RequestBuilder {
         let request = self.api.get(url.clone());
         let request = match query {
@@ -1415,10 +1460,10 @@ impl IgClient {
         &self,
         request: reqwest::RequestBuilder,
         referer: &str,
-        style: Surface,
+        style: Surface<'_>,
     ) -> reqwest::RequestBuilder {
         let mut request = request;
-        if style == Surface::App {
+        if style.announces_the_app() {
             request = request
                 // Without this header Instagram answers 403 even with a good
                 // session -- on the API routes. A navigation announces none of
@@ -1428,9 +1473,29 @@ impl IgClient {
                 .header("X-IG-WWW-Claim", self.claim())
                 .header("X-Requested-With", "XMLHttpRequest");
         }
+        // What a Relay request says about itself that an `/api/v1/` one does
+        // not. Both values already travel in the body of the same request --
+        // `fb_api_req_friendly_name` and `lsd` -- so neither is new state and
+        // neither is invented; this is the request agreeing with itself in the
+        // second place the site states it. Read off a real browser in August
+        // 2026, where every `/api/graphql` call carried both.
+        if let Surface::Relay { friendly_name, lsd } = style {
+            request = request
+                .header("X-FB-Friendly-Name", friendly_name)
+                .header("X-FB-LSD", lsd);
+        }
         let mut request = request
-            // Not a literal: a navigation asks for HTML and an XHR asks
-            // for anything, and Instagram answers `Vary` on the pair below.
+            // Not a literal: a navigation asks for HTML and an XHR asks for
+            // anything. This used to say Instagram answers `Vary` on the two
+            // `Sec-Fetch-*` headers below; the August 2026 capture saw `Vary`
+            // on `Origin`, on `Accept-Encoding` and on `Accept-Language,
+            // Cookie`, and on no `Sec-Fetch-*` at all. **Unverified rather than
+            // corrected**: that capture kept no response headers that survive
+            // to be re-read, so the honest state of the claim is that nobody
+            // has checked it, not that it is false. It changes nothing either
+            // way -- the reason to send them is the one two paragraphs up in
+            // [`Surface`], that a browser sends them and a request without them
+            // is the anomaly.
             .header("Accept", style.accept())
             // Computed from the User-Agent like the rest of the set rather
             // than written out, because Chromium began offering `zstd` in the
@@ -1442,8 +1507,11 @@ impl IgClient {
             // The one header here that comes from the person rather than from
             // the User-Agent. Every browser sends it on every request.
             .header("Accept-Language", client_hints::accept_language())
-            // Instagram answers `Vary` on the first two, which is it saying
-            // its reply depends on them.
+            // See the note on `Accept` above for what is and is not known
+            // about `Vary` here. `Accept-Language` is the one the capture did
+            // confirm: Instagram answered `Vary: Accept-Language, Cookie`, so
+            // the value `client_hints::accept_language` computes really does
+            // change the reply, which until then was an assumption.
             .header("Sec-Fetch-Site", "same-origin")
             .header("Sec-Fetch-Mode", style.fetch_mode().0)
             .header("Sec-Fetch-Dest", style.fetch_mode().1)
@@ -1474,7 +1542,16 @@ impl IgClient {
         // same-origin. Omitting it there would be the identical incoherence the
         // other way round, so `post` adds it, and only `post`.
 
-        if let Some(csrf) = &self.session.csrftoken {
+        // **Only where an app would send one.** A browser navigating to
+        // `instagram.com/nasa/` sends no `X-CSRFToken`; it is a header the page
+        // adds to its own XHRs once it is running. This was applied to every
+        // request that had a token, which put it on the page fetch in
+        // [`IgClient::page`] -- the one request in this program that is a
+        // navigation. `a_navigation_does_not_claim_to_be_the_app` exists to
+        // catch exactly this and was checking four other names.
+        if let Some(csrf) = &self.session.csrftoken
+            && style.announces_the_app()
+        {
             request = request.header("X-CSRFToken", csrf.expose());
         }
 
@@ -1487,9 +1564,13 @@ impl IgClient {
                 .header("Sec-CH-UA-Platform", self.hints.platform);
         }
 
-        // Likewise: only the versions that send one.
-        if let Some(priority) = self.hints.priority {
-            request = request.header("Priority", priority);
+        // Likewise: only the versions that send one. **Which one is the
+        // surface's to say, not the browser's** -- the hints answer whether
+        // this Chrome sends a `Priority` at all, and the request answers how
+        // urgent it is. One value went out on both until the surfaces were
+        // separated, and the constant carrying it is called `FETCH_PRIORITY`.
+        if self.hints.priority.is_some() {
+            request = request.header("Priority", style.priority());
         }
 
         request
@@ -3030,11 +3111,17 @@ mod tests {
     /// no browser produces on either.
     #[tokio::test]
     async fn a_navigation_does_not_claim_to_be_the_app() {
-        const APP_ONLY: [&str; 4] = [
+        // The last two were applied to every request that could carry them,
+        // which put both on the one navigation this program makes. A browser
+        // going to `instagram.com/nasa/` sends neither: `X-CSRFToken` is what a
+        // running page adds to its own XHRs, and `Priority` on a document is
+        // `u=0`, not the default fetch urgency.
+        const APP_ONLY: [&str; 5] = [
             "x-ig-app-id",
             "x-asbd-id",
             "x-ig-www-claim",
             "x-requested-with",
+            "x-csrftoken",
         ];
 
         let server = instagram_that_takes_a_write(FOLLOWED).await;
@@ -3065,6 +3152,34 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html"),
             "a navigation asks for HTML"
+        );
+        assert_eq!(
+            page.headers.get("priority").unwrap(),
+            client_hints::NAVIGATION_PRIORITY,
+            "a document is the most urgent thing on the page, not a default fetch"
+        );
+
+        // And the mutation, which is the other half of the same distinction.
+        let write = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("the mutation");
+        assert_eq!(
+            write.headers.get("x-fb-friendly-name").unwrap(),
+            "usePolarisFollowMutation",
+            "a Relay request names its operation in the headers as well as the body"
+        );
+        assert!(
+            write.headers.contains_key("x-fb-lsd"),
+            "a Relay request carries the page token it was given"
+        );
+        assert!(
+            write.headers.contains_key("x-csrftoken"),
+            "a write still carries the token the write rule requires"
+        );
+        assert_eq!(
+            write.headers.get("priority").unwrap(),
+            client_hints::FETCH_PRIORITY
         );
     }
 
