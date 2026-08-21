@@ -164,6 +164,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Fans(args) => commands::sets::run(args, store, &paths, SetOp::Fans).await,
         Command::Friends(args) => commands::sets::run(args, store, &paths, SetOp::Friends).await,
         Command::Pfp(args) => commands::pfp::run(args, store, &paths).await,
+        Command::Stories(args) => commands::stories::run(args, store, &paths).await,
+        Command::Follow(args) => {
+            commands::follow::run(args, commands::follow::Verb::Follow, store, &paths).await
+        }
+        Command::Unfollow(args) => {
+            commands::follow::run(args, commands::follow::Verb::Unfollow, store, &paths).await
+        }
         Command::Watch(args) => commands::watch::run(args, store, &paths).await,
     }
 }

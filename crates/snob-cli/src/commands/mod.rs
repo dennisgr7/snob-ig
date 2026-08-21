@@ -1,4 +1,5 @@
 pub mod common;
+pub mod follow;
 pub mod import;
 pub mod lists;
 pub mod login;
@@ -7,6 +8,7 @@ pub mod pfp;
 pub mod purge;
 pub mod scan;
 pub mod sets;
+pub mod stories;
 pub mod watch;
 pub mod watch_setup;
 pub mod whoami;

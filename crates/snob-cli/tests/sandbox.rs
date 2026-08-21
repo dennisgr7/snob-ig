@@ -689,3 +689,275 @@ async fn the_probe_tells_unconfigured_from_unstartable() {
         stderr(&unstartable)
     );
 }
+
+/// A reel with one photo and one video, mounted on an existing fake Instagram.
+///
+/// Two candidate sizes on the photo so the listing has something to choose
+/// wrongly: the client is told to take the largest, and taking the first is the
+/// mistake that would otherwise pass every assertion.
+async fn with_stories(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/feed/reels_media/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"reels_media":[{"items":[
+                {"pk":"1","media_type":1,"taken_at":1000,"expiring_at":99999999999,
+                 "image_versions2":{"candidates":[
+                    {"url":"https://scontent.cdninstagram.com/small.jpg","width":320,"height":320},
+                    {"url":"https://scontent.cdninstagram.com/big.jpg","width":1080,"height":1920}]}},
+                {"pk":"2","media_type":2,"taken_at":2000,"expiring_at":99999999999,
+                 "video_versions":[
+                    {"url":"https://scontent.cdninstagram.com/clip.mp4","width":720,"height":1280}]}
+            ]}]}"#,
+        ))
+        .mount(server)
+        .await;
+}
+
+/// The listing numbers the stories, and those numbers are what `--download`
+/// takes.
+#[tokio::test]
+async fn stories_are_listed_with_the_numbers_download_takes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["stories", "me", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("it is JSON");
+    let stories = listed["stories"].as_array().expect("an array");
+    assert_eq!(stories.len(), 2);
+    assert_eq!(stories[0]["number"], 1);
+    assert_eq!(stories[0]["kind"], "photo");
+    assert_eq!(stories[1]["kind"], "video");
+    assert_eq!(
+        stories[0]["url"], "https://scontent.cdninstagram.com/big.jpg",
+        "the largest candidate wins, not the first"
+    );
+}
+
+/// **Nothing that would register a view goes out.** The whole reason the
+/// command exists in the shape it does, asserted against what the server
+/// actually received rather than against what the code appears to do.
+#[tokio::test]
+async fn listing_stories_sends_nothing_that_marks_them_seen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    snob(tmp.path(), Some(&instagram), &["stories", "me"]);
+
+    for request in posted(&instagram).await {
+        assert!(
+            !request.url.path().contains("seen"),
+            "a request went to {} while only reading stories",
+            request.url.path()
+        );
+        assert_eq!(
+            request.method,
+            wiremock::http::Method::GET,
+            "reading stories sent a {} to {}",
+            request.method,
+            request.url.path()
+        );
+    }
+}
+
+/// A number nobody has is refused by name rather than by panic, and an
+/// out-of-range one does not wrap round to the last story.
+#[tokio::test]
+async fn a_story_number_nobody_has_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    for number in ["0", "9"] {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &["stories", "me", "--download", number],
+        );
+        assert!(
+            !out.status.success(),
+            "story {number} should not have been downloaded"
+        );
+        assert!(
+            stderr(&out).contains("there is no story"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+/// The same sandbox login, with a CSRF token, which is what
+/// `snob login --browser` produces and what a write needs.
+fn log_in_writing(root: &Path, instagram: &MockServer) {
+    let out = snob_typing(
+        root,
+        instagram,
+        &[
+            "login",
+            "--paste",
+            "--user-agent",
+            UA,
+            "--csrftoken",
+            "SANDBOXTOKEN",
+        ],
+        &format!("{SESSIONID}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "the sandbox could not log in to write: {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+}
+
+/// **A session that cannot write refuses before it spends anything.**
+///
+/// `log_in` pastes a sessionid and nothing else, which is exactly the session
+/// `snob login --paste` produces, so this is the ordinary case rather than a
+/// contrived one. The assertion that matters is the second: no request was
+/// made, so no budget was charged and nothing reached Instagram.
+#[tokio::test]
+async fn a_write_without_a_csrf_token_never_reaches_instagram() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = posted(&instagram).await.len();
+
+    let out = snob(tmp.path(), Some(&instagram), &["unfollow", "someone", "-y"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("CSRF"), "{}", stderr(&out));
+    assert_eq!(
+        posted(&instagram).await.len(),
+        before,
+        "the refusal must happen before any request goes out"
+    );
+}
+
+/// With no terminal and no -y, a write is not made and the exit code says who
+/// decided: 130, stopped by the user, rather than 1, failed.
+#[tokio::test]
+async fn a_write_nobody_could_confirm_is_not_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .and(query_param("username", "someone"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":false}}}"#,
+        ))
+        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
+        // any username with the session's own account. At equal priority
+        // wiremock takes the first matching mount, and that one is first.
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    log_in_writing(tmp.path(), &instagram);
+
+    let out = snob(tmp.path(), Some(&instagram), &["follow", "someone"]);
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        posted(&instagram)
+            .await
+            .iter()
+            .all(|r| r.method != wiremock::http::Method::POST),
+        "nothing may be sent without an answer"
+    );
+}
+
+/// A confirmed unfollow sends one POST, to the right path, with the token.
+#[tokio::test]
+async fn a_confirmed_unfollow_sends_one_post() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/v1/friendships/destroy/\d+/$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"status":"ok","friendship_status":{"following":false,"outgoing_request":false}}"#,
+        ))
+        .mount(&instagram)
+        .await;
+    // The profile has to say the relationship exists, or the command correctly
+    // decides there is nothing to do and sends nothing.
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .and(query_param("username", "someone"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":true}}}"#,
+        ))
+        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
+        // any username with the session's own account. At equal priority
+        // wiremock takes the first matching mount, and that one is first.
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    log_in_writing(tmp.path(), &instagram);
+
+    let out = snob(tmp.path(), Some(&instagram), &["unfollow", "someone", "-y"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+
+    let writes: Vec<_> = posted(&instagram)
+        .await
+        .into_iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .collect();
+    assert_eq!(writes.len(), 1, "one account, one write");
+    assert_eq!(writes[0].url.path(), "/api/v1/friendships/destroy/9001/");
+    assert_eq!(
+        writes[0].headers.get("x-csrftoken").unwrap(),
+        "SANDBOXTOKEN"
+    );
+    assert!(String::from_utf8_lossy(&writes[0].body).contains("user_id=9001"));
+}
+
+/// A relationship that already holds costs no request at all, which matters
+/// when a write slot is a quarter of an hour.
+#[tokio::test]
+async fn unfollowing_somebody_you_do_not_follow_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .and(query_param("username", "stranger"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"9002","username":"stranger","followed_by_viewer":false}}}"#,
+        ))
+        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
+        // any username with the session's own account. At equal priority
+        // wiremock takes the first matching mount, and that one is first.
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    log_in_writing(tmp.path(), &instagram);
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "stranger", "-y"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stderr(&out).contains("do not follow"), "{}", stderr(&out));
+
+    assert!(
+        posted(&instagram)
+            .await
+            .iter()
+            .all(|r| r.method != wiremock::http::Method::POST),
+        "nothing needed changing, so nothing should have been sent"
+    );
+}

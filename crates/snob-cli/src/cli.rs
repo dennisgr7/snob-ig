@@ -13,9 +13,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     long_about = "Instagram from the terminal.\n\n\
                   Walks your followers and your following, crosses them, and answers who \
                   does not follow you back, who you never followed back, and who you and \
-                  somebody else both know.\n\n\
-                  It only ever reads. snob never follows, unfollows, blocks or removes \
-                  anyone.",
+                  somebody else both know. It also shows and downloads the stories an \
+                  account has up.\n\n\
+                  It changes exactly two things and asks first about both: \"follow\" and \
+                  \"unfollow\", one account at a time. It never blocks, never removes a \
+                  follower, and never tells anybody you looked at their story.",
     after_help = EXAMPLES
 )]
 pub struct Cli {
@@ -115,6 +117,9 @@ Examples:
   snob unfollowers                    who does not follow you back
   snob scan someone                   the full picture of another account
   snob pfp someone -o picture.jpg     their profile picture, at full size
+  snob stories someone                what they have up right now
+  snob stories someone -i             move through it with the arrow keys
+  snob unfollow someone               the one thing snob changes, after asking
   snob unfollowers --format csv -o unfollowers.csv
 
 A username may be written with or without a leading @. If you write the @, quote
@@ -177,6 +182,29 @@ pub enum Command {
     /// Download a profile picture in high resolution
     Pfp(PfpArgs),
 
+    /// Show the stories an account has up, and download them
+    #[command(
+        after_help = "Listing and downloading a story does not tell the account you looked. \
+                      snob has no way of doing that and a test keeps it that way."
+    )]
+    Stories(StoriesArgs),
+
+    /// Follow an account
+    #[command(
+        after_help = "One account per run, on purpose: what Instagram acts on is a burst of \
+                      follows rather than the day's total. Needs a session with a CSRF token, \
+                      which \"snob login --browser\" captures."
+    )]
+    Follow(FollowArgs),
+
+    /// Unfollow an account
+    #[command(
+        after_help = "One account per run, on purpose: what Instagram acts on is a burst of \
+                      unfollows rather than the day's total. Needs a session with a CSRF token, \
+                      which \"snob login --browser\" captures."
+    )]
+    Unfollow(FollowArgs),
+
     /// Track an account over time and report what changed
     Watch(WatchArgs),
     // `import dyi` is written and tested but not wired up here on purpose: the
@@ -200,6 +228,15 @@ pub struct LoginArgs {
     /// installed browser. It has to match or Instagram will reject the session.
     #[arg(long, value_name = "STRING")]
     pub user_agent: Option<String>,
+
+    /// The csrftoken cookie, alongside the pasted sessionid
+    ///
+    /// Only "follow" and "unfollow" need it; everything else reads, and reads
+    /// do not. "--browser" picks it up on its own, so this is for the machine
+    /// with no browser to launch — the headless case this tool supports on
+    /// purpose — where the two cookies have to be copied by hand.
+    #[arg(long, value_name = "TOKEN", requires = "paste")]
+    pub csrftoken: Option<String>,
 
     /// Keep the browser profile "--browser" creates, so a later login skips
     /// the Instagram form
@@ -540,6 +577,42 @@ pub struct PfpArgs {
     pub output: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct StoriesArgs {
+    /// Account whose stories to show. Defaults to your own.
+    pub target: Option<String>,
+
+    /// Download the story with this number, as printed by the listing
+    #[arg(short = 'd', long, value_name = "N", conflicts_with_all = ["all", "interactive"])]
+    pub download: Option<usize>,
+
+    /// Download every story
+    #[arg(long, conflicts_with = "interactive")]
+    pub all: bool,
+
+    /// Move through the stories with the arrow keys
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+
+    /// Where a download goes. A directory with --all, a file otherwise.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Output format. Defaults to a table on a terminal and JSON in a pipe.
+    #[arg(long, value_enum)]
+    pub format: Option<StoryFormat>,
+}
+
+#[derive(Args, Debug)]
+pub struct FollowArgs {
+    /// The one account to follow or unfollow
+    pub target: String,
+
+    /// Do not ask for confirmation. Needed when there is no terminal to ask at.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
 /// Not reachable from the CLI yet; see the note in [`Command`].
 #[derive(Subcommand, Debug)]
 pub enum ImportCommand {
@@ -565,6 +638,32 @@ pub enum Format {
     Csv,
     Xlsx,
     Md,
+}
+
+/// The formats a story listing actually has.
+///
+/// A narrower enum rather than [`Format`] with three values quietly ignored.
+/// `--format xlsx` on a list of five stories would have been accepted, printed
+/// a table, and left the user believing they had a spreadsheet somewhere. The
+/// three that are missing are the ones that exist to hand a **list of accounts**
+/// to something else — a column of usernames — and a story has no username in
+/// it. Adding them would mean deciding what a spreadsheet of five expiring
+/// links is for, and nobody has asked.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryFormat {
+    Table,
+    Json,
+    Ndjson,
+}
+
+impl From<StoryFormat> for Format {
+    fn from(story: StoryFormat) -> Self {
+        match story {
+            StoryFormat::Table => Self::Table,
+            StoryFormat::Json => Self::Json,
+            StoryFormat::Ndjson => Self::Ndjson,
+        }
+    }
 }
 
 #[cfg(test)]

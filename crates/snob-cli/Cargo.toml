@@ -32,6 +32,7 @@ anyhow.workspace = true
 serde_json.workspace = true
 dialoguer.workspace = true
 console.workspace = true
+opener.workspace = true
 indicatif.workspace = true
 supports-hyperlinks.workspace = true
 # `custom_styling` is what makes the width calculation look past the escape

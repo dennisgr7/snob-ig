@@ -1,0 +1,286 @@
+//! `snob follow` and `snob unfollow`: the only two commands that change
+//! anything on Instagram.
+//!
+//! Two requests: the profile, to turn a name into an id and to find out what
+//! the relationship is already, and the write itself. Both are paid for, the
+//! second out of the write budget, and neither happens during a cooldown.
+//!
+//! **One account per run, and there is no flag that changes it.** The reasoning
+//! is in `AGENTS.md` with the rest of the write regime, and the short version is
+//! that Instagram acts on bursts rather than on daily totals — so the shape of
+//! this command is the safeguard, not a limit inside it. Somebody determined to
+//! run it in a loop can write the loop; what this refuses to do is ship one.
+//!
+//! The other half of the design is that it asks first. A follow is not
+//! reversible in the way a read is: unfollowing afterwards does not undo the
+//! notification the other person already got, and following then unfollowing is
+//! the exact pattern Instagram's detection was built for. So the question is
+//! asked before the request, and `-y` is how a script answers it in advance.
+
+use anyhow::{Result, anyhow};
+use snob_core::model::printable;
+use snob_core::paths::AppPaths;
+use snob_core::secrets::SecretStore;
+use snob_ig::client::IgClient;
+use snob_ig::model::FriendshipStatus;
+
+use crate::app::App;
+use crate::cli::FollowArgs;
+use crate::engine::target;
+use crate::exit::{ExitCode, ExitError};
+use crate::report;
+use crate::ui;
+
+/// Which of the two verbs is being run.
+///
+/// Not a boolean. Every sentence this command prints differs between the two,
+/// and a boolean named `unfollow` reads backwards at exactly the call sites
+/// where getting it backwards is worst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Follow,
+    Unfollow,
+}
+
+impl Verb {
+    fn present(self) -> &'static str {
+        match self {
+            Self::Follow => "follow",
+            Self::Unfollow => "unfollow",
+        }
+    }
+}
+
+pub async fn run(
+    args: FollowArgs,
+    verb: Verb,
+    secrets: SecretStore,
+    paths: &AppPaths,
+) -> Result<ExitCode> {
+    // No progress bar: two requests, and the second one may sit on the write
+    // budget for a quarter of an hour, which is a wait to be told about in a
+    // sentence rather than animated.
+    let Some(app) = App::open(&secrets, paths, false)? else {
+        ui::no_session();
+        return Ok(ExitCode::NoSession);
+    };
+
+    // **Before anything is spent.** A session that cannot write is the common
+    // case rather than the odd one — `snob login --paste` produces one unless
+    // `--csrftoken` was given — and finding out from Instagram's 403 would cost
+    // a request, a slot of write budget, and a message telling the user their
+    // session had expired when it had not.
+    if app.client().session().csrftoken.is_none() {
+        return Err(ExitError::new(
+            ExitCode::NoSession,
+            format!(
+                "this session can read but not {}: it has no CSRF token",
+                verb.present()
+            ),
+        )
+        .with_hint(
+            "run \"snob login --browser\", which captures it, or \
+             \"snob login --paste --csrftoken <token>\"",
+        )
+        .into());
+    }
+
+    if let Some(until_ms) = app.client().pacer().cooldown()? {
+        return Err(ExitError::new(
+            ExitCode::RateLimited,
+            format!(
+                "the account is in cooldown until {}, so nothing can be sent",
+                report::cooldown_ends_at(until_ms)
+            ),
+        )
+        .into());
+    }
+
+    let profile = app
+        .client()
+        .web_profile_info(target::clean(&args.target))
+        .await?;
+
+    // Instagram spells the name; the user typed a spelling of it. Everything
+    // from here on uses Instagram's, filtered, because it is going to a
+    // terminal and it came off a server.
+    let name = printable(&profile.username);
+
+    // Refusing to follow yourself here rather than letting Instagram do it:
+    // its answer is a generic 400 that `classify` cannot tell apart from a
+    // real failure, and the user would be told the account is throttled.
+    if Some(profile.id) == Some(app.client().session().ds_user_id) {
+        return Err(anyhow!("you cannot {} your own account", verb.present()));
+    }
+
+    // Nothing to do is worth saying rather than doing. It also saves the write
+    // budget for a write that changes something, which matters when a slot is
+    // fifteen minutes.
+    if let Some(settled) = already_done(verb, &profile, &name) {
+        ui::info(&settled);
+        return Ok(ExitCode::Ok);
+    }
+
+    let question = match verb {
+        Verb::Follow if profile.is_private == Some(true) => {
+            format!("Send @{name} a follow request?")
+        }
+        Verb::Follow => format!("Follow @{name}?"),
+        Verb::Unfollow => format!("Unfollow @{name}?"),
+    };
+
+    // `confirm` answers with its default the moment nobody can answer, so the
+    // two cases are told apart here: `-y` is somebody answering in advance,
+    // and no terminal without `-y` is nobody having been asked at all. A write
+    // nobody agreed to is the one outcome this command exists to prevent.
+    if !args.yes {
+        if !ui::can_be_asked() {
+            return Err(ExitError::new(
+                ExitCode::Interrupted,
+                format!(
+                    "nothing was {}ed: there is nobody to confirm it",
+                    verb.present()
+                ),
+            )
+            .with_hint("pass -y to confirm in advance")
+            .into());
+        }
+        if !ui::confirm(&question, false)? {
+            return Ok(ExitCode::Interrupted);
+        }
+    }
+
+    let status = send(app.client(), verb, profile.id, &profile.username).await?;
+    ui::info(&outcome(verb, &status, &name));
+    Ok(ExitCode::Ok)
+}
+
+/// What the profile already says, when it says the request would change
+/// nothing.
+///
+/// `followed_by_viewer` and `requested_by_viewer` are `Option` because the
+/// endpoint omits them on some answers, and `None` means unknown. Unknown must
+/// send the request rather than assume: refusing on a missing field would make
+/// the command stop working the day Instagram drops it from the response.
+fn already_done(
+    verb: Verb,
+    profile: &snob_ig::model::WebProfileInfo,
+    name: &str,
+) -> Option<String> {
+    match verb {
+        Verb::Follow if profile.followed_by_viewer == Some(true) => {
+            Some(format!("You already follow @{name}."))
+        }
+        Verb::Follow if profile.requested_by_viewer == Some(true) => Some(format!(
+            "You have already asked to follow @{name}, and they have not answered yet."
+        )),
+        Verb::Unfollow
+            if profile.followed_by_viewer == Some(false)
+                && profile.requested_by_viewer != Some(true) =>
+        {
+            Some(format!("You do not follow @{name}."))
+        }
+        _ => None,
+    }
+}
+
+/// The network half, kept apart from the session, the question and the
+/// terminal so a test can drive it against a mock server.
+async fn send(
+    client: &IgClient,
+    verb: Verb,
+    pk: snob_core::Pk,
+    username: &str,
+) -> Result<FriendshipStatus> {
+    Ok(match verb {
+        Verb::Follow => client.follow(pk, username).await?,
+        Verb::Unfollow => client.unfollow(pk, username).await?,
+    })
+}
+
+/// What actually happened, as Instagram describes it afterwards.
+///
+/// **Following a private account does not follow it — it asks.** Saying
+/// "Followed" there would be the command lying about the one thing it was run
+/// to do, and the user would go looking for stories that will not be there.
+fn outcome(verb: Verb, status: &FriendshipStatus, name: &str) -> String {
+    match verb {
+        Verb::Follow if status.following => format!("Now following @{name}."),
+        Verb::Follow if status.outgoing_request => {
+            format!("Asked to follow @{name}. They have to accept it.")
+        }
+        // Instagram answered, and answered that nothing is different. Better
+        // said plainly than dressed up as success.
+        Verb::Follow => {
+            format!("Instagram accepted the request, but @{name} is still not followed.")
+        }
+        Verb::Unfollow if !status.following && !status.outgoing_request => {
+            format!("No longer following @{name}.")
+        }
+        Verb::Unfollow => format!("Instagram accepted the request, but @{name} is still followed."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snob_ig::model::WebProfileInfo;
+
+    fn profile(followed: Option<bool>, requested: Option<bool>) -> WebProfileInfo {
+        WebProfileInfo {
+            id: 7,
+            username: "someone".into(),
+            full_name: None,
+            is_private: None,
+            is_verified: None,
+            followed_by_viewer: followed,
+            requested_by_viewer: requested,
+            profile_pic_url: None,
+            profile_pic_url_hd: None,
+            followers: None,
+            following: None,
+        }
+    }
+
+    #[test]
+    fn a_relationship_that_already_holds_costs_no_request() {
+        assert!(already_done(Verb::Follow, &profile(Some(true), None), "x").is_some());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), None), "x").is_some());
+        assert!(already_done(Verb::Follow, &profile(Some(false), Some(true)), "x").is_some());
+    }
+
+    /// The endpoint omits these fields on some answers. Unknown has to mean
+    /// "send it and find out", or the command stops working the day Instagram
+    /// drops the field.
+    #[test]
+    fn an_unknown_relationship_is_not_treated_as_settled() {
+        assert!(already_done(Verb::Follow, &profile(None, None), "x").is_none());
+        assert!(already_done(Verb::Unfollow, &profile(None, None), "x").is_none());
+    }
+
+    /// A pending request is not a follow, and unfollow has something to do
+    /// about it: withdrawing the request.
+    #[test]
+    fn a_pending_request_is_still_something_to_withdraw() {
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(true)), "x").is_none());
+    }
+
+    #[test]
+    fn following_a_private_account_is_reported_as_the_request_it_is() {
+        let asked = FriendshipStatus {
+            following: false,
+            outgoing_request: true,
+            ..Default::default()
+        };
+        let said = outcome(Verb::Follow, &asked, "someone");
+        assert!(said.contains("Asked to follow"), "{said}");
+        assert!(!said.contains("Now following"), "{said}");
+    }
+
+    #[test]
+    fn a_write_instagram_accepted_but_did_not_apply_is_not_called_a_success() {
+        let unchanged = FriendshipStatus::default();
+        let said = outcome(Verb::Follow, &unchanged, "someone");
+        assert!(said.contains("still not followed"), "{said}");
+    }
+}

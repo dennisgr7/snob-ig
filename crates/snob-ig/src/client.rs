@@ -607,6 +607,21 @@ impl IgClient {
         self.download_capped(url, MAX_ASSET_BYTES).await
     }
 
+    /// The same, with the caller naming the ceiling.
+    ///
+    /// A story video does not fit under [`MAX_ASSET_BYTES`], which was sized
+    /// for a 1080x1080 picture. Rather than raising that constant — and with it
+    /// the ceiling on every profile picture, for a reason that has nothing to
+    /// do with profile pictures — the caller that needs a different one says
+    /// so, and says why where it says it.
+    ///
+    /// Everything else is identical, [`IgClient::check_downloadable`]
+    /// included: the URL still has to point at the CDN, and every redirect hop
+    /// after it is held to the same rule.
+    pub async fn download_capped_public(&self, url: &str, cap: usize) -> Result<Vec<u8>, IgError> {
+        self.download_capped(url, cap).await
+    }
+
     /// Refuses a picture URL that does not go where a picture goes.
     ///
     /// The address of the first hop comes straight out of Instagram's answer,

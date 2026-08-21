@@ -121,6 +121,28 @@ impl AppPaths {
         self.data.join("browser-profile")
     }
 
+    /// Where `snob stories --interactive` puts a story it is about to hand to
+    /// the system viewer.
+    ///
+    /// **Under the data directory rather than under the operating system's
+    /// temporary one, and the reason is that this cannot be cleaned up
+    /// reliably.** The viewer is a separate process; `start` on Windows returns
+    /// as soon as it has launched one, so there is no moment at which this
+    /// program knows the window was closed — and while an image viewer holds
+    /// the file open, Windows refuses to delete it. The browser sits here for
+    /// the same reason, and the same answer applies: the session deletes what
+    /// it can on the way out, and whatever a viewer is still holding is caught
+    /// by `snob purge`, which takes this whole directory.
+    ///
+    /// The operating system's temporary directory would have been cleaned by
+    /// somebody eventually, and it is world-readable on some systems. This one
+    /// is created 0700 on Unix by `create_private_dir` along with the rest of
+    /// the data directory, which is the better default for somebody else's
+    /// photograph.
+    pub fn story_scratch(&self) -> PathBuf {
+        self.data.join("stories")
+    }
+
     /// Every directory this tool may have created, for `snob purge` to remove.
     ///
     /// Assembled here rather than by the command so that a directory added

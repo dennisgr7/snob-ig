@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+**snob follows, unfollows, and shows you stories.** The first release that
+changes anything on Instagram at all, and the rule it replaces is worth reading
+before the features: `snob` used to write nothing, deliberately, because writing
+is what gets accounts actioned. That rule was lifted for two verbs and no
+others, and what took its place is a regime rather than permission.
+
+- **`snob follow` and `snob unfollow`**, one account per command. Both ask
+  before they send; `-y` answers in advance. Both come out of a request budget
+  of their own — one action every fifteen minutes, at most three in a row —
+  which is separate from the one reads come out of, so an exhausted write budget
+  never holds up a walk and a walk never spends a write. **There is no bulk
+  mode and no flag that makes one.** What Instagram acts on is the burst rather
+  than the daily total, and the follow-then-unfollow churn this tool makes easy
+  to automate is the pattern its detection exists for.
+- A write needs a session with a CSRF token. `snob login --browser` already
+  captured one; a session created by pasting a sessionid does not have one, and
+  the two commands now **refuse before spending anything** rather than finding
+  out from a 403 that would read as an expired session.
+  `snob login --paste --csrftoken <token>` is the way to add one on a machine
+  with no browser to launch.
+- **`snob stories`** lists what an account has up: what each story is, when it
+  went up and how long it has left. `--download 2` saves one by the number the
+  listing printed, `--all` saves all of them, and `--interactive` is a list you
+  move through with the arrow keys — Enter hands the story to the system viewer,
+  `D` keeps a copy. It is built on what was already in the binary rather than on
+  a terminal-UI framework, so it costs nothing to carry.
+- **Nothing tells anybody you looked at their story.** Instagram registers a
+  view through a separate request, snob does not make it, and a test reads the
+  source of all three crates on every build so that adding one is a failing
+  build rather than a code review somebody has to catch.
+- A write follows no redirect. Instagram redirecting a POST would mean doing the
+  thing twice, and the HTTP client replays the method and the body on a 307.
+
 ## 0.2.0 — 2026-08-21
 
 **`snob watch` says what has changed since the last time it looked.** The

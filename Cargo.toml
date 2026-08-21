@@ -76,6 +76,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = { version = "0.12", default-features = false }
 console = "0.16"
+# Hands a downloaded story to whatever the user already opens pictures and
+# videos with. `default-features = false` drops the two optional Linux
+# dependencies -- `zbus` and `url` -- which exist for the "reveal in file
+# manager" half nothing here calls; what is left is `bstr` on Linux, nothing at
+# all on macOS, and `normpath` plus `windows-sys` on Windows, where the version
+# is already the one this workspace pins.
+#
+# Preferred over invoking `cmd /C start` and `xdg-open` by hand, which is the
+# obvious dependency-free answer and is worse: on Windows it puts a command line
+# between this program and a file name, and `ShellExecuteW` -- which this crate
+# calls -- takes the path as a path.
+opener = { version = "0.8", default-features = false }
 url = "2"
 # Talking to a browser we launched, over the DevTools protocol. Loopback only,
 # so no TLS stack is pulled in: `connect` alone speaks ws:// and nothing more.

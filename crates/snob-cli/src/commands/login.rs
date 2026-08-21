@@ -371,6 +371,25 @@ async fn by_paste(args: LoginArgs, store: SecretStore, pacer: Pacer) -> Result<E
     let mut session = login::session_from_paste(&sessionid, &chosen.user_agent)?;
     session.user_agent_pinned = chosen.pinned;
     session.browser = chosen.browser;
+    // Taken as given rather than prompted for, because it is not a credential
+    // in the sense the sessionid is — it is the CSRF double-submit token, which
+    // is worth nothing without the cookie — and because prompting for a second
+    // secret nobody needs would put a question in front of every paste login to
+    // serve the two commands that write. It still goes into a `Secret`: it is
+    // part of the session record, and everything in that record is handled the
+    // same way regardless of what it is worth on its own.
+    //
+    // Trimmed, and an empty value is left unset rather than stored blank.
+    // `cookie_header` skips an empty optional cookie, so a blank one would have
+    // been silently absent while `IgClient::post`'s guard saw `Some` and let
+    // the request go — a refusal moved from before the request to after it, for
+    // no reason.
+    session.csrftoken = args
+        .csrftoken
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(Into::into);
     finish(session, store, pacer, LoginMethod::Paste).await
 }
 

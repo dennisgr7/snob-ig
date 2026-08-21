@@ -152,6 +152,29 @@ snob pfp someone -o picture.jpg
 
 Their profile picture at 1080x1080, which is not the size the web page serves.
 
+```bash
+snob stories someone
+```
+
+What they have up right now, numbered, with what each one is and how long it
+has left. `--download 2` saves the second one, `--all` saves all of them, and
+`-i` opens a list you move through with the arrow keys — Enter opens the story
+in whatever you already open pictures and videos with, `D` keeps a copy.
+
+**None of that tells them you looked.** Instagram registers a view through a
+separate request; snob does not make it, has no code that could, and a test
+reads the whole source on every build to keep it that way.
+
+```bash
+snob unfollow someone
+```
+
+One of the two things snob changes, and it asks first. The other is
+`snob follow`. One account per command — see [the risk](#the-risk-and-what-the-design-does-about-it)
+for why there is no bulk mode — and they need a session with a CSRF token,
+which `snob login --browser` picks up on its own. If you logged in by pasting,
+`snob login --paste --csrftoken <token>` is how to add it.
+
 Every list takes `--format json|ndjson|csv|xlsx|md` and `-o file`, filters like
 `--only private` or `--no-verified`, and `--limit`. Run `snob --help` for the
 rest.
@@ -367,8 +390,16 @@ individual is a verification checkpoint on their account.
 
 Most of the design exists to make that unlikely:
 
-- **It never writes.** No follow, unfollow, block or remove-follower, ever. The
-  operations that get accounts banned are not in the tool at all.
+- **It writes two things, and nothing else.** `snob follow` and `snob unfollow`,
+  one account per command. No block, no remove-follower, no like, no comment,
+  no message, and nothing that marks a story as seen. Both ask before they send,
+  both come out of a budget of their own that allows one action every fifteen
+  minutes and at most three in a row, and there is **no bulk mode and no flag
+  that makes one**. That is deliberate rather than unfinished: what Instagram
+  acts on is not the day's total but the burst, and the follow-then-unfollow
+  churn a tool like this makes easy to automate is the specific pattern its
+  detection was built for. Writing your own loop around it is your business;
+  shipping you the loop is not something snob will do.
 - **Requests are paced**, with the timings borrowed from
   [InstagramUnfollowers][iu], which has years of real use behind it, and only
   ever adjusted downwards. Nothing in snob can send a request without paying for

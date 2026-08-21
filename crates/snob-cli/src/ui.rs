@@ -461,3 +461,7 @@ mod tests {
         assert!(!looks_like_console_dump(ua));
     }
 }
+
+/// The interactive story list. See its own header for why it is built on
+/// `console` rather than on a terminal-UI framework.
+pub mod stories;
