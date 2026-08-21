@@ -44,6 +44,40 @@
 //! protect. Trading that away to match a number that is itself a guess would be
 //! paying a certain cost for an uncertain benefit.
 //!
+//! **One local measurement, August 2026, and the four reasons it settles
+//! nothing.** A real Chrome session against instagram.com was recorded over the
+//! DevTools Protocol and driven by hand — login, profiles, stories, follow,
+//! unfollow, block, unblock, like. In 251 seconds it made 193 requests to
+//! `/api/v1/` and the two GraphQL routes, and was refused none of them: no 429,
+//! no `Retry-After`, no rate-limit header of any kind. Scaled to the window
+//! used here that is about 507, against this walker's 172 and instaloader's 75.
+//!
+//! It is worth having for one thing only: it is the only number anybody here
+//! has taken rather than inherited, and it is evidence against slowing *down*
+//! to 75, which is not what a client on this endpoint family does.
+//!
+//! It is not evidence that 507 is safe, and the reasons are worth spelling out
+//! because a number in a comment gets quoted back as permission:
+//!
+//! - It is a 251-second observation extrapolated into an 11-minute window.
+//! - Its **shape** is wrong. Median gap between requests 105 ms, ninetieth
+//!   percentile 3.2 seconds: a browser bursts at page load and then sits while
+//!   somebody reads. A walk never sits.
+//! - Its **content** is wrong. Fifty-six distinct operations across half a
+//!   dozen surfaces, against one endpoint paged thousands of times — which is
+//!   the pattern enumeration limits are built for.
+//! - **Nothing in it was refused**, so it bounds nothing. The line is still
+//!   somewhere above the largest un-refused session anyone has recorded, which
+//!   is where it was before.
+//!
+//! The rate stays at 172. What the capture did produce is in
+//! `IgClient::note_push_back`: Instagram volunteers `x-ig-capacity-level` and
+//! `x-ig-peak-time` on its answers, and those are now written down when it
+//! pushes back — so that the run which finally *is* refused says what the load
+//! was at that moment. Acting on them is deliberately not done: they describe a
+//! datacenter's headroom, which is the same for everyone in that region, and
+//! the thing being managed here is a checkpoint on one account.
+//!
 //! One figure that is **not** evidence, because it is quoted at this problem
 //! constantly: the ubiquitous "200 calls per user per hour" is Meta's Graph API
 //! platform limit for `graph.facebook.com`. It has nothing to do with these

@@ -949,14 +949,32 @@ left in a report nobody can find, and in the order they are worth doing.
   somebody's account. When it is implemented it is a floor and never a ceiling,
   because a server naming thirty seconds is answering a different question from
   how long an account is left alone after Instagram has objected. That is
-  written at `note_push_back`, where somebody adding it will be looking. Two
-  tests read the log back and assert the recorded cooldown is unchanged.
+  written at `note_push_back`, where somebody adding it will be looking. The
+  tests assert on the value `Answer` carries and that the recorded cooldown is
+  unchanged.
+
+  **The write path was not covered by any of that until August 2026**, which
+  defeated the point: `post` neither read the header nor called
+  `note_push_back`, so the one class of request that earns the twelve-hour
+  cooldown was the one nobody was listening to. It goes through `decode` now,
+  like a read, and `decode` is where the push-back is noted.
+
+  **Alongside it, what Instagram volunteers about its own load.** A browser
+  capture found `x-ig-capacity-level` and `x-ig-peak-time` on every API answer,
+  and `Answer::load` now carries them into the same line. Also not acted on, and
+  for a sharper reason than `Retry-After`: they describe a datacenter's
+  headroom, which is identical for everyone served by that region, while what
+  the pace is managing is a checkpoint on one account. Acting on them would also
+  be a mechanism for going *faster*, and these numbers have only ever moved the
+  other way.
 
   **What is still owed is a real run.** The logging is in so that somebody who
   gets throttled with `--verbose` on can say whether the header ever arrives and
-  in which of its two forms — seconds or an HTTP date. Until somebody has, there
-  is nothing here to implement, which is why it is parsed into nothing and kept
-  as the string that was sent.
+  in which of its two forms — seconds or an HTTP date — and what the capacity
+  level was when it did. The capture answered none of it: 426 answers, every one
+  of them a 200. Until somebody has been refused, there is nothing here to
+  implement, which is why it is parsed into nothing and kept as the string that
+  was sent.
 
 ## Known walls
 

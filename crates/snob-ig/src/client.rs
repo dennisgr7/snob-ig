@@ -182,6 +182,25 @@ async fn read_capped_bytes(mut response: reqwest::Response, cap: u64) -> Result<
 /// forms, seconds and an HTTP date, and until it is known which of them these
 /// endpoints send — if either — turning it into a number would be deciding the
 /// answer to the question the logging exists to ask.
+/// The load headers, if Instagram volunteered any, as one string to log.
+///
+/// Absent from a CDN answer and from anything that is not the API, so `None` is
+/// ordinary rather than notable.
+fn load_of(response: &reqwest::Response) -> Option<String> {
+    let headers = response.headers();
+    let named = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| format!("{name}={value}"))
+    };
+    let found: Vec<String> = ["x-ig-capacity-level", "x-ig-peak-time"]
+        .into_iter()
+        .filter_map(named)
+        .collect();
+    (!found.is_empty()).then(|| found.join(" "))
+}
+
 fn retry_after(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
@@ -194,13 +213,23 @@ fn retry_after(response: &reqwest::Response) -> Option<String> {
 /// hold of.
 ///
 /// `classify` is a pure function of a status and a body and does not receive
-/// headers, which is why `Retry-After` travels separately rather than being
-/// read where the decision is made. **Nothing decides anything from it yet**,
-/// deliberately — see [`IgClient::note_push_back`].
+/// headers, which is why `Retry-After` and the load below travel separately
+/// rather than being read where the decision is made. **Nothing decides
+/// anything from either of them**, deliberately — see
+/// [`IgClient::note_push_back`].
 struct Answer {
     status: u16,
     body: String,
     retry_after: Option<String>,
+    /// What Instagram said about its own load while answering.
+    ///
+    /// `x-ig-capacity-level` and `x-ig-peak-time`, joined. Not decided on, and
+    /// the reason is with the rest of the pacing reasoning in [`crate::pace`]:
+    /// they describe a datacenter's headroom, which is the same for everyone in
+    /// that region, and what the pace is managing is a checkpoint on one
+    /// account. Carried so that the run which is finally refused can say what
+    /// the load was at that moment, which is the observation nobody has.
+    load: Option<String>,
 }
 
 /// Which side of the relationship is being requested.
@@ -882,6 +911,7 @@ impl IgClient {
         // the header is on the response, and a body that will not read must not
         // take the one measurement worth having away with it.
         let retry_after = retry_after(&response);
+        let load = load_of(&response);
 
         // A redirect reaches here as a status rather than as a new request,
         // because the policy is `none()`. It is not success and it is not
@@ -903,6 +933,7 @@ impl IgClient {
             status: status.as_u16(),
             body,
             retry_after,
+            load,
         })
     }
     /// The stories an account has up right now. One request.
@@ -1295,6 +1326,7 @@ impl IgClient {
             // the next run knocked again. What Instagram said is the status;
             // the body only refines it.
             let retry_after = retry_after(&response);
+            let load = load_of(&response);
 
             let body = match self.read_or_cancel(response, MAX_BODY_BYTES).await {
                 Ok(body) => body,
@@ -1306,6 +1338,7 @@ impl IgClient {
                         status: status.as_u16(),
                         body: String::new(),
                         retry_after,
+                        load,
                     };
                     self.note_push_back(&answer);
                     return Err(self.classify_and_record(answer.status, ""));
@@ -1316,6 +1349,7 @@ impl IgClient {
                 status: status.as_u16(),
                 body,
                 retry_after,
+                load,
             });
         }
     }
@@ -1396,6 +1430,7 @@ impl IgClient {
         tracing::debug!(
             status = answer.status,
             retry_after = answer.retry_after.as_deref().unwrap_or("<absent>"),
+            load = answer.load.as_deref().unwrap_or("<absent>"),
             "Instagram pushed back"
         );
     }
@@ -2603,6 +2638,11 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("Retry-After", "30")
+                    // What Instagram volunteers about its own load on every
+                    // API answer. Carried for the same reason and decided on
+                    // for neither: see `note_push_back`.
+                    .insert_header("x-ig-capacity-level", "2")
+                    .insert_header("x-ig-peak-time", "1")
                     .set_body_string(r#"{"message":"Please wait a few minutes"}"#),
             )
             .mount(&server)
@@ -2638,8 +2678,13 @@ mod tests {
             .expect("a 429 is an answer, not a transport failure");
         assert_eq!(answer.status, 429);
         assert_eq!(answer.retry_after.as_deref(), Some("30"));
+        assert_eq!(
+            answer.load.as_deref(),
+            Some("x-ig-capacity-level=2 x-ig-peak-time=1"),
+            "nobody has ever recorded the load Instagram announced while refusing"
+        );
 
-        // And the cooldown is untouched by it. Thirty seconds is far shorter
+        // And the cooldown is untouched by either of them. Thirty seconds is far shorter
         // than the rate-limit cooldown, so a header that had been allowed to
         // shorten anything would show up right here.
         let error = client.validate().await.unwrap_err();
