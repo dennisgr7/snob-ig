@@ -2584,7 +2584,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "snob-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "snob-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "snob-ig"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fastrand",
  "reqwest",

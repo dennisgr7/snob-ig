@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-21
 
 **`snob watch` says what has changed since the last time it looked.** The
 monitor, in two commands. Who has started following you and who has stopped,
