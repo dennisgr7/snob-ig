@@ -671,7 +671,7 @@ pub enum Due {
 /// Four years covers a leap day, which is the longest anything expressible here
 /// can legitimately wait for. Past that the expression matches nothing —
 /// `0 0 31 2 *` — and the search has to stop rather than spin.
-const HORIZON_MINUTES: i64 = 4 * 366 * 24 * 60;
+const HORIZON_MINUTES: i64 = 4 * 366 * 24 * 60; // four years, in minutes
 
 /// The next moment this schedule is due, for somebody who wants to see it
 /// rather than sleep until it.
@@ -2234,7 +2234,7 @@ mod tests {
     #[test]
     fn a_schedule_that_names_nothing_is_never_due_rather_than_due_at_the_end_of_time() {
         // A century out, which is past anything expressible here:
-        // `MAX_INTERVAL_SECS` is a year and the search horizon is four minutes.
+        // `MAX_INTERVAL_SECS` is a year and the search horizon is four years.
         let a_century = at(0) + 100 * 366 * 24 * 3_600;
         for schedule in [
             Schedule::every(Duration::from_secs(hours(6) as u64)).unwrap(),

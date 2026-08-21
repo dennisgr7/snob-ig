@@ -1019,9 +1019,8 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
 /// `snob watch check` spends nothing while the account is in cooldown.
 ///
 /// It is built to be polled, and it was the one request path in the tool with
-/// no cooldown gate: `Pacer::clear_to_send`
-/// charges the budget but never reads the `cooldowns` table, so nothing below
-/// it would have caught this. One `validate` plus one `web_profile_info` per
+/// no cooldown gate: `Pacer::clear_to_send` charges the budget but never
+/// reads the `cooldowns` table, so nothing below it would have caught this. One `validate` plus one `web_profile_info` per
 /// configured account, on whatever interval a monitoring system polls at,
 /// knocking on a door Instagram had just closed.
 ///

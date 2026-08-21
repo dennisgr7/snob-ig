@@ -27,7 +27,7 @@ $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitect
 
 $version = $env:SNOB_VERSION
 if (-not $version) {
-    $latest = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
+    $latest = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/latest"
     $version = $latest.tag_name -replace '^v', ''
 }
 
@@ -39,9 +39,9 @@ New-Item -ItemType Directory -Force $work | Out-Null
 try {
     Write-Host "Downloading snob $version for $arch"
     $zip = Join-Path $work "$name.zip"
-    Invoke-WebRequest "$base/$name.zip" -OutFile $zip
+    Invoke-WebRequest -UseBasicParsing "$base/$name.zip" -OutFile $zip
     $sumsFile = Join-Path $work 'SHA256SUMS'
-    Invoke-WebRequest "$base/SHA256SUMS" -OutFile $sumsFile
+    Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS" -OutFile $sumsFile
 
     # Not optional: this downloads an executable and puts it on the PATH.
     $expected = ((Get-Content $sumsFile | Select-String -SimpleMatch "$name.zip") -split '\s+')[0]

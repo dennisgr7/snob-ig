@@ -140,8 +140,9 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
     // covered by the URL's signature, so it cannot simply be stripped off.
     //
     // A failure here is not worth losing the picture over: the smaller one
-    // below still works. But the reason is kept rather than logged away. It used to go to `debug!`,
-    // which nobody passes `--verbose` to see on a command that appeared to
+    // below still works. But the reason is kept rather than logged away. It
+    // used to go to `debug!`, which nobody passes `--verbose` to see on a
+    // command that appeared to
     // work — and it can be the 429 that has just put the account in cooldown,
     // so the next command refusing came with no explanation anywhere.
     let (full_size, why_not) = match client.user_info(profile.id).await {
