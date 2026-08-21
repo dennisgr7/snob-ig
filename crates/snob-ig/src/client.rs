@@ -1520,11 +1520,26 @@ impl IgClient {
         let mut request = request;
         if style.announces_the_app() {
             request = request
-                // Without this header Instagram answers 403 even with a good
-                // session -- on the API routes. A navigation announces none of
-                // these, because at that moment there is no app yet.
+                // Without these Instagram answers 403 even with a good session
+                // -- on the API routes. A navigation announces neither, because
+                // at that moment there is no app yet.
                 .header("X-IG-App-ID", IG_APP_ID)
-                .header("X-ASBD-ID", client_hints::ASBD_ID)
+                .header("X-ASBD-ID", client_hints::ASBD_ID);
+        }
+        // **Only on `/api/v1/`, and this is measured rather than reasoned.** A
+        // second browser capture in August 2026 -- the first one recorded the
+        // headers a page set rather than the ones that went on the wire, which
+        // is why this waited for a second -- put the count beyond argument:
+        //
+        //     x-ig-www-claim     0/171 on /api/graphql, 97/97 on /api/v1/*
+        //     x-requested-with   0/171 on /api/graphql, 97/97 on /api/v1/*
+        //
+        // Relay does not announce itself as an XHR and does not echo the claim.
+        // It sends `X-FB-Friendly-Name` and `X-FB-LSD` instead, which is what
+        // the branch below is for, and sending both sets is a shape no browser
+        // produces -- the failure [`Surface`] exists to prevent.
+        if matches!(style, Surface::App) {
+            request = request
                 .header("X-IG-WWW-Claim", self.claim())
                 .header("X-Requested-With", "XMLHttpRequest");
         }
@@ -3241,6 +3256,19 @@ mod tests {
         assert!(
             write.headers.contains_key("x-csrftoken"),
             "a write still carries the token the write rule requires"
+        );
+        // **And does not wear the XHR's clothes.** Measured, not reasoned:
+        // across 171 `/api/graphql` requests in a real session, neither of
+        // these appeared once, while both appeared on all 97 `/api/v1/` ones.
+        for xhr_only in ["x-requested-with", "x-ig-www-claim"] {
+            assert!(
+                !write.headers.contains_key(xhr_only),
+                "a Relay request carried {xhr_only}, which Relay never sends"
+            );
+        }
+        assert!(
+            write.headers.contains_key("x-ig-app-id"),
+            "the app id is on every surface that has an app behind it"
         );
         assert_eq!(
             write.headers.get("priority").unwrap(),
