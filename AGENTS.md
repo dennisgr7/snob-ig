@@ -637,9 +637,8 @@ Two judgment calls worth understanding before touching them:
 
 ## State
 
-Every command works and has been exercised against the live API **except the
-three added with the write regime**, which are covered below. Two things are
-deliberately unfinished:
+Every command works and has been exercised against the live API. What follows
+is what meeting Instagram taught, including the parts that are still open:
 
 - **`snob stories` works and has been run against Instagram.**
   `GET /api/v1/feed/reels_media/?reel_ids=` answers on **`www.instagram.com`**
@@ -648,24 +647,40 @@ deliberately unfinished:
   says why this crate does not go there. Confirmed in August 2026 against a real
   account with stories up: the items, their sizes, `taken_at` and `expiring_at`
   all arrive, and the largest candidate is the one taken.
-- **`snob follow` and `snob unfollow` reach Instagram and do not work yet.**
-  Everything around the request is exercised and sound — the write budget, the
-  confirmation, the refusal without a CSRF token before anything is spent, the
-  refusal to follow a redirect — and the request itself is refused. Two
-  spellings were sent live and the relationship read back after each; neither
-  changed anything:
-  - `POST /api/v1/friendships/create/{pk}/` answers **200 with the web app's
-    HTML shell**, which is what that edge serves for a path its API router did
-    not accept. No status to classify and no message to read.
-  - `POST /web/friendships/{pk}/follow/`, the older web route the Python
-    clients use, answers **404**. It is gone.
+- **`snob follow` and `snob unfollow` work, and have been run against
+  Instagram.** The route is `POST /api/graphql` with a Relay operation name and
+  a `doc_id`; the word "friendship" appears nowhere in what a browser sends.
+  Two REST spellings were tried live first and both are dead —
+  `POST /api/v1/friendships/create/{pk}/` answers 200 with the web app's HTML
+  shell, and `POST /web/friendships/{pk}/follow/` answers 404 — which is
+  recorded because somebody will read a Python client and propose them again.
+  `x-web-session-id` was the one unexamined difference at the time, and the
+  capture below settles it: a browser does not send it on `/api/graphql` at
+  all, so the question is moot rather than answered.
+- **A real browser session has been recorded and compared against this code**,
+  August 2026: 251 seconds, 1890 requests, over the DevTools Protocol, driven
+  by hand through login, profiles, stories, follow, unfollow, block, unblock
+  and like. The transcript held a live session and was deleted; what it settled
+  is spread through this document and through `pace.rs`. Three things are worth
+  having in one place.
 
-  The one unexamined difference from what a browser sends is
-  `x-web-session-id`. It has not been added on a guess: inventing a header a
-  browser derives from its own session is the disguise the header rules exist
-  to avoid, and each failed write is a request that looks like probing.
-  **The next step is a capture of the real request from a logged-in browser**,
-  not another attempt. `IgClient::friendship` carries the same record.
+  It confirmed the two seeded `doc_id`s in `graphql.rs` unchanged, `ASBD_ID`,
+  the app id, and that `client_hints::brands` reproduces a real Chrome 151
+  byte for byte — GREASE spelling, GREASE version and entry order.
+
+  It showed the web client now reaches almost everything through GraphQL:
+  `/api/graphql` 151 times and `/graphql/query` 27 against 11 calls to
+  `/api/v1/`. **That is not a reason to migrate**, and the reasoning is with
+  the `show_many` decision above: every GraphQL operation is a POST, a POST is
+  a write here, and one door with one guard is worth more than fewer requests.
+  It is also not evidence about the reads this tool makes — the session
+  never opened a followers list, so no such operation was captured.
+
+  And **it is one capture, through a lens that reports the headers the page
+  set rather than the ones that went on the wire.** Absences in it prove
+  nothing; presences do. Any argument from it that rests on a header *not*
+  being sent needs a second capture with `requestWillBeSentExtraInfo` before it
+  is worth acting on.
 - **Some accounts cannot be resolved at all, and it is Instagram's fault.**
   `web_profile_info` answers **400** for certain business accounts with
   `Asset asset://laser.provider/ig_business_category_subvertical has been
