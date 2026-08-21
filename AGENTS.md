@@ -479,6 +479,62 @@ Two judgment calls worth understanding before touching them:
   look like they would work, and why neither does, are written out at
   `store::watch::set_mark`, with a test for each.
 
+- **The story browser draws with `console` and reads keys with `crossterm`, and
+  is not built on a terminal-UI framework.** Measured in August 2026 by building
+  this tree twice: the browser as it stands is **+18,432 B and 0 new crates on
+  Windows and macOS** — `comfy-table` was already compiling `crossterm`, so
+  only its `events` and `bracketed-paste` features are new, and on Linux that
+  is `signal-hook` and `signal-hook-mio` — against **+106,496 B and +27
+  crates** for the same five behaviors on `ratatui` 0.30 with `crossterm` 0.29.
+  What the difference buys is a cell buffer with a diff and a Cassowary solver
+  (`kasuari`), plus `compact_str`, `castaway`, `lru`, `strum`, `itertools`,
+  `line-clipping` and `unicode-truncate`. A list of rows of text uses none of
+  it: a line diff is 115 lines and is in `ui/browser/screen.rs`.
+  **What would reverse this** is a second pane, a navigable table with columns,
+  or a view that scrolls independently of the focus. At that point the cell
+  buffer stops being overhead and starts being the right tool, and 106 KB is not
+  a lot to pay for it. One list with one highlighted row is not that point.
+  `termwiz` was measured too and is not close: **+688,640 B and 86 crates**, six
+  times `ratatui`, because it is WezTerm's whole terminal layer. `cursive` is
+  comparable to `ratatui` in size and wrong in shape — it owns the event loop,
+  and `browse` is an `async` function making HTTP requests between keystrokes.
+- **Stories are handed to the system viewer and are not drawn in the terminal.**
+  Re-examined in August 2026 against what terminals actually do now, because
+  2026 genuinely moved: kitty's graphics protocol is no longer kitty's alone —
+  Ghostty has it since 1.0 (December 2024), iTerm2 since the 3.6 series
+  (September 2025) and VS Code since 1.110 (February 2026) — and Windows
+  Terminal shipped sixel in 1.22 (August 2024). It still does not survive
+  contact with this project's platforms. Windows Terminal speaks sixel and
+  nothing else (256 colors, no alpha; kitty graphics is microsoft/terminal#8389,
+  open since 2020 and unassigned), Alacritty speaks neither, and VTE — GNOME
+  Terminal, Tilix — speaks neither. Three things settle it:
+  - **The floor is +312,320 B and 17 crates**, for `image` with only `jpeg` and
+    `png`, and it is unavoidable: every protocol including the half-block
+    fallback needs the picture decoded and resized to the cell grid first.
+    `viuer` is +431,104 B and 44 crates on top of that; `ratatui-image` is
+    +637,952 B and 125 crates, and does not build on Windows with its default
+    features at all, because `chafa-dyn` wants `pkg-config` and libchafa.
+  - **What would be on screen is not the story.** A story is 9:16. On an 80x24
+    terminal, half-blocks give 80x48 subpixels, so fitting to the height
+    yields **27x48** — smaller than a favicon; octants, where a terminal draws
+    them at all, reach 54x96. The decisive part is not the resolution: stories
+    carry text on top of the picture — captions, stickers, polls, song titles
+    — and at that size, and at 112x200 in a maximized window too, that text is
+    not ugly, it is **absent**. A browser that renders stories as ANSI art
+    loses the actual content of a large share of them.
+  - **A large share of stories are video, and no protocol plays video.** kitty's
+    animation extension is implemented by kitty alone and explicitly declined by
+    Ghostty. `commands::stories` already sniffs `ftyp` and writes `.mp4`. The
+    best a terminal could do is one silent cover frame, which is strictly worse
+    than what `opener` already does: the real file, in a real player, with
+    sound and a scrub bar, on every platform, for no dependencies.
+
+  If it is ever wanted anyway, the only defensible shape is `image` with
+  `jpeg`+`png`, the kitty protocol written by hand with a DA1 probe and a hard
+  timeout, **for photo stories only**, with `opener` for video and as the
+  fallback everywhere. That avoids `viuer`, `ratatui-image` and `ratatui`
+  entirely and still costs 3.9% of the binary.
+
 ## State
 
 Every command works and has been exercised against the live API **except the
@@ -689,6 +745,9 @@ against.
 | Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
 | `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats |
 | Static CRT on Windows | +126,976 B per binary |
+| Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
+| `ratatui` + `crossterm` for the same browser | +106,496 B, 1.32%, +27 crates — rejected |
+| `image` with only `jpeg`+`png`, the floor under any terminal image | +312,320 B, 3.9%, +17 crates — rejected |
 | Chromium profile after `snob login --browser` | 87.2 MB, 886 files |
 
 The first two of those are the price of "one binary, no runtime", and they are
@@ -700,6 +759,20 @@ why `login` removes the profile when it is done with it.
 The three Unix targets have never been measured — nothing here cross-links
 them. Note that musl carries the Secret Service stack, some thirty crates a
 Windows build does not, so it is not comparable.
+
+**The three terminal-interface rows are measured on `x86_64-pc-windows-msvc`**,
+not on ARM64 like the rest: they are deltas taken by building the same tree
+twice, which is the only honest way to price a library, and the host is what it
+is. The baseline they are against is 8,068,096 B, which is 1.37x the ARM64
+figure above and agrees with the second row. Deltas of this kind do not
+transfer between targets exactly, but they do not change order of magnitude
+either.
+
+Two of those numbers are much smaller than the same libraries cost on their own,
+and the gap is the point. `ratatui` with `crossterm` on a hello-world is
++167,936 B; inside this binary it is +106,496, because LTO shares code with
+everything already here. Quoting the standalone figure would overstate the cost
+by 58%, and quoting a standalone figure for anything else here would too.
 
 ## Measured, decided, and not done yet
 
