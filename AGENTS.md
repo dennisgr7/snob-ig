@@ -315,7 +315,7 @@ its keys through `console::Term::stderr()`: that call answers `Key::Unknown`
 immediately and forever when the stream is not a TTY, so gated on standard input
 alone `snob login --paste 2> log` spun a core and never read what was pasted.
 
-Two judgement calls worth understanding before touching them:
+Two judgment calls worth understanding before touching them:
 
 - **`truncated()` in `pager.rs`** decides whether a short list means the counter
   lied — it includes deleted accounts — or Instagram stopped serving pages. The

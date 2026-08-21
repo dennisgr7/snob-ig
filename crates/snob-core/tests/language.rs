@@ -179,6 +179,148 @@ fn no_spanish_is_left_in_the_repository() {
     );
 }
 
+/// British spellings of words this project writes the US way.
+///
+/// AGENTS.md has said "US spelling. A test enforces it" since the translation,
+/// and no test did — only the Spanish half was ever checked. Thirty-six of
+/// these had accumulated across twenty-four files, including AGENTS.md itself
+/// and a shipped SQL migration, against far more numerous US forms of the same
+/// words: `canceled` 63 against `cancelled` 4, `behavior` 9 against `behaviour`
+/// 5. `pace.rs` contradicted itself twice inside two hundred lines.
+///
+/// Longer forms come first, so `neighbouring` is reported as itself rather than
+/// as `neighbour`. **`cancellation` is deliberately absent**: it is spelled
+/// with two Ls in US English too, and there are some twenty correct uses of it
+/// in the tree — putting it here would turn this guard into noise, which is how
+/// a guard gets switched off.
+const BRITISH: [&str; 17] = [
+    "ageing",
+    "behaviour",
+    "cancelling",
+    "cancelled",
+    "colour",
+    "honoured",
+    "judgement",
+    "labelled",
+    "licence",
+    "neighbouring",
+    "neighbours",
+    "neighbour",
+    "recognising",
+    "recognised",
+    "recognise",
+    "travelling",
+    "travelled",
+];
+
+#[test]
+fn us_spelling_is_what_the_repository_writes() {
+    let Some(root) = repo_root() else {
+        return; // packaged build, nothing to walk
+    };
+
+    let mut violations = Vec::new();
+    for file in source_files(&root, &EXTENSIONS) {
+        let relative = relative(&root, &file);
+
+        // This file holds the word list, for the reason the Spanish allowlist
+        // gives about itself.
+        if ALLOWLIST.contains(&relative.as_str()) {
+            continue;
+        }
+
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for (number, line) in contents.lines().enumerate() {
+            if line.contains("spelling-allow") {
+                continue;
+            }
+            if let Some(found) = british_in(line) {
+                violations.push(format!("{relative}:{}: {found}", number + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "British spelling found in {} place(s):
+{}",
+        violations.len(),
+        violations.join(
+            "
+"
+        )
+    );
+}
+
+/// The first British spelling in the line, if any.
+///
+/// Whole words only, so `licence` does not fire on a hypothetical `licenced`
+/// that is not in the list, and — the case that matters — nothing fires on a
+/// longer word that merely contains one of these.
+fn british_in(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    BRITISH
+        .iter()
+        .find(|word| whole_word(&lower, word))
+        .map(|word| (*word).to_string())
+}
+
+/// Whether `needle` occurs in `haystack` bounded by non-letters on both sides.
+fn whole_word(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = haystack[from..].find(needle) {
+        let start = from + at;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphabetic());
+        let after_ok = !haystack[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The guard has to be able to fail, and it has to leave `cancellation` alone.
+#[test]
+fn the_spelling_guard_knows_a_word_from_a_word_that_contains_one() {
+    assert_eq!(
+        british_in("the walk was cancelled"),
+        Some("cancelled".into())
+    );
+    assert_eq!(
+        british_in("neighbouring pages"),
+        Some("neighbouring".into()),
+        "the longer form names itself"
+    );
+    assert_eq!(
+        british_in("Behaviour at the edge"),
+        Some("behaviour".into())
+    );
+
+    assert_eq!(
+        british_in("cancellation is spelled this way in both"),
+        None,
+        "two Ls is correct US English and there are twenty of these"
+    );
+    assert_eq!(british_in("the walk was canceled"), None);
+    assert_eq!(
+        british_in("licenced"),
+        None,
+        "whole words only, or the list has to grow a form for every suffix"
+    );
+}
+
 /// Returns the first offending token in the line, if any.
 fn spanish_in(line: &str) -> Option<String> {
     if let Some(c) = line.chars().find(|c| SPANISH_CHARS.contains(c)) {

@@ -163,7 +163,7 @@ impl CheckReport {
     }
 }
 
-/// How many upcoming moments to work out, so somebody can recognise their own
+/// How many upcoming moments to work out, so somebody can recognize their own
 /// schedule in them. Three is enough to tell "every Monday" from "every day".
 const MOMENTS_SHOWN: usize = 3;
 

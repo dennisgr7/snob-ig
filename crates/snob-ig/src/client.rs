@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     /// `Cookie` is dropped by the HTTP client on a cross-host redirect, but
-    /// `X-CSRFToken` is not on its list and would have travelled. Instagram's
+    /// `X-CSRFToken` is not on its list and would have traveled. Instagram's
     /// API does not redirect off its own host, so refusing costs nothing.
     #[tokio::test]
     async fn an_api_redirect_off_the_origin_is_refused() {

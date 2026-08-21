@@ -50,7 +50,7 @@ impl ExitCode {
     /// the program.
     ///
     /// `None` rather than a default, because a token this build does not
-    /// recognise came from a newer one, and guessing at what it meant is how a
+    /// recognize came from a newer one, and guessing at what it meant is how a
     /// probe learns to lie. What to do about it is the caller's decision.
     pub fn from_token(token: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|code| code.as_str() == token)

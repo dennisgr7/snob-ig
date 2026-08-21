@@ -882,7 +882,7 @@ fn next_after<Tz: TimeZone>(
 ///
 /// Falls back to `last` itself when the calendar names nothing in the whole
 /// horizon — an expression that matches no moment at all, where the old
-/// behaviour is as good an answer as any and nothing is owed regardless.
+/// behavior is as good an answer as any and nothing is owed regardless.
 ///
 /// Deliberately asks `Calendar::allows` and not the fuller predicate the search
 /// uses: a repeated wall-clock hour is refused for a run that has *not* happened
@@ -1098,7 +1098,7 @@ fn next_local_midnight<Tz: TimeZone>(at: i64, zone: &Tz) -> Option<i64> {
 /// ceiling; the default is 900 seconds and a breach needs
 /// `s > nominal_gap - 4500`.
 ///
-/// **It does not close the whole class, and the neighbour has no jitter in it at
+/// **It does not close the whole class, and the neighbor has no jitter in it at
 /// all.** `MIN_GAP_SECS` is real seconds while the grid is local, so on the
 /// short day `--at 01:50,03:00` has 600 real seconds between its two moments
 /// where `tightest_gap` declared 4200 and `validated` accepted it: the run at
@@ -1763,7 +1763,7 @@ mod tests {
     /// schedule that names one run a day.
     ///
     /// The comment at the search credited `single()` with refusing this and the
-    /// rationale on the neighbouring test credited `MIN_GAP_SECS`. Neither was
+    /// rationale on the neighboring test credited `MIN_GAP_SECS`. Neither was
     /// doing anything, and that test used a `FixedOffset`, which has no
     /// transitions to be ambiguous about.
     #[test]

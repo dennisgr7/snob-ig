@@ -151,7 +151,7 @@ fn existing_to_replace(paths: &AppPaths, dry_run: bool) -> Result<Option<WatchCo
 /// Instagram serves roughly this many whatever `per_page` asks for, which is
 /// the settled note in AGENTS.md. It is here to turn a follower count into a
 /// number of requests for the sentence below, and nothing depends on it being
-/// exact — it is an estimate offered to a person, labelled as one.
+/// exact — it is an estimate offered to a person, labeled as one.
 const ACCOUNTS_PER_REQUEST: u64 = 25;
 
 /// What taking the baseline now would walk, over every account it covers.

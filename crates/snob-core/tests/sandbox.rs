@@ -145,7 +145,7 @@ fn is_the_feature_gate(line: &str) -> bool {
 ///
 /// `#[cfg(test)]` and `#[cfg(all(test, ...))]` both. Matched on `test` as a
 /// bare predicate rather than on the whole attribute, so the longer spelling
-/// `main.rs` uses is recognised as the same thing.
+/// `main.rs` uses is recognized as the same thing.
 fn is_a_test_gate(line: &str) -> bool {
     let line = line.trim();
     line.starts_with("#[cfg(") && (line.contains("(test)") || line.contains("(test,"))
