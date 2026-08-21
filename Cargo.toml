@@ -214,3 +214,41 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The lint policy, in the manifest rather than only on CI's command line.
+#
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings` is what
+# the `lint` job runs and it is unchanged; what this adds is that a contributor
+# who types plain `cargo clippy` — or whose editor runs it — gets the same
+# answer. A policy that only exists in a YAML file is one every local build
+# disagrees with until the pull request goes red.
+[workspace.lints.rust]
+# Linking this binary has made MSVC announce that it is creating an import
+# library, because a native dependency exports symbols. There is nothing to act
+# on, and it was the first thing printed on every build. Kept even though
+# Windows no longer links aws-lc: the message belongs to the linker, not to any
+# one dependency.
+#
+# At the workspace level rather than on `snob-cli`, because a crate cannot have
+# both `lints.workspace = true` and a `[lints]` table of its own. Nothing else
+# links a binary, so the widening costs nothing.
+linker_messages = "allow"
+
+[workspace.lints.clippy]
+# **The rule this project already keeps, made checkable.** Of the 57 `unsafe`
+# blocks in the tree, 50 already carry a `// SAFETY:` comment — the practice is
+# established, and what was missing was anything that noticed the fifty-first
+# going in without one. This is the cheapest possible ratchet: it changes no
+# code that is already right.
+#
+# Deliberately the only clippy lint named here, and not a group. `all` is
+# already on by default; `pedantic` and `nursery` would each land a few hundred
+# findings that have nothing to do with anything this project has got wrong, and
+# the settled position on that is that a lint earns its place by catching a
+# defect this codebase actually had.
+#
+# Not `unsafe_op_in_unsafe_fn`, which is the obvious companion and is moot
+# twice: it is warn-by-default in edition 2024, which this workspace is on, and
+# there is not one `unsafe fn` defined anywhere in the tree. Every unsafe here
+# is a block.
+undocumented_unsafe_blocks = "warn"

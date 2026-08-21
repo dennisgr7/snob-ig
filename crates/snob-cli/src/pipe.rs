@@ -299,8 +299,13 @@ mod windows_impl {
         ended: Option<Ended>,
     }
 
-    // The two handles are owned by this struct and touched only through it.
+    // SAFETY: the two handles are owned by this struct and reached only through
+    // it, and `&mut self` on every method that touches them means no two threads
+    // hold one at once. Windows handles are process-wide values with no thread
+    // affinity, so moving one across a thread is what the API already expects.
     unsafe impl Send for Process {}
+    // SAFETY: the same, for a shared reference. Nothing reachable through `&self`
+    // reads or writes either handle.
     unsafe impl Sync for Process {}
 
     impl Process {
@@ -528,6 +533,9 @@ mod windows_impl {
             return Err(last_error("UpdateProcThreadAttribute"));
         }
 
+        // SAFETY: all-zero is the documented empty value for this structure —
+        // `cb` and the fields below are what fill it in, and every pointer in it
+        // is one Windows reads as absent when null.
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.cbReserved2 = blob.len() as u16;
@@ -541,6 +549,8 @@ mod windows_impl {
         }
         let mut command_line = wide(&command_line);
 
+        // SAFETY: an out parameter. `CreateProcessW` fills it, and all-zero is
+        // what it is documented to be handed.
         let mut information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // Suspended, so the job below is joined before a single instruction of
         // the browser runs. Created after the job would leave an instant in
@@ -619,6 +629,8 @@ mod windows_impl {
         // SAFETY: two pipe handles this process owns and hands over exactly
         // once; `File` closes them from here on.
         let writer = unsafe { std::fs::File::from_raw_handle(to_browser_write.take() as _) };
+        // SAFETY: the same, for the other end. `take` is what makes each handover
+        // happen exactly once.
         let reader = unsafe { std::fs::File::from_raw_handle(from_browser_read.take() as _) };
 
         Ok((super::BrowserProcess { inner }, super::pump(reader, writer)))
@@ -633,6 +645,8 @@ mod windows_impl {
         }
         let job = Owned(job);
 
+        // SAFETY: all-zero means "no limits", which is the base this then sets
+        // exactly one flag on.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: the structure matches the class being set.
