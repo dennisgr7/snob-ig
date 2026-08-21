@@ -373,9 +373,15 @@ Two judgment calls worth understanding before touching them:
   requests to 14, which is a real saving in the direction this project's pacing
   has only ever moved. It is still a no, on three grounds in increasing order of
   weight:
-  - Its page limit, response shape and throttle weighting are all unverified, so
-    the 52-to-14 is an estimate. "Request pacing is not changed without a
-    documented reason" and an estimate is not one.
+  - The 52-to-14 was an estimate, and the August 2026 capture makes it look
+    like the wrong way round. **The real client batches twelve or thirteen ids
+    per call, never more** — 41 calls in one session, median 12, and it makes
+    about 1.5 of them per page of 12 followers, because the list payload
+    carries `pk`, `username` and `full_name` and no friendship status at all.
+    At that batch size a thousand accounts is roughly eighty calls, which is
+    worse than walking the second list, not better. Whether the limit is the
+    endpoint's or just what the page asks for is still unverified — but the
+    saving the estimate rested on is no longer the obvious part.
   - It is a POST, and **in this codebase POST means write**. `IgClient::post` is
     the one function that sends anything other than a GET, and it is where the
     write budget is paid, the CSRF token is required and the redirect policy
@@ -688,14 +694,26 @@ is what meeting Instagram taught, including the parts that are still open:
   `/api/v1/`. **That is not a reason to migrate**, and the reasoning is with
   the `show_many` decision above: every GraphQL operation is a POST, a POST is
   a write here, and one door with one guard is worth more than fewer requests.
-  It is also not evidence about the reads this tool makes — the session
-  never opened a followers list, so no such operation was captured.
 
-  And **it is one capture, through a lens that reports the headers the page
-  set rather than the ones that went on the wire.** Absences in it prove
-  nothing; presences do. Any argument from it that rests on a header *not*
-  being sent needs a second capture with `requestWillBeSentExtraInfo` before it
-  is worth acting on.
+  The first one was taken through a lens that reports the headers a page set
+  rather than the ones that went on the wire, so nothing could be concluded
+  from an absence in it. **A second capture, with the wire headers, settled
+  four things the first could only suggest**, and the counts are kept because
+  they are what makes them settled rather than argued:
+
+  - `x-ig-www-claim`, `x-requested-with` and `x-web-session-id`: 0 of 171 on
+    `/api/graphql`, 0 of 23 on `/graphql/query`, 97 of 97 on `/api/v1/`. Relay
+    does not announce itself as an XHR and does not echo the claim, so the two
+    this tool was sending there are not sent any more.
+  - `Priority`: `u=0, i` on all six navigations, `u=1, i` on all 924 fetches
+    and XHRs, which sources a constant written from the RFC.
+  - **`/api/v1/friendships/{pk}/followers/` is alive and is this tool's own
+    route** — twenty-seven calls in one session of scrolling the list, with no
+    GraphQL operation near it. The read this program spends nearly every
+    request on has nothing to migrate to.
+  - The list payload carries `pk`, `username` and `full_name` and **no
+    friendship status**, which is why `friendships/show_many/` exists at all.
+    See the settled note about it, and the batch size recorded there.
 - **Some accounts cannot be resolved at all, and it is Instagram's fault.**
   `web_profile_info` answers **400** for certain business accounts with
   `Asset asset://laser.provider/ig_business_category_subvertical has been
