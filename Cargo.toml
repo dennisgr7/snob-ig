@@ -104,7 +104,15 @@ rust_xlsxwriter = "0.97"
 # rather than adding a second copy of the compression code.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# No `env-filter`. It exists to parse `RUST_LOG`'s full grammar -- span names,
+# field matchers, `[span{field=value}]` -- and to do that it compiles
+# `matchers`, `regex-automata` and `regex-syntax`: a complete regular-expression
+# engine, for a program whose two filters are `target=level` lists. The
+# `Targets` filter parses exactly that syntax with no regex behind it, and it is
+# what `main::init_tracing` builds. Same shape as dropping the Windows keyring's
+# `search` feature, which took `regex` and `aho-corasick` out of the tree.
+# `ansi` stays: it is what colors the level on a terminal, and costs one crate.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 dialoguer = { version = "0.12", default-features = false }
 console = "0.16"
 # **Already compiled into this binary before it was ever declared here**, by

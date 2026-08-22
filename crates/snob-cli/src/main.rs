@@ -245,20 +245,82 @@ fn restore_terminal_on_panic() {
     }));
 }
 
+/// What is logged, and at which level.
+///
+/// `--verbose` turns on `debug` for this workspace's crates and nothing else;
+/// without it, `SNOB_LOG` is read as a list of `target=level` directives --
+/// `snob_ig=debug,warn` -- and `warn` is the answer when it is unset or does not
+/// parse. A directive that does not parse is said so, once, rather than
+/// silently read as `warn`: somebody who set the variable is debugging and is
+/// the one person who needs to know it was ignored.
+///
+/// `Targets` rather than `EnvFilter`, which is the obvious type and was the
+/// one here: `EnvFilter` understands span and field matchers, and to do so it
+/// links a regular-expression engine. Nothing here logs a span. The manifest
+/// says what that cost.
+fn log_filter(verbose: bool, spec: Option<&str>) -> tracing_subscriber::filter::Targets {
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+
+    if verbose {
+        return Targets::new()
+            .with_target("snob", Level::DEBUG)
+            .with_target("snob_ig", Level::DEBUG)
+            .with_target("snob_core", Level::DEBUG)
+            .with_target("snob_store", Level::DEBUG)
+            .with_target("snob_cli", Level::DEBUG);
+    }
+    let quiet = || Targets::new().with_default(Level::WARN);
+    match spec {
+        Some(spec) => spec.parse::<Targets>().unwrap_or_else(|e| {
+            eprintln!("warning: SNOB_LOG was ignored: {e}");
+            quiet()
+        }),
+        None => quiet(),
+    }
+}
+
 fn init_tracing(verbose: bool) {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
-    let filter = if verbose {
-        EnvFilter::new("snob=debug,snob_ig=debug,snob_core=debug,snob_cli=debug")
-    } else {
-        EnvFilter::try_from_env("SNOB_LOG").unwrap_or_else(|_| EnvFilter::new("warn"))
-    };
-
+    let spec = std::env::var("SNOB_LOG").ok();
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .without_time()
+        .finish()
+        .with(log_filter(verbose, spec.as_deref()))
         .init();
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::log_filter;
+    use tracing::Level;
+
+    /// The two settings a person reaches for, and the one they mistype.
+    #[test]
+    fn the_filter_reads_what_was_asked_for() {
+        let verbose = log_filter(true, None);
+        assert!(verbose.would_enable("snob_ig::client", &Level::DEBUG));
+        assert!(!verbose.would_enable("hyper_util::client", &Level::DEBUG));
+        assert!(!verbose.would_enable("snob_ig::client", &Level::TRACE));
+
+        let quiet = log_filter(false, None);
+        assert!(quiet.would_enable("snob_ig::client", &Level::WARN));
+        assert!(!quiet.would_enable("snob_ig::client", &Level::INFO));
+
+        let chosen = log_filter(false, Some("snob_store=debug,warn"));
+        assert!(chosen.would_enable("snob_store::secrets", &Level::DEBUG));
+        assert!(!chosen.would_enable("snob_ig::client", &Level::DEBUG));
+        assert!(chosen.would_enable("snob_ig::client", &Level::WARN));
+
+        // A spec that does not parse falls back to the quiet default rather
+        // than to nothing at all, so a typo does not also silence warnings.
+        let typo = log_filter(false, Some("snob_ig=loud"));
+        assert!(typo.would_enable("snob_ig::client", &Level::WARN));
+        assert!(!typo.would_enable("snob_ig::client", &Level::INFO));
+    }
 }
 
 #[cfg(all(test, feature = "testing"))]
