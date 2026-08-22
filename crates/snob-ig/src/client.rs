@@ -1083,10 +1083,16 @@ impl IgClient {
         let name = mutation.friendly_name();
 
         for url in graphql::bundles_in(html).into_iter().take(MOST_BUNDLES) {
-            let Ok(bytes) = self.download_capped(&url, MAX_BUNDLE_BYTES).await else {
+            let bytes = match self.download_capped(&url, MAX_BUNDLE_BYTES).await {
+                Ok(bytes) => bytes,
+                // The user stopping it is not a bundle that would not come
+                // down. Read as one, an interrupt here churned through the
+                // remaining sixty and then reported Instagram's original
+                // refusal, with its exit code, for what was a Ctrl+C.
+                Err(IgError::Canceled) => return Err(IgError::Canceled),
                 // A bundle that will not come down is not the end of the
                 // search: there are others, and the next may hold it.
-                continue;
+                Err(_) => continue,
             };
             if let Some(id) = graphql::doc_id_in(&String::from_utf8_lossy(&bytes), name) {
                 tracing::debug!(name, %url, "found the mutation id");

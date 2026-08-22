@@ -186,7 +186,7 @@ impl<'a> ListWalker<'a> {
         S: FnMut(&FriendshipsPage, u32) -> Result<usize, Box<dyn Error + Send + Sync>>,
         O: FnMut(Event),
     {
-        self.check_cooldown()?;
+        self.check_cooldown().await?;
 
         observe(Event::Started {
             estimated: request.estimated,
@@ -232,7 +232,8 @@ impl<'a> ListWalker<'a> {
             if self
                 .client
                 .pacer()
-                .cooldown()
+                .cooldown_off_thread()
+                .await
                 .map_err(WalkError::Budget)?
                 .is_some()
             {
@@ -313,8 +314,13 @@ impl<'a> ListWalker<'a> {
         })
     }
 
-    fn check_cooldown(&self) -> Result<(), WalkError> {
-        let until = self.client.pacer().cooldown().map_err(WalkError::Budget)?;
+    async fn check_cooldown(&self) -> Result<(), WalkError> {
+        let until = self
+            .client
+            .pacer()
+            .cooldown_off_thread()
+            .await
+            .map_err(WalkError::Budget)?;
         if let Some(until_ms) = until {
             let remaining_ms = until_ms - snob_core::clock::now_ms();
             return Err(WalkError::Cooldown {

@@ -303,7 +303,12 @@ impl Pacer {
     /// synchronous because its callers are gates in `snob-cli` that run once,
     /// with nothing else on the runtime waiting — this one runs in the hot path,
     /// where a blocked worker is the Ctrl+C that does nothing.
-    async fn cooldown_off_thread(&self) -> Result<Option<i64>, crate::error::IgError> {
+    ///
+    /// Public because the pager is the hot path too: it asked the synchronous
+    /// one once per page and once before the walk, on two workers, and a
+    /// second `snob` holding the write lock made each of those a stall of up
+    /// to the busy timeout during which an interrupt went nowhere.
+    pub async fn cooldown_off_thread(&self) -> Result<Option<i64>, crate::error::IgError> {
         let budget = Arc::clone(&self.budget);
         tokio::task::spawn_blocking(move || budget.cooldown())
             .await
