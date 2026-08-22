@@ -163,7 +163,7 @@ base64 = "0.22"
 # from a template, because a serializer cannot put the reason for a value next
 # to it and this project puts the reason next to the thing it governs.
 # `default-features = false` drops the serializing half and `toml_edit` with it.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 hmac = "0.12"
 sha2 = { version = "0.10", default-features = false }
 # Already in the tree under `url`, so this costs no extra compilation. Used to
