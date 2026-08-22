@@ -239,10 +239,13 @@ pub async fn read_capped(
     mut response: reqwest::Response,
     cap: usize,
 ) -> Result<String, reqwest::Error> {
+    // Said, not silently emptied: the same body with no declared length
+    // comes back as its first `cap` bytes, and a reader of the excerpt could
+    // not tell an empty answer from one too big to show.
     if let Some(declared) = response.content_length()
         && declared > cap as u64
     {
-        return Ok(String::new());
+        return Ok(format!("<{declared} bytes, more than the {cap} shown>"));
     }
 
     let mut bytes: Vec<u8> = Vec::new();
