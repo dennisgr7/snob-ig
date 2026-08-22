@@ -151,7 +151,7 @@ url = "2"
 # two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
 # no such crate -- it goes through `windows-sys`, which is already here.
 libc = "0.2"
-base64 = "0.23"
+base64 = "0.22"
 # Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
 # backends are optional features and stay off, which is what makes these build
 # on Windows ARM64 -- the target that has no LLVM and is the reason the TLS
