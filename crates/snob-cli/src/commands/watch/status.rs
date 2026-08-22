@@ -661,16 +661,23 @@ pub(super) fn describe_config(config: &WatchConfig) -> Vec<String> {
         lines.push(sentence);
     }
 
-    match &config.webhook {
-        Some(webhook) => {
-            // Redacted, not just filtered. `webhook::check` refuses an address
-            // carrying a password and its comment says why: it "would be
-            // echoed by `status`". This is `status`, and it echoed it.
-            let address = url::Url::parse(&webhook.url).map_or_else(
-                |_| webhook.url.clone(),
-                |u| crate::watch::webhook::shown(&u),
-            );
-            lines.push(format!("Reports to {}", printable(&address)));
+    // Redacted, not just filtered. `webhook::check` refuses an address
+    // carrying a password and its comment says why: it "would be echoed by
+    // `status`". This is `status`, and it echoed it -- twice, because the
+    // sentence about other people's names below printed the raw string
+    // after this one had been cleaned. One address, cleaned once, and both
+    // sentences read it.
+    let address = config.webhook.as_ref().map(|webhook| {
+        let shown = url::Url::parse(&webhook.url).map_or_else(
+            |_| webhook.url.clone(),
+            |u| crate::watch::webhook::shown(&u),
+        );
+        printable(&shown)
+    });
+
+    match (&config.webhook, &address) {
+        (Some(webhook), Some(address)) => {
+            lines.push(format!("Reports to {address}"));
             if webhook.heartbeat {
                 lines.push("Sends a report even when nothing changed".to_string());
             }
@@ -680,7 +687,7 @@ pub(super) fn describe_config(config: &WatchConfig) -> Vec<String> {
         // leaves nothing here to read back, so a flat "sends nothing" described
         // a monitor that delivers on every run as one that does not — the same
         // wrong reading the health verdict made of the same field.
-        None => lines.push(
+        _ => lines.push(
             "No address here: the report goes to standard output unless a run is given \
              --webhook"
                 .to_string(),
@@ -695,12 +702,11 @@ pub(super) fn describe_config(config: &WatchConfig) -> Vec<String> {
     // this configuration a person would most want to be reminded of, and it is
     // the part nothing said. "Their" rather than a count, because
     // `watching_line` directly above has just said how many.
-    if let Some(webhook) = &config.webhook
+    if let Some(address) = &address
         && config.accounts.iter().any(|a| !a.is_own())
     {
         lines.push(format!(
-            "Their usernames and names go to {} with every report",
-            printable(&webhook.url)
+            "Their usernames and names go to {address} with every report"
         ));
     }
 
@@ -743,6 +749,33 @@ mod tests {
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
+    }
+
+    /// The one address in the file is shown twice when somebody else is
+    /// watched, and both showings are the cleaned one. The second was the
+    /// raw string, so a hand-written `user:pass@` -- which `check` refuses
+    /// and `status` does not run -- reached the terminal after the first
+    /// line had taken care to hide it.
+    #[test]
+    fn a_password_in_the_address_is_hidden_from_every_line() {
+        let lines = describe_config(&config(
+            "schema = 1
+every = \"6h\"
+
+[webhook]
+url = \"https://me:hunter2@n8n.local/hook\"
+
+[[account]]
+target = \"someone\"
+",
+        ));
+        let text = lines.join(
+            "
+",
+        );
+        assert!(text.contains("go to"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("n8n.local/hook"), "{text}");
     }
 
     #[test]
