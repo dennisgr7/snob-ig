@@ -99,14 +99,18 @@ pub fn error_json(error: &anyhow::Error) -> serde_json::Value {
         .map(|cause| filtered(&cause.to_string(), "\n"));
     let message = chain.next().unwrap_or_default();
     let causes: Vec<String> = chain.collect();
+    let instagram = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>());
+    // The same fallback `rendered` applies, so the two shapes cannot disagree
+    // about whether there was any advice — which is the whole reason this
+    // function exists rather than a second rendering.
     let hint = error
         .chain()
         .find_map(|c| c.downcast_ref::<ExitError>())
         .and_then(ExitError::hint)
+        .or_else(|| instagram.and_then(advice_for))
         .map(|hint| filtered(hint, "\n"));
-    let instagram = error
-        .chain()
-        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>());
     let url = instagram.and_then(|e| e.challenge_url());
     let lifts = instagram.and_then(|e| match e {
         snob_ig::error::IgError::InCooldown { until_ms } => Some(cooldown_ends_at_secs(*until_ms)),
@@ -150,10 +154,25 @@ fn rendered(error: &anyhow::Error) -> String {
         out.push_str(&format!("  {caused} {}\n", indented(&cause.to_string())));
     }
 
+    // The command's own advice first, and Instagram's client's only when the
+    // command had none. `IgError`'s two pieces of advice used to be part of its
+    // message, so they arrived whatever else was in the chain; putting them on
+    // the hint means deciding which one line the reader gets, and a command
+    // that has written advice for this exact situation knows more than a
+    // variant does. The two cannot in fact meet — `ExitError` carries no
+    // source, so nothing of Instagram's is ever underneath one — but the order
+    // is written down rather than left to that, and `error_json` reads it the
+    // same way so the two shapes cannot come to disagree.
     if let Some(hint) = error
         .chain()
         .find_map(|c| c.downcast_ref::<ExitError>())
         .and_then(ExitError::hint)
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>())
+                .and_then(advice_for)
+        })
     {
         let label = console::style("hint:").cyan().bold().for_stderr();
         out.push_str(&format!("{label}  {}\n", indented(hint)));
@@ -509,6 +528,47 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
         StopReason::RateLimit => Some("Instagram is throttling requests"),
         StopReason::Network => Some("network failure"),
         StopReason::SessionInvalid => Some("the session stopped working"),
+    }
+}
+
+/// What to do about something Instagram's client reported, when there is
+/// anything to do about it.
+///
+/// Two of `IgError`'s messages used to end in advice — "run \"snob login\"
+/// again", and the two ways to get a CSRF token — which named subcommands of a
+/// binary `snob-ig` does not know it is part of, from a crate that has no
+/// terminal and no exit codes. The diagnosis stays in the variant, because only
+/// the client knows what happened; the advice lives here, where the rest of the
+/// tool's advice lives, and reaches the reader as the `hint:` line that every
+/// other refusal already puts it on.
+///
+/// `&'static str` and not a sentence built per call: none of this depends on
+/// what was being asked for. Where a cooldown lifts is the counter-example, and
+/// it is a date rather than advice — [`rendered`] adds that one separately.
+pub fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
+    use snob_ig::error::IgError;
+    match error {
+        IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::NoCsrfToken => Some(
+            "run \"snob login --browser\", or pass the token with \
+             \"snob login --paste --csrftoken\"",
+        ),
+        _ => None,
+    }
+}
+
+/// One line: what Instagram's client said, and what to do about it.
+///
+/// The `hint:` line is what a **reported failure** gets, and the two places
+/// that print an `IgError` are not that: `engine::walk` warns about what
+/// stopped a walk while the walk's own refusal is still to come, and
+/// `engine::check` puts the answer in a column of its own. Both used to print
+/// the message whole, advice included, so this rejoins the two halves exactly
+/// where they were joined before.
+pub fn what_instagram_said(error: &snob_ig::error::IgError) -> String {
+    match advice_for(error) {
+        Some(advice) => format!("{error}; {advice}"),
+        None => error.to_string(),
     }
 }
 
@@ -1171,6 +1231,74 @@ third",
         assert!(stopped_short.contains("continues from where it stopped"));
     }
 
+    /// Advice that names a `snob` subcommand belongs to the binary, not to its
+    /// HTTP client — and it still has to reach the person reading.
+    ///
+    /// It used to be the tail of two `IgError` messages, so it arrived wherever
+    /// the message did. Moved to the hint, the thing to check is that every
+    /// path it took before still carries it: the labeled failure, the JSON
+    /// shape, and the two places that print an `IgError` as one line.
+    #[test]
+    fn the_advice_an_ig_error_carried_still_reaches_the_reader() {
+        use snob_ig::error::IgError;
+
+        for (error, advice) in [
+            (IgError::SessionExpired, "run \"snob login\" again"),
+            (
+                IgError::NoCsrfToken,
+                "run \"snob login --browser\", or pass the token with \
+                 \"snob login --paste --csrftoken\"",
+            ),
+        ] {
+            // One line, exactly as the message used to read.
+            assert_eq!(
+                what_instagram_said(&error),
+                format!("{error}; {advice}"),
+                "the two halves have to rejoin where they were joined before"
+            );
+
+            let said = error.to_string();
+            let error: anyhow::Error = anyhow::Error::new(error);
+            let out = rendered(&error);
+            assert!(out.contains(&said), "{out}");
+            assert!(out.contains("hint:"), "{out}");
+            assert!(out.contains(advice), "{out}");
+
+            let json = error_json(&error);
+            assert_eq!(json["error"]["hint"], advice);
+            assert_eq!(json["error"]["message"], said);
+        }
+
+        // Everything else has nothing to advise, and an invented hint would be
+        // worse than none.
+        assert_eq!(advice_for(&IgError::TooManyRedirects), None);
+        assert_eq!(
+            what_instagram_said(&IgError::TooManyRedirects),
+            IgError::TooManyRedirects.to_string()
+        );
+    }
+
+    /// One hint, whoever wrote it. A reader is being told what to do, and two
+    /// answers to that is worse than either of them alone.
+    #[test]
+    fn a_failure_carries_one_piece_of_advice() {
+        let from_the_client: anyhow::Error =
+            anyhow::Error::new(snob_ig::error::IgError::SessionExpired);
+        assert_eq!(rendered(&from_the_client).matches("hint:").count(), 1);
+
+        // A command's own advice is the one that shows, and the client's is
+        // not consulted. They cannot in fact meet — an `ExitError` carries no
+        // source, so nothing of Instagram's is ever underneath one — but the
+        // order is written down rather than left to that.
+        let from_the_command: anyhow::Error =
+            ExitError::new(ExitCode::NoSession, "no session is stored")
+                .with_hint("run \"snob login\"")
+                .into();
+        let out = rendered(&from_the_command);
+        assert_eq!(out.matches("hint:").count(), 1, "{out}");
+        assert!(out.contains("run \"snob login\"\n"), "{out}");
+    }
+
     /// The pager reports a condition and this is where it becomes a sentence,
     /// so this is where the sentence is asserted on.
     ///
@@ -1206,7 +1334,10 @@ third",
             walked: 80,
             declared: 100,
         });
-        assert!(deleted.contains("80") && deleted.contains("100"), "{deleted}");
+        assert!(
+            deleted.contains("80") && deleted.contains("100"),
+            "{deleted}"
+        );
     }
 
     /// Only a full walk has nothing to explain. Every other ending owes the

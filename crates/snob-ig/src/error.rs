@@ -10,7 +10,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IgError {
-    #[error("the session has expired; run \"snob login\" again")]
+    /// The diagnosis and nothing else. What to do about it — running a
+    /// subcommand of a binary this crate does not know it is part of — is
+    /// `snob_cli::report::advice_for`, which puts it back as the `hint:` line
+    /// beside every other piece of advice the tool gives.
+    #[error("the session has expired")]
     SessionExpired,
 
     #[error(
@@ -103,11 +107,13 @@ pub enum IgError {
     /// every session created by `snob login --paste` without `--csrftoken`,
     /// because the sessionid is all that is pasted; `snob login --browser`
     /// captures the token along with the cookie.
-    #[error(
-        "this session has no CSRF token, so it can read but not follow or unfollow; \
-         run \"snob login --browser\", or pass the token with \
-         \"snob login --paste --csrftoken\""
-    )]
+    ///
+    /// The two ways out of it are advice about a binary, so they are in
+    /// `snob_cli::report::advice_for` with the rest of the tool's advice, and
+    /// this says only what is wrong. The same reasoning as
+    /// [`IgError::SessionExpired`], and the same reason
+    /// [`IgError::InCooldown`] carries an epoch rather than a date.
+    #[error("this session has no CSRF token, so it can read but not follow or unfollow")]
     NoCsrfToken,
 
     #[error("canceled")]

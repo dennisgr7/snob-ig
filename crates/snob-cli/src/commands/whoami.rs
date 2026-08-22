@@ -5,6 +5,7 @@ use snob_store::secrets::SecretStore;
 
 use crate::cli::WhoamiArgs;
 use crate::exit::ExitCode;
+use crate::report;
 use crate::ui;
 
 pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
@@ -109,16 +110,22 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
                 Err(e) => {
                     alive = Some(false);
                     code = ExitCode::from_ig_error(&e);
+                    // Through `report`, in both shapes. Two of the client's
+                    // messages used to end in advice naming a `snob`
+                    // subcommand and that half lives in `report` now -- and a
+                    // dead session, which is the whole reason somebody runs
+                    // this command, is one of the two.
+                    let said = report::what_instagram_said(&e);
                     failure = Some(serde_json::json!({
                         "code": code.as_str(),
                         // Validated against instagram.com before it ever reached
                         // an `IgError`, so handing it to a caller adds no trust.
                         "url": e.challenge_url(),
-                        "message": e.to_string(),
+                        "message": said,
                     }));
                     // The detail goes to standard error either way, so the JSON
                     // on standard output stays parseable.
-                    eprintln!("The session is not responding: {e}");
+                    eprintln!("The session is not responding: {said}");
                 }
             }
         }

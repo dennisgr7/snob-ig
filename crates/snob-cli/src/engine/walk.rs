@@ -103,8 +103,12 @@ pub async fn fetch(
     // "the session stopped working" — with the address that would have cleared
     // it, which `IgError::Checkpoint` carries precisely so it can be shown,
     // dropped on the way.
+    //
+    // Through `report`, because two of the client's messages end in advice
+    // about a `snob` subcommand and that half is `report`'s now. The line the
+    // user sees is the one they saw before, rejoined.
     let stopped_by = summary.error.map(|error| {
-        app.warn(&error.to_string());
+        app.warn(&crate::report::what_instagram_said(&error));
         ExitCode::from_ig_error(&error)
     });
 
