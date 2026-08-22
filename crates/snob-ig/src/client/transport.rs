@@ -125,12 +125,6 @@ pub(super) async fn read_capped_bytes(
     Ok(bytes)
 }
 
-/// `Retry-After`, if the answer carried one.
-///
-/// A string rather than a parsed duration on purpose: the header has two legal
-/// forms, seconds and an HTTP date, and until it is known which of them these
-/// endpoints send — if either — turning it into a number would be deciding the
-/// answer to the question the logging exists to ask.
 /// The load headers, if Instagram volunteered any, as one string to log.
 ///
 /// Absent from a CDN answer and from anything that is not the API, so `None` is
@@ -150,6 +144,12 @@ pub(super) fn load_of(response: &reqwest::Response) -> Option<String> {
     (!found.is_empty()).then(|| found.join(" "))
 }
 
+/// `Retry-After`, if the answer carried one.
+///
+/// A string rather than a parsed duration on purpose: the header has two legal
+/// forms, seconds and an HTTP date, and until it is known which of them these
+/// endpoints send — if either — turning it into a number would be deciding the
+/// answer to the question the logging exists to ask.
 pub(super) fn retry_after(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
