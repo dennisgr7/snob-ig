@@ -1012,7 +1012,7 @@ against.
 | Binary, aarch64-pc-windows-msvc | 5,885,952 B |
 | Binary, x86_64-pc-windows-msvc | larger by roughly a third |
 | Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
-| `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats |
+| `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats — behind the `xlsx` feature, on by default. Measured on x86_64 Windows, August 2026: **656,384 B, 9.3%**, and six crates, between the default build and `--no-default-features`, which is what the feature lets a source build leave out |
 | Static CRT on Windows | +126,976 B per binary |
 | `tracing-subscriber`'s `env-filter`, replaced by `Targets` | **−327,680 B, 4.4%**, −3 crates (`matchers`, `regex-automata`, `regex-syntax`), measured on x86_64 Windows release either side of the change |
 | Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |

@@ -7,6 +7,7 @@ set -euo pipefail
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy -p snob-cli --all-targets --no-default-features --locked -- -D warnings
 
 # The keyring daemon needs a session bus, and the suite needs the daemon:
 # without one the secret store falls back to a file and the backend under

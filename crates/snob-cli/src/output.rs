@@ -19,6 +19,7 @@ use crate::ui;
 pub(crate) mod csv;
 pub(crate) mod md;
 pub(crate) mod table;
+#[cfg(feature = "xlsx")]
 pub(crate) mod xlsx;
 
 /// How the result will be seen.
@@ -122,6 +123,15 @@ fn format_from_extension(path: &Path) -> Option<Format> {
 /// Refuses up front what would only fail once the walk had already been paid
 /// for. Called before the first request, never after.
 pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<()> {
+    // Before the walk, like every other refusal here: a build without the
+    // feature still parses `--format xlsx` and still reads the extension, so
+    // the answer has to be given here and not after the requests were spent.
+    #[cfg(not(feature = "xlsx"))]
+    if format == Format::Xlsx {
+        return Err(anyhow!(
+            "this build of snob was made without the \"xlsx\" format; use csv, json, ndjson or md"
+        ));
+    }
     if format == Format::Xlsx && destination.is_none() {
         return Err(anyhow!(
             "the \"xlsx\" format is a binary file; write it with -o (for example -o result.xlsx)"
@@ -290,7 +300,10 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
 
 fn render(users: &[User], format: Format, presentation: Presentation) -> Result<Rendered> {
     if format == Format::Xlsx {
+        #[cfg(feature = "xlsx")]
         return Ok(Rendered::Bytes(xlsx::workbook(users)?));
+        #[cfg(not(feature = "xlsx"))]
+        anyhow::bail!("this build of snob was made without the \"xlsx\" format");
     }
     Ok(Rendered::Text(match format {
         // The drawn table is for someone watching it appear. Down a pipe or
@@ -376,6 +389,7 @@ mod tests {
     }
 
     /// Every format a list can be asked for now produces something.
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_list_renders_in_every_format() {
         for f in [
@@ -393,6 +407,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_spreadsheet_reaches_the_file_as_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -453,6 +468,19 @@ mod tests {
         }
     }
 
+    /// Without the feature the refusal comes first, before a walk is paid for,
+    /// and names the formats that are there.
+    #[cfg(not(feature = "xlsx"))]
+    #[test]
+    fn a_build_without_xlsx_refuses_the_format_up_front() {
+        let error = check_destination(Format::Xlsx, Some(Path::new("x.xlsx"))).unwrap_err();
+        assert!(
+            error.to_string().contains("without the \"xlsx\" format"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_spreadsheet_needs_a_file_to_go_to() {
         let error = check_destination(Format::Xlsx, None).unwrap_err();

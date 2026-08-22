@@ -54,6 +54,10 @@ jobs:
       # protect -- a live session cookie not reaching somebody else's server --
       # is the last thing that should go unlinted.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # And without the one default feature, so the build somebody makes with
+      # `--no-default-features` keeps compiling: a `cfg` that only ever sees
+      # one value is a `cfg` that rots on the other.
+      - run: cargo clippy -p snob-cli --all-targets --no-default-features --locked -- -D warnings
 
       # The release regenerates the formula and the manifests in its very last
       # job, which is the most expensive place to learn that the generator is

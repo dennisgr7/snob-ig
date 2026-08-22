@@ -21,6 +21,14 @@ path = "src/main.rs"
 # flags nor the code behind them. `cargo test --features testing` is what turns
 # them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
 [features]
+default = ["xlsx"]
+# The `.xlsx` export and the `zip` crate behind it. On by default, and the
+# released binary carries it; what the feature buys is that somebody building
+# from source can leave it out -- `rust_xlsxwriter` and `zopfli` are the
+# largest single feature cost in the tree, ~498 KiB for one of five formats,
+# and six crates that nothing else here pulls in. `commands::import` rides on
+# the same feature because it is the only other reader of `zip`.
+xlsx = ["dep:rust_xlsxwriter", "dep:zip"]
 testing = ["snob-ig/testing"]
 
 [dependencies]
@@ -45,8 +53,8 @@ supports-hyperlinks.workspace = true
 # sequences an OSC 8 link puts around a username.
 comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
-rust_xlsxwriter.workspace = true
-zip.workspace = true
+rust_xlsxwriter = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

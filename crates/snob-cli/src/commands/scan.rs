@@ -22,6 +22,7 @@ use crate::commands::common::{self, Destination};
 use crate::engine::{self, ListOutcome, ResultSource, people};
 use crate::exit::ExitCode;
 use crate::output::Rendered;
+#[cfg(feature = "xlsx")]
 use crate::output::xlsx::Cell;
 use crate::report;
 use crate::{output, ui};
@@ -256,6 +257,11 @@ fn render_to(summary: &Summary<'_>, destination: &Destination) -> Result<()> {
 }
 
 fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered> {
+    #[cfg(not(feature = "xlsx"))]
+    if format == Format::Xlsx {
+        anyhow::bail!("this build of snob was made without the \"xlsx\" format");
+    }
+    #[cfg(feature = "xlsx")]
     if format == Format::Xlsx {
         return Ok(Rendered::Bytes(output::xlsx::single_row_workbook(
             &ROW_HEADER,
@@ -453,6 +459,7 @@ fn row_fields(summary: &Summary<'_>) -> Vec<String> {
     fields
 }
 
+#[cfg(feature = "xlsx")]
 fn row_cells(summary: &Summary<'_>) -> Vec<Cell> {
     let mut cells = vec![
         Cell::Text(summary.target.to_string()),
@@ -802,10 +809,16 @@ mod tests {
         assert!(md.contains("| Unfollowers | 32 |"), "{md}");
         assert!(md.contains("| Friends | 104 |"), "{md}");
 
+        #[cfg(feature = "xlsx")]
         match render(&summary(counts(), false, &outcomes), Format::Xlsx, false).unwrap() {
             Rendered::Bytes(bytes) => assert_eq!(&bytes[..4], b"PK\x03\x04"),
             Rendered::Text(_) => panic!("a workbook is not text"),
         }
+        #[cfg(not(feature = "xlsx"))]
+        assert!(
+            render(&summary(counts(), false, &outcomes), Format::Xlsx, false).is_err(),
+            "a build without the format has to say so rather than hand back text"
+        );
     }
 
     /// The counts a person reads are the ones a script reads. If the summary
