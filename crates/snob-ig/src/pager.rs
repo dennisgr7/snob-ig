@@ -72,12 +72,45 @@ pub enum Event {
         after: Duration,
         error: String,
     },
-    Warning(String),
+    Warning(Warning),
     Finished {
         pages: u32,
         users: usize,
         reason: StopReason,
     },
+}
+
+/// Something the walk noticed and the caller ought to say out loud.
+///
+/// A variant per condition rather than a sentence, because the sentence is not
+/// this crate's to write: `snob-ig` reports what it saw and `snob-cli`'s
+/// `report::pager_warning` decides the words. Six English sentences used to be
+/// authored here and printed unmodified by the progress bar, which put the
+/// wording of the walk's most alarming lines inside the HTTP client.
+///
+/// Five of the six end the walk as [`StopReason::Truncated`]; they are separate
+/// variants because what a reader has to understand differs by guard, and
+/// because a caller may want to recognize one of them without reading a
+/// sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warning {
+    /// The cursor came back the same as the one just sent, so following it
+    /// would ask for the page that has already been served.
+    SameCursorTwice,
+    /// Two pages in a row carried nobody.
+    TwoEmptyPages,
+    /// [`MAX_PAGES_WITHOUT_NEW`] pages in a row carried only accounts that had
+    /// already been walked.
+    GoingInCircles,
+    /// One empty page, and no counter to tell an account with no followers
+    /// from an account Instagram would not serve.
+    EmptyAndNoCounter,
+    /// The walk ended cleanly far short of what the profile declared, and
+    /// [`truncated`] read that as Instagram having stopped serving pages.
+    StoppedShort { walked: usize, declared: usize },
+    /// The same shortfall, read the other way: a counter that includes
+    /// accounts which no longer appear in the list.
+    ShortOfDeclared { walked: usize, declared: usize },
 }
 
 /// What to walk.
@@ -498,19 +531,14 @@ impl WalkState {
         if self.last_cursor.as_deref() == Some(next.as_str())
             || self.cursor.as_deref() == Some(next.as_str())
         {
-            observe(Event::Warning(
-                "Instagram returned the same cursor twice; stopping so the request is not repeated"
-                    .into(),
-            ));
+            observe(Event::Warning(Warning::SameCursorTwice));
             return Some(StopReason::Truncated);
         }
 
         if received == 0 {
             self.empty_in_a_row += 1;
             if self.empty_in_a_row >= 2 {
-                observe(Event::Warning(
-                    "Instagram returned two empty pages in a row".into(),
-                ));
+                observe(Event::Warning(Warning::TwoEmptyPages));
                 return Some(StopReason::Truncated);
             }
         } else {
@@ -520,10 +548,7 @@ impl WalkState {
         if added == 0 {
             self.barren_in_a_row += 1;
             if self.barren_in_a_row >= MAX_PAGES_WITHOUT_NEW {
-                observe(Event::Warning(
-                    "several pages in a row with no new accounts; the list is going in circles"
-                        .into(),
-                ));
+                observe(Event::Warning(Warning::GoingInCircles));
                 return Some(StopReason::Truncated);
             }
         } else {
@@ -561,12 +586,7 @@ impl WalkState {
         // follow an unfollower. A real empty account loses nothing by being
         // asked again, so this refuses.
         if request.estimated.is_none() && self.users == 0 {
-            observe(Event::Warning(
-                "the list came back empty and the profile counter could not be read, so there is \
-                 no way to tell an empty list from one Instagram did not serve; treating it as \
-                 incomplete rather than risking the comparison"
-                    .into(),
-            ));
+            observe(Event::Warning(Warning::EmptyAndNoCounter));
             return StopReason::Truncated;
         }
 
@@ -588,19 +608,17 @@ impl WalkState {
         }
 
         if truncated(self.users, estimated) {
-            observe(Event::Warning(format!(
-                "Instagram stopped serving pages at {} of the {estimated} accounts it declared; \
-                 the list is incomplete and cannot be compared against",
-                self.users
-            )));
+            observe(Event::Warning(Warning::StoppedShort {
+                walked: self.users,
+                declared: estimated,
+            }));
             return StopReason::Truncated;
         }
 
-        observe(Event::Warning(format!(
-            "walked {} accounts while Instagram declared {estimated}; \
-             the difference is usually deleted accounts",
-            self.users
-        )));
+        observe(Event::Warning(Warning::ShortOfDeclared {
+            walked: self.users,
+            declared: estimated,
+        }));
         reason
     }
 }
@@ -791,7 +809,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::Warning(w) if w.contains("came back empty"))),
+                .any(|e| matches!(e, Event::Warning(Warning::EmptyAndNoCounter))),
             "{events:?}"
         );
     }

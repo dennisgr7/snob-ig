@@ -210,7 +210,11 @@ impl Progress {
                 self.warn(&format!("retry {attempt} after a failure: {error}"));
                 self.waiting(&format!("waiting before retry {attempt}"), *after);
             }
-            Event::Warning(text) => self.warn(text),
+            // The pager says what it saw; `report` says it in English. The six
+            // sentences that used to arrive already written came out of the
+            // HTTP crate, which is the one place in the tool that has no
+            // business deciding how anything reads.
+            Event::Warning(warning) => self.warn(&crate::report::pager_warning(*warning)),
             // Deliberately not `finish_and_clear`. One walk ending is not the
             // run ending, and the commands already clear the bar themselves
             // when it is — see `Started` for what finishing here cost.

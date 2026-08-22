@@ -5,6 +5,7 @@
 //! read as two different pieces of advice about the same situation.
 
 use snob_core::model::{ListKind, StopReason, User, printable};
+use snob_ig::pager::Warning;
 
 use crate::engine::Provenance;
 
@@ -508,6 +509,44 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
         StopReason::RateLimit => Some("Instagram is throttling requests"),
         StopReason::Network => Some("network failure"),
         StopReason::SessionInvalid => Some("the session stopped working"),
+    }
+}
+
+/// What the walker noticed, in the words the person watching it reads.
+///
+/// These six sentences were authored inside `snob_ig::pager` and printed
+/// unmodified by `progress.rs`, which put the wording of the walk's most
+/// alarming lines in the HTTP crate — the one part of the tool that has no
+/// terminal, no format and no business having an opinion about either. The
+/// pager reports the condition now; the words are decided here, beside every
+/// other sentence the tool prints.
+///
+/// Two of them carry numbers, which is why this returns a `String` rather than
+/// a `&'static str`: what makes a shortfall worth reading is how big it is.
+pub fn pager_warning(warning: Warning) -> String {
+    match warning {
+        Warning::SameCursorTwice => {
+            "Instagram returned the same cursor twice; stopping so the request is not repeated"
+                .to_string()
+        }
+        Warning::TwoEmptyPages => "Instagram returned two empty pages in a row".to_string(),
+        Warning::GoingInCircles => {
+            "several pages in a row with no new accounts; the list is going in circles".to_string()
+        }
+        Warning::EmptyAndNoCounter => {
+            "the list came back empty and the profile counter could not be read, so there is \
+             no way to tell an empty list from one Instagram did not serve; treating it as \
+             incomplete rather than risking the comparison"
+                .to_string()
+        }
+        Warning::StoppedShort { walked, declared } => format!(
+            "Instagram stopped serving pages at {walked} of the {declared} accounts it declared; \
+             the list is incomplete and cannot be compared against"
+        ),
+        Warning::ShortOfDeclared { walked, declared } => format!(
+            "walked {walked} accounts while Instagram declared {declared}; \
+             the difference is usually deleted accounts"
+        ),
     }
 }
 
@@ -1130,6 +1169,44 @@ third",
 
         let stopped_short = try_again_advice(StopReason::Truncated, true);
         assert!(stopped_short.contains("continues from where it stopped"));
+    }
+
+    /// The pager reports a condition and this is where it becomes a sentence,
+    /// so this is where the sentence is asserted on.
+    ///
+    /// `pager.rs` used to write these itself and its own tests read them back
+    /// with `contains`. They match on the variant now, which is the right test
+    /// over there and leaves the words untested unless something checks them
+    /// here.
+    #[test]
+    fn every_warning_the_walk_raises_says_something() {
+        assert!(
+            pager_warning(Warning::EmptyAndNoCounter).contains("came back empty"),
+            "{}",
+            pager_warning(Warning::EmptyAndNoCounter)
+        );
+        for warning in [
+            Warning::SameCursorTwice,
+            Warning::TwoEmptyPages,
+            Warning::GoingInCircles,
+            Warning::EmptyAndNoCounter,
+        ] {
+            assert!(!pager_warning(warning).is_empty(), "{warning:?}");
+        }
+
+        // The two that carry numbers name both of them: a shortfall with only
+        // one of its halves shown says nothing about how big it is.
+        let short = pager_warning(Warning::StoppedShort {
+            walked: 39,
+            declared: 21_631,
+        });
+        assert!(short.contains("39") && short.contains("21631"), "{short}");
+
+        let deleted = pager_warning(Warning::ShortOfDeclared {
+            walked: 80,
+            declared: 100,
+        });
+        assert!(deleted.contains("80") && deleted.contains("100"), "{deleted}");
     }
 
     /// Only a full walk has nothing to explain. Every other ending owes the
