@@ -34,13 +34,59 @@ async fn main() -> std::process::ExitCode {
     init_tracing(cli.verbose);
     restore_terminal_on_panic();
 
+    let wording = wording_for(&cli);
     match run(cli).await {
         Ok(code) => code.into(),
         Err(e) => {
-            snob_cli::report::print_error(&e);
-            exit_code_for(&e).into()
+            snob_cli::report::print_error(&e, wording);
+            snob_cli::exit::exit_code_for(&e).into()
         }
     }
+}
+
+/// Whether a failure is told in JSON: when the answer was going to be.
+///
+/// The same decision the command makes about its result, made once more
+/// here for its failure -- `--format json`, `--json`, an extension that
+/// means JSON, or standard output not being a terminal, which is what turns
+/// a list into JSON on its own. A program reading one stream should not
+/// have to read the other in English.
+fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
+    use snob_cli::cli::{Format, WatchCommand};
+    use snob_cli::output::effective_format;
+    use snob_cli::report::Wording;
+
+    let json = match &cli.command {
+        Command::Followers(args)
+        | Command::Following(args)
+        | Command::Scan(args)
+        | Command::Unfollowers(args)
+        | Command::Fans(args)
+        | Command::Friends(args) => matches!(
+            effective_format(args.format, args.output.as_deref()),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Stories(args) => matches!(
+            effective_format(args.format.map(Format::from), None),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Whoami(args) => args.json,
+        Command::Watch(args) => match &args.command {
+            None => args.run.json,
+            Some(WatchCommand::Once(once)) => once.json,
+            Some(WatchCommand::Check(check)) => check.json,
+            Some(WatchCommand::Status(status)) => status.json,
+            Some(WatchCommand::Diff(diff)) => diff.json,
+            Some(WatchCommand::Setup(_)) => false,
+        },
+        Command::Login(_)
+        | Command::Logout(_)
+        | Command::Purge(_)
+        | Command::Pfp(_)
+        | Command::Follow(_)
+        | Command::Unfollow(_) => false,
+    };
+    if json { Wording::Json } else { Wording::Prose }
 }
 
 /// Where this run keeps its files, whether the keyring is off, and — for a
@@ -160,31 +206,6 @@ fn sandbox_keyring_namespace(root: &std::path::Path) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("snob-ig-sandbox-{hash:016x}")
-}
-
-/// Looks for an Instagram error in the cause chain so the exit code is one the
-/// v2 service can interpret without reading text.
-fn exit_code_for(error: &anyhow::Error) -> ExitCode {
-    // An error that already knows its code wins: it was set by whoever refused
-    // the result, which is more specific than anything reconstructed from an
-    // Instagram error further down.
-    if let Some(code) = ExitCode::from_chain(error) {
-        return code;
-    }
-
-    error
-        .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<snob_ig::error::IgError>()
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<snob_ig::login::LoginError>()
-                        .and_then(|e| e.as_instagram())
-                })
-                .map(ExitCode::from_ig_error)
-        })
-        .unwrap_or(ExitCode::Error)
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {

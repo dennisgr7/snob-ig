@@ -10,7 +10,7 @@ use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
 use crate::cli::ListArgs;
-use crate::commands::common::{self, Session};
+use crate::commands::common;
 use crate::engine::{self, ListOutcome, ResultSource};
 use crate::exit::ExitCode;
 use crate::report;
@@ -25,9 +25,7 @@ pub async fn run(
     let filter = common::filter_from(&args)?;
     let destination = common::destination(&args)?;
 
-    let Session::Open(mut app) = common::open(&args, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let mut app = common::open(&args, &secrets, paths)?;
 
     // Named before the engine runs, so the bar says what it is about during
     // consent, resolution and the counter poll rather than only once pages

@@ -32,8 +32,8 @@ use snob_ig::model::{ReelItem, largest};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
-use crate::app::App;
 use crate::cli::{Format, StoriesArgs, StoryFormat};
+use crate::commands::common;
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
@@ -102,21 +102,8 @@ pub struct Stories {
 }
 
 pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    let Some(app) = App::open(&secrets, paths, false)? else {
-        ui::no_session();
-        return Ok(ExitCode::NoSession);
-    };
-
-    if let Some(until_ms) = app.client().pacer().cooldown()? {
-        return Err(ExitError::new(
-            ExitCode::RateLimited,
-            format!(
-                "the account is in cooldown until {}, so no request can be made",
-                report::cooldown_ends_at(until_ms)
-            ),
-        )
-        .into());
-    }
+    let app = common::app(&secrets, paths, false)?;
+    common::refuse_during_cooldown(&app, "no request can be made")?;
 
     // No target is the viewer's own account, like the list commands. The
     // viewer's username is already known from the session, so this costs

@@ -26,11 +26,10 @@ use snob_ig::model::FriendshipStatus;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
-use crate::app::App;
 use crate::cli::FollowArgs;
+use crate::commands::common;
 use crate::engine::target;
 use crate::exit::{ExitCode, ExitError};
-use crate::report;
 use crate::ui;
 
 /// Which of the two verbs is being run.
@@ -62,10 +61,7 @@ pub async fn run(
     // No progress bar: two requests, and the second one may sit on the write
     // budget for a quarter of an hour, which is a wait to be told about in a
     // sentence rather than animated.
-    let Some(app) = App::open(&secrets, paths, false)? else {
-        ui::no_session();
-        return Ok(ExitCode::NoSession);
-    };
+    let app = common::app(&secrets, paths, false)?;
 
     // **Before anything is spent.** A session that cannot write is the common
     // case rather than the odd one — `snob login --paste` produces one unless
@@ -87,16 +83,7 @@ pub async fn run(
         .into());
     }
 
-    if let Some(until_ms) = app.client().pacer().cooldown()? {
-        return Err(ExitError::new(
-            ExitCode::RateLimited,
-            format!(
-                "the account is in cooldown until {}, so nothing can be sent",
-                report::cooldown_ends_at(until_ms)
-            ),
-        )
-        .into());
-    }
+    common::refuse_during_cooldown(&app, "nothing can be sent")?;
 
     // **Also before anything is spent.** Whether anybody can answer is a
     // property of this process's streams, not of the account, so it is known

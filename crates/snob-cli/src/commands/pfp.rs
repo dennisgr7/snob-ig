@@ -13,34 +13,21 @@ use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
-use crate::app::App;
 use crate::cli::PfpArgs;
+use crate::commands::common;
 use crate::engine::target;
-use crate::exit::{ExitCode, ExitError};
+use crate::exit::ExitCode;
 use crate::output::{self, Rendered};
-use crate::report;
 use crate::ui;
 
 pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // No bar: three requests do not need one, and the picture goes to standard
     // output when there is no `-o`.
-    let Some(app) = App::open(&secrets, paths, false)? else {
-        ui::no_session();
-        return Ok(ExitCode::NoSession);
-    };
+    let app = common::app(&secrets, paths, false)?;
 
     // A picture is cheap, but the rules do not change with the price: during a
     // cooldown nothing is spent, and there is nothing stored to serve instead.
-    if let Some(until_ms) = app.client().pacer().cooldown()? {
-        return Err(ExitError::new(
-            ExitCode::RateLimited,
-            format!(
-                "the account is in cooldown until {}, so no request can be made",
-                report::cooldown_ends_at(until_ms)
-            ),
-        )
-        .into());
-    }
+    common::refuse_during_cooldown(&app, "no request can be made")?;
 
     // Nothing here records a cooldown. `IgClient::classify_and_record` already
     // did, on the request that earned it, which is the one place that sees

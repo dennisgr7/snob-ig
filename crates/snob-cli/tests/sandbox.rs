@@ -843,6 +843,38 @@ fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> 
     command.output().expect("the binary runs")
 }
 
+/// A failure is told in the language the answer was going to be in.
+///
+/// `snob followers --format json` against nothing stored used to print
+/// "No session stored." in English on standard error and exit 3 -- a stable
+/// code and nothing a program could parse, not the hint and not the address
+/// a challenge carries. The same run asked for prose gets the prose, with
+/// the advice set apart as a hint.
+#[test]
+fn a_failure_is_json_when_the_answer_would_have_been() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = snob(tmp.path(), None, &["followers", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim()).expect("standard error is one JSON object");
+    assert_eq!(told["error"]["code"], "no_session");
+    assert_eq!(told["error"]["exit"], 3);
+    assert_eq!(told["error"]["message"], "no session is stored");
+    assert_eq!(told["error"]["hint"], "run \"snob login\"");
+    assert_eq!(
+        stdout(&out),
+        "",
+        "nothing on standard output to mistake for a result"
+    );
+
+    let out = snob(tmp.path(), None, &["followers", "--format", "md"]);
+    assert_eq!(out.status.code(), Some(3));
+    let said = stderr(&out);
+    assert!(said.contains("error: no session is stored"), "{said}");
+    assert!(said.contains("hint:  run \"snob login\""), "{said}");
+}
+
 /// A reader that leaves early is not an error of this program's.
 ///
 /// `println!` panics on a closed pipe, and with `panic = "abort"` a release

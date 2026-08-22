@@ -122,6 +122,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
     // Installed once for the process, which is what lets this open an `App` per
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
+    let wording = Printing::unattended(args.json).wording();
 
     let mut last_run = seed_for(paths, &schedule, snob_core::clock::now())?;
 
@@ -137,7 +138,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
         // delaying a run somebody just asked for would only look broken.
         last_run = Some(snob_core::clock::now());
         if let Err(e) = open_and_run(&args, &watched, delivery.as_ref(), &secrets, paths).await {
-            report::print_error(&e);
+            report::print_error(&e, wording);
         }
     }
 
@@ -227,7 +228,7 @@ async fn scheduled(args: WatchRunArgs, secrets: SecretStore, paths: &AppPaths) -
             // point of something that watches.
             if let Err(e) = open_and_run(&args, &watched, delivery.as_ref(), &secrets, paths).await
             {
-                report::print_error(&e);
+                report::print_error(&e, wording);
             }
             continue;
         }
@@ -442,6 +443,15 @@ struct Printing {
 }
 
 impl Printing {
+    /// How a failure is told, decided by the same flag as the result.
+    fn wording(self) -> report::Wording {
+        if self.json {
+            report::Wording::Json
+        } else {
+            report::Wording::Prose
+        }
+    }
+
     fn unattended(json: bool) -> Self {
         Self {
             json,
@@ -588,7 +598,7 @@ async fn run_accounts(
 
     let (print_here, failed) = to_print_and_to_return(failures);
     for earlier in print_here {
-        report::print_error(&earlier);
+        report::print_error(&earlier, printing.wording());
     }
 
     RunOutcome {
@@ -1057,12 +1067,9 @@ async fn once(args: WatchOnceArgs, secrets: SecretStore, paths: &AppPaths) -> Re
     let configured = config::load(paths)?;
     let delivery = delivery_from(&args.delivery, configured.as_ref(), &secrets)?;
 
-    let Session::Open(mut app) = common::open_with_progress(!args.no_progress, &secrets, paths)?
-    else {
-        // Already settled, at the top: this run is the one that most needs it,
-        // and it is not the only door that closes before `run_accounts`.
-        return Ok(ExitCode::NoSession);
-    };
+    // Already settled, at the top: this run is the one that most needs it,
+    // and it is not the only door that closes before `run_accounts`.
+    let mut app = common::app(&secrets, paths, !args.no_progress)?;
     // The monitor takes an answer in advance from `watch.toml`, never from a
     // flag, so the refusal when nobody is at a terminal has to say so.
     app.consent_comes_from_the_config();
@@ -1365,9 +1372,7 @@ pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<
 /// thing `snob watch` does when it has actually reported them somewhere.
 fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Nothing is fetched here, so there is no bar to draw.
-    let Session::Open(app) = common::open_with_progress(false, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let app = common::app(&secrets, paths, false)?;
 
     let report = crate::engine::watch::from_store(&app, args.target.as_deref())?;
 

@@ -18,7 +18,7 @@ use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
 use crate::cli::{Format, ListArgs};
-use crate::commands::common::{self, Destination, Session};
+use crate::commands::common::{self, Destination};
 use crate::engine::{self, ListOutcome, ResultSource, people};
 use crate::exit::ExitCode;
 use crate::output::Rendered;
@@ -87,9 +87,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         ui::warn("--limit has no effect on scan: it prints counts, not accounts");
     }
 
-    let Session::Open(mut app) = common::open(&args, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let mut app = common::open(&args, &secrets, paths)?;
 
     // The label of the account being summarized, worked out up front so the
     // hints can name it.

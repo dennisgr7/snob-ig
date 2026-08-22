@@ -135,6 +135,32 @@ impl ExitCode {
     }
 }
 
+/// The exit code for a failed run, from whatever in the chain knows it.
+///
+/// An error that already knows its code wins: it was set by whoever refused
+/// the result, which is more specific than anything reconstructed from an
+/// Instagram error further down. Here rather than in `main`, because the
+/// JSON rendering of a failure names the same code and the two must agree.
+pub fn exit_code_for(error: &anyhow::Error) -> ExitCode {
+    if let Some(code) = ExitCode::from_chain(error) {
+        return code;
+    }
+
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<IgError>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<snob_ig::login::LoginError>()
+                        .and_then(|e| e.as_instagram())
+                })
+                .map(ExitCode::from_ig_error)
+        })
+        .unwrap_or(ExitCode::Error)
+}
+
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
         std::process::ExitCode::from(code as u8)

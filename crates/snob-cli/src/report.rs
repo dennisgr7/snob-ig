@@ -61,8 +61,68 @@ pub const NO_RECORDED_CONSENT: &str =
 /// decides on stdout's color state, so the labels lose their color when only
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
-pub fn print_error(error: &anyhow::Error) {
-    eprint!("{}", rendered(error));
+pub fn print_error(error: &anyhow::Error, wording: Wording) {
+    match wording {
+        Wording::Prose => eprint!("{}", rendered(error)),
+        Wording::Json => eprintln!("{}", error_json(error)),
+    }
+}
+
+/// How a failure is told: to a person, or to a program.
+///
+/// A run whose result was going to be JSON had its failure written as
+/// English prose, so a script reading `snob followers --format json` got a
+/// stable exit code and nothing else it could parse -- not the hint, not the
+/// challenge address a code 4 carries. `whoami --json` already answered in
+/// JSON on failure; this makes every command do the same, and makes the
+/// decision `main`'s, from the format the command was going to answer in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wording {
+    Prose,
+    Json,
+}
+
+/// The failure as one JSON object, for a caller that asked for JSON.
+///
+/// One shape for every command: `code` is the same token the exit status
+/// names, so a reader that only has the stream and a reader that only has
+/// `$?` are told the same thing; `message` and `causes` are the chain the
+/// prose prints, in the same order; `hint` is the advice the prose sets
+/// apart; `url` is the address a challenge has to be cleared at. Filtered
+/// line by line like the prose, and for the same reason -- a name is
+/// filtered before anything draws it, and a JSON consumer may well print it.
+pub fn error_json(error: &anyhow::Error) -> serde_json::Value {
+    let code = crate::exit::exit_code_for(error);
+    let mut chain = error
+        .chain()
+        .map(|cause| filtered(&cause.to_string(), "\n"));
+    let message = chain.next().unwrap_or_default();
+    let causes: Vec<String> = chain.collect();
+    let hint = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<ExitError>())
+        .and_then(ExitError::hint)
+        .map(|hint| filtered(hint, "\n"));
+    let instagram = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>());
+    let url = instagram.and_then(|e| e.challenge_url());
+    let lifts = instagram.and_then(|e| match e {
+        snob_ig::error::IgError::InCooldown { until_ms } => Some(cooldown_ends_at_secs(*until_ms)),
+        _ => None,
+    });
+
+    serde_json::json!({
+        "error": {
+            "code": code.as_str(),
+            "exit": code as u8,
+            "message": message,
+            "causes": causes,
+            "hint": hint,
+            "url": url,
+            "cooldown_until": lifts,
+        }
+    })
 }
 
 /// The block `print_error` writes, built rather than printed.
@@ -764,6 +824,35 @@ mod tests {
             format_epoch_in(1_722_700_000, "earlier", &madrid_in_august),
             "Aug 3 at 17:46"
         );
+    }
+
+    /// A failure told to a program carries what the prose carries: the code
+    /// the exit status names, the message, the advice set apart, and the
+    /// address a challenge is cleared at -- filtered, since the consumer may
+    /// print it.
+    #[test]
+    fn a_failure_in_json_carries_the_code_the_hint_and_the_address() {
+        let hostile = "gh\u{1b}[2K";
+        let error: anyhow::Error = anyhow::Error::new(snob_ig::error::IgError::Challenge {
+            url: Some("https://www.instagram.com/challenge/".into()),
+        })
+        .context(format!("could not read @{hostile}'s followers list"));
+        let json = error_json(&error);
+        let error = &json["error"];
+
+        assert_eq!(error["code"], "challenge");
+        assert_eq!(error["exit"], 4);
+        assert_eq!(error["message"], "could not read @gh[2K's followers list");
+        assert_eq!(error["url"], "https://www.instagram.com/challenge/");
+        assert_eq!(error["causes"].as_array().map(Vec::len), Some(1));
+
+        let advised: anyhow::Error = ExitError::new(ExitCode::NoSession, "no session")
+            .with_hint("run \"snob login\"")
+            .into();
+        let json = error_json(&advised);
+        assert_eq!(json["error"]["code"], "no_session");
+        assert_eq!(json["error"]["hint"], "run \"snob login\"");
+        assert!(json["error"]["url"].is_null());
     }
 
     /// The refusal has to name the mistake the caller would otherwise have

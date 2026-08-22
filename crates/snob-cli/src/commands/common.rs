@@ -16,34 +16,50 @@ use snob_store::secrets::SecretStore;
 use crate::app::App;
 use crate::cli::{Attr, Format, ListArgs};
 use crate::engine::{self, ListOutcome};
+use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
-use crate::ui;
 
-/// What opening a session produced.
+/// What opening a session produced, for the one caller that has something
+/// to do without one.
 ///
-/// An enum rather than an `Option` because the empty case is not "nothing
-/// happened": it has already told the user what to do, and the caller's only
-/// job is to return the matching code.
+/// `snob watch check` reports a missing session as one finding among
+/// several rather than stopping at it. Everything else wants [`app`], which
+/// turns the empty case into the refusal every command gives.
 pub enum Session {
     Open(Box<App>),
     Missing,
 }
 
-/// Opens the app, or explains that there is no session and says so once.
-///
-/// Every command printed this same line and returned this same code. Having one
-/// copy is what stops them drifting into three different ways of saying it.
-pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Session> {
+/// Opens the app for a list command, or refuses because there is no session.
+pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Box<App>> {
     // No bar when the answer comes out of storage: there is nothing to watch.
-    open_with_progress(!args.no_progress && !args.cache, secrets, paths)
+    app(secrets, paths, !args.no_progress && !args.cache)
 }
 
-/// The same, for a command whose arguments are not [`ListArgs`].
+/// Opens the app, or refuses because there is no session.
 ///
-/// Split out rather than copied so that the one sentence about there being no
-/// session, and the code that goes with it, stay in one place — which is the
-/// whole reason [`open`] exists.
+/// Every command printed the same line and returned the same code, by hand,
+/// and what that cost was not drift but shape: a refusal printed as a line
+/// and returned as `Ok` went round `report::print_error`, so a caller that
+/// had asked for JSON got English on standard error for the one failure it
+/// is likeliest to meet. It is an error now, with the code and the hint
+/// every other refusal carries, and the printer decides how to say it.
+pub fn app(secrets: &SecretStore, paths: &AppPaths, with_progress: bool) -> Result<Box<App>> {
+    match open_with_progress(with_progress, secrets, paths)? {
+        Session::Open(app) => Ok(app),
+        Session::Missing => Err(no_session()),
+    }
+}
+
+/// The refusal every command gives when there is no session.
+pub fn no_session() -> anyhow::Error {
+    ExitError::new(ExitCode::NoSession, "no session is stored")
+        .with_hint("run \"snob login\"")
+        .into()
+}
+
+/// Opens the app, and says whether there was a session to open it with.
 pub fn open_with_progress(
     with_progress: bool,
     secrets: &SecretStore,
@@ -51,11 +67,30 @@ pub fn open_with_progress(
 ) -> Result<Session> {
     match App::open(secrets, paths, with_progress)? {
         Some(app) => Ok(Session::Open(Box::new(app))),
-        None => {
-            ui::no_session();
-            Ok(Session::Missing)
-        }
+        None => Ok(Session::Missing),
     }
+}
+
+/// Refuses a command outright while the account is in cooldown.
+///
+/// For the commands that have nothing stored to serve instead -- a picture,
+/// a story, a write. The list commands do not come here: `engine::cooldown`
+/// answers them out of storage, which a refusal cannot. The gate is still
+/// explicit at each call site, before anything is asked of a person and
+/// before anything is spent; what is shared is the sentence, which three
+/// commands had written out in two spellings.
+pub fn refuse_during_cooldown(app: &App, doing: &str) -> Result<()> {
+    if let Some(until_ms) = app.client().pacer().cooldown()? {
+        return Err(ExitError::new(
+            ExitCode::RateLimited,
+            format!(
+                "the account is in cooldown until {}, so {doing}",
+                report::cooldown_ends_at(until_ms)
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Where the result goes and what shape it takes.
