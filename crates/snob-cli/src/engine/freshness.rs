@@ -61,7 +61,7 @@ pub async fn decide_and_fetch(
         // this could not hold, so nothing reaches here that would wrap — but
         // "it is checked somewhere else" is how the wrap got written in the
         // first place, and the next reader of a `Duration` inherits an answer
-        // this way rather than a hole. Same shape as `schedule.rs`.
+        // this way rather than a hole. Same shape as `watch::schedule`.
         && is_still_good(
             snapshot,
             declared,
