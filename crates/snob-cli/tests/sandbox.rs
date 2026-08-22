@@ -796,6 +796,139 @@ async fn a_story_number_nobody_has_is_refused() {
     }
 }
 
+/// A reel whose media the fake Instagram itself serves, so a download has
+/// somewhere to go. The client downloads from the origin it was pointed at
+/// as readily as from the CDN, which is what makes this reachable offline.
+async fn with_downloadable_stories(server: &MockServer) {
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/feed/reels_media/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"reels_media":[{{"items":[
+                {{"pk":"1","media_type":1,"taken_at":1000,"expiring_at":99999999999,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/big.jpg","width":1080,"height":1920}}]}}}},
+                {{"pk":"2","media_type":2,"taken_at":2000,"expiring_at":99999999999,
+                 "video_versions":[
+                    {{"url":"{base}/clip.mp4","width":720,"height":1280}}]}}
+            ]}}]}}"#
+        )))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/big.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xe0 a picture".to_vec()),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/clip.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"\x00\x00\x00\x18ftypisom a clip".to_vec()),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The binary, run from a directory of the test's choosing -- which is where a
+/// story lands when `-o` says nothing.
+fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_snob"));
+    command.arg("--sandbox-root").arg(root);
+    command.arg("--ig-base-url").arg(instagram.uri());
+    command.args(args);
+    command.env("NO_COLOR", "1");
+    command.current_dir(cwd);
+    command.output().expect("the binary runs")
+}
+
+/// **A story can actually be saved.** The name this command invents carries
+/// a hyphen, and the allowlist the name is checked against did not -- so
+/// every `--download` fetched the bytes and then refused its own name. No
+/// test drove the command to the write, which is the only place that shows.
+#[tokio::test]
+async fn a_story_is_downloaded_under_the_name_the_listing_implies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "--download", "1"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("me-1.jpg")).expect("the story was written where the command ran"),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+
+    // A second download of the same story is refused rather than replacing
+    // the file: the name was invented here, not typed.
+    let again = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "--download", "1"],
+    );
+    assert!(!again.status.success(), "{}", stdout(&again));
+    assert!(
+        stderr(&again).contains("already exists"),
+        "{}",
+        stderr(&again)
+    );
+}
+
+/// `--all -o somewhere` puts every story in `somewhere`, and not in the
+/// working directory next to an empty folder of that name.
+#[tokio::test]
+async fn all_stories_land_in_the_directory_that_was_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "--all", "-o", "saved"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(here.join("saved").join("me-1.jpg").is_file());
+    assert!(here.join("saved").join("me-2.mp4").is_file());
+    assert!(
+        !here.join("me-1.jpg").exists(),
+        "a story leaked into the working directory"
+    );
+
+    // Run again into the same directory: both names are taken, both are
+    // reported, and the second is still attempted after the first failed.
+    let again = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "--all", "-o", "saved"],
+    );
+    assert!(!again.status.success());
+    let said = stderr(&again);
+    assert!(
+        said.contains("2 of 2 stories could not be downloaded"),
+        "{said}"
+    );
+    assert!(
+        said.contains("me-2.mp4"),
+        "the loop stopped at the first failure: {said}"
+    );
+}
+
 /// The same sandbox login, with a CSRF token, which is what
 /// `snob login --browser` produces and what a write needs.
 fn log_in_writing(root: &Path, instagram: &MockServer) {

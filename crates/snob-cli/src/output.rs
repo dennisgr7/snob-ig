@@ -167,9 +167,14 @@ pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBu
     let usable = !stem.is_empty()
         && stem.len() <= 64
         && !stem.starts_with('.')
+        // The hyphen is what `stories` puts between the name and the number,
+        // and it was not here -- so `snob stories --download` refused every
+        // name it invented, lowercase ASCII included, after the bytes had
+        // been fetched. A separator on no platform, and nothing a username
+        // can carry, so it says nothing about the account.
         && stem
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
         && !RESERVED.contains(&device.as_str());
 
     if !usable {
@@ -490,6 +495,15 @@ mod tests {
         // started from.
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path();
+
+        // What `stories` and `pfp` actually invent has to pass, or the refusal
+        // above is the only outcome the command can have -- which it was.
+        for good in ["someone-1", "some.one-12", "a_b.c", "x"] {
+            assert!(
+                default_path(here, good, "jpg").is_ok(),
+                "{good:?} is a name this tool invents"
+            );
+        }
 
         for bad in [
             "nul",

@@ -27,6 +27,7 @@ use anyhow::{Context, Result, anyhow};
 use comfy_table::{Attribute as Style, Cell, ContentArrangement, Table, presets};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
+use snob_ig::error::IgError;
 use snob_ig::model::{ReelItem, largest};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
@@ -390,7 +391,7 @@ async fn download_one(
                 printable(&stories.username),
                 match stories.items.len() {
                     1 => "one".to_string(),
-                    n => format!("{n}"),
+                    n => format!("{n} stories"),
                 }
             )
         })?;
@@ -411,7 +412,13 @@ async fn download_one(
 /// Keeps going past one that fails, and says so at the end. Stopping at the
 /// first would leave the user with a partial set and no idea which ones are
 /// missing — and a story URL expiring mid-run is the ordinary case here, not
-/// the exceptional one.
+/// the exceptional one. That covers the write as well as the fetch: a name
+/// already taken in the directory is the ordinary case on a second run, and
+/// it used to stop the loop at story one with the rest never attempted.
+///
+/// A Ctrl+C is the one failure that is not collected. Every fetch after it
+/// answers `Canceled` at once, so carrying on would count them all as
+/// failures and exit 1 for what the user did on purpose.
 async fn download_all(
     client: &IgClient,
     stories: &Stories,
@@ -423,11 +430,25 @@ async fn download_all(
     let mut failed = Vec::new();
     for (index, story) in stories.items.iter().enumerate() {
         let number = index + 1;
-        match bytes_of(client, story).await {
-            Ok(bytes) => {
-                let path = default_name(dir, &stories.username, number, extension_of(&bytes))?;
-                write(&bytes, &path, false)?;
-                ui::info(&format!("Saved {}", path.display()));
+        let saved = async {
+            let bytes = bytes_of(client, story).await?;
+            // `default_name` answers a bare name and checks the directory
+            // only for a collision; joined here, or `-o somewhere` made the
+            // directory and the file landed in the working directory.
+            let path = dir.join(default_name(
+                dir,
+                &stories.username,
+                number,
+                extension_of(&bytes),
+            )?);
+            write(&bytes, &path, false)?;
+            Ok::<_, anyhow::Error>(path)
+        }
+        .await;
+        match saved {
+            Ok(path) => ui::info(&format!("Saved {}", path.display())),
+            Err(e) if was_canceled(&e) => {
+                return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
             }
             Err(e) => failed.push(format!("{number}: {e}")),
         }
@@ -446,6 +467,12 @@ async fn download_all(
         ),
     )
     .into())
+}
+
+/// Whether a failed download was the user stopping it.
+fn was_canceled(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| matches!(cause.downcast_ref::<IgError>(), Some(IgError::Canceled)))
 }
 
 /// The bytes of one story, from the CDN.

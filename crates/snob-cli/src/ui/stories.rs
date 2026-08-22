@@ -314,7 +314,12 @@ async fn keep(
         index + 1,
         extension_of(&bytes),
     )?;
-    std::fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
+    // Created, not written over: the name is one this program invented, and
+    // `snob stories --download` refuses to replace a file under such a name.
+    // This key did not, which was two answers to one question.
+    output::create_new(&path)?
+        .write_all(&bytes)
+        .with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
 }
 
