@@ -336,9 +336,17 @@ impl Schedule {
                 }
                 Duration::from_secs(room as u64)
             }
-            // No grid to miss. An interval is measured from the previous run, so
-            // what the jitter moves is the whole schedule rather than one run
-            // out of it, and the interval itself is the only bound needed.
+            // No grid to miss, so the interval is the only bound. What that
+            // costs is said rather than assumed: the loop records the
+            // jittered moment as the last run and the floor is measured from
+            // it, so every roll is added for good and the mean period is the
+            // interval plus the mean jitter -- `--every 6h --jitter 6h` runs
+            // about 160 times in sixty days where 240 were implied. The
+            // default jitter is a tenth of the interval capped at fifteen
+            // minutes, so it costs a few per cent; only an explicit --jitter
+            // reaches further, and that is what the person asked for. The
+            // calendar arm above subtracts the step because a grid moment
+            // missed is a run lost; here nothing is lost, only later.
             //
             // `validated` refuses a schedule with neither half, so the fallback
             // is unreachable; a day is the answer that cannot be wrong by much.
