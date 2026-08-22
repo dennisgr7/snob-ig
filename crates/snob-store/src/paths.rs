@@ -363,7 +363,57 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
         path: dir.to_path_buf(),
         source,
     })?;
+    restrict_to_this_account(dir)
+}
 
+/// Creates a private directory that **did not exist a moment ago**, under a
+/// parent that is made private first.
+///
+/// For a directory whose name somebody else can predict, which is what a
+/// scratch directory named after the process id is. [`create_private_dir`]
+/// adopts whatever is already at the path: `create_dir_all` answers `Ok` when
+/// the entry exists, a symbolic link to a directory included, and the
+/// permissions are then set on **whatever it points at**. On a machine with
+/// other users, a `/tmp/snob-ig-stories/run-<pid>` planted ahead of time as a
+/// link was therefore a way to choose where a run wrote every story it
+/// fetched, and to have a directory of the victim's own made `0700`. That
+/// needs the parent to be creatable by anybody -- which `/tmp` is, and which
+/// the parent was, because only the leaf was ever restricted.
+///
+/// Two things close it. The parent is created and restricted first, so on a
+/// run that is the first to use it nobody else can put an entry inside; and
+/// the leaf is created with `create_dir`, which fails rather than adopts when
+/// something is already there. What is already there is removed if it is
+/// something this tool could have left -- an earlier run's directory under a
+/// reused process id, which Windows hands out again freely -- and the creation
+/// is tried once more. A link is removed as a link, never followed:
+/// `remove_dir_all` on a symbolic link deletes the link.
+pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
+    let create = |source| PathError::Create {
+        path: dir.to_path_buf(),
+        source,
+    };
+    if let Some(parent) = dir.parent() {
+        create_private_dir(parent)?;
+    }
+    if let Err(e) = std::fs::create_dir(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(create(e));
+        }
+        // `symlink_metadata` does not follow, so a link is seen as a link.
+        let found = std::fs::symlink_metadata(dir).map_err(create)?;
+        if found.is_dir() {
+            std::fs::remove_dir_all(dir).map_err(create)?;
+        } else {
+            std::fs::remove_file(dir).map_err(create)?;
+        }
+        std::fs::create_dir(dir).map_err(create)?;
+    }
+    restrict_to_this_account(dir)
+}
+
+/// The half of [`create_private_dir`] that makes the directory private.
+fn restrict_to_this_account(dir: &Path) -> Result<(), PathError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -841,6 +891,64 @@ mod tests {
             "a relative path would follow whoever ran the command around"
         );
         assert!(paths.data_dir().is_absolute());
+    }
+
+    /// A scratch directory with a guessable name is never adopted.
+    ///
+    /// The planted entry is a symbolic link to a directory of the victim's
+    /// own. `create_dir_all` answered `Ok` on it and the permissions then
+    /// landed on the target, and every story fetched afterwards was written
+    /// wherever the link pointed. The fresh variant removes the link as a
+    /// link -- the target is untouched -- and makes a real directory.
+    #[test]
+    fn a_planted_link_under_the_scratch_name_is_replaced_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("theirs.txt"), b"untouched").unwrap();
+
+        let root = tmp.path().join("snob-ig-stories");
+        std::fs::create_dir(&root).unwrap();
+        let leaf = root.join("run-1234");
+        #[cfg(unix)]
+        let planted = std::os::unix::fs::symlink(&elsewhere, &leaf).is_ok();
+        // A link to a directory needs a privilege on Windows that a test
+        // runner does not always have; without it the case is a leftover
+        // directory, which the second half covers.
+        #[cfg(windows)]
+        let planted = std::os::windows::fs::symlink_dir(&elsewhere, &leaf).is_ok();
+
+        create_fresh_private_dir(&leaf).unwrap();
+
+        let made = std::fs::symlink_metadata(&leaf).unwrap();
+        assert!(made.is_dir() && !made.is_symlink(), "a link was adopted");
+        assert!(
+            elsewhere.join("theirs.txt").exists(),
+            "removing the link must not reach through it"
+        );
+        let _ = planted;
+
+        // An earlier run's directory under a reused process id is replaced,
+        // and what it held does not survive into the new run.
+        std::fs::write(leaf.join("stale.jpg"), b"x").unwrap();
+        create_fresh_private_dir(&leaf).unwrap();
+        assert!(!leaf.join("stale.jpg").exists());
+        assert!(leaf.is_dir());
+    }
+
+    /// The parent is made private before the leaf, so on a first run nobody
+    /// else can put an entry inside it.
+    #[cfg(unix)]
+    #[test]
+    fn the_scratch_root_is_private_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("snob-ig-stories").join("run-1");
+        create_fresh_private_dir(&leaf).unwrap();
+        for dir in [leaf.parent().unwrap(), leaf.as_path()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
     }
 
     #[test]

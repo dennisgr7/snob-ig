@@ -212,6 +212,21 @@ pub fn write(
 /// writing afterwards leaves a gap — a whole network download wide, in `pfp` —
 /// in which the name can become a symlink to somewhere else.
 pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
+    create_new(path)?
+        .write_all(rendered.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))?;
+
+    ui::info(&format!("Written to {}", path.display()));
+    Ok(())
+}
+
+/// Opens a file that must not already exist, readable by this account only.
+///
+/// The creation is the check: looking first and writing afterwards leaves a
+/// gap in which the name can become a link to somewhere else. Shared by
+/// [`write_new`] and by the story browser, which writes into its scratch
+/// directory and says nothing about it.
+pub fn create_new(path: &Path) -> Result<std::fs::File> {
     use std::fs::OpenOptions;
 
     let mut options = OpenOptions::new();
@@ -227,14 +242,9 @@ pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
+    options
         .open(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    file.write_all(rendered.as_bytes())
-        .with_context(|| format!("could not write {}", path.display()))?;
-
-    ui::info(&format!("Written to {}", path.display()));
-    Ok(())
+        .with_context(|| format!("could not create {}", path.display()))
 }
 
 /// Writes an already-rendered result to the destination, with the same

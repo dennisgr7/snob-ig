@@ -30,6 +30,7 @@
 //! and it survived; the numbers and the argument are in AGENTS.md so that it
 //! does not have to be re-examined every year.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -40,6 +41,7 @@ use snob_store::paths::AppPaths;
 
 use crate::commands::stories::{Stories, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
+use crate::output;
 use crate::ui::browser::input::{Action, Next, Session, TICK, next, page};
 use crate::ui::browser::screen::Screen;
 use crate::ui::browser::viewport::Viewport;
@@ -270,13 +272,22 @@ async fn open(
     }
 
     let bytes = bytes_of(client, &stories.items[index]).await?;
-    let path = scratch.dir().join(format!(
-        "{}-{}.{}",
-        printable(&stories.username),
+    // Through the same gate as `keep` and `snob stories --download`, and for
+    // the same reason: the name came off the server. `printable` strips what
+    // a terminal must not draw and leaves everything a path reads -- a `..`,
+    // a drive letter, a UNC share -- and `Path::join` hands an absolute name
+    // the whole path. This was the one write of a story that did not ask
+    // `default_path`, and with `fs::write` it would also have followed a link.
+    let name = default_name(
+        scratch.dir(),
+        &stories.username,
         index + 1,
-        extension_of(&bytes)
-    ));
-    std::fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
+        extension_of(&bytes),
+    )?;
+    let path = scratch.dir().join(name);
+    output::create_new(&path)?
+        .write_all(&bytes)
+        .with_context(|| format!("could not write {}", path.display()))?;
     opener::open(&path).context("the system viewer would not start")?;
     cache[index] = Some(path.clone());
     Ok(path)
@@ -340,7 +351,10 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(dir: PathBuf) -> Result<Self> {
-        snob_store::paths::create_private_dir(&dir)
+        // Fresh, not adopted: the name carries the process id, which anybody
+        // on the machine can guess ahead of time. The function says what a
+        // planted entry under that name used to be able to do.
+        snob_store::paths::create_fresh_private_dir(&dir)
             .with_context(|| format!("could not create {}", dir.display()))?;
         Ok(Self(dir))
     }
