@@ -120,7 +120,9 @@ fn render(analysis: &Analysis, format: Format) -> Result<Rendered> {
         if !analysis.unfollowers.is_empty() {
             out.push('\n');
             for name in &analysis.unfollowers {
-                out.push_str(name);
+                // Off a file somebody else could have written, and drawn on a
+                // terminal: the same rule as every name off the wire.
+                out.push_str(&snob_core::model::printable(name));
                 out.push('\n');
             }
         }
