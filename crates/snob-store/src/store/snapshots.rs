@@ -221,7 +221,7 @@ pub fn resumable(
                  WHERE id = (
                    SELECT id FROM snapshots
                    WHERE {RESUMABLE}
-                   ORDER BY started_at DESC LIMIT 1
+                   ORDER BY started_at DESC, id DESC LIMIT 1
                  )
                  RETURNING {SNAPSHOT_COLUMNS}"
             ),
@@ -419,9 +419,17 @@ pub fn save_page(
 /// window is narrow — an exhausted retry sequence is about two minutes against
 /// a `CLAIM_TTL_SECS` of five — but a rationing budget or a suspend reaches it,
 /// and it is the exact case the claim exists for.
+///
+/// **And a refusal is answered, not swallowed.** The guard alone left the
+/// row alone and said `Ok`, so a walk whose lease had gone stale reported a
+/// finished capture it did not own: `engine::walk` went on to build an
+/// outcome that said `Completed` with this id, and the monitor's mark then
+/// pointed at a row `usable_snapshots` would not return, so the next diff
+/// silently started over from a baseline. `save_page` answers `ClaimTaken`
+/// for the same condition, and now both writers do.
 pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), StoreError> {
     let complete = reason.yields_complete_list();
-    conn.execute(
+    let closed = conn.execute(
         "UPDATE snapshots
          SET complete = ?2, taken_at = ?3, stopped_by = ?4,
              next_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE next_cursor END,
@@ -429,6 +437,21 @@ pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), Store
          WHERE id = ?1 AND complete = 0 AND claimed_by = ?5",
         params![id, complete, now(), reason.as_str(), this_process()],
     )?;
+    if closed == 0 {
+        // Already finished is not a refusal: the capture the caller is about
+        // to report on is whole, whoever closed it. Anything else -- held by
+        // another process, or gone -- is.
+        let finished: Option<bool> = conn
+            .query_row(
+                "SELECT complete = 1 FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if finished != Some(true) {
+            return Err(StoreError::ClaimTaken);
+        }
+    }
     Ok(())
 }
 
@@ -902,7 +925,12 @@ mod tests {
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
         claimed_by_somebody_else(&db, id, now());
 
-        close(db.conn(), id, StopReason::Completed).unwrap();
+        let refused = close(db.conn(), id, StopReason::Completed);
+        assert!(
+            matches!(refused, Err(StoreError::ClaimTaken)),
+            "a close that changed nothing has to say so, or the caller reports a \
+             finished capture it does not own: {refused:?}"
+        );
 
         let (complete, claimed): (i64, Option<String>) = db
             .conn()
