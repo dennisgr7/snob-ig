@@ -141,10 +141,24 @@ pub fn printable(text: &str) -> String {
 /// The word-joiner range runs to U+206F rather than stopping at the invisible
 /// operators, because the deprecated formatting characters between them are
 /// invisible on the same terms.
+///
+/// **The whole of `Cf`, because AGENTS.md says so.** `char::is_control` is
+/// `Cc` alone, so this list is the entire format-character coverage, and it
+/// was the familiar two thirds of it: the Arabic number signs (U+0600–U+0605,
+/// U+06DD, U+070F, U+0890–U+0891, U+08E2), the Kaithi and Egyptian-hieroglyph
+/// format marks, the shorthand controls and the musical-symbol controls
+/// were not here. A name is `[a-z0-9._]`, so only `full_name` can carry one,
+/// and the cost is a display name drawn shorter than it is — but the rules
+/// table states the guarantee flatly, and a reader believes it.
 fn is_invisible(c: char) -> bool {
     matches!(c,
         '\u{00ad}'
+        | '\u{0600}'..='\u{0605}'
         | '\u{061c}'
+        | '\u{06dd}'
+        | '\u{070f}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08e2}'
         | '\u{115f}'..='\u{1160}'
         | '\u{180e}'
         | '\u{200b}'..='\u{200f}'
@@ -154,6 +168,11 @@ fn is_invisible(c: char) -> bool {
         | '\u{feff}'
         | '\u{ffa0}'
         | '\u{fff9}'..='\u{fffb}'
+        | '\u{110bd}'
+        | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}'
+        | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}'
         | '\u{e0000}'..='\u{e007f}')
 }
 
@@ -380,6 +399,17 @@ mod tests {
             '\u{ffa0}', // halfwidth Hangul filler
             '\u{fff9}', // interlinear annotation anchor
             '\u{fffb}', // interlinear annotation terminator
+            // One per range that was missing from the `Cf` coverage.
+            '\u{0600}',  // Arabic number sign
+            '\u{06dd}',  // Arabic end of ayah
+            '\u{070f}',  // Syriac abbreviation mark
+            '\u{0890}',  // Arabic pound mark above
+            '\u{08e2}',  // Arabic disputed end of ayah
+            '\u{110bd}', // Kaithi number sign
+            '\u{110cd}', // Kaithi number sign above
+            '\u{13430}', // Egyptian hieroglyph vertical joiner
+            '\u{1bca0}', // shorthand format letter overlap
+            '\u{1d173}', // musical symbol begin beam
         ] {
             let name = format!("real{hidden}name");
             assert_eq!(
