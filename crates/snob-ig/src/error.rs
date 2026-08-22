@@ -71,7 +71,10 @@ pub enum IgError {
     #[error("too many redirects")]
     TooManyRedirects,
 
-    #[error("the download exceeds {limit} bytes, so it is not a profile picture")]
+    /// Every capped read answers this -- an API body, a story, a script
+    /// bundle -- so it says what happened and not what the first caller was
+    /// fetching.
+    #[error("the response exceeds {limit} bytes, which is more than this could be")]
     TooLarge { limit: usize },
 
     #[error("could not parse Instagram's response: {0}")]
@@ -270,6 +273,23 @@ impl IgError {
     /// [`Reaction::Retry`]: crate::error::Reaction::Retry
     pub fn worth_a_second_route(&self) -> bool {
         matches!(self, Self::Unexpected { status, .. } if (400..500).contains(status))
+    }
+
+    /// Whether Instagram objected to the account, as opposed to the request.
+    ///
+    /// The four answers that earn a cooldown, and the backstop that reports
+    /// one already standing. What they have in common is that the next
+    /// request will be refused too, which is what makes them worth saying
+    /// out loud even from a place that could otherwise shrug.
+    pub fn is_push_back(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited
+                | Self::FeedbackRequired
+                | Self::Challenge { .. }
+                | Self::Checkpoint { .. }
+                | Self::InCooldown { .. }
+        )
     }
 
     /// Whether it invalidates the stored session, and so must not be persisted.

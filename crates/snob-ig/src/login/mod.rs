@@ -151,9 +151,17 @@ pub async fn validate(
     }
 
     // The username is cosmetic: failing to get it does not invalidate anything.
+    // A push-back on it is not cosmetic, though. `classify_and_record` has
+    // just written a cooldown, so the next command will refuse for half an
+    // hour -- and at `debug` the person had been told their login succeeded
+    // and nothing else. The session is still good; the warning is about what
+    // Instagram said on the way.
     if session.username.is_none() {
         match client.resolve_username(session.ds_user_id).await {
             Ok(name) => session.username = name,
+            Err(e) if e.is_push_back() => {
+                tracing::warn!(error = %e, "the session works, but Instagram pushed back on the follow-up request; the account is in cooldown");
+            }
             Err(e) => tracing::debug!(error = %e, "could not resolve the username"),
         }
     }
