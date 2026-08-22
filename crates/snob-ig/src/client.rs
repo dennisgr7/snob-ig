@@ -2990,7 +2990,11 @@ mod tests {
             status,
             body: String::new(),
         };
-        for refused in [unexpected(400), unexpected(200), IgError::NotFound { what: None }] {
+        for refused in [
+            unexpected(400),
+            unexpected(200),
+            IgError::NotFound { what: None },
+        ] {
             assert!(worth_rediscovering(&refused), "{refused:?}");
         }
         for ambiguous in [

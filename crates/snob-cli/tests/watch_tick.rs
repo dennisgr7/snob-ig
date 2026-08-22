@@ -444,6 +444,45 @@ async fn a_second_watched_account_is_walked_as_itself() {
     );
 }
 
+/// A cooldown on an account nothing is stored about yet refuses both lists
+/// before either has said whose they are -- and the report that came out of
+/// that was the **viewer's**: `account.pk` 42 on the wire, and a
+/// `rate_limited` row written against the viewer in `watch_runs`, displacing
+/// that account's own newest row in `status`. A tick that learned nothing
+/// about a named account has nothing to report under that name, and says so.
+#[tokio::test]
+async fn a_tick_that_could_not_look_at_a_stranger_is_not_reported_as_the_viewer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+    let server = MockServer::start().await;
+
+    budget
+        .start_cooldown("rate_limit", std::time::Duration::from_secs(3600))
+        .unwrap();
+    let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+
+    let outcome = watch::tick(
+        &mut app,
+        &Watched::consented("stranger".into(), watch::Consent),
+    )
+    .await;
+
+    let error = match outcome {
+        Ok(tick) => panic!(
+            "a report was made under account {}, which is nobody this run looked at",
+            tick.report.account_pk
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        error.to_string().contains("stranger"),
+        "the refusal names the account: {error:#}"
+    );
+    assert_eq!(requests(&server).await, 0, "a cooldown spends nothing");
+}
+
 /// Your own account needs nobody's permission; somebody else's does, and a
 /// scheduled run has nobody to ask.
 #[tokio::test]

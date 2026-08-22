@@ -13,7 +13,7 @@
 //! Both return data and the interval it covers. What any of it looks like is
 //! [`crate::commands::watch`]'s question.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
@@ -532,7 +532,16 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
     // Whose account this turned out to be, taken from the engine's answer
     // rather than from the viewer: on a third party they are different, and the
     // id the engine reports is the one that cannot be wrong about it.
-    let mut pk = app.viewer().pk;
+    //
+    // `None` until a list answers, and not the viewer's id as a stand-in. The
+    // two arms below that `continue` learn nothing about the account, and
+    // when both lists took one of them -- a cooldown on a freshly added
+    // account with no capture, or a Ctrl+C before the first page -- the
+    // comparison, the report's `account.pk` and the `watch_runs` row all
+    // went out under the viewer's id, displacing that account's own newest
+    // row in `status`. What is stored about the name is the fallback, and
+    // when nothing is, the run says so instead of guessing.
+    let mut pk: Option<Pk> = None;
 
     for kind in [ListKind::Followers, ListKind::Following] {
         // A canceled walk comes back `Ok`, so without this the loop went
@@ -585,7 +594,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
             }
             Err(e) => return Err(e),
         };
-        pk = outcome.account_pk;
+        pk = Some(outcome.account_pk);
 
         let skipped = refusal(&outcome);
         if skipped.is_none() {
@@ -593,6 +602,21 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         }
         lists.push(TickList { kind, skipped });
     }
+
+    let pk = match (pk, watched.name()) {
+        (Some(pk), _) => pk,
+        (None, None) => app.viewer().pk,
+        (None, Some(name)) => {
+            let name = target::clean(name);
+            accounts::find_pk_by_username(app.db().conn(), name)?.ok_or_else(|| {
+                anyhow!(
+                    "nothing could be looked at for @{} this time, and nothing is stored \
+                     about that account yet to report against",
+                    snob_core::model::printable(name)
+                )
+            })?
+        }
+    };
 
     // Read before the comparison, and both handed back, so that whatever
     // commits this report writes the same two numbers the renames were read
