@@ -12,15 +12,14 @@ use snob_ig::pager::{ListRequest, ListWalker, WalkError};
 use snob_store::store::{now, snapshots};
 
 use crate::app::App;
-use crate::cli::ListArgs;
 use crate::engine::target::Target;
-use crate::engine::{ListOutcome, Provenance};
+use crate::engine::{ListOutcome, ListQuery, Provenance};
 use crate::exit::ExitCode;
 
 /// Walks the list, resuming an interrupted one when there is a usable one.
 pub async fn fetch(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     declared: Option<u64>,
@@ -148,7 +147,7 @@ struct Opened {
 /// cleared out rather than piling up.
 fn open_snapshot(
     app: &App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     declared: Option<u64>,

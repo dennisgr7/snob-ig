@@ -12,14 +12,13 @@ use snob_core::model::{ListKind, User};
 use snob_store::store::{accounts, now, snapshots};
 
 use crate::app::App;
-use crate::cli::ListArgs;
 use crate::engine::target::{Counters, Target};
-use crate::engine::{ListOutcome, Provenance, walk};
+use crate::engine::{ListOutcome, ListQuery, Provenance, walk};
 
 /// Polls, compares, and either serves what is stored or walks.
 pub async fn decide_and_fetch(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     stored: Option<snapshots::Snapshot>,

@@ -20,8 +20,7 @@ use snob_core::watch::{Basis, Changes, ListDiff, Rename};
 use snob_store::store::{accounts, snapshots, users, watch as store};
 
 use crate::app::App;
-use crate::cli::ListArgs;
-use crate::engine::{self, ListOutcome, Provenance, target};
+use crate::engine::{self, ListOutcome, ListQuery, Provenance, target};
 use crate::exit::ExitCode;
 
 /// What one list has to report.
@@ -186,17 +185,10 @@ impl Watched {
     /// record. `refresh` stays off because the counter poll is what decides
     /// whether to walk, and `cache` stays off because a promise not to look is
     /// not a monitor.
-    fn list_args(&self) -> ListArgs {
-        ListArgs {
+    fn list_args(&self) -> ListQuery {
+        ListQuery {
             target: self.target.clone(),
             yes: self.consent.is_some(),
-            hide: vec![],
-            only: vec![],
-            no_verified: false,
-            exclude_list: None,
-            format: None,
-            output: None,
-            limit: None,
             refresh: false,
             cache: false,
             // A stored capture whose counter has not moved is still current, so
@@ -205,7 +197,6 @@ impl Watched {
             max_age: std::time::Duration::from_secs(6 * 3600),
             no_resume: false,
             max_pages: None,
-            no_progress: true,
         }
     }
 }

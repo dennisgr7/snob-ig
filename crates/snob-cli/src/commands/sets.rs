@@ -90,7 +90,7 @@ pub async fn run(
     // The list being crossed against comes first. If it turns out incomplete
     // there is no result to give, so it is worth finding out before spending
     // the second walk.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let (against, against_outcome) =
         common::walk_named(&mut app, &args, op.against(), &subject, |outcome| {
             check_against_list(op, outcome)

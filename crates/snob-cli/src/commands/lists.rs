@@ -30,7 +30,7 @@ pub async fn run(
     // Named before the engine runs, so the bar says what it is about during
     // consent, resolution and the counter poll rather than only once pages
     // start arriving.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let result = common::walk_named(&mut app, &args, kind, &subject, |_| Ok(())).await;
     app.progress().finish();
     let (found, outcome) = result?;

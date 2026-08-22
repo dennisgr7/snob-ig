@@ -71,6 +71,24 @@ pub fn open_with_progress(
     }
 }
 
+/// The part of the command line the engine is asked with.
+///
+/// Here and not in `engine`, so the engine knows nothing about clap: this is
+/// the one place the parser's struct is read for what the engine needs.
+impl From<&ListArgs> for engine::ListQuery {
+    fn from(args: &ListArgs) -> Self {
+        Self {
+            target: args.target.clone(),
+            yes: args.yes,
+            refresh: args.refresh,
+            cache: args.cache,
+            max_age: args.max_age,
+            no_resume: args.no_resume,
+            max_pages: args.max_pages,
+        }
+    }
+}
+
 /// What is left of a list after the filter and the cap, and how many there
 /// were at each step -- the three numbers the summary line is built from.
 ///

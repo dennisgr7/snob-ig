@@ -12,7 +12,7 @@ use snob_core::model::{ListKind, printable};
 use snob_store::store::{accounts, users};
 
 use crate::app::App;
-use crate::cli::ListArgs;
+use crate::engine::ListQuery;
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -69,8 +69,8 @@ pub fn clean(typed: &str) -> &str {
 /// The typed name when there is one, the viewer's own label otherwise. It goes
 /// through `printable` because it is drawn on a terminal and `clean` only
 /// strips the at sign.
-pub fn label(app: &App, args: &ListArgs) -> String {
-    match args.target.as_deref() {
+pub fn label(app: &App, typed: Option<&str>) -> String {
+    match typed {
         Some(raw) => format!("@{}", snob_core::model::printable(clean(raw))),
         None => app.viewer().label(),
     }
@@ -81,7 +81,7 @@ pub fn label(app: &App, args: &ListArgs) -> String {
 /// A private account the viewer does not follow is refused **here**, before a
 /// single page is walked: Instagram serves those lists to followers only, so
 /// walking would buy nothing but empty pages.
-pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
+pub async fn resolve(app: &mut App, args: &ListQuery) -> Result<Target> {
     let Some(typed) = args.target.as_deref() else {
         let viewer = app.viewer().clone();
         let resolved = match viewer.username {

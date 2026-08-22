@@ -98,7 +98,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // Followers first, mirroring the order `unfollowers` consumes the cache
     // in, and so an incomplete list is found out before the second walk is
     // spent.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let (followers, followers_outcome) =
         common::walk_named(&mut app, &args, ListKind::Followers, &subject, |outcome| {
             check_complete(ListKind::Followers, outcome)

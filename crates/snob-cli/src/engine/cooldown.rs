@@ -10,8 +10,7 @@ use snob_core::model::{ListKind, User};
 use snob_store::store::snapshots;
 
 use crate::app::App;
-use crate::cli::ListArgs;
-use crate::engine::{ListOutcome, Provenance, target};
+use crate::engine::{ListOutcome, ListQuery, Provenance, target};
 use crate::report::{self, Blocked, cooldown_ends_at, stored_on};
 
 /// Serves what is stored, or explains why nothing can be.
@@ -20,7 +19,7 @@ use crate::report::{self, Blocked, cooldown_ends_at, stored_on};
 /// ignored for the same reason `--cache` ignores it.
 pub fn serve(
     app: &App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     until_ms: i64,
 ) -> Result<(Vec<User>, ListOutcome)> {

@@ -22,7 +22,6 @@ use snob_core::model::{ListKind, StopReason, User};
 use snob_store::store::{accounts, snapshots, users};
 
 use crate::app::{App, ConsentInAdvance};
-use crate::cli::ListArgs;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
 
@@ -221,6 +220,39 @@ impl ListOutcome {
     }
 }
 
+/// What a list is asked for: which account, and how the answer may be got.
+///
+/// The engine used to take `cli::ListArgs`, the clap struct, and so was
+/// parameterized by the command-line parser: eight of its fifteen fields
+/// are presentation -- the format, the output path, the filters, the cap --
+/// which the engine never reads and whose presence said it might. The cost
+/// showed in the monitor, which had to fabricate the whole struct with eleven
+/// dummy values to ask for a list. These are the seven the engine reads, and
+/// `commands::common` is where a `ListArgs` becomes one.
+#[derive(Debug, Clone, Default)]
+pub struct ListQuery {
+    /// The account, as typed. `None` is the session's own.
+    pub target: Option<String>,
+    /// Consent given in advance, for a list that is somebody else's.
+    pub yes: bool,
+    /// Walk even when storage could answer.
+    pub refresh: bool,
+    /// Answer out of storage and spend nothing.
+    pub cache: bool,
+    /// How old a stored list may be and still be served.
+    pub max_age: std::time::Duration,
+    /// Start over rather than continue an interrupted walk.
+    pub no_resume: bool,
+    /// Stop after this many pages.
+    pub max_pages: Option<u32>,
+}
+
+impl From<&ListQuery> for ListQuery {
+    fn from(query: &ListQuery) -> Self {
+        query.clone()
+    }
+}
+
 /// Gets one list, deciding along the way whether anything needs fetching.
 ///
 /// The order of the checks is the whole policy, and each one exists to stop a
@@ -238,9 +270,10 @@ impl ListOutcome {
 /// 7. Otherwise, walk.
 pub async fn list(
     app: &mut App,
-    args: &ListArgs,
+    query: impl Into<ListQuery>,
     kind: ListKind,
 ) -> Result<(Vec<User>, ListOutcome)> {
+    let args = &query.into();
     // Measured rather than added up along the way. Every request goes through
     // the pacer, including the ones a retry makes and the ones spent before
     // the walk begins, so asking it afterwards is the only count that cannot
@@ -253,7 +286,7 @@ pub async fn list(
 
 async fn decide(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
 ) -> Result<(Vec<User>, ListOutcome)> {
     if let Some(until_ms) = app.client().pacer().cooldown()? {
@@ -365,7 +398,7 @@ async fn decide(
 /// than the one Instagram spells. That costs nothing when it is wrong, and the
 /// only account it can wrongly ask about is your own, which needs you to have
 /// typed your own name.
-async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
+async fn ask_consent(app: &mut App, args: &ListQuery) -> Result<()> {
     ask_consent_with(app, args, ui::can_be_asked()).await
 }
 
@@ -378,9 +411,10 @@ async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
 #[doc(hidden)]
 pub async fn ask_consent_with(
     app: &mut App,
-    args: &ListArgs,
+    query: impl Into<ListQuery>,
     someone_is_there: bool,
 ) -> Result<()> {
+    let args = &query.into();
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
@@ -409,7 +443,7 @@ pub async fn ask_consent_with(
     // the same question here: `args.target` is `Some` at this point, so `label`
     // returns exactly the at sign and the filtered name these three sentences
     // want. Repeating the rule was how one of them ended up unfiltered.
-    let shown = target::label(app, args);
+    let shown = target::label(app, args.target.as_deref());
 
     // Being unable to ask and being told no are two different events, and they
     // were reported as one. `confirm` answers with its default the moment
