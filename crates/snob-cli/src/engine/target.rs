@@ -6,9 +6,9 @@
 //! which costs nothing and is therefore the only one allowed when the network
 //! is off.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use snob_core::Pk;
-use snob_core::model::{ListKind, printable};
+use snob_core::model::ListKind;
 use snob_store::store::{accounts, users};
 
 use crate::app::App;
@@ -118,20 +118,14 @@ pub async fn resolve(app: &mut App, args: &ListQuery) -> Result<Target> {
     // never turn into a refusal: with `None` the walk runs and fails, or does
     // not, on its own terms.
     if !is_self && profile.is_private == Some(true) && profile.followed_by_viewer == Some(false) {
-        // Filtered: it came off Instagram, not out of anybody's keyboard, and
-        // this sentence is written to a terminal. `pfp.rs` does the same with
-        // the same field in the same shape of refusal.
-        if profile.requested_by_viewer == Some(true) {
-            bail!(
-                "@{} is private and your follow request has not been accepted yet, \
-                 so its lists cannot be read",
-                printable(&profile.username)
-            );
-        }
-        bail!(
-            "@{} is a private account you do not follow, so its lists cannot be read",
-            printable(&profile.username)
-        );
+        // Which of the two refusals it is, and nothing about how either reads.
+        // The name is filtered inside `report`, where it came off Instagram
+        // rather than out of anybody's keyboard; `pfp.rs` refuses in the same
+        // shape on the same field.
+        return Err(crate::report::refuse_private(
+            &profile.username,
+            profile.requested_by_viewer == Some(true),
+        ));
     }
 
     // The profile endpoint answers 400 for certain business accounts, and the
@@ -148,13 +142,8 @@ pub async fn resolve(app: &mut App, args: &ListQuery) -> Result<Target> {
     // Said here rather than in the client because this is where a *walk* is
     // being set up; `pfp` reaches the same fallback and loses nothing by it.
     if !profile.counters_are_knowable() {
-        app.progress().warn(&format!(
-            "Instagram would not serve the profile of @{}, so its id came from search \
-             instead. That route carries no follower or following counts, so this run \
-             cannot tell a truncated list from a complete one, and cannot judge whether \
-             a cached list is still current.",
-            printable(&profile.username)
-        ));
+        app.progress()
+            .warn(&crate::report::counters_unknowable(&profile.username));
     }
 
     Ok(Target {

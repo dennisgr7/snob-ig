@@ -21,8 +21,8 @@ use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_store::store::{accounts, snapshots, users};
 
-use crate::app::{App, ConsentInAdvance};
-use crate::exit::{ExitCode, ExitError};
+use crate::app::App;
+use crate::exit::ExitCode;
 use crate::ui;
 
 /// Where a returned list came from.
@@ -441,8 +441,9 @@ pub async fn ask_consent_with(
 
     // How an account is named on screen is `target::label`'s question, and it is
     // the same question here: `args.target` is `Some` at this point, so `label`
-    // returns exactly the at sign and the filtered name these three sentences
-    // want. Repeating the rule was how one of them ended up unfiltered.
+    // returns exactly the at sign and the filtered name the sentences in
+    // `report` want. Repeating the rule was how one of them ended up
+    // unfiltered.
     let shown = target::label(app, args.target.as_deref());
 
     // Being unable to ask and being told no are two different events, and they
@@ -460,41 +461,23 @@ pub async fn ask_consent_with(
     // standard error, and the gate did not follow it.
     if !someone_is_there {
         // Which way to answer in advance is the *caller's* fact, not this
-        // function's. Both commands that reach here take an answer beforehand
-        // and they do not take it the same way, and one sentence named `-y` for
-        // both — so `snob watch once someone` refused with advice that then
-        // failed to parse, because `watch once` deliberately has no `-y`.
-        let in_advance = match app.consent_in_advance() {
-            ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
-            ConsentInAdvance::WatchConfig => format!(
-                "Run \"snob watch setup\" to answer it once, or ask about {shown} \
-                 while you are here."
-            ),
-        };
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!(
-                "reading {shown}'s lists needs confirmation, and there is no terminal to \
-                 ask at. {in_advance}"
-            ),
-        )
-        .into());
+        // function's, and it is the one thing this hands over: the sentence
+        // itself is `report`'s, like every other sentence the tool prints.
+        return Err(crate::report::refuse_unconsented(
+            &shown,
+            app.consent_in_advance(),
+        ));
     }
 
-    app.warn(
-        "this reads a list that belongs to somebody else, and lands their followers \
-         in your local database. It is also a heavier request than reading your own, \
-         and Instagram is readier to refuse it",
-    );
-    if !ui::confirm_off_thread(app.progress(), format!("Continue with {shown}?"), false).await? {
-        // No mention of -y here. They have just said no, and answering that
-        // with "pass the flag that skips the question" is telling them to do
-        // it anyway.
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!("nothing was done: {shown} was not confirmed"),
-        )
-        .into());
+    app.warn(crate::report::READING_SOMEBODY_ELSES_LIST);
+    if !ui::confirm_off_thread(
+        app.progress(),
+        crate::report::ask_to_continue(&shown),
+        false,
+    )
+    .await?
+    {
+        return Err(crate::report::refuse_declined(&shown));
     }
     // Asked and answered. A crossing wants two lists and a summary four, and
     // asking again about the same account reads as not having listened.

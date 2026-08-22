@@ -11,7 +11,7 @@ use snob_store::store::snapshots;
 
 use crate::app::App;
 use crate::engine::{ListOutcome, ListQuery, Provenance, target};
-use crate::report::{self, Blocked, cooldown_ends_at, stored_on};
+use crate::report::{self, Blocked};
 
 /// Serves what is stored, or explains why nothing can be.
 ///
@@ -50,13 +50,9 @@ pub fn serve(
         ));
     };
 
-    let when = cooldown_ends_at(until_ms);
     let taken_at = snapshot.taken_at.unwrap_or_default();
-    // The list is named because a crossing serves two of them, and two
-    // identical warnings in a row read like the same one printed twice.
-    app.warn(&format!(
-        "the account is in cooldown until {when}; serving the {kind} list stored on {}",
-        stored_on(taken_at)
+    app.warn(&report::serving_stored_in_cooldown(
+        until_ms, kind, taken_at,
     ));
 
     Ok((

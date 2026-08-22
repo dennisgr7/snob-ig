@@ -7,6 +7,7 @@
 use snob_core::model::{ListKind, StopReason, User, printable};
 use snob_ig::pager::Warning;
 
+use crate::app::ConsentInAdvance;
 use crate::engine::Provenance;
 
 use crate::exit::{ExitCode, ExitError};
@@ -427,6 +428,175 @@ pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
         ),
     )
     .into()
+}
+
+/// What somebody is agreeing to when they let a run read a stranger's lists.
+///
+/// Three facts about the request rather than about the account, which is why
+/// there is one of these rather than one per target.
+pub const READING_SOMEBODY_ELSES_LIST: &str = "this reads a list that belongs to somebody else, and lands their followers \
+     in your local database. It is also a heavier request than reading your own, \
+     and Instagram is readier to refuse it";
+
+/// The consent question, with the account named the way the warning above
+/// named it.
+pub fn ask_to_continue(shown: &str) -> String {
+    format!("Continue with {shown}?")
+}
+
+/// Nobody is there to be asked, so nothing is enumerated.
+///
+/// Which way to answer in advance is the **caller's** fact rather than this
+/// sentence's, and it arrives as [`ConsentInAdvance`]. Both commands that reach
+/// here take an answer beforehand and they do not take it the same way, and one
+/// sentence named `-y` for both — so `snob watch once someone` refused with
+/// advice that then failed to parse, because `watch once` deliberately has no
+/// `-y`.
+///
+/// `shown` is `target::label`'s answer, so it is already the at sign and the
+/// filtered name.
+pub fn refuse_unconsented(shown: &str, in_advance: ConsentInAdvance) -> anyhow::Error {
+    let in_advance = match in_advance {
+        ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
+        ConsentInAdvance::WatchConfig => format!(
+            "Run \"snob watch setup\" to answer it once, or ask about {shown} \
+             while you are here."
+        ),
+    };
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!(
+            "reading {shown}'s lists needs confirmation, and there is no terminal to \
+             ask at. {in_advance}"
+        ),
+    )
+    .into()
+}
+
+/// They were asked, and they said no.
+///
+/// No mention of `-y` here, and that is the whole difference from
+/// [`refuse_unconsented`]: they have just said no, and answering that with
+/// "pass the flag that skips the question" is telling them to do it anyway.
+pub fn refuse_declined(shown: &str) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!("nothing was done: {shown} was not confirmed"),
+    )
+    .into()
+}
+
+/// Serving a stored list because nothing may be spent.
+///
+/// The list is named because a crossing serves two of them, and two identical
+/// warnings in a row read like the same one printed twice.
+pub fn serving_stored_in_cooldown(until_ms: i64, kind: ListKind, taken_at: i64) -> String {
+    format!(
+        "the account is in cooldown until {}; serving the {kind} list stored on {}",
+        cooldown_ends_at(until_ms),
+        stored_on(taken_at)
+    )
+}
+
+/// The counter poll failed and there is a stored list to fall back on.
+///
+/// Walking the whole list right when Instagram is already having trouble is the
+/// worst possible reaction, so the warning says what was served rather than
+/// what was refused.
+pub fn poll_failed_serving_stored(error: &anyhow::Error) -> String {
+    format!(
+        "could not check for changes ({}); using the stored list",
+        what_went_wrong(error)
+    )
+}
+
+/// The counter poll failed and nothing is stored, so the walk goes ahead
+/// without a number to check it against.
+pub fn poll_failed(error: &anyhow::Error) -> String {
+    format!("could not read the profile ({})", what_went_wrong(error))
+}
+
+/// A failure as one clause inside a sentence.
+///
+/// Interpolating the error would print [`snob_ig::error::IgError`]'s diagnosis
+/// and drop the advice that used to be part of the same message, on the two
+/// warnings a dead session reaches most often. Only the head of the chain is
+/// asked, because that is the one whose text is about to be printed.
+fn what_went_wrong(error: &anyhow::Error) -> String {
+    match error
+        .chain()
+        .next()
+        .and_then(|head| head.downcast_ref::<snob_ig::error::IgError>())
+    {
+        Some(instagram) => what_instagram_said(instagram),
+        None => error.to_string(),
+    }
+}
+
+/// A private account nobody here can read the lists of.
+///
+/// Two answers rather than one, because a pending follow request is a different
+/// situation from never having asked: the first is waiting on somebody else and
+/// the second is waiting on the reader.
+///
+/// Filtered here rather than at the call site: the name came off Instagram and
+/// this sentence is written to a terminal.
+pub fn refuse_private(username: &str, requested: bool) -> anyhow::Error {
+    if requested {
+        return anyhow::anyhow!(
+            "@{} is private and your follow request has not been accepted yet, \
+             so its lists cannot be read",
+            printable(username)
+        );
+    }
+    anyhow::anyhow!(
+        "@{} is a private account you do not follow, so its lists cannot be read",
+        printable(username)
+    )
+}
+
+/// The account whose profile Instagram will not serve, and what that costs the
+/// run.
+///
+/// Two things people expect quietly stop happening — the truncation wall cannot
+/// be detected without a declared size, and `--cache` has nothing to weigh
+/// freshness against — so both are said out loud rather than left to be
+/// discovered.
+pub fn counters_unknowable(username: &str) -> String {
+    format!(
+        "Instagram would not serve the profile of @{}, so its id came from search \
+         instead. That route carries no follower or following counts, so this run \
+         cannot tell a truncated list from a complete one, and cannot judge whether \
+         a cached list is still current.",
+        printable(username)
+    )
+}
+
+/// A run that concluded nothing about an account nothing is stored for.
+///
+/// It is the tick's own refusal rather than a report, so it names no command:
+/// there was nothing wrong with what the user asked for, and the next run may
+/// well answer it.
+pub fn refuse_nothing_looked_at(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "nothing could be looked at for @{} this time, and nothing is stored \
+         about that account yet to report against",
+        printable(name)
+    )
+}
+
+/// A name the monitor was pointed at and has never walked.
+///
+/// Deliberately not [`refuse_nothing_stored`], which talks about `--cache` — a
+/// flag the commands that reach this do not have. What the user has to do here
+/// is walk the account once, and the sentence says so.
+pub fn refuse_never_walked(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "nothing is stored about @{}. Run \"snob followers {}\" once and the monitor \
+         will have something to compare against from then on.",
+        printable(name),
+        printable(name),
+    )
 }
 
 /// "@someone followers" — what a run is walking, said the same way by every

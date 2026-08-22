@@ -13,7 +13,7 @@
 //! Both return data and the interval it covers. What any of it looks like is
 //! [`crate::commands::watch`]'s question.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
@@ -599,13 +599,8 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         (None, None) => app.viewer().pk,
         (None, Some(name)) => {
             let name = target::clean(name);
-            accounts::find_pk_by_username(app.db().conn(), name)?.ok_or_else(|| {
-                anyhow!(
-                    "nothing could be looked at for @{} this time, and nothing is stored \
-                     about that account yet to report against",
-                    snob_core::model::printable(name)
-                )
-            })?
+            accounts::find_pk_by_username(app.db().conn(), name)?
+                .ok_or_else(|| crate::report::refuse_nothing_looked_at(name))?
         }
     };
 
@@ -995,9 +990,10 @@ fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Op
 
 /// Which account this is about, from storage alone.
 ///
-/// Deliberately not `target::from_store`: that one refuses with a sentence
-/// about `--cache`, which is a flag this command does not have. What the user
-/// has to do here is walk the account once, and the refusal says so.
+/// Deliberately not `target::from_store`: that one refuses with
+/// `report::refuse_nothing_stored`, a sentence about `--cache`, which is a flag
+/// this command does not have. `report::refuse_never_walked` is the one that
+/// belongs here, and it carries the difference between the two.
 fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
     let Some(typed) = typed else {
         let viewer = app.viewer();
@@ -1006,12 +1002,7 @@ fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
 
     let name = target::clean(typed);
     let Some(pk) = accounts::find_pk_by_username(app.db().conn(), name)? else {
-        bail!(
-            "nothing is stored about @{}. Run \"snob followers {}\" once and the monitor \
-             will have something to compare against from then on.",
-            snob_core::model::printable(name),
-            snob_core::model::printable(name),
-        );
+        return Err(crate::report::refuse_never_walked(name));
     };
 
     Ok((pk, users::name(app.db().conn(), pk)?))

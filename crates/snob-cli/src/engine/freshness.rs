@@ -41,15 +41,13 @@ pub async fn decide_and_fetch(
             if let Some(snapshot) = &stored
                 && !args.refresh
             {
-                app.warn(&format!(
-                    "could not check for changes ({e}); using the stored list"
-                ));
+                app.warn(&crate::report::poll_failed_serving_stored(&e));
                 // Served, but with nothing said about whether it is still
                 // true. It is fine to print; it is not fine to cross against
                 // another list, and only the provenance can carry that.
                 return serve(app, snapshot, Provenance::PollFailed);
             }
-            app.warn(&format!("could not read the profile ({e})"));
+            app.warn(&crate::report::poll_failed(&e));
             None
         }
     };
