@@ -217,11 +217,6 @@ impl Calendar {
             .min()
     }
 
-    /// Whether some day this calendar allows can be immediately followed by
-    /// another.
-    ///
-    /// Only [`Calendar::tightest_gap`] asks, to decide whether the wrap around
-    /// midnight is a gap between two runs or a week of waiting.
     /// Whether the day fields name a subset of the days rather than all of them.
     ///
     /// The jitter ceiling asks, because pushing a run past midnight is only
@@ -240,6 +235,11 @@ impl Calendar {
         24 * 3_600 - latest
     }
 
+    /// Whether some day this calendar allows can be immediately followed by
+    /// another.
+    ///
+    /// Only [`Calendar::tightest_gap`] asks, to decide whether the wrap around
+    /// midnight is a gap between two runs or a week of waiting.
     fn days_can_be_consecutive(&self) -> bool {
         let dom_restricted = !self.days_of_month.is_all(1..=31);
         let dow_restricted = !self.days_of_week.is_all(0..=6);
@@ -1266,7 +1266,8 @@ fn number(
         .map_err(|_| unreadable_field(text, name))?;
     if !range.contains(&value) {
         return Err(ScheduleError::Unreadable(format!(
-            "{value} is not a {name} (it has to be between {} and {})",
+            "{value} is not {} {name} (it has to be between {} and {})",
+            article(name),
             range.start(),
             range.end()
         )));
@@ -1274,9 +1275,20 @@ fn number(
     Ok(value)
 }
 
+/// "an hour", "a minute": the field names are few and one of them starts
+/// with a vowel sound, and "24 is not a hour" is what a person was shown.
+fn article(name: &str) -> &'static str {
+    if name.starts_with(['a', 'e', 'i', 'o', 'u', 'h']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
 fn unreadable_field(text: &str, name: &str) -> ScheduleError {
     ScheduleError::Unreadable(format!(
-        "\"{text}\" is not a {name} a cron expression can have"
+        "\"{text}\" is not {} {name} a cron expression can have",
+        article(name)
     ))
 }
 
