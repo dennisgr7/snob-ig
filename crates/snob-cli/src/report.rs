@@ -30,7 +30,7 @@ pub const NOTHING_CONFIGURED: &str =
 /// wording.
 ///
 /// What it deliberately does not do is say what to do about it.
-/// `commands::watch::refuse_unattended` is the sentence that names
+/// `commands::watch::scheduled::refuse_unattended` is the sentence that names
 /// `snob watch setup`, and that is the refusal itself rather than a report about
 /// one.
 ///
