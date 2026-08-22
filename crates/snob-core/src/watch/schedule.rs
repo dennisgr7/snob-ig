@@ -469,6 +469,7 @@ impl Schedule {
     /// interval alone: `--every 2w --on mon --at 09:00 --jitter 5d` kept all
     /// five days, so a run due Monday at nine woke on Friday evening — a day the
     /// calendar does not allow, on a schedule that names one.
+    #[must_use]
     pub fn with_jitter(mut self, jitter: Duration) -> Self {
         self.jitter = jitter.min(self.room_for_jitter());
         self

@@ -220,6 +220,7 @@ impl Session {
 
     /// Reduced version for when the store cannot take the full record. Keeps
     /// only what the session cannot work without.
+    #[must_use]
     pub fn minimal(&self) -> Self {
         Self {
             username: None,

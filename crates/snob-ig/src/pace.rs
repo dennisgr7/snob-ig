@@ -238,12 +238,14 @@ impl Pacer {
         self.spent.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
         self
     }
 
     /// Sets who gets told about a wait the budget imposed.
+    #[must_use]
     pub fn announcing(mut self, announce: Arc<dyn Fn(Duration) + Send + Sync>) -> Self {
         self.announce = Some(announce);
         self

@@ -261,3 +261,12 @@ linker_messages = "allow"
 # there is not one `unsafe fn` defined anywhere in the tree. Every unsafe here
 # is a block.
 undocumented_unsafe_blocks = "warn"
+# The second, and it clears the same bar. Six builders in the tree consume
+# and return `Self` -- `Pacer::with_cancel`, `Pacer::announcing`,
+# `Schedule::with_jitter`, `ExitError::with_hint`, `IgClient::with_base_url`,
+# `Session::minimal` -- and dropping the result of any of them is a silent
+# no-op. AGENTS.md records the defect: `login` and `whoami` built a `Pacer`
+# "and nothing else", losing the cancel token and the wait announcement, and
+# a lint that makes `Pacer::new(budget).with_cancel(token);` a warning is
+# the cheapest thing that would have noticed.
+return_self_not_must_use = "warn"

@@ -588,6 +588,7 @@ impl IgClient {
     /// Instagram with no waits between pages. `snob-cli` is the only consumer,
     /// and it only does this in tests.
     #[doc(hidden)]
+    #[must_use]
     pub fn with_base_url(self, base: Url) -> Self {
         Self::pointed_at(self.session, self.pacer, base)
             .expect("rebuilding a client that already exists cannot fail")

@@ -282,6 +282,7 @@ impl SecretStore {
     /// [`Kind`] other than the session have no file form — so the service name
     /// is what actually separates them.
     #[doc(hidden)]
+    #[must_use]
     pub fn with_service(mut self, service: &str) -> Self {
         self.service = service.to_string();
         self
@@ -357,6 +358,7 @@ impl SecretStore {
     ///
     /// Called after [`SecretStore::probe_writable`] so that the store saves
     /// where it proved it could, rather than where it was first asked to.
+    #[must_use]
     pub fn using(mut self, backend: Backend) -> Self {
         self.backend = backend;
         self

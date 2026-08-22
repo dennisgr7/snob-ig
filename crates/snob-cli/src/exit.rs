@@ -198,6 +198,7 @@ impl ExitError {
     /// Adds the advice. A builder rather than a third argument to `new`,
     /// because most of the places that construct one of these have no advice
     /// to give and should not have to say so.
+    #[must_use]
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self

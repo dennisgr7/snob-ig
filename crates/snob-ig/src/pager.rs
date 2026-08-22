@@ -161,11 +161,13 @@ impl<'a> ListWalker<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_pace(mut self, pace: Pace) -> Self {
         self.pace = pace;
         self
     }
 
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
         self
