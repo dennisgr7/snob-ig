@@ -6,7 +6,7 @@
 //! anything, so nobody completes a two-factor login only to be told afterwards
 //! that there was nowhere to put the result.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use snob_core::session::Session;
 use snob_ig::login::{self, ValidationOutcome};
 use snob_ig::pace::{CancelToken, Pacer};
@@ -218,7 +218,13 @@ async fn by_browser(
     // "the profile does not outlive the login" held only on the path that
     // succeeded.
     if !args.keep_profile {
-        discard_profile(&profile);
+        // Off the worker: the removal retries with sleeps adding up to five
+        // seconds, and this runtime has two workers, one of which has to stay
+        // free for the Ctrl+C task to run at all.
+        let profile = profile.clone();
+        tokio::task::spawn_blocking(move || discard_profile(&profile))
+            .await
+            .context("the profile could not be removed")?;
     }
     if cancel.is_canceled() {
         ui::info("Login canceled.");
