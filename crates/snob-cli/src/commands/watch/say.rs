@@ -260,7 +260,7 @@ pub(super) fn earliest_since(report: &WatchReport) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::watch::tests::fixtures::{list, report_with, user};
+    use crate::commands::watch::fixtures::{list, report_with, user};
     use crate::engine::watch::ListReport;
     use snob_core::Pk;
     use snob_core::model::ListKind;

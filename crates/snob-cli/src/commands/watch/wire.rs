@@ -481,7 +481,7 @@ pub(super) fn basis_token(basis: Basis) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::watch::tests::fixtures::{list, report_with, user};
+    use crate::commands::watch::fixtures::{list, report_with, user};
     use crate::engine::Provenance;
     use crate::engine::watch::TickList;
     use snob_core::model::ListKind;

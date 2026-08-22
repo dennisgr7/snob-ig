@@ -20,6 +20,8 @@ use crate::engine::check::Verdict;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
 
+use super::preflight::{baseline_now, describe_check, preflight};
+use super::schedule::{calendar_from, schedule_from};
 use super::status::{describe_config, plural};
 
 /// Walks somebody through configuring the monitor.
@@ -114,8 +116,8 @@ pub async fn setup(
     // has gone are all cheap to fix now and expensive to discover from an
     // unattended run's log a week later.
     crate::ui::say!();
-    let report = super::preflight(&Default::default(), &secrets, paths).await?;
-    for line in super::describe_check(&report) {
+    let report = preflight(&Default::default(), &secrets, paths).await?;
+    for line in describe_check(&report) {
         crate::ui::say!("{line}");
     }
 
@@ -296,7 +298,7 @@ async fn offer_the_baseline(
     }
 
     let configured = config::load(paths)?;
-    super::baseline_now(configured.as_ref(), secrets, paths).await
+    baseline_now(configured.as_ref(), secrets, paths).await
 }
 
 /// Stores a secret, or clears whatever was there when this run has none.
@@ -367,7 +369,7 @@ fn ask_schedule() -> Result<WatchConfig> {
     // gap between what the wizard accepts and what a run accepts: this is the
     // function `snob watch` itself calls, over the configuration about to be
     // written rather than over one answer at a time.
-    let schedule = super::schedule_from(&Default::default(), Some(&config))?;
+    let schedule = schedule_from(&Default::default(), Some(&config))?;
     config.jitter = ask_jitter(&schedule)?;
 
     Ok(config)
@@ -484,7 +486,7 @@ fn calendar_of(days: &str, times: &str) -> Result<(Vec<String>, Vec<String>)> {
 
     // Through the very function a run parses the file with, so the wizard
     // cannot accept a calendar the scheduler would then refuse.
-    super::calendar_from(&days, &times)?;
+    calendar_from(&days, &times)?;
 
     Ok((
         days.iter().map(|d| (*d).to_string()).collect(),
@@ -1056,7 +1058,7 @@ evry = \"6h\"
             ("", "09:00,09:05"),
         ] {
             let wizard = calendar_of(days, times);
-            let run = super::super::calendar_from(
+            let run = calendar_from(
                 &days
                     .split(',')
                     .map(str::trim)

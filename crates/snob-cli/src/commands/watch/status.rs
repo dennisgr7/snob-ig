@@ -20,6 +20,9 @@ use crate::engine::check::Verdict;
 use crate::exit::ExitCode;
 use crate::report;
 
+use super::schedule::schedule_from;
+use super::watched::watched_from;
+
 /// Reports what is configured and what has happened.
 pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     let config = config::load(paths)?;
@@ -274,7 +277,7 @@ fn watched_pks(db: &Store, config: Option<&WatchConfig>) -> Result<Option<Vec<sn
         return Ok(None);
     };
 
-    let watched = super::watched_from(None, Some(config));
+    let watched = watched_from(None, Some(config));
     let mut pks = Vec::new();
     if watched.iter().any(|w| w.name().is_none()) {
         match snob_store::store::accounts::own(conn)? {
@@ -348,7 +351,7 @@ fn expected_gap(config: &WatchConfig, now: i64) -> Option<i64> {
     /// uniform grid has already given its answer by step one.
     const MOST_STEPS: usize = 200;
 
-    let schedule = super::schedule_from(&Default::default(), Some(config)).ok()?;
+    let schedule = schedule_from(&Default::default(), Some(config)).ok()?;
     let first = schedule::next_moment(&schedule, Some(now), now, &chrono::Local)?;
 
     let mut at = first;
@@ -431,7 +434,7 @@ fn health(
     // `status` said "Runs every 5m" and exited 0 about a file that kills every
     // invocation at `schedule_from`. Nothing here built a schedule at all.
     if let Some(config) = config
-        && let Err(e) = super::schedule_from(&Default::default(), Some(config))
+        && let Err(e) = schedule_from(&Default::default(), Some(config))
     {
         at_least(Verdict::Failed);
         notes.push(format!("the configured schedule cannot be built: {e}"));
@@ -692,7 +695,7 @@ pub(super) fn describe_config(config: &WatchConfig) -> Vec<String> {
 /// `None` for the target, because there is no command line here: this is what a
 /// scheduled run over this file alone would walk.
 fn watching_line(config: &WatchConfig) -> String {
-    let watched = super::watched_from(None, Some(config));
+    let watched = watched_from(None, Some(config));
     let own = watched.iter().any(|w| w.name().is_none());
     let others = watched.iter().filter(|w| w.name().is_some()).count();
 
