@@ -352,7 +352,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     // A moment the report is still young at. The queue refuses to hand back a
     // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
     // so a synthetic timestamp from 1970 would simply never be due.
-    let queued_at = 1_000_000;
+    let queued_at = snob_core::Epoch::new(1_000_000);
     let id =
         deliveries::enqueue(app.db().conn(), "run-1", Pk::new(42), BODY, queued_at, None).unwrap();
 
@@ -368,7 +368,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     // Still owed, and the bytes are the ones that were signed.
     let owed = deliveries::due(
         app.db().conn(),
-        queued_at + 3_600,
+        queued_at + std::time::Duration::from_secs(3_600),
         10,
         "https://receiver.example",
     )
@@ -388,7 +388,13 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
         )
         .await;
     assert_eq!(outcome, Attempt::Delivered { status: 200 });
-    deliveries::delivered(app.db().conn(), id, 200, queued_at + 3_600).unwrap();
+    deliveries::delivered(
+        app.db().conn(),
+        id,
+        200,
+        queued_at + std::time::Duration::from_secs(3_600),
+    )
+    .unwrap();
 
     assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
     let requests = up.received_requests().await.unwrap();

@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, MappedLocalTime, TimeZone};
 
+use crate::Epoch;
+
 use super::calendar::Calendar;
 use super::{Due, MIN_GAP_SECS, Schedule};
 
@@ -28,24 +30,29 @@ const HORIZON_MINUTES: i64 = 4 * 366 * 24 * 60; // four years, in minutes
 /// before anything is scheduled at all.
 pub fn next_moment<Tz: TimeZone>(
     schedule: &Schedule,
-    last_run: Option<i64>,
-    now: i64,
+    last_run: Option<Epoch>,
+    now: Epoch,
     zone: &Tz,
-) -> Option<i64> {
+) -> Option<Epoch> {
     next_after(schedule, last_run, now, zone)
 }
 
 /// The next moment this schedule is due after `now`.
 ///
 /// `None` only when the calendar can never match. Both arguments and the answer
-/// are epoch seconds; the zone is what turns them into wall-clock time, and it
-/// is passed in so a test can pick one rather than inherit the machine's.
+/// are moments; the zone is what turns them into wall-clock time, and it is
+/// passed in so a test can pick one rather than inherit the machine's.
+///
+/// The minute arithmetic below works in bare seconds, and deliberately: a
+/// minute index is not a moment, and neither is the offset of one from another.
+/// The moments come in and go out as [`Epoch`], which is where a transposition
+/// would cost something.
 pub(super) fn next_after<Tz: TimeZone>(
     schedule: &Schedule,
-    last_run: Option<i64>,
-    now: i64,
+    last_run: Option<Epoch>,
+    now: Epoch,
     zone: &Tz,
-) -> Option<i64> {
+) -> Option<Epoch> {
     // The floor. Counted from the previous run rather than from an absolute
     // grid: `--every 6h` started at 09:13 means 15:13, which is what people
     // mean by it.
@@ -63,10 +70,11 @@ pub(super) fn next_after<Tz: TimeZone>(
     // into the search start, the answer is always both on the grid and far
     // enough from the last run.
     //
-    // `saturating_add` because an absurd `--every` can arrive from a
-    // hand-edited `watch.toml`: the sum overflowed, which panicked a debug
-    // build and in release wrapped to a negative floor, turning an interval of
-    // billions of years into one that ran every fifteen minutes.
+    // The addition saturates, and [`Epoch`]'s own `Add` is where that now
+    // lives: an absurd `--every` can arrive from a hand-edited `watch.toml`,
+    // the sum overflowed, and that panicked a debug build and in release
+    // wrapped to a negative floor — turning an interval of billions of years
+    // into one that ran every fifteen minutes.
     let interval = schedule
         .every
         .map(|every| i64::try_from(every.as_secs()).unwrap_or(i64::MAX))
@@ -78,7 +86,9 @@ pub(super) fn next_after<Tz: TimeZone>(
         //
         // Nothing has run: there is no past to wait from, and no run to be too
         // close to.
-        let floor = last_run.map_or(now, |last| last.saturating_add(interval.max(MIN_GAP_SECS)));
+        let floor = last_run.map_or(now, |last| {
+            last + Duration::from_secs(interval.max(MIN_GAP_SECS) as u64)
+        });
         return Some(floor.max(now));
     };
 
@@ -103,10 +113,11 @@ pub(super) fn next_after<Tz: TimeZone>(
     // statement about the moments, not about the instants the process happened
     // to write a row at.
     //
-    // `saturating_add` because an absurd `--every` can arrive from a hand-edited
-    // `watch.toml`: the sum overflowed, which panicked a debug build and in
-    // release wrapped to a negative floor, turning an interval of billions of
-    // years into one that ran every fifteen minutes.
+    // The addition saturates, in [`Epoch`]'s own `Add`, because an absurd
+    // `--every` can arrive from a hand-edited `watch.toml`: the sum overflowed,
+    // which panicked a debug build and in release wrapped to a negative floor,
+    // turning an interval of billions of years into one that ran every fifteen
+    // minutes.
     let served = last_run.map(|last| moment_served(calendar, last, zone));
     let floor = match (served, last_run) {
         // Never earlier than the row the last run wrote, whatever the snap
@@ -114,7 +125,9 @@ pub(super) fn next_after<Tz: TimeZone>(
         // hour past a moment the row already trails — and the thing that keeps
         // this monotonic if a calendar is ever strange enough to snap somewhere
         // unhelpful.
-        (Some(moment), Some(last)) => moment.saturating_add(interval.max(MIN_GAP_SECS)).max(last),
+        (Some(moment), Some(last)) => {
+            (moment + Duration::from_secs(interval.max(MIN_GAP_SECS) as u64)).max(last)
+        }
         _ => now,
     };
 
@@ -132,7 +145,8 @@ pub(super) fn next_after<Tz: TimeZone>(
         let Some(at) = zone.timestamp_opt(seconds, 0).single() else {
             return false;
         };
-        calendar.allows(&at) && !already_run_at_this_wall_clock(zone, seconds, &at, last_run)
+        calendar.allows(&at)
+            && !already_run_at_this_wall_clock(zone, Epoch::new(seconds), &at, last_run)
     };
 
     // **A moment that has already gone by is still owed.** The search only ever
@@ -181,11 +195,11 @@ pub(super) fn next_after<Tz: TimeZone>(
     // is: what must not be served twice is the moment, and everything after it
     // is owed.
     let earliest = match served {
-        Some(moment) => moment.div_euclid(60) + 1,
-        None => now.div_euclid(60),
+        Some(moment) => moment.get().div_euclid(60) + 1,
+        None => now.get().div_euclid(60),
     };
     if floor <= now {
-        let latest = now.div_euclid(60);
+        let latest = now.get().div_euclid(60);
         if (earliest..=latest)
             .rev()
             .take(HORIZON_MINUTES as usize)
@@ -209,13 +223,13 @@ pub(super) fn next_after<Tz: TimeZone>(
     // floor from the moment a run served rather than from when the row was
     // written, which changes what `MIN_GAP_SECS` means. Not a thing to change
     // in passing.
-    let start = floor.max(now);
+    let start = floor.max(now).get();
     let first = start.div_euclid(60) + i64::from(start.rem_euclid(60) != 0);
 
     (first..)
         .take(HORIZON_MINUTES as usize)
         .find(allowed)
-        .map(|minute| minute * 60)
+        .map(|minute| Epoch::new(minute * 60))
 }
 
 /// The moment on the grid that a run recorded at `last` was serving.
@@ -233,8 +247,8 @@ pub(super) fn next_after<Tz: TimeZone>(
 /// Deliberately asks `Calendar::allows` and not the fuller predicate the search
 /// uses: a repeated wall-clock hour is refused for a run that has *not* happened
 /// yet, and this is looking at one that has.
-fn moment_served<Tz: TimeZone>(calendar: &Calendar, last: i64, zone: &Tz) -> i64 {
-    let from = last.div_euclid(60);
+fn moment_served<Tz: TimeZone>(calendar: &Calendar, last: Epoch, zone: &Tz) -> Epoch {
+    let from = last.get().div_euclid(60);
     (0..)
         .take(HORIZON_MINUTES as usize)
         .map(|back| from - back)
@@ -243,7 +257,7 @@ fn moment_served<Tz: TimeZone>(calendar: &Calendar, last: i64, zone: &Tz) -> i64
                 .single()
                 .is_some_and(|at| calendar.allows(&at))
         })
-        .map_or(last, |minute| minute * 60)
+        .map_or(last, |minute| Epoch::new(minute * 60))
 }
 
 /// Whether this instant is the **second** showing of a wall-clock time the last
@@ -265,16 +279,16 @@ fn moment_served<Tz: TimeZone>(calendar: &Calendar, last: i64, zone: &Tz) -> i64
 /// machine that was switched off through the first showing still runs.
 fn already_run_at_this_wall_clock<Tz: TimeZone>(
     zone: &Tz,
-    at_secs: i64,
+    at: Epoch,
     local: &DateTime<Tz>,
-    last_run: Option<i64>,
+    last_run: Option<Epoch>,
 ) -> bool {
     let Some(last) = last_run else {
         return false;
     };
     match zone.from_local_datetime(&local.naive_local()) {
         MappedLocalTime::Ambiguous(first, second) => {
-            second.timestamp() == at_secs && first.timestamp() <= last
+            second.timestamp() == at.get() && first.timestamp() <= last.get()
         }
         _ => false,
     }
@@ -287,7 +301,12 @@ fn already_run_at_this_wall_clock<Tz: TimeZone>(
 /// exists to avoid — and they would all give the same answer anyway, because
 /// the diff is against the last report and there is only one present state.
 /// There is nothing to catch up on; there is one thing to report.
-pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, zone: &Tz) -> Due {
+pub fn due<Tz: TimeZone>(
+    schedule: &Schedule,
+    last_run: Option<Epoch>,
+    now: Epoch,
+    zone: &Tz,
+) -> Due {
     // A clock that went backwards. The same reading `rate_budget` takes: trust
     // the present over a stored future, rather than refusing to run for however
     // long the skew was.
@@ -339,8 +358,8 @@ pub fn due<Tz: TimeZone>(schedule: &Schedule, last_run: Option<i64>, now: i64, z
 /// downtime is not worth doing to reach a larger number.
 fn missed_since<Tz: TimeZone>(
     schedule: &Schedule,
-    last_run: Option<i64>,
-    now: i64,
+    last_run: Option<Epoch>,
+    now: Epoch,
     zone: &Tz,
 ) -> u32 {
     let Some(last) = last_run else {
@@ -407,21 +426,21 @@ const MAX_MISSED_COUNTED: u32 = 1_000;
 /// The bound is not applied here. [`wake_at`] is what the loop calls, because
 /// deciding how much room a moment has needs the zone, and this deliberately has
 /// no arithmetic in it beyond the multiplication.
-pub fn with_jitter(due_at: i64, jitter: Duration, roll: f64) -> i64 {
+pub fn with_jitter(due_at: Epoch, jitter: Duration, roll: f64) -> Epoch {
     let spread = jitter.as_secs() as f64 * roll.clamp(0.0, 1.0);
-    due_at.saturating_add(spread as i64)
+    due_at + Duration::from_secs(spread as u64)
 }
 
 /// The first instant of the local day after `at`.
 ///
 /// `None` when the zone skips its own midnight, which some have done: there is
 /// no such instant, and the calendar's own search is then the only bound left.
-pub(super) fn next_local_midnight<Tz: TimeZone>(at: i64, zone: &Tz) -> Option<i64> {
-    let local = zone.timestamp_opt(at, 0).single()?;
+pub(super) fn next_local_midnight<Tz: TimeZone>(at: Epoch, zone: &Tz) -> Option<Epoch> {
+    let local = zone.timestamp_opt(at.get(), 0).single()?;
     let tomorrow = local.date_naive().succ_opt()?.and_hms_opt(0, 0, 0)?;
     zone.from_local_datetime(&tomorrow)
         .earliest()
-        .map(|midnight| midnight.timestamp())
+        .map(|midnight| Epoch::new(midnight.timestamp()))
 }
 
 /// The moment to wake at for a run due at `due_at`. What the loop calls.
@@ -452,7 +471,7 @@ pub(super) fn next_local_midnight<Tz: TimeZone>(at: i64, zone: &Tz) -> Option<i6
 /// dropped rather than run. The next answer is the following day's 01:50. That
 /// is the floor doing exactly what the floor is for, and nothing here can help
 /// with it.
-pub fn wake_at<Tz: TimeZone>(schedule: &Schedule, due_at: i64, roll: f64, zone: &Tz) -> i64 {
+pub fn wake_at<Tz: TimeZone>(schedule: &Schedule, due_at: Epoch, roll: f64, zone: &Tz) -> Epoch {
     with_jitter(
         due_at,
         schedule.jitter().min(schedule.room_at(due_at, zone)),
@@ -464,7 +483,7 @@ pub fn wake_at<Tz: TimeZone>(schedule: &Schedule, due_at: i64, roll: f64, zone: 
 mod tests {
     use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 
-    use super::super::tests::{MONDAY_0000, at, hours};
+    use super::super::tests::{MONDAY_0000, at, hours, secs};
     use super::super::{MAX_INTERVAL_SECS, Weekday};
     use super::*;
 
@@ -613,8 +632,8 @@ mod tests {
         // Started at 09:13, so the next one is 15:13 rather than 12:00.
         let last = at(hours(9) + 13 * 60);
         assert_eq!(
-            next_after(&schedule, Some(last), last + 60, &Utc),
-            Some(last + hours(6))
+            next_after(&schedule, Some(last), last + secs(60), &Utc),
+            Some(last + secs(hours(6)))
         );
     }
 
@@ -659,9 +678,9 @@ mod tests {
         // Whatever the current moment is before the next one comes round, `due`
         // names that next moment: on the quarter hour, and a full grid step from
         // the one that was served.
-        let last = start + 7;
+        let last = start + secs(7);
         for ahead in 0..(grid - 7) {
-            match due(&schedule, Some(last), last + ahead, &Utc) {
+            match due(&schedule, Some(last), last + secs(ahead), &Utc) {
                 Due::At(next) => {
                     assert_eq!(
                         next - start,
@@ -681,7 +700,7 @@ mod tests {
         // And the moment itself is taken when it arrives, rather than pushed
         // past by the seven seconds the row trails.
         assert!(matches!(
-            due(&schedule, Some(last), start + grid, &Utc),
+            due(&schedule, Some(last), start + secs(grid), &Utc),
             Due::Now { .. }
         ));
 
@@ -691,9 +710,9 @@ mod tests {
         // fifteen minutes, on an account that takes fifteen minutes to walk,
         // amounts to — and what bounds the requests there is the pacer's budget,
         // not this.
-        let slow = start + grid - 1;
+        let slow = start + secs(grid - 1);
         assert!(matches!(
-            due(&schedule, Some(slow), start + grid, &Utc),
+            due(&schedule, Some(slow), start + secs(grid), &Utc),
             Due::Now { .. }
         ));
     }
@@ -722,8 +741,8 @@ mod tests {
 
                 for step in 1..=4 {
                     // The row is written when the walk finishes.
-                    let row = served + walk;
-                    let expected = start + step * grid;
+                    let row = served + secs(walk);
+                    let expected = start + secs(step * grid);
 
                     match due(&schedule, Some(row), expected, &Utc) {
                         Due::Now { .. } => {}
@@ -775,7 +794,7 @@ mod tests {
 
         let woken = wake_at(&schedule, due_at, 0.999, &SpringsForward);
         assert!(
-            woken + MIN_GAP_SECS <= next,
+            woken + secs(MIN_GAP_SECS) <= next,
             "woke at {woken}, which leaves no room before the next moment at {next}"
         );
     }
@@ -802,7 +821,10 @@ mod tests {
         );
 
         let woken = wake_at(&schedule, due_at, 0.96, &SpringsForward);
-        let landed = SpringsForward.timestamp_opt(woken, 0).single().unwrap();
+        let landed = SpringsForward
+            .timestamp_opt(woken.get(), 0)
+            .single()
+            .unwrap();
         assert_eq!(
             landed.weekday(),
             chrono::Weekday::Mon,
@@ -829,7 +851,7 @@ mod tests {
             // half the bound, and this test is here to walk the real path.
             let mut last = wake_at(&schedule, start, 0.999_999, &Utc);
             for step in 1..=4 {
-                let expected = start + step * grid;
+                let expected = start + secs(step * grid);
                 match due(&schedule, Some(last), expected, &Utc) {
                     Due::Now { .. } => {}
                     other => panic!(
@@ -865,7 +887,7 @@ mod tests {
 
         // The fixture has to be the thing it claims: two instants for one
         // reading, or the test proves nothing about the guard.
-        let reading = DateTime::from_timestamp(first, 0)
+        let reading = DateTime::from_timestamp(first.get(), 0)
             .unwrap()
             .with_timezone(&FallsBack)
             .naive_local();
@@ -889,7 +911,12 @@ mod tests {
         // still runs at the second. The rule is "not twice", not "not at all".
         assert!(
             matches!(
-                due(&schedule, Some(first - 24 * 3_600), second, &FallsBack),
+                due(
+                    &schedule,
+                    Some(first - secs(24 * 3_600)),
+                    second,
+                    &FallsBack
+                ),
                 Due::Now { .. }
             ),
             "a run that has not happened is still owed"
@@ -909,7 +936,7 @@ mod tests {
 
         // Last ran one Monday at nine; it is now the Monday a fortnight later.
         let last = at(hours(9));
-        match due(&schedule, Some(last), last + 14 * hours(24), &Utc) {
+        match due(&schedule, Some(last), last + secs(14 * hours(24)), &Utc) {
             Due::Now { missed } => assert_eq!(missed, 1, "one Monday went by unrun"),
             other => panic!("should be due: {other:?}"),
         }
@@ -1041,7 +1068,7 @@ mod tests {
         let schedule = Schedule::every(Duration::from_secs(hours(6) as u64)).unwrap();
         let last = at(0);
         // Three days later: twelve intervals have gone by.
-        match due(&schedule, Some(last), last + hours(72), &Utc) {
+        match due(&schedule, Some(last), last + secs(hours(72)), &Utc) {
             Due::Now { missed } => assert_eq!(missed, 11, "eleven skipped, and this one now"),
             other => panic!("should be due: {other:?}"),
         }
@@ -1079,11 +1106,11 @@ mod tests {
             .unwrap();
 
         let last = at(hours(9));
-        let next = next_after(&schedule, Some(last), last + 60, &Utc).unwrap();
+        let next = next_after(&schedule, Some(last), last + secs(60), &Utc).unwrap();
 
         assert_eq!(
             next,
-            last + 14 * hours(24),
+            last + secs(14 * hours(24)),
             "the Monday a fortnight later, not the one a week later"
         );
     }
@@ -1105,7 +1132,7 @@ mod tests {
         for _ in 0..5 {
             let from_dsl = next_after(&dsl, None, at, &Utc);
             assert_eq!(from_dsl, next_after(&cron, None, at, &Utc));
-            at = from_dsl.expect("Monday comes round") + 60;
+            at = from_dsl.expect("Monday comes round") + secs(60);
         }
     }
 
@@ -1120,9 +1147,9 @@ mod tests {
         let mut at = at(0);
         for _ in 0..4 {
             let next = next_after(&schedule, None, at, &Utc).unwrap();
-            let local = Utc.timestamp_opt(next, 0).unwrap();
+            let local = Utc.timestamp_opt(next.get(), 0).unwrap();
             fired.push(format!("{:02}:{:02}", local.hour(), local.minute()));
-            at = next + 60;
+            at = next + secs(60);
         }
 
         assert_eq!(fired, vec!["09:00", "21:30", "09:00", "21:30"]);
@@ -1139,9 +1166,9 @@ mod tests {
         let mut at = at(0);
         for _ in 0..4 {
             let next = next_after(&schedule, None, at, &Utc).unwrap();
-            let local = Utc.timestamp_opt(next, 0).unwrap();
+            let local = Utc.timestamp_opt(next.get(), 0).unwrap();
             fired.push(format!("{:02}:{:02}", local.hour(), local.minute()));
-            at = next + 60;
+            at = next + secs(60);
         }
 
         assert_eq!(fired, vec!["09:00", "09:30", "21:00", "21:30"]);
@@ -1162,7 +1189,7 @@ mod tests {
     fn a_schedule_that_names_nothing_is_never_due_rather_than_due_at_the_end_of_time() {
         // A century out, which is past anything expressible here:
         // `MAX_INTERVAL_SECS` is a year and the search horizon is four years.
-        let a_century = at(0) + 100 * 366 * 24 * 3_600;
+        let a_century = at(0) + secs(100 * 366 * 24 * 3_600);
         for schedule in [
             Schedule::every(Duration::from_secs(hours(6) as u64)).unwrap(),
             Schedule::every(Duration::from_secs(MAX_INTERVAL_SECS as u64)).unwrap(),
@@ -1215,7 +1242,7 @@ mod tests {
         let zone = FixedOffset::east_opt(3_600).unwrap();
         let next = next_after(&schedule, None, at(0), &zone).unwrap();
 
-        let local = zone.timestamp_opt(next, 0).unwrap();
+        let local = zone.timestamp_opt(next.get(), 0).unwrap();
         assert_eq!((local.hour(), local.minute()), (2, 30));
     }
 
@@ -1240,7 +1267,7 @@ mod tests {
         for roll in [0.0, 0.5, 0.99] {
             let woken = with_jitter(due_at, Duration::from_secs(900), roll);
             assert!(woken >= due_at, "jitter must not pull a run earlier");
-            assert!(woken <= due_at + 900);
+            assert!(woken <= due_at + secs(900));
         }
     }
 
@@ -1251,7 +1278,7 @@ mod tests {
         let due_at = at(0);
         assert_eq!(
             with_jitter(due_at, Duration::from_secs(900), 5.0),
-            due_at + 900
+            due_at + secs(900)
         );
         assert_eq!(with_jitter(due_at, Duration::from_secs(900), -1.0), due_at);
     }
@@ -1269,12 +1296,12 @@ mod tests {
         let now = at(0);
 
         // The last run is recorded a day in the future.
-        let Due::At(next) = due(&schedule, Some(now + hours(24)), now, &Utc) else {
+        let Due::At(next) = due(&schedule, Some(now + secs(hours(24))), now, &Utc) else {
             panic!("a run six hours out is not due yet");
         };
         assert_eq!(
             next,
-            now + hours(6),
+            now + secs(hours(6)),
             "the skew is discarded rather than waited out"
         );
     }

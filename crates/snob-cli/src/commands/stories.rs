@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{Attribute as Style, Cell, ContentArrangement, Table, presets};
+use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_ig::error::IgError;
@@ -84,8 +85,8 @@ impl Kind {
 #[derive(Debug, Clone)]
 pub struct Story {
     pub kind: Kind,
-    pub taken_at: i64,
-    pub expiring_at: Option<i64>,
+    pub taken_at: Epoch,
+    pub expiring_at: Option<Epoch>,
     /// Where the best copy is. Absent when Instagram described a story and
     /// offered no version of it, which happens and must not be a crash.
     pub url: Option<String>,
@@ -308,11 +309,11 @@ pub(crate) fn posted_and_left(story: &Story) -> String {
 /// An absent `expiring_at` prints as a dash rather than as an expired story:
 /// zero would be read as "gone", which is a statement, and what is true is that
 /// nobody said.
-fn remaining(expiring_at: Option<i64>) -> String {
+fn remaining(expiring_at: Option<Epoch>) -> String {
     let Some(at) = expiring_at else {
         return "-".into();
     };
-    countdown(at - chrono::Utc::now().timestamp())
+    countdown(at - snob_core::clock::now())
 }
 
 /// "7h 23m", "12m", "expired".
@@ -538,8 +539,8 @@ mod tests {
         ReelItem {
             pk: "1".into(),
             media_type,
-            taken_at: 1_000,
-            expiring_at: Some(2_000),
+            taken_at: Epoch::new(1_000),
+            expiring_at: Some(Epoch::new(2_000)),
             image_versions2: Some(Candidates { candidates: images }),
             video_versions: videos,
             reel_mentions: Vec::new(),

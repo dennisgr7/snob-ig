@@ -13,9 +13,9 @@
 //! report says, this decides where it goes and what travels with it.
 
 use anyhow::{Context, Result, bail};
-use snob_core::Pk;
 use snob_core::secret::Secret;
 use snob_core::watch::Changes;
+use snob_core::{Epoch, Pk};
 use snob_store::config::{WatchConfig, WebhookConfig};
 use snob_store::secrets::{Kind, SecretStore, Stored};
 use snob_store::store::{deliveries, watch::Queued};
@@ -488,9 +488,9 @@ async fn send_one(
 
 /// The far end's answer, whatever shape the attempt came back in.
 /// "in 4m", for a moment in the near future.
-fn describe_when(at: i64, now: i64) -> String {
-    match at.checked_sub(now) {
-        Some(seconds) if seconds > 0 => format!(
+fn describe_when(at: Epoch, now: Epoch) -> String {
+    match at - now {
+        seconds if seconds > 0 => format!(
             "in {}",
             snob_core::duration::format(std::time::Duration::from_secs(seconds as u64))
         ),
@@ -607,7 +607,7 @@ const DRAIN_LIMIT: usize = 10;
 /// `now` is an argument rather than read inside, which is this project's shape
 /// for anything with arithmetic in it -- and here it is also what lets the
 /// uniqueness be tested without building a whole tick.
-pub(super) fn run_id(now: i64, account_pk: Pk) -> String {
+pub(super) fn run_id(now: Epoch, account_pk: Pk) -> String {
     format!(
         "{}-{:08x}",
         now,
@@ -672,7 +672,7 @@ mod tests {
                     gained: vec![user(Pk::new(7), "newcomer")],
                     lost: vec![],
                 },
-                Some(1_000),
+                Some(Epoch::new(1_000)),
             )),
             vec![],
         )
@@ -700,13 +700,16 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1_000 {
             assert!(
-                seen.insert(run_id(1_700, Pk::new(42))),
+                seen.insert(run_id(Epoch::new(1_700), Pk::new(42))),
                 "the same second and the same account produced one id twice"
             );
         }
         // And two accounts in one second, which is one run of a monitor
         // watching more than one.
-        assert_ne!(run_id(1_700, Pk::new(42)), run_id(1_700, Pk::new(43)));
+        assert_ne!(
+            run_id(Epoch::new(1_700), Pk::new(42)),
+            run_id(Epoch::new(1_700), Pk::new(43))
+        );
     }
 
     async fn accepting(server: &wiremock::MockServer) {
@@ -717,7 +720,7 @@ mod tests {
             .await;
     }
 
-    fn owe(app: &crate::app::App, delivery: &Delivery, how_many: usize, at: i64) {
+    fn owe(app: &crate::app::App, delivery: &Delivery, how_many: usize, at: Epoch) {
         for n in 0..how_many {
             deliveries::enqueue(
                 app.db().conn(),

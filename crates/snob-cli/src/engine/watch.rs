@@ -14,9 +14,9 @@
 //! [`crate::commands::watch`]'s question.
 
 use anyhow::Result;
-use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
+use snob_core::{Epoch, Pk};
 use snob_store::store::{accounts, snapshots, users, watch as store};
 
 use crate::app::App;
@@ -34,9 +34,9 @@ pub struct ListReport {
     /// The receipt's moment, not the marked capture's `taken_at`. Those come
     /// apart the moment somebody types `snob followers` between two runs, and
     /// this is the one that says what has actually been said out loud.
-    pub since: Option<i64>,
+    pub since: Option<Epoch>,
     /// When the newest capture was taken.
-    pub until: i64,
+    pub until: Epoch,
     pub diff: ListDiff,
     /// How many accounts the newest capture holds, so a report can say "three
     /// left, of a hundred and forty" without the caller counting again.
@@ -250,7 +250,7 @@ pub struct TickReport {
     /// comparison could not build a report for, and asking the store again
     /// afterwards would find both and mark them anyway.
     committable: Vec<(ListKind, i64)>,
-    at: i64,
+    at: Epoch,
     /// How far along the rename history this report has covered, when it read a
     /// window at all. `None` means the cursor must not move.
     rename_cursor: Option<i64>,
@@ -344,7 +344,7 @@ pub fn commit(
 /// moment anybody can be told. Everything else it did stays in a trace. It
 /// returns the count rather than printing it for the reason the module header
 /// gives -- `engine` says what happened and `commands` decides how it reads.
-pub fn settle(db: &snob_store::store::Store, at: i64) -> usize {
+pub fn settle(db: &snob_store::store::Store, at: Epoch) -> usize {
     match store::prune(db.conn(), at) {
         Ok(swept) => {
             if swept.captures > 0 {
@@ -388,8 +388,11 @@ pub fn settle_daily(db: &snob_store::store::Store) {
     let last = snob_store::store::meta_get(db.conn(), KEY)
         .ok()
         .flatten()
+        // The one row this is kept in is TEXT, so the moment is parsed back
+        // out of it here, at the boundary, and nothing further in handles a
+        // number.
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
+        .map_or(Epoch::default(), Epoch::new);
     if now - last < A_DAY {
         return;
     }
@@ -424,7 +427,7 @@ pub fn settle_daily(db: &snob_store::store::Store) {
 /// Best-effort, like the rest of settling. A database that cannot be opened is
 /// the run's own problem a moment later, and it is not worth turning a refusal
 /// about a webhook into a different failure.
-pub fn settle_without_a_session(paths: &snob_store::paths::AppPaths, at: i64) -> usize {
+pub fn settle_without_a_session(paths: &snob_store::paths::AppPaths, at: Epoch) -> usize {
     match snob_store::store::Store::open(paths) {
         Ok(db) => settle(&db, at),
         Err(e) => {
@@ -442,7 +445,7 @@ impl TickReport {
     /// module can decide that — a caller that could set `committable` could
     /// retire the mark of a list the run refused.
     #[doc(hidden)]
-    pub fn for_test(report: WatchReport, requests: u32, at: i64) -> Self {
+    pub fn for_test(report: WatchReport, requests: u32, at: Epoch) -> Self {
         Self {
             report,
             requests,
@@ -454,14 +457,14 @@ impl TickReport {
         }
     }
 
-    /// When this run concluded, in epoch seconds.
+    /// When this run concluded.
     ///
     /// Read once, inside [`tick`], just before the comparison, and handed out
     /// rather than read again: this is the moment `commit_report` files the
     /// mark at, and a body or a stream line that asked the clock a second time
     /// would put a different moment on the same event. The field stays
     /// private, so only a real tick can decide it.
-    pub fn at(&self) -> i64 {
+    pub fn at(&self) -> Epoch {
         self.at
     }
 
@@ -1017,8 +1020,8 @@ mod tests {
             provenance,
             reason,
             requests: 0,
-            started_at: 1_000,
-            taken_at: 1_100,
+            started_at: Epoch::new(1_000),
+            taken_at: Epoch::new(1_100),
             account_pk: Pk::new(42),
             snapshot_id: 7,
             stopped_by: None,
@@ -1092,7 +1095,7 @@ mod tests {
                 )),
             }],
             committable: Vec::new(),
-            at: 0,
+            at: Epoch::default(),
             rename_cursor: None,
             renames_sent: Vec::new(),
         };
@@ -1132,7 +1135,7 @@ mod tests {
                 skipped: Some(Skipped::Incomplete(StopReason::SessionInvalid, said)),
             }],
             committable: Vec::new(),
-            at: 0,
+            at: Epoch::default(),
             rename_cursor: None,
             renames_sent: Vec::new(),
         };

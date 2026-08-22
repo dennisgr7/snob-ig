@@ -6,6 +6,7 @@
 //! sentences a loop no test can drive still has to get right.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_core::watch::schedule::{self, Due, Schedule};
 use snob_store::config;
@@ -101,10 +102,10 @@ pub(super) async fn scheduled(
     // answer with the *next* one and the wake-up would creep forward instead of
     // arriving. Recomputed when the clock stops ticking and starts jumping —
     // see `CLOCK_JUMP_SECS`.
-    let mut waiting_for: Option<(i64, u32)> = None;
+    let mut waiting_for: Option<(Epoch, u32)> = None;
     // The previous time round's clock reading, which is how a clock that jumped
     // is told from one that ticked.
-    let mut clock_was: Option<i64> = None;
+    let mut clock_was: Option<Epoch> = None;
 
     loop {
         let now = snob_core::clock::now();
@@ -257,7 +258,7 @@ const CLOCK_JUMP_SECS: i64 = 120;
 /// Opened and closed here rather than held: the loop deliberately keeps no
 /// SQLite connection while it sleeps, so `snob purge` in another terminal is not
 /// blocked by a file this has open.
-fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
+fn last_started(paths: &AppPaths) -> Result<Option<Epoch>> {
     let store = snob_store::store::Store::open(paths)?;
     Ok(snob_store::store::watch::last_started(store.conn())?)
 }
@@ -284,7 +285,7 @@ fn last_started(paths: &AppPaths) -> Result<Option<i64>> {
 ///   started at 08:50 printed "Running at 09:00." and then slept for a day and
 ///   ten minutes. `None` is what the schedule module's own contract asks for
 ///   here — there is no past to wait from, and no run to be too close to.
-fn seed_last_run(recorded: Option<i64>, schedule: &Schedule, now: i64) -> Option<i64> {
+fn seed_last_run(recorded: Option<Epoch>, schedule: &Schedule, now: Epoch) -> Option<Epoch> {
     recorded.or_else(|| (!schedule.is_on_a_calendar()).then_some(now))
 }
 
@@ -307,7 +308,7 @@ fn seed_last_run(recorded: Option<i64>, schedule: &Schedule, now: i64) -> Option
 ///
 /// A calendar seeds nothing, for the reason [`seed_last_run`] gives: inventing
 /// a run for it steps over every moment in the next quarter of an hour.
-fn seed_for(paths: &AppPaths, schedule: &Schedule, now: i64) -> Result<Option<i64>> {
+fn seed_for(paths: &AppPaths, schedule: &Schedule, now: Epoch) -> Result<Option<Epoch>> {
     if let Some(recorded) = last_started(paths)? {
         return Ok(Some(recorded));
     }
@@ -341,11 +342,11 @@ mod tests {
         let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
         let every = Schedule::every(std::time::Duration::from_secs(24 * 3_600)).unwrap();
 
-        let first = seed_for(&paths, &every, 1_700_000_000).unwrap();
-        assert_eq!(first, Some(1_700_000_000));
+        let first = seed_for(&paths, &every, Epoch::new(1_700_000_000)).unwrap();
+        assert_eq!(first, Some(Epoch::new(1_700_000_000)));
 
         // A second start two hours later, with the run log still empty.
-        let second = seed_for(&paths, &every, 1_700_007_200).unwrap();
+        let second = seed_for(&paths, &every, Epoch::new(1_700_007_200)).unwrap();
         assert_eq!(
             second, first,
             "a restart must not put the interval back to zero"
@@ -360,7 +361,10 @@ mod tests {
         let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
         let at_nine = Schedule::calendar(&[], &[schedule::parse_time("09:00").unwrap()]).unwrap();
 
-        assert_eq!(seed_for(&paths, &at_nine, 1_700_000_000).unwrap(), None);
+        assert_eq!(
+            seed_for(&paths, &at_nine, Epoch::new(1_700_000_000)).unwrap(),
+            None
+        );
     }
 
     /// Both slots of the refusal take the same name, so both must be filtered.
@@ -394,7 +398,7 @@ mod tests {
     fn a_fresh_install_keeps_the_first_moment_its_calendar_names() {
         // Midnight UTC on a Monday, so the wall clock is checkable by hand.
         const MONDAY_0000: i64 = 1_786_924_800;
-        let at = |secs: i64| MONDAY_0000 + secs;
+        let at = |secs: i64| Epoch::new(MONDAY_0000 + secs);
 
         let calendar = Schedule::cron("0 9 * * *").unwrap();
         let ten_to_nine = at(8 * 3600 + 50 * 60);

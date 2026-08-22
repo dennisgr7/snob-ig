@@ -12,10 +12,12 @@
 //! they set up to be talked to, and a webhook that drops a report because n8n
 //! was restarting is a webhook nobody can rely on.
 
+use std::time::Duration;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, pk_to_sql};
-use snob_core::Pk;
+use snob_core::{Epoch, Pk};
 
 /// How long to wait before the first retry. Each attempt doubles it.
 const FIRST_BACKOFF_SECS: i64 = 60;
@@ -83,14 +85,14 @@ pub fn enqueue(
     run_id: &str,
     account_pk: Pk,
     body: &str,
-    at: i64,
+    at: Epoch,
     destination: Option<&str>,
 ) -> Result<i64, StoreError> {
     conn.execute(
         "INSERT INTO watch_deliveries
             (run_id, account_pk, created_at, body, next_try_at, destination)
          VALUES (?1, ?2, ?3, ?4, ?3, ?5)",
-        params![run_id, pk_to_sql(account_pk), at, body, destination],
+        params![run_id, pk_to_sql(account_pk), at.get(), body, destination],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -106,8 +108,8 @@ pub fn enqueue(
 /// `a_report_too_old_to_be_news_is_given_up_on` pins it: a report is too old the
 /// moment it *reaches* [`MAX_AGE_SECS`], and everything strictly newer is still
 /// news.
-fn still_news_after(now: i64) -> i64 {
-    now - MAX_AGE_SECS
+fn still_news_after(now: Epoch) -> Epoch {
+    now - Duration::from_secs(MAX_AGE_SECS as u64)
 }
 
 /// Gives up on reports that have grown too old to be news.
@@ -126,14 +128,14 @@ fn still_news_after(now: i64) -> i64 {
 /// The outbox's rules live in this file — the header says so — and that
 /// statement out there is how the age bound came to be spelled a third time, in
 /// a third direction, with nothing to compare the three against.
-pub(super) fn expire_stale(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+pub(super) fn expire_stale(conn: &Connection, now: Epoch) -> Result<usize, StoreError> {
     let expired = conn.execute(
         "UPDATE watch_deliveries
          SET state = 'expired', settled_at = ?1,
              next_try_at = NULL,
              last_error = coalesce(last_error, 'it grew too old to be news')
          WHERE state = 'pending' AND created_at <= ?2",
-        params![now, still_news_after(now)],
+        params![now.get(), still_news_after(now).get()],
     )?;
     Ok(expired)
 }
@@ -148,11 +150,11 @@ pub const KEEP_SETTLED_FOR_SECS: i64 = 7 * 24 * 3_600;
 /// **A pending row is never deleted here.** [`failed`] and [`expire_stale`] are
 /// what decide when a report stops being owed, and removing one from under them
 /// would lose a report that was still going to be tried.
-pub(super) fn forget_settled(conn: &Connection, now: i64) -> Result<usize, StoreError> {
+pub(super) fn forget_settled(conn: &Connection, now: Epoch) -> Result<usize, StoreError> {
     let removed = conn.execute(
         "DELETE FROM watch_deliveries
          WHERE state != 'pending' AND settled_at IS NOT NULL AND settled_at < ?1",
-        params![now - KEEP_SETTLED_FOR_SECS],
+        params![(now - Duration::from_secs(KEEP_SETTLED_FOR_SECS as u64)).get()],
     )?;
     Ok(removed)
 }
@@ -190,7 +192,7 @@ pub(super) fn forget_settled(conn: &Connection, now: i64) -> Result<usize, Store
 /// about where they belong.
 pub fn due(
     conn: &Connection,
-    now: i64,
+    now: Epoch,
     limit: usize,
     destination: &str,
 ) -> Result<Vec<Delivery>, StoreError> {
@@ -204,7 +206,12 @@ pub fn due(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(
-        params![now, limit as i64, still_news_after(now), destination],
+        params![
+            now.get(),
+            limit as i64,
+            still_news_after(now).get(),
+            destination
+        ],
         |row| {
             Ok(Delivery {
                 id: row.get(0)?,
@@ -218,13 +225,13 @@ pub fn due(
 }
 
 /// Records that a report arrived.
-pub fn delivered(conn: &Connection, id: i64, status: u16, at: i64) -> Result<(), StoreError> {
+pub fn delivered(conn: &Connection, id: i64, status: u16, at: Epoch) -> Result<(), StoreError> {
     conn.execute(
         "UPDATE watch_deliveries
          SET state = 'delivered', settled_at = ?2, next_try_at = NULL,
              attempts = attempts + 1, last_status = ?3, last_error = NULL
          WHERE id = ?1",
-        params![id, at, status as i64],
+        params![id, at.get(), status as i64],
     )?;
     Ok(())
 }
@@ -233,7 +240,7 @@ pub fn delivered(conn: &Connection, id: i64, status: u16, at: i64) -> Result<(),
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// It will be tried again, at this moment.
-    Retrying(i64),
+    Retrying(Epoch),
     /// It will not. Either it was refused in a way waiting cannot fix, or it
     /// ran out of attempts, or it got too old to be news.
     GaveUp(GaveUp),
@@ -269,12 +276,12 @@ pub fn failed(
     status: Option<u16>,
     error: &str,
     permanent: bool,
-    now: i64,
+    now: Epoch,
 ) -> Result<Outcome, StoreError> {
-    let (attempts, created_at): (i64, i64) = conn.query_row(
+    let (attempts, created_at): (i64, Epoch) = conn.query_row(
         "SELECT attempts, created_at FROM watch_deliveries WHERE id = ?1",
         params![id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, Epoch::new(row.get(1)?))),
     )?;
     let attempts = attempts + 1;
 
@@ -295,17 +302,17 @@ pub fn failed(
                  SET state = 'expired', settled_at = ?2, next_try_at = NULL,
                      attempts = ?3, last_status = ?4, last_error = ?5
                  WHERE id = ?1",
-                params![id, now, attempts, status.map(i64::from), error],
+                params![id, now.get(), attempts, status.map(i64::from), error],
             )?;
             Ok(Outcome::GaveUp(reason))
         }
         None => {
-            let next = now + backoff(attempts);
+            let next = now + Duration::from_secs(backoff(attempts) as u64);
             conn.execute(
                 "UPDATE watch_deliveries
                  SET attempts = ?2, next_try_at = ?3, last_status = ?4, last_error = ?5
                  WHERE id = ?1",
-                params![id, attempts, next, status.map(i64::from), error],
+                params![id, attempts, next.get(), status.map(i64::from), error],
             )?;
             Ok(Outcome::Retrying(next))
         }
@@ -449,7 +456,7 @@ mod tests {
         assert_eq!(MAX_AGE_SECS, 24 * 3_600);
     }
 
-    fn queued(db: &Store, run_id: &str, at: i64) -> i64 {
+    fn queued(db: &Store, run_id: &str, at: Epoch) -> i64 {
         enqueue(db.conn(), run_id, ME, r#"{"a":1}"#, at, Some(HERE)).unwrap()
     }
 
@@ -459,27 +466,34 @@ mod tests {
     fn the_body_that_comes_back_is_the_body_that_went_in() {
         let db = store();
         let body = r#"{"schema":1,"events":{"followers_gained":[]}}"#;
-        enqueue(db.conn(), "run-1", ME, body, 1_000, Some(HERE)).unwrap();
+        enqueue(db.conn(), "run-1", ME, body, Epoch::new(1_000), Some(HERE)).unwrap();
 
-        let waiting = due(db.conn(), 1_000, 10, HERE).unwrap();
+        let waiting = due(db.conn(), Epoch::new(1_000), 10, HERE).unwrap();
         assert_eq!(waiting[0].body, body);
     }
 
     #[test]
     fn a_queued_report_is_due_at_once() {
         let db = store();
-        queued(&db, "run-1", 1_000);
-        assert_eq!(due(db.conn(), 1_000, 10, HERE).unwrap().len(), 1);
+        queued(&db, "run-1", Epoch::new(1_000));
+        assert_eq!(
+            due(db.conn(), Epoch::new(1_000), 10, HERE).unwrap().len(),
+            1
+        );
         assert_eq!(pending(db.conn()).unwrap(), 1);
     }
 
     #[test]
     fn a_delivered_report_is_not_due_again() {
         let db = store();
-        let id = queued(&db, "run-1", 1_000);
+        let id = queued(&db, "run-1", Epoch::new(1_000));
 
-        delivered(db.conn(), id, 200, 1_010).unwrap();
-        assert!(due(db.conn(), 2_000, 10, HERE).unwrap().is_empty());
+        delivered(db.conn(), id, 200, Epoch::new(1_010)).unwrap();
+        assert!(
+            due(db.conn(), Epoch::new(2_000), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(state(db.conn(), id).unwrap().unwrap(), "delivered");
         assert_eq!(pending(db.conn()).unwrap(), 0);
     }
@@ -489,15 +503,19 @@ mod tests {
     #[test]
     fn a_temporary_failure_is_retried_later_and_not_sooner() {
         let db = store();
-        let id = queued(&db, "run-1", 1_000);
+        let id = queued(&db, "run-1", Epoch::new(1_000));
 
         let Outcome::Retrying(next) =
-            failed(db.conn(), id, Some(503), "busy", false, 1_000).unwrap()
+            failed(db.conn(), id, Some(503), "busy", false, Epoch::new(1_000)).unwrap()
         else {
             panic!("a 503 is worth another try");
         };
-        assert_eq!(next, 1_000 + FIRST_BACKOFF_SECS);
-        assert!(due(db.conn(), next - 1, 10, HERE).unwrap().is_empty());
+        assert_eq!(next, Epoch::new(1_000 + FIRST_BACKOFF_SECS));
+        assert!(
+            due(db.conn(), next - Duration::from_secs(1), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(due(db.conn(), next, 10, HERE).unwrap().len(), 1);
     }
 
@@ -512,15 +530,19 @@ mod tests {
     #[test]
     fn a_request_that_cannot_be_sent_is_not_retried_at_all() {
         let db = store();
-        let id = queued(&db, "run-1", 1_000);
+        let id = queued(&db, "run-1", Epoch::new(1_000));
 
         assert_eq!(
             // `None`, not `Some(0)`: `Attempt::Refused` carries no status
             // because no server answered, and 0 is not a code one can send.
-            failed(db.conn(), id, None, "not a header", true, 1_000).unwrap(),
+            failed(db.conn(), id, None, "not a header", true, Epoch::new(1_000)).unwrap(),
             Outcome::GaveUp(GaveUp::Refused)
         );
-        assert!(due(db.conn(), 999_999, 10, HERE).unwrap().is_empty());
+        assert!(
+            due(db.conn(), Epoch::new(999_999), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(state(db.conn(), id).unwrap().unwrap(), "expired");
     }
 
@@ -548,7 +570,7 @@ mod tests {
     #[test]
     fn a_receiver_down_for_hours_still_has_its_report_retried() {
         let db = store();
-        let queued_at = 1_000;
+        let queued_at = Epoch::new(1_000);
         let id = queued(&db, "run-1", queued_at);
 
         let mut now = queued_at;
@@ -571,7 +593,11 @@ mod tests {
             "it gave up after {}s, and a day is what the age bound names",
             now - queued_at
         );
-        assert!(due(db.conn(), now + 999_999, 10, HERE).unwrap().is_empty());
+        assert!(
+            due(db.conn(), now + Duration::from_secs(999_999), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// And the attempt count is still there, for a queue that is somehow tried
@@ -580,12 +606,12 @@ mod tests {
     #[test]
     fn the_attempt_count_is_the_backstop_when_the_clock_does_not_move() {
         let db = store();
-        let id = queued(&db, "run-1", 1_000);
+        let id = queued(&db, "run-1", Epoch::new(1_000));
 
         for _ in 1..MAX_ATTEMPTS {
             assert!(
                 matches!(
-                    failed(db.conn(), id, Some(500), "boom", false, 1_000).unwrap(),
+                    failed(db.conn(), id, Some(500), "boom", false, Epoch::new(1_000)).unwrap(),
                     Outcome::Retrying(_)
                 ),
                 "not out of attempts yet"
@@ -593,7 +619,7 @@ mod tests {
         }
 
         assert_eq!(
-            failed(db.conn(), id, Some(500), "boom", false, 1_000).unwrap(),
+            failed(db.conn(), id, Some(500), "boom", false, Epoch::new(1_000)).unwrap(),
             Outcome::GaveUp(GaveUp::OutOfAttempts)
         );
     }
@@ -604,7 +630,7 @@ mod tests {
     #[test]
     fn a_report_too_old_to_be_news_is_given_up_on() {
         let db = store();
-        let id = queued(&db, "run-1", 1_000);
+        let id = queued(&db, "run-1", Epoch::new(1_000));
 
         assert_eq!(
             failed(
@@ -613,7 +639,7 @@ mod tests {
                 None,
                 "connection refused",
                 false,
-                1_000 + MAX_AGE_SECS
+                Epoch::new(1_000 + MAX_AGE_SECS)
             )
             .unwrap(),
             Outcome::GaveUp(GaveUp::TooOld)
@@ -625,10 +651,10 @@ mod tests {
     #[test]
     fn reports_come_out_oldest_first() {
         let db = store();
-        queued(&db, "later", 2_000);
-        queued(&db, "earlier", 1_000);
+        queued(&db, "later", Epoch::new(2_000));
+        queued(&db, "earlier", Epoch::new(1_000));
 
-        let order: Vec<String> = due(db.conn(), 3_000, 10, HERE)
+        let order: Vec<String> = due(db.conn(), Epoch::new(3_000), 10, HERE)
             .unwrap()
             .into_iter()
             .map(|d| d.run_id)
@@ -647,27 +673,27 @@ mod tests {
     #[test]
     fn a_report_is_only_due_at_the_address_it_was_addressed_to() {
         let db = store();
-        let mine = enqueue(db.conn(), "run-1", ME, "{}", 1_000, Some(HERE)).unwrap();
+        let mine = enqueue(db.conn(), "run-1", ME, "{}", Epoch::new(1_000), Some(HERE)).unwrap();
         let elsewhere = enqueue(
             db.conn(),
             "run-2",
             ME,
             "{}",
-            1_000,
+            Epoch::new(1_000),
             Some("https://bin.example"),
         )
         .unwrap();
         // Queued before the column existed, so nothing can say where it belongs.
-        let legacy = enqueue(db.conn(), "run-3", ME, "{}", 1_000, None).unwrap();
+        let legacy = enqueue(db.conn(), "run-3", ME, "{}", Epoch::new(1_000), None).unwrap();
 
-        let here: Vec<i64> = due(db.conn(), 1_000, 10, HERE)
+        let here: Vec<i64> = due(db.conn(), Epoch::new(1_000), 10, HERE)
             .unwrap()
             .iter()
             .map(|d| d.id)
             .collect();
         assert_eq!(here, vec![mine, legacy]);
 
-        let there: Vec<i64> = due(db.conn(), 1_000, 10, "https://bin.example")
+        let there: Vec<i64> = due(db.conn(), Epoch::new(1_000), 10, "https://bin.example")
             .unwrap()
             .iter()
             .map(|d| d.id)
@@ -691,9 +717,17 @@ mod tests {
         const TEST_RUN: &str = "https://n8n.local/webhook-test/snob";
 
         let db = store();
-        let owed = enqueue(db.conn(), "run-1", ME, "{}", 1_000, Some(PUBLISHED)).unwrap();
+        let owed = enqueue(
+            db.conn(),
+            "run-1",
+            ME,
+            "{}",
+            Epoch::new(1_000),
+            Some(PUBLISHED),
+        )
+        .unwrap();
 
-        let to_the_test_run: Vec<i64> = due(db.conn(), 1_000, 10, TEST_RUN)
+        let to_the_test_run: Vec<i64> = due(db.conn(), Epoch::new(1_000), 10, TEST_RUN)
             .unwrap()
             .iter()
             .map(|d| d.id)
@@ -703,7 +737,7 @@ mod tests {
             "a report addressed to {PUBLISHED} was drained to {TEST_RUN}"
         );
 
-        let to_where_it_belongs: Vec<i64> = due(db.conn(), 1_000, 10, PUBLISHED)
+        let to_where_it_belongs: Vec<i64> = due(db.conn(), Epoch::new(1_000), 10, PUBLISHED)
             .unwrap()
             .iter()
             .map(|d| d.id)
@@ -729,18 +763,18 @@ mod tests {
     #[test]
     fn what_is_owed_is_split_from_what_is_addressed_elsewhere() {
         let db = store();
-        enqueue(db.conn(), "here", ME, "{}", 1_000, Some(HERE)).unwrap();
+        enqueue(db.conn(), "here", ME, "{}", Epoch::new(1_000), Some(HERE)).unwrap();
         enqueue(
             db.conn(),
             "there",
             ME,
             "{}",
-            1_000,
+            Epoch::new(1_000),
             Some("https://bin.example"),
         )
         .unwrap();
         // Queued before the column existed, so it belongs to whoever asks.
-        enqueue(db.conn(), "legacy", ME, "{}", 1_000, None).unwrap();
+        enqueue(db.conn(), "legacy", ME, "{}", Epoch::new(1_000), None).unwrap();
 
         let here = owed(db.conn(), Some(HERE)).unwrap();
         assert_eq!(
@@ -753,7 +787,7 @@ mod tests {
             "the row for {HERE} and the one with no address are owed here; the other is not"
         );
         assert_eq!(
-            due(db.conn(), 1_000, 10, HERE).unwrap().len(),
+            due(db.conn(), Epoch::new(1_000), 10, HERE).unwrap().len(),
             here.waiting,
             "what is reported as owed has to be what a run would be handed"
         );
@@ -786,14 +820,14 @@ mod tests {
     #[test]
     fn a_report_given_up_on_is_still_counted_while_the_row_is_kept() {
         let db = store();
-        enqueue(db.conn(), "old", ME, "{}", 1_000, Some(HERE)).unwrap();
+        enqueue(db.conn(), "old", ME, "{}", Epoch::new(1_000), Some(HERE)).unwrap();
 
         let before = owed(db.conn(), Some(HERE)).unwrap();
         assert_eq!(before.waiting, 1);
         assert_eq!(before.given_up, 0);
 
         // Far enough past the age bound that it is no longer news.
-        let much_later = 1_000 + MAX_AGE_SECS + 1;
+        let much_later = Epoch::new(1_000 + MAX_AGE_SECS + 1);
         assert_eq!(expire_stale(db.conn(), much_later).unwrap(), 1);
 
         let after = owed(db.conn(), Some(HERE)).unwrap();
@@ -813,8 +847,8 @@ mod tests {
     /// Whichever reading is right, one of them has to be it.
     #[test]
     fn a_report_exactly_a_day_old_is_the_same_answer_to_everyone() {
-        let queued_at = 1_000;
-        let now = queued_at + MAX_AGE_SECS;
+        let queued_at = Epoch::new(1_000);
+        let now = queued_at + Duration::from_secs(MAX_AGE_SECS as u64);
 
         let db = store();
         let id = queued(&db, "run-1", queued_at);
@@ -853,9 +887,9 @@ mod tests {
     #[test]
     fn two_reports_cannot_share_a_run_id() {
         let db = store();
-        queued(&db, "run-1", 1_000);
+        queued(&db, "run-1", Epoch::new(1_000));
         assert!(
-            enqueue(db.conn(), "run-1", ME, "{}", 2_000, None).is_err(),
+            enqueue(db.conn(), "run-1", ME, "{}", Epoch::new(2_000), None).is_err(),
             "the id a receiver deduplicates on must be unique"
         );
     }

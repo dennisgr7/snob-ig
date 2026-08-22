@@ -121,13 +121,18 @@ impl RateBudget for LateCooldown {
         self.reserve()
     }
 
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+    fn cooldown(&self) -> Result<Option<snob_core::EpochMs>, RateBudgetError> {
         let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok((seen >= self.calls_before).then(|| snob_core::clock::now_ms() + 3_600_000))
+        Ok((seen >= self.calls_before)
+            .then(|| snob_core::clock::now_ms() + std::time::Duration::from_millis(3_600_000)))
     }
 
-    fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {
-        Ok(0)
+    fn start_cooldown(
+        &self,
+        _: &str,
+        _: std::time::Duration,
+    ) -> Result<snob_core::EpochMs, RateBudgetError> {
+        Ok(snob_core::EpochMs::new(0))
     }
 }
 

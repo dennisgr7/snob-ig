@@ -140,10 +140,10 @@ async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snob_core::Pk;
     use snob_core::model::ListKind;
+    use snob_core::{Epoch, Pk};
 
-    fn snapshot(taken_at: i64, declared: Option<u64>) -> snapshots::Snapshot {
+    fn snapshot(taken_at: Epoch, declared: Option<u64>) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
             account_pk: Pk::new(1),
@@ -172,7 +172,10 @@ mod tests {
 
     #[test]
     fn an_old_list_is_walked_however_still_the_counter_is() {
-        let old = snapshot(now() - SIX_HOURS - 1, Some(300));
+        let old = snapshot(
+            now() - std::time::Duration::from_secs(SIX_HOURS as u64 + 1),
+            Some(300),
+        );
         assert!(!is_still_good(&old, Some(300), SIX_HOURS));
     }
 
@@ -184,7 +187,7 @@ mod tests {
     /// rather than walking everything.
     #[test]
     fn an_absurd_maximum_age_reuses_rather_than_walks() {
-        let ancient = snapshot(0, Some(300));
+        let ancient = snapshot(Epoch::default(), Some(300));
         let forever =
             i64::try_from(std::time::Duration::from_secs(u64::MAX).as_secs()).unwrap_or(i64::MAX);
 

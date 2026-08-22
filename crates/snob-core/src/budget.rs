@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use crate::EpochMs;
+
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(2 * 3600);
 const ACTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(12 * 3600);
 
@@ -52,11 +54,11 @@ pub trait RateBudget: Send + Sync {
     /// neither takes an argument that could pick the wrong one.
     fn reserve_write(&self) -> Result<Duration, RateBudgetError>;
 
-    /// Until when the account is in cooldown, as an epoch in milliseconds.
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError>;
+    /// Until when the account is in cooldown.
+    fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError>;
 
     /// Puts the account in cooldown and returns until when.
-    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError>;
+    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<EpochMs, RateBudgetError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,11 +103,15 @@ impl RateBudget for UnlimitedRateBudget {
     fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
         Ok(Duration::ZERO)
     }
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+    fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
         Ok(None)
     }
-    fn start_cooldown(&self, _reason: &str, _minimum: Duration) -> Result<i64, RateBudgetError> {
-        Ok(0)
+    fn start_cooldown(
+        &self,
+        _reason: &str,
+        _minimum: Duration,
+    ) -> Result<EpochMs, RateBudgetError> {
+        Ok(EpochMs::new(0))
     }
 }
 

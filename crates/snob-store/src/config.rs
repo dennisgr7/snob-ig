@@ -22,6 +22,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::paths::AppPaths;
+use snob_core::Epoch;
 use snob_core::duration;
 
 /// What the file says.
@@ -91,8 +92,8 @@ pub struct AccountConfig {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentConfig {
-    /// When it was given, as an epoch in seconds.
-    pub agreed_at: i64,
+    /// When it was given.
+    pub agreed_at: Epoch,
 }
 
 impl AccountConfig {
@@ -639,7 +640,10 @@ agreed_at = 1786925176
         assert_eq!(config.accounts.len(), 2);
         assert!(config.accounts[0].is_own());
         assert!(config.accounts[0].consent.is_none());
-        assert_eq!(config.accounts[1].consent.unwrap().agreed_at, 1_786_925_176);
+        assert_eq!(
+            config.accounts[1].consent.unwrap().agreed_at,
+            Epoch::new(1_786_925_176)
+        );
     }
 
     /// What the template writes is what the parser reads -- the whole of it, as
@@ -684,7 +688,7 @@ agreed_at = 1786925176
                 AccountConfig {
                     target: "someone".to_string(),
                     consent: Some(ConsentConfig {
-                        agreed_at: 1_700_000_000,
+                        agreed_at: Epoch::new(1_700_000_000),
                     }),
                 },
             ],

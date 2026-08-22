@@ -6,7 +6,7 @@
 //! `null` should not bring down a walk over two thousand accounts.
 
 use serde::Deserialize;
-use snob_core::Pk;
+use snob_core::{Epoch, Pk};
 
 /// An account as it appears in a followers or following list.
 #[derive(Debug, Clone, Deserialize)]
@@ -399,12 +399,12 @@ pub struct ReelItem {
     #[serde(default)]
     pub media_type: u8,
     #[serde(default)]
-    pub taken_at: i64,
+    pub taken_at: Epoch,
     /// When it disappears. Absent on some items, which is why it is optional
     /// rather than defaulted to zero: "expires at the epoch" would print as an
     /// expired story rather than as an unknown one.
     #[serde(default)]
-    pub expiring_at: Option<i64>,
+    pub expiring_at: Option<Epoch>,
     #[serde(default)]
     pub image_versions2: Option<Candidates>,
     #[serde(default)]

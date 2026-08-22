@@ -7,6 +7,9 @@
 //! business with them.
 
 use snob_core::Pk;
+use std::time::Duration;
+
+use snob_core::Epoch;
 use snob_core::model::{ListKind, User};
 use snob_core::watch::{Basis, ListDiff, Rename};
 use snob_store::config::{self, WatchConfig};
@@ -50,13 +53,13 @@ pub(in crate::commands::watch) fn report_with(
 pub(in crate::commands::watch) fn list(
     basis: Basis,
     diff: ListDiff,
-    since: Option<i64>,
+    since: Option<Epoch>,
 ) -> ListReport {
     ListReport {
         kind: ListKind::Followers,
         basis,
         since,
-        until: 2_000,
+        until: Epoch::new(2_000),
         diff,
         total: 10,
     }
@@ -114,7 +117,7 @@ pub(in crate::commands::watch) fn watch_toml(body: &str) -> WatchConfig {
 /// over-age row, and only a failed attempt expires one.
 pub(in crate::commands::watch) fn owed_long_ago(
     paths: &snob_store::paths::AppPaths,
-    now: i64,
+    now: Epoch,
 ) -> i64 {
     let db = snob_store::store::Store::open(paths).unwrap();
     snob_store::store::users::upsert(db.conn(), &user(Pk::new(42), "me")).unwrap();
@@ -124,7 +127,7 @@ pub(in crate::commands::watch) fn owed_long_ago(
         "run-old",
         Pk::new(42),
         "{}",
-        now - deliveries::MAX_AGE_SECS - 1,
+        now - Duration::from_secs(deliveries::MAX_AGE_SECS as u64 + 1),
         Some("https://receiver.example"),
     )
     .unwrap()

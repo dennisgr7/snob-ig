@@ -245,16 +245,16 @@ fn proportion(part: usize, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snob_core::Pk;
     use snob_core::model::StopReason;
+    use snob_core::{Epoch, Pk};
 
     fn outcome(reason: StopReason) -> ListOutcome {
         ListOutcome {
             provenance: engine::Provenance::Walked,
             reason,
             requests: 1,
-            started_at: 0,
-            taken_at: 0,
+            started_at: Epoch::default(),
+            taken_at: Epoch::default(),
             account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
@@ -262,7 +262,7 @@ mod tests {
         }
     }
 
-    fn stored(taken_at: i64) -> ListOutcome {
+    fn stored(taken_at: Epoch) -> ListOutcome {
         ListOutcome {
             provenance: engine::Provenance::CacheFlag,
             requests: 0,
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn a_crossing_served_from_storage_says_when_it_is_from() {
         // Two captures a day apart. The line has to name the older.
-        let older = 1_700_000_000;
+        let older = Epoch::new(1_700_000_000);
         let line = summary_line(
             SetOp::Unfollowers,
             3,
@@ -313,7 +313,7 @@ mod tests {
             3,
             412,
             &stored(older),
-            &stored(older + 24 * 3_600),
+            &stored(older + std::time::Duration::from_secs(24 * 3_600)),
         );
 
         assert!(

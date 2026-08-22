@@ -1,4 +1,5 @@
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
@@ -51,7 +52,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
     // Why the session was not checked is not a third variable. It is these two
     // read back at the point it is reported, so a return added inside the block
     // below cannot leave it claiming a check that never happened.
-    let mut cooldown_until: Option<i64> = None;
+    let mut cooldown_until: Option<Epoch> = None;
     let mut failure: Option<serde_json::Value> = None;
     // The code the command exits with, held rather than returned so the JSON
     // still gets printed on the way out. Reporting `alive: false` under exit 0
@@ -80,9 +81,9 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
         // is what this falls back to.
         if let Some(until_ms) = pacer.cooldown()? {
             // Seconds, like `created_at` and `validated_at` in the same object.
-            // The conversion comes from `report`, which owns the rule and prints
-            // the same cooldown as a date on the next line.
-            cooldown_until = Some(crate::report::cooldown_ends_at_secs(until_ms));
+            // The conversion is the moment type's own, so the field here and the
+            // date on the next line cannot disagree about which second it is.
+            cooldown_until = Some(until_ms.to_epoch());
             eprintln!(
                 "The account is in cooldown until {}, so the session was not checked.",
                 crate::report::cooldown_ends_at(until_ms)
@@ -166,7 +167,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
 /// Derived rather than tracked. Both inputs are already held for their own sake
 /// — `--offline` is the request not to look, and a cooldown end only exists when
 /// one was found — so there is nothing here that can disagree with them.
-fn not_checked(offline: bool, cooldown_until: Option<i64>) -> Option<&'static str> {
+fn not_checked(offline: bool, cooldown_until: Option<Epoch>) -> Option<&'static str> {
     if offline {
         Some("offline")
     } else if cooldown_until.is_some() {
@@ -206,6 +207,7 @@ mod tests {
     use snob_ig::error::IgError;
 
     use super::*;
+    use snob_core::EpochMs;
 
     /// The one thing a caller can act on: the address that clears the check.
     /// It is held exactly once ever — nothing stores it — so dropping it means
@@ -250,21 +252,19 @@ mod tests {
 
     /// `pacer.cooldown()` answers in milliseconds while `created_at` next to it
     /// in the same object is in seconds. Emitting the raw value would put two
-    /// units in one object with nothing saying so.
+    /// units in one object with nothing saying so — and it is now a build error
+    /// rather than a review note, because the two are different types.
     ///
-    /// Asserted through the function that owns the conversion, not against the
-    /// arithmetic copied out of it: pinning `div_euclid` here would keep passing
-    /// while `report` did something else and the date on screen disagreed with
-    /// the field beside it.
+    /// Asserted through the conversion the field goes through, not against
+    /// arithmetic copied out of it. `EpochMs::to_epoch` owns the flooring and
+    /// has its own test; this one is about which of the two units lands in the
+    /// object.
     #[test]
     fn the_cooldown_is_emitted_in_the_same_unit_as_the_timestamps() {
-        use crate::report::cooldown_ends_at_secs;
-
-        assert_eq!(cooldown_ends_at_secs(1_786_310_990_123), 1_786_310_990);
-
-        // And flooring rather than rounding towards zero, so a value before the
-        // epoch does not land in the wrong second.
-        assert_eq!(cooldown_ends_at_secs(-1_500), -2);
+        assert_eq!(
+            EpochMs::new(1_786_310_990_123).to_epoch(),
+            Epoch::new(1_786_310_990)
+        );
     }
 
     /// The three states, and the one that matters: `--offline` is why nothing
@@ -273,8 +273,8 @@ mod tests {
     #[test]
     fn why_nothing_was_checked_is_read_back_off_the_two_facts() {
         assert_eq!(not_checked(true, None), Some("offline"));
-        assert_eq!(not_checked(true, Some(1)), Some("offline"));
-        assert_eq!(not_checked(false, Some(1)), Some("cooldown"));
+        assert_eq!(not_checked(true, Some(Epoch::new(1))), Some("offline"));
+        assert_eq!(not_checked(false, Some(Epoch::new(1))), Some("cooldown"));
         assert_eq!(not_checked(false, None), None);
     }
 }

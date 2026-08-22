@@ -74,6 +74,13 @@ pub enum StoreError {
 /// It lives in `snob_core::clock` now: `snob-ig` reads one too, and reaching a
 /// clock through the module that opens SQLite was the same accidental edge the
 /// request budget's trait had.
+///
+/// What the two answer with is [`Epoch`](snob_core::Epoch) and
+/// [`EpochMs`](snob_core::EpochMs) rather than a pair of `i64`s that only a
+/// `_ms` suffix told apart. The columns are still `INTEGER`, and every one of
+/// them is bound with `.get()` and read back with `::new()` at the row itself —
+/// the road `pk_to_sql` takes, and for the same two reasons an impl of
+/// `rusqlite`'s traits is not available for either of them.
 pub use snob_core::clock::{now, now_ms};
 
 /// SQLite only has signed 64-bit integers, and `rusqlite` stopped converting

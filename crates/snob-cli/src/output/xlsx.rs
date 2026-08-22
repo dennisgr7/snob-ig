@@ -17,6 +17,7 @@
 
 use anyhow::{Context, Result};
 use rust_xlsxwriter::{ExcelDateTime, Format, FormatAlign, Workbook, Worksheet};
+use snob_core::Epoch;
 use snob_core::Pk;
 use snob_core::model::{User, printable};
 
@@ -55,7 +56,7 @@ pub(crate) enum Cell {
     /// understands. Only `scan` uses it, and only because a column of epoch
     /// integers in a spreadsheet is unreadable where the same number in csv is
     /// exactly what a script wants.
-    DateTime(i64),
+    DateTime(Epoch),
     Empty,
 }
 
@@ -190,8 +191,8 @@ fn write_header(sheet: &mut Worksheet, header: &[&str]) -> Result<()> {
 /// spreadsheet can hold (1900-9999) on the way. Doing the arithmetic here meant
 /// the "outside what a spreadsheet can hold" fallback rested on two chained
 /// `.ok()?` calls rather than on one documented check.
-fn datetime(epoch: i64) -> Option<ExcelDateTime> {
-    ExcelDateTime::from_timestamp(epoch).ok()
+fn datetime(at: Epoch) -> Option<ExcelDateTime> {
+    ExcelDateTime::from_timestamp(at.get()).ok()
 }
 
 fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Result<()> {
@@ -205,14 +206,14 @@ fn write_cell(sheet: &mut Worksheet, row: u32, column: u16, cell: &Cell) -> Resu
         // A timestamp outside what a spreadsheet can hold is written as the
         // number it is rather than dropped: wrong-looking beats absent, and
         // nothing else in this file invents a value.
-        Cell::DateTime(epoch) => match datetime(*epoch) {
+        Cell::DateTime(at) => match datetime(*at) {
             Some(value) => {
                 let format = Format::new().set_num_format("yyyy-mm-dd hh:mm");
                 sheet
                     .write_datetime_with_format(row, column, &value, &format)
                     .map(|_| ())
             }
-            None => sheet.write_number(row, column, *epoch as f64).map(|_| ()),
+            None => sheet.write_number(row, column, at.get() as f64).map(|_| ()),
         },
         Cell::Empty => Ok(()),
     }

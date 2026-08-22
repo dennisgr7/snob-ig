@@ -11,6 +11,7 @@
 //! rely on is in here, in one place, so that "did this change break somebody's
 //! integration" is a question about one file.
 
+use snob_core::Epoch;
 use snob_core::model::User;
 use snob_core::watch::{Basis, ListDiff, Rename};
 
@@ -240,7 +241,7 @@ pub(super) fn run_lists_json(tick: &TickReport) -> serde_json::Value {
 pub(super) fn failed_tick_json(
     watched: &Watched,
     error: &anyhow::Error,
-    at: i64,
+    at: Epoch,
     requests: u32,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -404,7 +405,7 @@ pub(super) fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_jso
 /// nothing and spent nothing on the account, and a `false` there would read as
 /// a report that could not see rather than as a message that is not a report.
 /// The `note` says so in words, for whoever opens one by hand.
-pub(super) fn preflight_body(run_id: &str, at: i64) -> serde_json::Value {
+pub(super) fn preflight_body(run_id: &str, at: Epoch) -> serde_json::Value {
     serde_json::json!({
         "schema": SCHEMA,
         "event": crate::engine::check::PREFLIGHT_EVENT,
@@ -558,7 +559,7 @@ mod tests {
             serde_json::from_str(block).expect("the README's example has to be JSON");
 
         let real = payload(
-            &TickReport::for_test(report_with(None, vec![]), 14, 1_700_000_000),
+            &TickReport::for_test(report_with(None, vec![]), 14, Epoch::new(1_700_000_000)),
             "run-1",
             "watch.changes",
         );
@@ -613,15 +614,15 @@ mod tests {
     #[test]
     fn every_message_carries_the_schema() {
         let report = payload(
-            &TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000),
+            &TickReport::for_test(report_with(None, vec![]), 0, Epoch::new(1_700_000_000)),
             "run-1",
             "watch.changes",
         );
-        let preflight = preflight_body("run-2", 1_700_000_000);
+        let preflight = preflight_body("run-2", Epoch::new(1_700_000_000));
         let streamed = tick_json(&TickReport::for_test(
             report_with(None, vec![]),
             0,
-            1_700_000_000,
+            Epoch::new(1_700_000_000),
         ));
 
         for (which, message) in [
@@ -687,12 +688,12 @@ mod tests {
                             gained: vec![user(Pk::new(1), "arrived")],
                             lost: vec![],
                         },
-                        Some(1_000),
+                        Some(Epoch::new(1_000)),
                     )),
                     vec![],
                 ),
                 7,
-                1_700_000_000,
+                Epoch::new(1_700_000_000),
             );
             tick.lists = vec![
                 TickList {
@@ -753,8 +754,8 @@ mod tests {
             tick_json(&tick)
         };
 
-        let first = quiet_run_at(1_700_000_000);
-        let second = quiet_run_at(1_700_021_600);
+        let first = quiet_run_at(Epoch::new(1_700_000_000));
+        let second = quiet_run_at(Epoch::new(1_700_021_600));
 
         assert_eq!(first["run"]["at"], 1_700_000_000);
         assert_ne!(
@@ -764,7 +765,7 @@ mod tests {
 
         // The moment is the tick's own, so the file and whatever the webhook
         // delivered can be joined on it.
-        let tick = TickReport::for_test(report_with(None, vec![]), 0, 1_700_000_000);
+        let tick = TickReport::for_test(report_with(None, vec![]), 0, Epoch::new(1_700_000_000));
         assert_eq!(
             tick_json(&tick)["run"]["at"],
             payload(&tick, "run-1", "watch.changes")["run"]["at"],
@@ -790,7 +791,7 @@ mod tests {
         let line = failed_tick_json(
             &Watched::consented("friend".into(), crate::engine::watch::Consent),
             &error,
-            1_700_000_000,
+            Epoch::new(1_700_000_000),
             1,
         );
 
@@ -811,7 +812,7 @@ mod tests {
         let ok = tick_json(&TickReport::for_test(
             report_with(None, vec![]),
             0,
-            1_700_000_000,
+            Epoch::new(1_700_000_000),
         ));
         assert!(
             ok.get("error").is_none(),
@@ -851,18 +852,18 @@ mod tests {
                         gained: vec![user(Pk::new(1), "arrived")],
                         lost: vec![user(Pk::new(2), "left")],
                     },
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![Rename {
                     pk: Pk::new(7),
                     history_id: 7,
                     from: "before".into(),
                     to: "after".into(),
-                    at: 1_500,
+                    at: Epoch::new(1_500),
                 }],
             ),
             14,
-            1_700_000_000,
+            Epoch::new(1_700_000_000),
         );
 
         let payload = payload(&tick, "run-1", "watch.changes");

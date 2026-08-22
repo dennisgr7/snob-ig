@@ -8,8 +8,8 @@
 use std::error::Error;
 use std::time::Duration;
 
-use snob_core::Pk;
 use snob_core::model::StopReason;
+use snob_core::{EpochMs, Pk};
 
 use crate::client::{Direction, IgClient};
 use crate::error::{IgError, Reaction};
@@ -152,7 +152,12 @@ impl WalkSummary {
 #[derive(Debug, thiserror::Error)]
 pub enum WalkError {
     #[error("the account is in cooldown for another {}", minutes(.remaining_ms))]
-    Cooldown { until_ms: i64, remaining_ms: i64 },
+    Cooldown {
+        until_ms: EpochMs,
+        /// How long is left of it, in milliseconds. A length of time rather than
+        /// a moment, which is why it stays a number.
+        remaining_ms: i64,
+    },
     #[error(transparent)]
     Budget(IgError),
     #[error("could not save the page: {0}")]
@@ -662,7 +667,7 @@ mod tests {
     #[test]
     fn the_cooldown_display_pluralizes_the_minutes() {
         let one = WalkError::Cooldown {
-            until_ms: 0,
+            until_ms: EpochMs::new(0),
             remaining_ms: 30_000,
         };
         assert_eq!(
@@ -671,7 +676,7 @@ mod tests {
         );
 
         let four = WalkError::Cooldown {
-            until_ms: 0,
+            until_ms: EpochMs::new(0),
             remaining_ms: 240_000,
         };
         assert_eq!(
@@ -1227,11 +1232,13 @@ mod tests {
             fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
                 self.reserve()
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-                Ok(Some(snob_core::clock::now_ms() + 3_600_000))
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
+                Ok(Some(
+                    snob_core::clock::now_ms() + Duration::from_millis(3_600_000),
+                ))
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 
@@ -1288,12 +1295,13 @@ mod tests {
             fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
                 self.reserve()
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
                 let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok((asked >= 3).then(|| snob_core::clock::now_ms() + 7_200_000))
+                Ok((asked >= 3)
+                    .then(|| snob_core::clock::now_ms() + Duration::from_millis(7_200_000)))
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 
@@ -1346,11 +1354,11 @@ mod tests {
             fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
                 self.reserve()
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
                 Ok(None)
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 

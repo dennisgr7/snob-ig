@@ -3,14 +3,14 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, now, pk_to_sql};
-use snob_core::Pk;
 use snob_core::model::ListKind;
+use snob_core::{Epoch, Pk};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub pk: Pk,
     pub is_self: bool,
-    pub polled_at: Option<i64>,
+    pub polled_at: Option<Epoch>,
     pub follower_count: Option<u64>,
     pub following_count: Option<u64>,
 }
@@ -30,7 +30,7 @@ pub fn upsert(conn: &Connection, pk: Pk, is_self: bool) -> Result<(), StoreError
     conn.execute(
         "INSERT INTO accounts (pk, is_self, added_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(pk) DO UPDATE SET is_self = excluded.is_self",
-        params![pk_to_sql(pk), is_self, now()],
+        params![pk_to_sql(pk), is_self, now().get()],
     )?;
     Ok(())
 }
@@ -50,7 +50,7 @@ pub fn record_poll(
          WHERE pk = ?1",
         params![
             pk_to_sql(pk),
-            now(),
+            now().get(),
             followers.map(|v| v as i64),
             following.map(|v| v as i64),
         ],
@@ -115,7 +115,7 @@ pub fn find(conn: &Connection, pk: Pk) -> Result<Option<Account>, StoreError> {
                 Ok(Account {
                     pk: super::pk_from_sql(row.get(0)?),
                     is_self: row.get(1)?,
-                    polled_at: row.get(2)?,
+                    polled_at: row.get::<_, Option<i64>>(2)?.map(Epoch::new),
                     follower_count: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                     following_count: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 })

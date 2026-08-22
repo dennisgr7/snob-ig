@@ -9,9 +9,9 @@
 //! That detail rules out the console-snippet shortcut and is the reason the two
 //! ways are the ones they are.
 
-use snob_core::Pk;
 use snob_core::secret::Secret;
 use snob_core::session::{Session, SessionError, SessionOrigin};
+use snob_core::{EpochMs, Pk};
 use thiserror::Error;
 
 use crate::client::IgClient;
@@ -75,7 +75,7 @@ pub enum ValidationOutcome {
     /// Nothing was asked because the account is in cooldown. Storing an
     /// unchecked session beats spending the one request the cooldown exists to
     /// prevent — and a fresh session is the usual reason someone is here.
-    Skipped { until_ms: i64 },
+    Skipped { until_ms: EpochMs },
 }
 
 /// Builds a session from what the user pasted.

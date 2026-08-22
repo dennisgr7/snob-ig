@@ -17,8 +17,8 @@ pub mod walk;
 pub mod watch;
 
 use anyhow::Result;
-use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
+use snob_core::{Epoch, Pk};
 use snob_store::store::{accounts, snapshots, users};
 
 use crate::app::App;
@@ -95,10 +95,10 @@ pub struct ListOutcome {
     /// twenty minutes, and every question about whether two lists describe one
     /// moment is really about the time between the two walks rather than
     /// between the two moments they happened to finish at.
-    pub started_at: i64,
+    pub started_at: Epoch,
     /// When it finished. The date shown to a person, and the one the store
     /// orders by.
-    pub taken_at: i64,
+    pub taken_at: Epoch,
     /// Whose list this is.
     ///
     /// The caller asked with a name and gets back an id, which is the only
@@ -495,8 +495,8 @@ mod tests {
             id: 1,
             account_pk: Pk::new(7),
             kind: ListKind::Followers,
-            started_at: 0,
-            taken_at: Some(0),
+            started_at: Epoch::default(),
+            taken_at: Some(Epoch::default()),
             member_count: 0,
             declared_count: None,
             next_cursor: None,

@@ -8,6 +8,7 @@
 //! `status` there cannot describe the same file differently.
 
 use anyhow::{Context, Result, bail};
+use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_core::secret::Secret;
 use snob_core::{duration, watch::schedule};
@@ -676,7 +677,7 @@ fn last_of_each(typed: Vec<(String, String)>) -> Vec<(String, String)> {
     headers.into_iter().collect()
 }
 
-fn ask_accounts(webhook: Option<&str>) -> Result<Vec<(String, Option<i64>)>> {
+fn ask_accounts(webhook: Option<&str>) -> Result<Vec<(String, Option<Epoch>)>> {
     let mut accounts = vec![("self".to_string(), None)];
 
     if ui::confirm("Also watch somebody else's account?", false)? {

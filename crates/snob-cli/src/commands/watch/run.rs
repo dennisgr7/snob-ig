@@ -7,6 +7,7 @@
 //! copies that drift.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
@@ -277,7 +278,7 @@ fn record_failed_run(
     watched: &Watched,
     error: &anyhow::Error,
     requests: u32,
-    at: i64,
+    at: Epoch,
 ) {
     let pk = match watched.name() {
         Some(name) => snob_store::store::accounts::find_pk_by_username(

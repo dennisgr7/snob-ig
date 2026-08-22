@@ -194,6 +194,7 @@ mod tests {
     use super::super::parse::parse_cron;
     use super::super::tests::{at, hours};
     use super::super::{Schedule, ScheduleError, Weekday};
+    use crate::Epoch;
 
     /// The midnight wrap is only a gap when there is a next day.
     ///
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn two_restricted_day_fields_combine_with_or() {
         let calendar = parse_cron("0 9 13 * 5").unwrap();
-        let day = |ts: i64| calendar.allows(&Utc.timestamp_opt(ts, 0).unwrap());
+        let day = |at: Epoch| calendar.allows(&Utc.timestamp_opt(at.get(), 0).unwrap());
 
         // Friday 2026-08-21 at 09:00 -- a Friday that is not the 13th.
         assert!(day(at(4 * hours(24) + hours(9))));
@@ -249,7 +250,7 @@ mod tests {
     #[test]
     fn one_unrestricted_day_field_leaves_the_other_in_charge() {
         let calendar = parse_cron("0 9 * * 1").unwrap();
-        let day = |ts: i64| calendar.allows(&Utc.timestamp_opt(ts, 0).unwrap());
+        let day = |at: Epoch| calendar.allows(&Utc.timestamp_opt(at.get(), 0).unwrap());
 
         assert!(day(at(hours(9))), "Monday");
         assert!(!day(at(hours(24) + hours(9))), "Tuesday");

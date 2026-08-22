@@ -174,7 +174,7 @@ mod tests {
                 snob_store::config::AccountConfig {
                     target: "friend".to_string(),
                     consent: Some(snob_store::config::ConsentConfig {
-                        agreed_at: 1_700_000_000,
+                        agreed_at: snob_core::Epoch::new(1_700_000_000),
                     }),
                 },
             ],

@@ -22,7 +22,7 @@
 //! question, and whether a monitoring system should go red about it is
 //! `commands::watch::status`'s.
 
-use snob_core::Pk;
+use snob_core::{Epoch, EpochMs, Pk};
 use snob_store::secrets::SecretStore;
 use snob_store::store::snapshots;
 use snob_store::store::watch as watch_store;
@@ -112,9 +112,9 @@ pub enum Problem {
     /// scheduler's.
     Unbuildable(String),
     /// Nothing was asked about this, because the account is in cooldown until
-    /// then. The moment is an epoch in milliseconds; turning it into a date is
-    /// `report`'s job, like every other date the tool prints.
-    InCooldown { until_ms: i64 },
+    /// then. Turning the moment into a date is `report`'s job, like every other
+    /// date the tool prints.
+    InCooldown { until_ms: EpochMs },
     /// An unattended run may not read this account, which is a fact about the
     /// file and not about the network. `in_cooldown` is the line for an account
     /// a cooldown also stopped anything else being checked about — the same
@@ -146,7 +146,7 @@ pub enum What {
     /// No `watch.toml` at all, so there is nothing else to check.
     NotConfigured,
     /// The schedule, and the next few moments it fires at.
-    Schedule { next: Vec<i64> },
+    Schedule { next: Vec<Epoch> },
     /// The session, and which backend the secret store landed on.
     Session {
         viewer: Option<String>,
@@ -172,7 +172,7 @@ pub enum What {
     /// Whether there is anything to compare the first scheduled run against.
     Baseline {
         /// When the newest capture of each list was taken. Empty means none.
-        taken_at: Vec<(snob_core::model::ListKind, i64)>,
+        taken_at: Vec<(snob_core::model::ListKind, Epoch)>,
     },
 }
 
@@ -227,7 +227,7 @@ const MOMENTS_SHOWN: usize = 3;
 /// session at all, and because it is what catches a file the scheduler would
 /// refuse at every run — `config::parse` reads TOML and a schema number, not
 /// what the values mean.
-pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
+pub fn schedule_of(schedule: &Schedule, now: Epoch) -> Checked {
     let mut next = Vec::new();
     let mut at = now;
     for _ in 0..MOMENTS_SHOWN {
@@ -263,7 +263,7 @@ pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
 pub fn without_a_session(
     configured: Option<&WatchConfig>,
     schedule: Option<&Result<Schedule, String>>,
-    now: i64,
+    now: Epoch,
 ) -> CheckReport {
     let mut report = CheckReport::default();
 
@@ -410,7 +410,7 @@ pub async fn with_a_session(
 /// Warned rather than Failed: a cooldown lifts on its own, and it is exactly
 /// the sort of thing somebody running `check` wants to be told rather than have
 /// skipped in silence.
-fn waiting_out(what: What, until_ms: i64) -> Checked {
+fn waiting_out(what: What, until_ms: EpochMs) -> Checked {
     Checked {
         what,
         verdict: Verdict::Warned,
@@ -427,7 +427,7 @@ fn waiting_out(what: What, until_ms: i64) -> Checked {
 /// warning because a cooldown happened to be standing made `check` exit 0 about
 /// a monitor that cannot run at all — from the command whose whole job is to
 /// answer that question before a run does.
-fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
+fn not_asked_about(account: &super::watch::Watched, until_ms: EpochMs) -> Checked {
     let may_run_unattended = account.may_run_unattended();
     let what = What::Account {
         target: account.name().map(str::to_string),
@@ -698,7 +698,7 @@ fn reported_baseline(
     app: &App,
     pk: Pk,
     kind: snob_core::model::ListKind,
-) -> Result<Option<i64>, snob_store::store::StoreError> {
+) -> Result<Option<Epoch>, snob_store::store::StoreError> {
     let Some(id) = watch_store::mark(app.db().conn(), pk, kind)?.and_then(|m| m.snapshot_id) else {
         return Ok(None);
     };
@@ -759,7 +759,8 @@ mod tests {
         .expect("config::parse reads TOML and a schema number, not what the values mean");
         let refused: Result<Schedule, String> = Err("5m is too often".to_string());
 
-        let report = without_a_session(Some(&configured), Some(&refused), 1_700_000_000);
+        let report =
+            without_a_session(Some(&configured), Some(&refused), Epoch::new(1_700_000_000));
 
         assert_eq!(report.verdict(), Verdict::Failed);
         assert_eq!(report.checked.len(), 1, "{:?}", report.checked);
@@ -797,7 +798,7 @@ mod tests {
     #[test]
     fn a_schedule_names_the_moments_it_will_fire_at() {
         let schedule = Schedule::every(Duration::from_secs(6 * 3_600)).unwrap();
-        let checked = schedule_of(&schedule, 1_700_000_000);
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
 
         assert_eq!(checked.verdict, Verdict::Ok);
         let What::Schedule { next } = checked.what else {
@@ -816,7 +817,7 @@ mod tests {
     #[test]
     fn a_schedule_that_never_fires_is_a_failure_rather_than_a_wait() {
         let schedule = Schedule::cron("0 0 31 2 *").unwrap();
-        let checked = schedule_of(&schedule, 1_700_000_000);
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
 
         assert_eq!(checked.verdict, Verdict::Failed);
         assert!(checked.problem.is_some());
@@ -826,7 +827,7 @@ mod tests {
     /// there has no schedule to run on, and saying so is the whole job.
     #[test]
     fn nothing_configured_is_reported_rather_than_passed_over() {
-        let report = without_a_session(None, None, 1_700_000_000);
+        let report = without_a_session(None, None, Epoch::new(1_700_000_000));
 
         assert_eq!(report.verdict(), Verdict::Warned);
         assert!(matches!(

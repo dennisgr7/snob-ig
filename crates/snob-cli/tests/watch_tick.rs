@@ -510,7 +510,8 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
     let app = app(&server, open_db(tmp.path()));
 
     let now = snob_core::clock::now();
-    let long_ago = now - snob_store::store::deliveries::MAX_AGE_SECS - 1;
+    let long_ago = now
+        - std::time::Duration::from_secs(snob_store::store::deliveries::MAX_AGE_SECS as u64 + 1);
     snob_store::store::users::upsert(
         app.db().conn(),
         &snob_core::model::User {
@@ -784,12 +785,17 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
         fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
             self.reserve()
         }
-        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+        fn cooldown(&self) -> Result<Option<snob_core::EpochMs>, RateBudgetError> {
             let spent = self.0.load(std::sync::atomic::Ordering::Relaxed);
-            Ok((spent >= 2).then(|| snob_core::clock::now_ms() + 7_200_000))
+            Ok((spent >= 2)
+                .then(|| snob_core::clock::now_ms() + std::time::Duration::from_millis(7_200_000)))
         }
-        fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {
-            Ok(0)
+        fn start_cooldown(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<snob_core::EpochMs, RateBudgetError> {
+            Ok(snob_core::EpochMs::new(0))
         }
     }
 

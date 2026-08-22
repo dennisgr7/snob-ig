@@ -13,9 +13,9 @@
 //! [`Basis`], which is the part with the judgment in it and therefore the part
 //! that gets tested on its own.
 
-use crate::Pk;
 use crate::model::User;
 use crate::sets;
+use crate::{Epoch, Pk};
 
 /// What changed in one list between two captures.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub struct Rename {
     pub to: String,
     /// When the change was noticed, not when it happened — we only find out on
     /// the walk that sees the new name.
-    pub at: i64,
+    pub at: Epoch,
 }
 
 /// Which two captures a comparison may be made from, if any.

@@ -7,12 +7,14 @@
 //! diff rests on reading the receipt rather than guessing at it from the
 //! captures.
 
+use std::time::Duration;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{StoreError, pk_from_sql, pk_to_sql};
-use snob_core::Pk;
 use snob_core::model::ListKind;
 use snob_core::watch::{RecordedOutcome, Rename};
+use snob_core::{Epoch, Pk};
 
 /// The receipt for one account and list: what was reported, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +25,7 @@ pub struct Mark {
     /// When the report was made. What gets shown to a person; the rename window
     /// is bounded by [`rename_cursor`] instead, for the reason the
     /// column's comment in `002_watch.sql` gives.
-    pub compared_at: i64,
+    pub compared_at: Epoch,
 }
 
 /// The receipt for this account and list, if there is one.
@@ -36,7 +38,7 @@ pub fn mark(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<Option<
             |row| {
                 Ok(Mark {
                     snapshot_id: row.get(0)?,
-                    compared_at: row.get(1)?,
+                    compared_at: Epoch::new(row.get(1)?),
                 })
             },
         )
@@ -84,8 +86,8 @@ pub struct Swept {
 /// `secure_delete` is on for the whole connection — `store::configure` says it
 /// is there for "whatever the monitor ends up expiring", which is this — so the
 /// rows go rather than being unlinked with their contents still readable.
-pub fn prune(conn: &Connection, now: i64) -> Result<Swept, StoreError> {
-    let cutoff = now - KEEP_FOR_SECS;
+pub fn prune(conn: &Connection, now: Epoch) -> Result<Swept, StoreError> {
+    let cutoff = now - Duration::from_secs(KEEP_FOR_SECS as u64);
 
     let removed = conn.execute(
         "DELETE FROM snapshots
@@ -101,7 +103,7 @@ pub fn prune(conn: &Connection, now: i64) -> Result<Swept, StoreError> {
                FROM usable_snapshots
              ) WHERE rank = 1
            )",
-        params![cutoff],
+        params![cutoff.get()],
     )?;
 
     // The outbox expires its own. A report too old to be news stops being owed,
@@ -141,7 +143,7 @@ pub fn prune(conn: &Connection, now: i64) -> Result<Swept, StoreError> {
         "DELETE FROM watch_runs
          WHERE started_at < ?1
            AND id NOT IN (SELECT id FROM newest_run)",
-        params![now - KEEP_RUNS_FOR_SECS],
+        params![(now - Duration::from_secs(KEEP_RUNS_FOR_SECS as u64)).get()],
     )?;
 
     Ok(Swept {
@@ -159,8 +161,8 @@ const KEEP_RUNS_FOR_SECS: i64 = 30 * 24 * 3_600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub account_pk: Pk,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
+    pub started_at: Epoch,
+    pub finished_at: Option<Epoch>,
     pub requests: u32,
     /// What came of it: the same vocabulary as the README's table and as `$?`,
     /// so a caller is told the same thing by the same name wherever it reads
@@ -194,8 +196,8 @@ pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             pk_to_sql(run.account_pk),
-            run.started_at,
-            run.finished_at,
+            run.started_at.get(),
+            run.finished_at.map(Epoch::get),
             run.requests,
             // The token the enum spells, which is what the column's CHECK
             // constraint accepts. An `Unknown` only ever arrives by being read
@@ -232,8 +234,8 @@ pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
     let rows = stmt.query_map([], |row| {
         Ok(Run {
             account_pk: pk_from_sql(row.get(0)?),
-            started_at: row.get(1)?,
-            finished_at: row.get(2)?,
+            started_at: Epoch::new(row.get(1)?),
+            finished_at: row.get::<_, Option<i64>>(2)?.map(Epoch::new),
             requests: row.get(3)?,
             // Parsed here, once, so no reader has to know the column is text.
             outcome: row
@@ -256,15 +258,15 @@ pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
 /// `--every 24h` on a machine powered on from eight to six, or under a
 /// supervisor restarting more often than the interval, never reached its first
 /// run — while `status` read this same table and said "it has not run yet".
-pub fn last_started(conn: &Connection) -> Result<Option<i64>, StoreError> {
+pub fn last_started(conn: &Connection) -> Result<Option<Epoch>, StoreError> {
     let started = conn
         .query_row(
             "SELECT started_at FROM watch_runs ORDER BY started_at DESC, id DESC LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    Ok(started)
+    Ok(started.map(Epoch::new))
 }
 
 /// One receipt, with what it is a receipt for.
@@ -273,7 +275,7 @@ pub struct AccountMark {
     pub account_pk: Pk,
     pub kind: ListKind,
     pub snapshot_id: Option<i64>,
-    pub compared_at: i64,
+    pub compared_at: Epoch,
 }
 
 /// Every receipt there is, newest first.
@@ -288,7 +290,12 @@ pub fn all_marks(conn: &Connection) -> Result<Vec<AccountMark>, StoreError> {
     )?;
     let rows = stmt.query_map([], |row| {
         let kind: String = row.get(1)?;
-        Ok((row.get::<_, i64>(0)?, kind, row.get(2)?, row.get(3)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            kind,
+            row.get(2)?,
+            Epoch::new(row.get(3)?),
+        ))
     })?;
 
     let mut marks = Vec::new();
@@ -391,7 +398,7 @@ pub fn set_mark(
     account_pk: Pk,
     kind: ListKind,
     snapshot_id: i64,
-    at: i64,
+    at: Epoch,
 ) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO watch_marks (account_pk, kind, snapshot_id, compared_at)
@@ -399,7 +406,7 @@ pub fn set_mark(
          ON CONFLICT(account_pk, kind) DO UPDATE SET
              snapshot_id    = excluded.snapshot_id,
              compared_at    = excluded.compared_at",
-        params![pk_to_sql(account_pk), kind.as_str(), snapshot_id, at],
+        params![pk_to_sql(account_pk), kind.as_str(), snapshot_id, at.get()],
     )?;
     Ok(())
 }
@@ -437,7 +444,7 @@ pub fn set_rename_cursor(
     conn: &Connection,
     account_pk: Pk,
     cursor: i64,
-    at: i64,
+    at: Epoch,
 ) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO watch_renames (account_pk, cursor, marked_at)
@@ -445,7 +452,7 @@ pub fn set_rename_cursor(
          ON CONFLICT(account_pk) DO UPDATE SET
              cursor    = excluded.cursor,
              marked_at = excluded.marked_at",
-        params![pk_to_sql(account_pk), cursor, at],
+        params![pk_to_sql(account_pk), cursor, at.get()],
     )?;
     Ok(())
 }
@@ -457,15 +464,15 @@ const INTERVAL_SEED: &str = "interval_seeded_at";
 ///
 /// Read only while `watch_runs` is empty, which is the whole window in which the
 /// answer matters: once a run has finished, `last_started` is the better one.
-pub fn interval_seeded_at(conn: &Connection) -> Result<Option<i64>, StoreError> {
+pub fn interval_seeded_at(conn: &Connection) -> Result<Option<Epoch>, StoreError> {
     let at = conn
         .query_row(
             "SELECT value FROM watch_state WHERE key = ?1",
             params![INTERVAL_SEED],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    Ok(at)
+    Ok(at.map(Epoch::new))
 }
 
 /// Writes it down once, so the next start does not begin again.
@@ -473,10 +480,10 @@ pub fn interval_seeded_at(conn: &Connection) -> Result<Option<i64>, StoreError> 
 /// `INSERT OR IGNORE`, not an upsert: a later start must never move the instant
 /// the interval is measured from, which is the whole defect. Two processes
 /// racing to seed leave whichever got there first, and either answer is right.
-pub fn set_interval_seeded_at(conn: &Connection, at: i64) -> Result<(), StoreError> {
+pub fn set_interval_seeded_at(conn: &Connection, at: Epoch) -> Result<(), StoreError> {
     conn.execute(
         "INSERT OR IGNORE INTO watch_state (key, value) VALUES (?1, ?2)",
-        params![INTERVAL_SEED, at],
+        params![INTERVAL_SEED, at.get()],
     )?;
     Ok(())
 }
@@ -515,14 +522,14 @@ fn record_renames_sent(
     conn: &Connection,
     account_pk: Pk,
     history_ids: &[i64],
-    at: i64,
+    at: Epoch,
 ) -> Result<(), StoreError> {
     for id in history_ids {
         conn.execute(
             "INSERT INTO watch_renames_sent (account_pk, history_id, sent_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(account_pk, history_id) DO NOTHING",
-            params![pk_to_sql(account_pk), id, at],
+            params![pk_to_sql(account_pk), id, at.get()],
         )?;
     }
     Ok(())
@@ -568,7 +575,7 @@ pub fn commit_report(
     store: &mut super::Store,
     account_pk: Pk,
     marks: &[(ListKind, i64)],
-    at: i64,
+    at: Epoch,
     rename_cursor: Option<i64>,
     renames_sent: &[i64],
     delivery: Option<Queued<'_>>,
@@ -665,7 +672,7 @@ pub fn renames_since(
             history_id: row.get(1)?,
             from: row.get(2)?,
             to: row.get(3)?,
-            at: row.get(4)?,
+            at: Epoch::new(row.get(4)?),
         })
     })?;
 
@@ -744,12 +751,19 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            id,
+            Epoch::new(1_700),
+        )
+        .unwrap();
         assert_eq!(
             mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(id),
-                compared_at: 1_700,
+                compared_at: Epoch::new(1_700),
             })
         );
     }
@@ -762,7 +776,14 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            id,
+            Epoch::new(1_700),
+        )
+        .unwrap();
         assert_eq!(
             mark(db.conn(), Pk::new(7), ListKind::Following).unwrap(),
             None
@@ -775,13 +796,27 @@ mod tests {
         let first = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
         let second = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, first, 1_700).unwrap();
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, second, 1_800).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            first,
+            Epoch::new(1_700),
+        )
+        .unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            second,
+            Epoch::new(1_800),
+        )
+        .unwrap();
         assert_eq!(
             mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(second),
-                compared_at: 1_800,
+                compared_at: Epoch::new(1_800),
             })
         );
     }
@@ -811,8 +846,8 @@ mod tests {
         let db = Store::in_memory().unwrap();
         users::upsert(db.conn(), &user(7, "me")).unwrap();
         accounts::upsert(db.conn(), Pk::new(7), true).unwrap();
-        let now = 2_000_000_000;
-        let long_ago = now - KEEP_RUNS_FOR_SECS - 1;
+        let now = Epoch::new(2_000_000_000);
+        let long_ago = now - Duration::from_secs(KEEP_RUNS_FOR_SECS as u64 + 1);
 
         // Two runs of one account in the same second, which `started_at` cannot
         // tell apart.
@@ -895,7 +930,7 @@ mod tests {
             &mut db,
             Pk::new(7),
             &[(ListKind::Followers, capture)],
-            1_700,
+            Epoch::new(1_700),
             None,
             &[],
             Some(Queued {
@@ -907,13 +942,13 @@ mod tests {
         .unwrap();
 
         assert!(
-            crate::store::deliveries::due(db.conn(), 1_700, 10, THE_TEST_RUN)
+            crate::store::deliveries::due(db.conn(), Epoch::new(1_700), 10, THE_TEST_RUN)
                 .unwrap()
                 .is_empty(),
             "a report committed for {HERE} was drained to {THE_TEST_RUN}"
         );
         assert_eq!(
-            crate::store::deliveries::due(db.conn(), 1_700, 10, HERE)
+            crate::store::deliveries::due(db.conn(), Epoch::new(1_700), 10, HERE)
                 .unwrap()
                 .len(),
             1,
@@ -934,14 +969,28 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_800).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            id,
+            Epoch::new(1_700),
+        )
+        .unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            id,
+            Epoch::new(1_800),
+        )
+        .unwrap();
 
         assert_eq!(
             mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(id),
-                compared_at: 1_800,
+                compared_at: Epoch::new(1_800),
             }),
             "a run that found nothing still reported, and status says when"
         );
@@ -961,7 +1010,14 @@ mod tests {
     fn a_receipt_whose_capture_was_pruned_can_be_marked_again() {
         let mut db = Store::in_memory().unwrap();
         let first = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, first, 1_700).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            first,
+            Epoch::new(1_700),
+        )
+        .unwrap();
 
         db.conn()
             .execute("DELETE FROM snapshots WHERE id = ?1", params![first])
@@ -976,13 +1032,20 @@ mod tests {
         );
 
         let second = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, second, 1_800).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            second,
+            Epoch::new(1_800),
+        )
+        .unwrap();
 
         assert_eq!(
             mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(second),
-                compared_at: 1_800,
+                compared_at: Epoch::new(1_800),
             }),
             "the next run lays a new baseline, and this is where it is recorded"
         );
@@ -1000,7 +1063,14 @@ mod tests {
     fn pruning_the_marked_capture_leaves_the_receipt_behind() {
         let mut db = Store::in_memory().unwrap();
         let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            id,
+            Epoch::new(1_700),
+        )
+        .unwrap();
 
         db.conn()
             .execute("DELETE FROM snapshots WHERE id = ?1", params![id])
@@ -1010,7 +1080,7 @@ mod tests {
             mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: None,
-                compared_at: 1_700,
+                compared_at: Epoch::new(1_700),
             }),
             "the baseline is gone but what has already been reported is not"
         );
@@ -1109,8 +1179,8 @@ mod tests {
         let mut db = Store::in_memory().unwrap();
         let _ = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        let long_ago = 1_000;
-        for started_at in [long_ago, long_ago + 1] {
+        let long_ago = Epoch::new(1_000);
+        for started_at in [long_ago, long_ago + Duration::from_secs(1)] {
             record_run(
                 db.conn(),
                 &Run {
@@ -1125,11 +1195,15 @@ mod tests {
             .unwrap();
         }
 
-        prune(db.conn(), long_ago + KEEP_RUNS_FOR_SECS + 10).unwrap();
+        prune(
+            db.conn(),
+            long_ago + Duration::from_secs(KEEP_RUNS_FOR_SECS as u64 + 10),
+        )
+        .unwrap();
 
         let runs = last_runs(db.conn()).unwrap();
         assert_eq!(runs.len(), 1, "the newest one stays: {runs:?}");
-        assert_eq!(runs[0].started_at, long_ago + 1);
+        assert_eq!(runs[0].started_at, long_ago + Duration::from_secs(1));
         assert_eq!(
             runs[0].outcome,
             Some(RunOutcome::NoSession.into()),
@@ -1191,7 +1265,14 @@ mod tests {
         // A newer one, so the marked capture is not kept merely for being last.
         account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), Pk::new(7), ListKind::Followers, marked, 1_000).unwrap();
+        set_mark(
+            db.conn(),
+            Pk::new(7),
+            ListKind::Followers,
+            marked,
+            Epoch::new(1_000),
+        )
+        .unwrap();
         age(&db, marked, KEEP_FOR_SECS * 10);
 
         prune(db.conn(), crate::store::now()).unwrap();
@@ -1272,12 +1353,18 @@ mod tests {
         // to exercise. `deliveries` owns that number now, and
         // `how_long_a_settled_report_is_kept_is_the_documented_one` is what pins
         // it; a fixture expressed as a multiple of it agrees with anything.
-        let long_ago = now - 365 * 24 * 3_600;
+        let long_ago = now - Duration::from_secs(365 * 24 * 3_600);
         // Owed, and young enough to still be news — the other half of the rule
         // is the test below.
-        let owed =
-            crate::store::deliveries::enqueue(db.conn(), "owed", Pk::new(7), "{}", now - 60, None)
-                .unwrap();
+        let owed = crate::store::deliveries::enqueue(
+            db.conn(),
+            "owed",
+            Pk::new(7),
+            "{}",
+            now - Duration::from_secs(60),
+            None,
+        )
+        .unwrap();
         let done =
             crate::store::deliveries::enqueue(db.conn(), "done", Pk::new(7), "{}", long_ago, None)
                 .unwrap();
@@ -1313,7 +1400,7 @@ mod tests {
         account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let now = crate::store::now();
-        let stale = now - crate::store::deliveries::MAX_AGE_SECS - 1;
+        let stale = now - Duration::from_secs(crate::store::deliveries::MAX_AGE_SECS as u64 + 1);
         let id =
             crate::store::deliveries::enqueue(db.conn(), "stale", Pk::new(7), "{}", stale, None)
                 .unwrap();
@@ -1344,13 +1431,13 @@ mod tests {
         account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let now = crate::store::now();
-        for age in [KEEP_RUNS_FOR_SECS + 1, 60] {
+        for age in [KEEP_RUNS_FOR_SECS as u64 + 1, 60] {
             record_run(
                 db.conn(),
                 &Run {
                     account_pk: Pk::new(7),
-                    started_at: now - age,
-                    finished_at: Some(now - age),
+                    started_at: now - Duration::from_secs(age),
+                    finished_at: Some(now - Duration::from_secs(age)),
                     requests: 1,
                     outcome: Some(RunOutcome::Ok.into()),
                     changes: 0,
@@ -1368,7 +1455,7 @@ mod tests {
         assert_eq!(left, 1, "the old one goes and the recent one stays");
         assert_eq!(
             one_of(&last_runs(db.conn()).unwrap(), Pk::new(7)).started_at,
-            now - 60
+            now - Duration::from_secs(60)
         );
     }
 

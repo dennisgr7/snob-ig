@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use snob_core::EpochMs;
 use snob_core::budget::{RateBudget, RateBudgetError};
 use snob_core::session::{Session, SessionOrigin};
 use url::Url;
@@ -53,19 +54,19 @@ impl snob_core::budget::RateBudget for Recording {
     fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
         self.reserve()
     }
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+    fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
         Ok(None)
     }
     fn start_cooldown(
         &self,
         reason: &str,
         minimum: std::time::Duration,
-    ) -> Result<i64, RateBudgetError> {
+    ) -> Result<EpochMs, RateBudgetError> {
         self.started
             .lock()
             .unwrap()
             .push((reason.to_string(), minimum));
-        Ok(0)
+        Ok(EpochMs::new(0))
     }
 }
 

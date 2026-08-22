@@ -89,6 +89,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use snob_core::EpochMs;
 use snob_core::budget::RateBudget;
 
 /// Request cadence during a walk.
@@ -263,7 +264,7 @@ impl Pacer {
     }
 
     /// Until when the account is in cooldown, if it is.
-    pub fn cooldown(&self) -> Result<Option<i64>, crate::error::IgError> {
+    pub fn cooldown(&self) -> Result<Option<EpochMs>, crate::error::IgError> {
         self.budget
             .cooldown()
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
@@ -275,7 +276,7 @@ impl Pacer {
         &self,
         reason: &str,
         minimum: Duration,
-    ) -> Result<i64, crate::error::IgError> {
+    ) -> Result<EpochMs, crate::error::IgError> {
         self.budget
             .start_cooldown(reason, minimum)
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
@@ -310,7 +311,7 @@ impl Pacer {
     /// one once per page and once before the walk, on two workers, and a
     /// second `snob` holding the write lock made each of those a stall of up
     /// to the busy timeout during which an interrupt went nowhere.
-    pub async fn cooldown_off_thread(&self) -> Result<Option<i64>, crate::error::IgError> {
+    pub async fn cooldown_off_thread(&self) -> Result<Option<EpochMs>, crate::error::IgError> {
         let budget = Arc::clone(&self.budget);
         tokio::task::spawn_blocking(move || budget.cooldown())
             .await
@@ -596,7 +597,7 @@ mod tests {
     /// A budget that is in cooldown and counts every reservation it is asked
     /// for, so a test can assert that it was asked for none.
     struct Cooling {
-        until_ms: i64,
+        until_ms: EpochMs,
         reserved: AtomicU32,
     }
 
@@ -611,7 +612,7 @@ mod tests {
             Ok(Duration::ZERO)
         }
 
-        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+        fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
             Ok(Some(self.until_ms))
         }
 
@@ -619,7 +620,7 @@ mod tests {
             &self,
             _reason: &str,
             _minimum: Duration,
-        ) -> Result<i64, RateBudgetError> {
+        ) -> Result<EpochMs, RateBudgetError> {
             Ok(self.until_ms)
         }
     }
@@ -635,7 +636,7 @@ mod tests {
     /// until `clear` read it the rule lived in eight places and held in seven.
     #[tokio::test]
     async fn nothing_is_cleared_to_send_during_a_cooldown() {
-        let until_ms = 1_722_700_000_000;
+        let until_ms = EpochMs::new(1_722_700_000_000);
         let budget = Arc::new(Cooling {
             until_ms,
             reserved: AtomicU32::new(0),

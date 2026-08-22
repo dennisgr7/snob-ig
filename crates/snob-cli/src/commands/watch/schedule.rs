@@ -332,10 +332,15 @@ mod tests {
         // one a fortnight later rather than the one a week later. That is the
         // conjunction the shape exists for -- the interval is the floor and the
         // days are the grid.
-        let ran_at = MONDAY_0000 + 9 * 3600;
+        let ran_at = snob_core::Epoch::new(MONDAY_0000 + 9 * 3600);
         assert_eq!(
-            schedule::next_moment(&schedule, Some(ran_at), ran_at + 60, &chrono::Utc),
-            Some(ran_at + A_FORTNIGHT),
+            schedule::next_moment(
+                &schedule,
+                Some(ran_at),
+                ran_at + std::time::Duration::from_secs(60),
+                &chrono::Utc
+            ),
+            Some(ran_at + std::time::Duration::from_secs(A_FORTNIGHT as u64)),
             "a weekly grid with a fortnightly floor is one Monday in every two"
         );
 

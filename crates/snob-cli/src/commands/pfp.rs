@@ -233,15 +233,15 @@ mod tests {
         fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
             self.reserve()
         }
-        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+        fn cooldown(&self) -> Result<Option<snob_core::EpochMs>, RateBudgetError> {
             Ok(None)
         }
         fn start_cooldown(
             &self,
             _reason: &str,
             _minimum: std::time::Duration,
-        ) -> Result<i64, RateBudgetError> {
-            Ok(0)
+        ) -> Result<snob_core::EpochMs, RateBudgetError> {
+            Ok(snob_core::EpochMs::new(0))
         }
     }
 

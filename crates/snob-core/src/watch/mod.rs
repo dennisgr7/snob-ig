@@ -47,8 +47,8 @@ impl Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pk;
     use crate::model::User;
+    use crate::{Epoch, Pk};
 
     fn user(pk: u64) -> User {
         User {
@@ -78,7 +78,7 @@ mod tests {
                 history_id: 7,
                 from: "before".into(),
                 to: "after".into(),
-                at: 1_000,
+                at: Epoch::new(1_000),
             }],
             ..Default::default()
         };

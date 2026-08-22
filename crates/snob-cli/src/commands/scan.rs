@@ -11,9 +11,9 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use snob_core::Pk;
 use snob_core::filters::Filter;
 use snob_core::model::{ListKind, User, printable};
+use snob_core::{Epoch, Pk};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
@@ -75,7 +75,7 @@ struct Summary<'a> {
     /// When the capture behind `followed_by` was taken. Carried beside it so
     /// this answer dates itself the way every other stored figure in the same
     /// object does.
-    followed_by_at: Option<i64>,
+    followed_by_at: Option<Epoch>,
     followers: &'a ListOutcome,
     following: &'a ListOutcome,
 }
@@ -588,8 +588,8 @@ mod tests {
             provenance: engine::Provenance::Walked,
             reason: StopReason::Completed,
             requests: 3,
-            started_at: 1_722_699_000,
-            taken_at: 1_722_700_000,
+            started_at: Epoch::new(1_722_699_000),
+            taken_at: Epoch::new(1_722_700_000),
             account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
@@ -873,7 +873,7 @@ mod tests {
         let outcomes = (outcome(), outcome());
         let known = vec![user(1, "ana"), user(2, "luis")];
         let dated = Summary {
-            followed_by_at: Some(1_720_360_320),
+            followed_by_at: Some(Epoch::new(1_720_360_320)),
             ..with_people(&outcomes, &known)
         };
 
@@ -881,7 +881,7 @@ mod tests {
         assert!(
             text.starts_with(&format!(
                 "Followed by @ana and @luis, as of {}\n",
-                report::stored_on(1_720_360_320)
+                report::stored_on(Epoch::new(1_720_360_320))
             )),
             "{text}"
         );

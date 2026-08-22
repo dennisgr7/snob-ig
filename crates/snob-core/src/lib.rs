@@ -26,6 +26,12 @@ pub mod session;
 pub mod sets;
 pub mod watch;
 
+/// The two moment types, at the crate root beside [`Pk`] because they are read
+/// as widely as it is and for the same reason: `snob_core::Epoch` next to
+/// `snob_core::Pk` in a signature says what the two arguments are, where
+/// `clock::Epoch` would say where the clock lives.
+pub use clock::{Epoch, EpochMs};
+
 /// Stable numeric identifier of an Instagram account.
 ///
 /// A type of its own rather than an alias for `u64`, because an id, a count

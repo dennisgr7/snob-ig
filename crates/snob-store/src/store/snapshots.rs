@@ -6,11 +6,13 @@
 //! simply a matter of stopping: whatever committed is durable even if the
 //! process dies outright.
 
+use std::time::Duration;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Store, StoreError, now, now_ms, pk_from_sql, pk_to_sql};
-use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
+use snob_core::{Epoch, Pk};
 
 /// How long an interrupted walk may still be resumed.
 ///
@@ -85,8 +87,8 @@ pub struct Snapshot {
     pub id: i64,
     pub account_pk: Pk,
     pub kind: ListKind,
-    pub started_at: i64,
-    pub taken_at: Option<i64>,
+    pub started_at: Epoch,
+    pub taken_at: Option<Epoch>,
     pub member_count: u64,
     pub declared_count: Option<u64>,
     pub next_cursor: Option<String>,
@@ -126,7 +128,7 @@ pub struct SavedPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Opened {
     pub id: i64,
-    pub started_at: i64,
+    pub started_at: Epoch,
 }
 
 /// Starts a new snapshot, claimed by this process.
@@ -144,7 +146,7 @@ pub fn begin(
         params![
             pk_to_sql(account_pk),
             kind.as_str(),
-            started_at,
+            started_at.get(),
             declared_count.map(|v| v as i64),
             this_process(),
         ],
@@ -228,14 +230,14 @@ pub fn resumable(
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
-                now - RESUME_WINDOW_SECS,
-                now - CLAIM_TTL_SECS,
+                (now - Duration::from_secs(RESUME_WINDOW_SECS as u64)).get(),
+                (now - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
                 // This process's own claim does not disqualify a row here: the
                 // caller is about to take it, and resuming its own work after a
                 // restart is what the window is for. `is_resumable` binds `None`
                 // to the same parameter and the clause goes inert.
                 this_process(),
-                now,
+                now.get(),
             ],
             row_to_snapshot,
         )
@@ -267,8 +269,8 @@ pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
-                now - RESUME_WINDOW_SECS,
-                now - CLAIM_TTL_SECS,
+                (now - Duration::from_secs(RESUME_WINDOW_SECS as u64)).get(),
+                (now - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
                 // Nobody's claim is excused here, including this process's own:
                 // `claimed_by = NULL` is NULL, so the last term of the shared
                 // predicate goes inert. The run that continues the walk is never
@@ -384,7 +386,7 @@ pub fn save_page(
              next_cursor  = ?3,
              claimed_at   = ?5
          WHERE id = ?1 AND claimed_by = ?4",
-        params![id, result.added as i64, cursor, this_process(), now()],
+        params![id, result.added as i64, cursor, this_process(), now().get()],
     )?;
     if held == 0 {
         // Dropping the transaction rolls the page back, so the capture is left
@@ -435,7 +437,7 @@ pub fn close(conn: &Connection, id: i64, reason: StopReason) -> Result<(), Store
              next_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE next_cursor END,
              claimed_by = NULL, claimed_at = NULL
          WHERE id = ?1 AND complete = 0 AND claimed_by = ?5",
-        params![id, complete, now(), reason.as_str(), this_process()],
+        params![id, complete, now().get(), reason.as_str(), this_process()],
     )?;
     if closed == 0 {
         // Already finished is not a refusal: the capture the caller is about
@@ -568,7 +570,7 @@ pub fn delete_partials(
             pk_to_sql(account_pk),
             kind.as_str(),
             this_process(),
-            now() - CLAIM_TTL_SECS,
+            (now() - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
         ],
     )?;
     Ok(deleted)
@@ -597,8 +599,8 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
         id: row.get(0)?,
         account_pk: pk_from_sql(row.get(1)?),
         kind,
-        started_at: row.get(3)?,
-        taken_at: row.get(4)?,
+        started_at: Epoch::new(row.get(3)?),
+        taken_at: row.get::<_, Option<i64>>(4)?.map(Epoch::new),
         member_count: row.get::<_, i64>(5)? as u64,
         declared_count: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
         next_cursor: row.get(7)?,
@@ -727,12 +729,12 @@ mod tests {
     /// process — but every read of a claim compares against that constant, and
     /// a row claimed by anything else is exactly what the other process leaves
     /// behind. `at` is when that process last saved a page.
-    fn claimed_by_somebody_else(db: &Store, id: i64, at: i64) {
+    fn claimed_by_somebody_else(db: &Store, id: i64, at: Epoch) {
         db.conn()
             .execute(
                 "UPDATE snapshots SET claimed_by = 'another-process', claimed_at = ?2
                  WHERE id = ?1",
-                params![id, at],
+                params![id, at.get()],
             )
             .unwrap();
     }
@@ -768,7 +770,11 @@ mod tests {
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
-        claimed_by_somebody_else(&db, id, now() - CLAIM_TTL_SECS - 1);
+        claimed_by_somebody_else(
+            &db,
+            id,
+            now() - Duration::from_secs(CLAIM_TTL_SECS as u64 + 1),
+        );
 
         let adopted = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
@@ -864,14 +870,14 @@ mod tests {
         // A walk that started well inside the resume window and whose process
         // was killed a moment after its last page: no `close`, so the claim is
         // still there.
-        let started = now() - CLAIM_TTL_SECS - 60;
+        let started = now() - Duration::from_secs(CLAIM_TTL_SECS as u64 + 60);
         db.conn()
             .execute(
                 "UPDATE snapshots SET started_at = ?2 WHERE id = ?1",
-                params![id, started],
+                params![id, started.get()],
             )
             .unwrap();
-        claimed_by_somebody_else(&db, id, started + 30);
+        claimed_by_somebody_else(&db, id, started + Duration::from_secs(30));
 
         let adopted = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
@@ -1081,7 +1087,11 @@ mod tests {
             .unwrap()
             .id;
         save_page(&mut db, abandoned, &[user(11)], Some("cursor")).unwrap();
-        claimed_by_somebody_else(&db, abandoned, now() - CLAIM_TTL_SECS - 1);
+        claimed_by_somebody_else(
+            &db,
+            abandoned,
+            now() - Duration::from_secs(CLAIM_TTL_SECS as u64 + 1),
+        );
 
         assert_eq!(
             delete_partials(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
@@ -1355,11 +1365,11 @@ mod tests {
             .id;
         save_page(&mut db, id, &[user(10)], Some("stale")).unwrap();
 
-        let long_ago = now() - RESUME_WINDOW_SECS - 1;
+        let long_ago = now() - Duration::from_secs(RESUME_WINDOW_SECS as u64 + 1);
         db.conn()
             .execute(
                 "UPDATE snapshots SET started_at = ?1 WHERE id = ?2",
-                params![long_ago, id],
+                params![long_ago.get(), id],
             )
             .unwrap();
 

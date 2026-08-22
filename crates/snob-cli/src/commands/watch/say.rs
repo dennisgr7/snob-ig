@@ -10,6 +10,7 @@
 //! something looks has a matching half, which is that this never decides what
 //! is true.
 
+use snob_core::Epoch;
 use snob_core::model::{ListKind, User, printable};
 use snob_core::watch::{Basis, ListDiff};
 
@@ -309,7 +310,7 @@ pub(super) fn since_line(report: &WatchReport) -> String {
 /// the interval the user is being shown starts at whichever was reported first
 /// — saying the later one would claim a window shorter than the one the numbers
 /// actually cover.
-pub(super) fn earliest_since(report: &WatchReport) -> Option<i64> {
+pub(super) fn earliest_since(report: &WatchReport) -> Option<Epoch> {
     [report.followers.as_ref(), report.following.as_ref()]
         .into_iter()
         .flatten()
@@ -322,9 +323,9 @@ mod tests {
     use super::*;
     use crate::commands::watch::fixtures::{list, report_with, user};
     use crate::engine::watch::ListReport;
-    use snob_core::Pk;
     use snob_core::model::ListKind;
     use snob_core::watch::{Basis, ListDiff, Rename};
+    use snob_core::{EpochMs, Pk};
 
     /// Every reason a check can give says something.
     ///
@@ -340,7 +341,7 @@ mod tests {
             Problem::NeverFires,
             Problem::Unbuildable("5m is too often".to_string()),
             Problem::InCooldown {
-                until_ms: 1_722_700_000_000,
+                until_ms: EpochMs::new(1_722_700_000_000),
             },
             Problem::NoRecordedConsent { in_cooldown: false },
             Problem::NoRecordedConsent { in_cooldown: true },
@@ -436,7 +437,7 @@ mod tests {
             kind,
             basis: Basis::Baseline { snapshot_id: 1 },
             since: None,
-            until: 2_000,
+            until: Epoch::new(2_000),
             diff: ListDiff::default(),
             total: 309,
         };
@@ -469,7 +470,7 @@ mod tests {
                 Some(list(
                     Basis::Unchanged { snapshot_id: 7 },
                     ListDiff::default(),
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![],
             ),
@@ -491,7 +492,7 @@ mod tests {
                         after: 2,
                     },
                     ListDiff::default(),
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![],
             ),
@@ -515,7 +516,7 @@ mod tests {
                         after: 2,
                     },
                     ListDiff::default(),
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![],
             ),
@@ -542,7 +543,7 @@ mod tests {
                         after: 2,
                     },
                     diff,
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![],
             ),
@@ -568,14 +569,14 @@ mod tests {
                         after: 2,
                     },
                     ListDiff::default(),
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![Rename {
                     pk: Pk::new(7),
                     history_id: 7,
                     from: "before".into(),
                     to: "after".into(),
-                    at: 1_500,
+                    at: Epoch::new(1_500),
                 }],
             ),
             false,
@@ -603,7 +604,7 @@ mod tests {
                             after: 2,
                         },
                         ListDiff::default(),
-                        Some(1_000),
+                        Some(Epoch::new(1_000)),
                     )),
                     names
                         .iter()
@@ -613,7 +614,7 @@ mod tests {
                             history_id: n as i64,
                             from: (*from).into(),
                             to: (*to).into(),
-                            at: 1_500,
+                            at: Epoch::new(1_500),
                         })
                         .collect(),
                 ),
@@ -644,7 +645,7 @@ mod tests {
                         gained: vec![user(Pk::new(1), "bad\u{202e}name")],
                         lost: vec![],
                     },
-                    Some(1_000),
+                    Some(Epoch::new(1_000)),
                 )),
                 vec![],
             ),

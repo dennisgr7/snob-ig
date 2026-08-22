@@ -9,6 +9,7 @@
 //! exit code, so a machine and a person are told the same thing.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_core::model::{ListKind, printable};
 use snob_core::watch::{RunOutcome, schedule};
 use snob_store::config::{self, WatchConfig};
@@ -342,7 +343,7 @@ const MISSED_BEFORE_FAILED: i64 = 3;
 /// `None` when the file has no schedule this can build, or names one that never
 /// fires. Both of those are their own line elsewhere and neither is a reason to
 /// call the monitor late as well.
-fn expected_gap(config: &WatchConfig, now: i64) -> Option<i64> {
+fn expected_gap(config: &WatchConfig, now: Epoch) -> Option<i64> {
     /// Far enough to see a whole week's pattern, and one day over so a weekly
     /// schedule is measured rather than truncated.
     const HORIZON_SECS: i64 = 8 * 24 * 3600;
@@ -386,7 +387,7 @@ fn health(
     runs: &[RunOf<'_>],
     reported: &[HalfRead],
     owed: deliveries::Owed,
-    now: i64,
+    now: Epoch,
 ) -> Health {
     let mut notes = Vec::new();
     let mut verdict = Verdict::Ok;
@@ -715,6 +716,7 @@ mod tests {
     use super::*;
     use snob_core::Pk;
     use snob_core::watch::RecordedOutcome;
+    use std::time::Duration;
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
@@ -921,7 +923,7 @@ target = \"someone\"
 
     /// A fixed present, so how old a run is is something these tests state
     /// rather than something they inherit from the wall clock.
-    const NOW: i64 = 1_700_000_000;
+    const NOW: Epoch = Epoch::new(1_700_000_000);
 
     /// A run that happened a minute ago.
     ///
@@ -932,8 +934,8 @@ target = \"someone\"
     fn ran(outcome: ExitCode) -> watch_store::Run {
         watch_store::Run {
             account_pk: Pk::new(42),
-            started_at: NOW - 60,
-            finished_at: Some(NOW - 60),
+            started_at: NOW - Duration::from_secs(60),
+            finished_at: Some(NOW - Duration::from_secs(60)),
             requests: 1,
             // The conversion `commit` writes through. This helper took a
             // `&str` and every call site spelled a token -- the same literals
@@ -1431,7 +1433,7 @@ url = \"https://example.com/hook\"
 
         // One six-hour gap missed is a laptop that was shut.
         let late = watch_store::Run {
-            started_at: NOW - 7 * 3_600,
+            started_at: NOW - Duration::from_secs(7 * 3_600),
             ..ran(ExitCode::Ok)
         };
         let one = health(
@@ -1445,7 +1447,7 @@ url = \"https://example.com/hook\"
 
         // Three weeks is nobody coming back.
         let gone = watch_store::Run {
-            started_at: NOW - 21 * 86_400,
+            started_at: NOW - Duration::from_secs(21 * 86_400),
             ..ran(ExitCode::Ok)
         };
         let stopped = health(
@@ -1471,7 +1473,7 @@ url = \"https://example.com/hook\"
     #[test]
     fn how_late_is_late_depends_on_the_schedule() {
         let two_days_ago = watch_store::Run {
-            started_at: NOW - 2 * 86_400,
+            started_at: NOW - Duration::from_secs(2 * 86_400),
             ..ran(ExitCode::Ok)
         };
 

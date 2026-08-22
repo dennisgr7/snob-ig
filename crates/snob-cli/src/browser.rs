@@ -485,7 +485,8 @@ mod tests {
         assert!(!refresh_user_agent(&mut session));
 
         // Past the interval it looks again, whatever it then decides.
-        let stale = snob_core::clock::now() - RECHECK_AFTER_SECS - 1;
+        let stale =
+            snob_core::clock::now() - std::time::Duration::from_secs(RECHECK_AFTER_SECS as u64 + 1);
         session.user_agent_checked_at = Some(stale);
         assert!(refresh_user_agent(&mut session));
 

@@ -113,7 +113,7 @@ async fn it_names_the_accounts_you_follow_who_follow_them_too() {
     // meant to recognize, and that is the list I know.
     assert_eq!(names(&found.people), vec!["ana", "luis"]);
     assert!(
-        found.taken_at > 0,
+        found.taken_at > snob_core::Epoch::default(),
         "the answer says which capture it was worked out from"
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 0);

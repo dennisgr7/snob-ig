@@ -6,6 +6,7 @@
 //! altogether.
 
 use serde::Deserialize;
+use snob_core::EpochMs;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -40,16 +41,18 @@ pub enum IgError {
     /// made `classify_and_record` record a second cooldown for a push-back that
     /// never happened.
     ///
-    /// It carries the epoch and no wording. When a cooldown lifts is a date, and
-    /// dates are formatted in `snob-cli` — this crate has no clock and no
-    /// business having one.
+    /// It carries the moment and no wording. When a cooldown lifts is a date,
+    /// and dates are formatted in `snob-cli` — this crate has no clock and no
+    /// business having one. An [`EpochMs`], because that is the unit the budget
+    /// answers in, and the conversion to the seconds every date is printed from
+    /// is `EpochMs::to_epoch` rather than a division somebody writes again.
     ///
     /// `reaction` answers `Abort` for it through the fallback arm, which is
     /// right and worth saying out loud: retrying is the one thing that must not
     /// happen, because the wait is measured in hours and every attempt would be
     /// charged.
     #[error("the account is in cooldown, so nothing may be spent until it lifts")]
-    InCooldown { until_ms: i64 },
+    InCooldown { until_ms: EpochMs },
 
     #[error("Instagram has temporarily blocked this action")]
     FeedbackRequired,

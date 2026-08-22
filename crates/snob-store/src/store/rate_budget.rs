@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use snob_core::EpochMs;
 use snob_core::budget::{RateBudget, RateBudgetError};
 use snob_core::clock::now_ms;
 
@@ -154,10 +155,14 @@ fn is_affirmative(value: &str) -> bool {
 ///
 /// `emission` is what a request costs in time and `burst` how far ahead one may
 /// run. Returns the new theoretical instant and the wait.
-fn decide(tat: i64, now: i64, emission: i64, burst: i64) -> (i64, i64) {
+///
+/// Two of the four are moments and two are lengths of time, which is exactly
+/// the pair a bare `i64` could not tell apart: `decide(now, tat, burst,
+/// emission)` used to compile.
+fn decide(tat: EpochMs, now: EpochMs, emission: i64, burst: i64) -> (EpochMs, i64) {
     let tat = tat.max(now);
-    let wait = (tat - burst - now).max(0);
-    (tat + emission, wait)
+    let wait = ((tat - Duration::from_millis(burst as u64)) - now).max(0);
+    (tat + Duration::from_millis(emission as u64), wait)
 }
 
 pub struct SqliteRateBudget {
@@ -216,13 +221,15 @@ impl SqliteRateBudget {
         bucket: &str,
         emission: i64,
         burst: i64,
-        now: i64,
+        now: EpochMs,
     ) -> Result<i64, RateBudgetError> {
-        let row: Option<(i64, i64)> = tx
+        // The two columns are `INTEGER` and become moments here, at the row
+        // boundary, the way an account id does through `pk_from_sql`.
+        let row: Option<(EpochMs, EpochMs)> = tx
             .query_row(
                 "SELECT tat_ms, updated_at_ms FROM rate_budget WHERE bucket = ?1",
                 params![bucket],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((EpochMs::new(row.get(0)?), EpochMs::new(row.get(1)?))),
             )
             .optional()
             .map_err(budget_err)?;
@@ -231,7 +238,9 @@ impl SqliteRateBudget {
             // If the clock went backwards the stored instant means nothing any
             // more: the wait would come out as hours. It is reset. That is not
             // a free pass, because it still grants no burst beyond tolerance.
-            Some((_, updated)) if now + CLOCK_SKEW_TOLERANCE_MS < updated => {
+            Some((_, updated))
+                if now + Duration::from_millis(CLOCK_SKEW_TOLERANCE_MS as u64) < updated =>
+            {
                 tracing::warn!(bucket, "the system clock went backwards; budget reset");
                 now
             }
@@ -249,7 +258,7 @@ impl SqliteRateBudget {
                  emission_ms = excluded.emission_ms,
                  burst_ms = excluded.burst_ms,
                  updated_at_ms = excluded.updated_at_ms",
-            params![bucket, new_tat, emission, burst, now],
+            params![bucket, new_tat.get(), emission, burst, now.get()],
         )
         .map_err(budget_err)?;
 
@@ -310,18 +319,18 @@ impl RateBudget for SqliteRateBudget {
         self.reserve_buckets(true)
     }
 
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+    fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
         if ignoring_cooldowns() {
             tracing::warn!("{IGNORE_COOLDOWN_ENV} is set: the cooldown is being ignored");
             return Ok(None);
         }
 
-        let row: Option<(i64, i64)> = self
+        let row: Option<(EpochMs, EpochMs)> = self
             .conn()
             .query_row(
                 "SELECT until_ms, set_at_ms FROM cooldowns WHERE scope = ?1",
                 params![SESSION_SCOPE],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((EpochMs::new(row.get(0)?), EpochMs::new(row.get(1)?))),
             )
             .optional()
             .map_err(budget_err)?;
@@ -346,7 +355,7 @@ impl RateBudget for SqliteRateBudget {
     /// throttle recorded ten minutes into a twelve-hour action block replaced
     /// it — the account came out of the more serious block early, which is the
     /// one direction this table must never be wrong in.
-    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<i64, RateBudgetError> {
+    fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<EpochMs, RateBudgetError> {
         let now = now_ms();
         let base = minimum.as_millis() as i64;
 
@@ -355,11 +364,17 @@ impl RateBudget for SqliteRateBudget {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(budget_err)?;
 
-        let previous: Option<(i64, i64, i64)> = tx
+        let previous: Option<(EpochMs, i64, EpochMs)> = tx
             .query_row(
                 "SELECT set_at_ms, strikes, until_ms FROM cooldowns WHERE scope = ?1",
                 params![SESSION_SCOPE],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        EpochMs::new(row.get(0)?),
+                        row.get(1)?,
+                        EpochMs::new(row.get(2)?),
+                    ))
+                },
             )
             .optional()
             .map_err(budget_err)?;
@@ -374,8 +389,8 @@ impl RateBudget for SqliteRateBudget {
             _ => (base.min(MAX_COOLDOWN_MS), 1),
         };
 
-        let standing = previous.map_or(0, |(_, _, until)| until);
-        let until = (now + length).max(standing);
+        let standing = previous.map_or(EpochMs::new(0), |(_, _, until)| until);
+        let until = (now + Duration::from_millis(length as u64)).max(standing);
 
         tx.execute(
             "INSERT INTO cooldowns (scope, until_ms, set_at_ms, reason, strikes)
@@ -385,7 +400,7 @@ impl RateBudget for SqliteRateBudget {
                  set_at_ms = excluded.set_at_ms,
                  reason = excluded.reason,
                  strikes = excluded.strikes",
-            params![SESSION_SCOPE, until, now, reason, strikes],
+            params![SESSION_SCOPE, until.get(), now.get(), reason, strikes],
         )
         .map_err(budget_err)?;
         tx.commit().map_err(budget_err)?;
@@ -445,14 +460,14 @@ mod tests {
 
     #[test]
     fn the_first_request_from_cold_does_not_wait() {
-        let (tat, wait) = decide(0, 1_000_000, T, TAU);
+        let (tat, wait) = decide(EpochMs::new(0), EpochMs::new(1_000_000), T, TAU);
         assert_eq!(wait, 0);
-        assert_eq!(tat, 1_000_000 + T);
+        assert_eq!(tat, EpochMs::new(1_000_000 + T));
     }
 
     #[test]
     fn nothing_waits_within_the_burst() {
-        let now = 1_000_000;
+        let now = EpochMs::new(1_000_000);
         let mut tat = now;
         for i in 0..FIT_IN_A_ROW {
             let (next, wait) = decide(tat, now, T, TAU);
@@ -463,7 +478,7 @@ mod tests {
 
     #[test]
     fn once_the_burst_is_spent_waiting_begins() {
-        let now = 1_000_000;
+        let now = EpochMs::new(1_000_000);
         let mut tat = now;
         for _ in 0..FIT_IN_A_ROW {
             tat = decide(tat, now, T, TAU).0;
@@ -474,22 +489,22 @@ mod tests {
 
     #[test]
     fn the_budget_refills_over_time() {
-        let now = 1_000_000;
+        let now = EpochMs::new(1_000_000);
         let mut tat = now;
         for _ in 0..25 {
             tat = decide(tat, now, T, TAU).0;
         }
         // An hour later it is fully refilled.
-        let (_, wait) = decide(tat, now + 3_600_000, T, TAU);
+        let (_, wait) = decide(tat, now + Duration::from_millis(3_600_000), T, TAU);
         assert_eq!(wait, 0);
     }
 
     #[test]
     fn an_instant_in_the_past_does_not_grant_unlimited_budget() {
         // The old tat is clamped to "now": idleness does not accrue credit.
-        let (tat, wait) = decide(1, 1_000_000, T, TAU);
+        let (tat, wait) = decide(EpochMs::new(1), EpochMs::new(1_000_000), T, TAU);
         assert_eq!(wait, 0);
-        assert_eq!(tat, 1_000_000 + T);
+        assert_eq!(tat, EpochMs::new(1_000_000 + T));
     }
 
     /// Built through the real constructor, not through `over`. The claim above

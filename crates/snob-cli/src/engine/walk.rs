@@ -6,6 +6,7 @@
 //! run destructors.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_core::model::{ListKind, User};
 use snob_ig::pace::Pace;
 use snob_ig::pager::{ListRequest, ListWalker, WalkError};
@@ -141,7 +142,7 @@ struct Opened {
     /// interval this list covers: it does reflect everything from that page
     /// onward, and `snapshots::RESUME_WINDOW_SECS` has already decided a pause
     /// of that length is one capture.
-    started_at: i64,
+    started_at: Epoch,
     cursor: Option<String>,
     already_stored: usize,
 }

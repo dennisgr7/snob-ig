@@ -6,6 +6,7 @@
 //! however old it is: stale beats nothing, and the warning names the date.
 
 use anyhow::Result;
+use snob_core::EpochMs;
 use snob_core::model::{ListKind, User};
 use snob_store::store::snapshots;
 
@@ -21,7 +22,7 @@ pub fn serve(
     app: &App,
     args: &ListQuery,
     kind: ListKind,
-    until_ms: i64,
+    until_ms: EpochMs,
 ) -> Result<(Vec<User>, ListOutcome)> {
     if args.refresh {
         return Err(report::refuse_in_cooldown(until_ms, Blocked::RefreshWanted));
@@ -140,7 +141,7 @@ fn gap_between(a: &ListOutcome, b: &ListOutcome) -> i64 {
 mod tests {
     use super::*;
     use crate::exit::ExitCode;
-    use snob_core::Pk;
+    use snob_core::{Epoch, Pk};
 
     /// The drift two stored lists may have between them, written out.
     ///
@@ -159,13 +160,17 @@ mod tests {
     }
 
     /// A stored row, which is what the outcomes under test are built from.
+    ///
+    /// The two moments arrive as plain seconds and become [`Epoch`] here, at
+    /// the edge, so every assertion below reads as the number of seconds
+    /// between two walks rather than as a constructor repeated forty times.
     fn stored(started_at: i64, taken_at: i64) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
             account_pk: Pk::new(1),
             kind: ListKind::Followers,
-            started_at,
-            taken_at: Some(taken_at),
+            started_at: Epoch::new(started_at),
+            taken_at: Some(Epoch::new(taken_at)),
             member_count: 0,
             declared_count: None,
             next_cursor: None,

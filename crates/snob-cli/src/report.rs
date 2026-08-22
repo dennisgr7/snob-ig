@@ -5,6 +5,7 @@
 //! read as two different pieces of advice about the same situation.
 
 use snob_core::model::{ListKind, StopReason, User, printable};
+use snob_core::{Epoch, EpochMs};
 use snob_ig::pager::Warning;
 
 use crate::app::ConsentInAdvance;
@@ -121,7 +122,7 @@ pub fn error_json(error: &anyhow::Error) -> serde_json::Value {
         .map(|hint| filtered(hint, "\n"));
     let url = instagram.and_then(|e| e.challenge_url());
     let lifts = instagram.and_then(|e| match e {
-        snob_ig::error::IgError::InCooldown { until_ms } => Some(cooldown_ends_at_secs(*until_ms)),
+        snob_ig::error::IgError::InCooldown { until_ms } => Some(until_ms.to_epoch()),
         _ => None,
     });
 
@@ -239,28 +240,19 @@ fn filtered(text: &str, join: &str) -> String {
         .join(join)
 }
 
-/// "Aug 3 at 14:12", from a timestamp in epoch seconds, in the local zone like
-/// every other moment the tool prints.
-pub fn stored_on(taken_at: i64) -> String {
+/// "Aug 3 at 14:12", in the local zone like every other moment the tool prints.
+pub fn stored_on(taken_at: Epoch) -> String {
     format_epoch(taken_at, "earlier")
 }
 
-/// "04/08 at 16:30", from a cooldown end in epoch milliseconds.
-pub fn cooldown_ends_at(until_ms: i64) -> String {
-    format_epoch(cooldown_ends_at_secs(until_ms), "later")
-}
-
-/// A cooldown end in the unit every timestamp this tool reports uses.
+/// "04/08 at 16:30", from a cooldown end.
 ///
-/// `Pacer::cooldown` answers in milliseconds while `created_at` and
-/// `validated_at` next to it in `whoami`'s object are in seconds, so something
-/// has to convert — and both the printed date above and that JSON field are the
-/// same cooldown, which is why they may not do their own arithmetic.
-///
-/// `div_euclid` rather than `/`, so a moment before the epoch floors instead of
-/// rounding towards zero into the wrong second.
-pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
-    until_ms.div_euclid(1000)
+/// The conversion to seconds is [`EpochMs::to_epoch`] and is not written here.
+/// It used to be — `cooldown_ends_at_secs`, in this file — and the printed date
+/// and `whoami`'s JSON field are the same cooldown, so the arithmetic belongs
+/// with the type rather than one crate out from it.
+pub fn cooldown_ends_at(until_ms: EpochMs) -> String {
+    format_epoch(until_ms.to_epoch(), "later")
 }
 
 /// A moment, for a person to read.
@@ -282,15 +274,15 @@ pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
 /// `--at 09:00` in Madrid reported having "last run on Aug 22 at 07:00",
 /// and a cooldown ending at four looked like it ended at two. The zone is
 /// taken at the call, so the test can pin the arithmetic with a fixed one.
-fn format_epoch(seconds: i64, unknown: &str) -> String {
-    format_epoch_in(seconds, unknown, &chrono::Local)
+fn format_epoch(at: Epoch, unknown: &str) -> String {
+    format_epoch_in(at, unknown, &chrono::Local)
 }
 
-fn format_epoch_in<Z: chrono::TimeZone>(seconds: i64, unknown: &str, zone: &Z) -> String
+fn format_epoch_in<Z: chrono::TimeZone>(at: Epoch, unknown: &str, zone: &Z) -> String
 where
     Z::Offset: std::fmt::Display,
 {
-    chrono::DateTime::from_timestamp(seconds, 0)
+    chrono::DateTime::from_timestamp(at.get(), 0)
         .map(|t| t.with_timezone(zone).format("%b %-d at %H:%M").to_string())
         .unwrap_or_else(|| unknown.to_string())
 }
@@ -347,8 +339,8 @@ pub fn refuse_incomplete(
 pub fn refuse_different_moments(
     a: Provenance,
     b: Provenance,
-    a_at: i64,
-    b_at: i64,
+    a_at: Epoch,
+    b_at: Epoch,
 ) -> anyhow::Error {
     // Each arm asks the same question of the same pair, so each one asks it the
     // same way. The cooldown arm used to go through a method of its own while its
@@ -400,7 +392,7 @@ pub enum Blocked<'a> {
 }
 
 /// The account is in cooldown and storage cannot answer either.
-pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error {
+pub fn refuse_in_cooldown(until_ms: EpochMs, blocked: Blocked<'_>) -> anyhow::Error {
     let when = cooldown_ends_at(until_ms);
     let detail = match blocked {
         Blocked::RefreshWanted => {
@@ -426,7 +418,7 @@ pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error 
 }
 
 /// A cooldown that landed between the check and the walk.
-pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
+pub fn refuse_cooldown_mid_walk(until_ms: EpochMs) -> anyhow::Error {
     ExitError::new(
         ExitCode::RateLimited,
         format!(
@@ -497,7 +489,7 @@ pub fn refuse_declined(shown: &str) -> anyhow::Error {
 ///
 /// The list is named because a crossing serves two of them, and two identical
 /// warnings in a row read like the same one printed twice.
-pub fn serving_stored_in_cooldown(until_ms: i64, kind: ListKind, taken_at: i64) -> String {
+pub fn serving_stored_in_cooldown(until_ms: EpochMs, kind: ListKind, taken_at: Epoch) -> String {
     format!(
         "the account is in cooldown until {}; serving the {kind} list stored on {}",
         cooldown_ends_at(until_ms),
@@ -1042,7 +1034,7 @@ mod tests {
     #[test]
     fn a_cooldown_refusal_cannot_be_made_to_erase_the_line_above_it() {
         let name = "gh\u{1b}[2K\u{1b}[A";
-        let error = refuse_in_cooldown(1_000, Blocked::AccountUnknown(name));
+        let error = refuse_in_cooldown(EpochMs::new(1_000), Blocked::AccountUnknown(name));
         let message = error.to_string();
 
         assert!(
@@ -1062,8 +1054,8 @@ mod tests {
             provenance: Provenance::Walked,
             reason,
             requests: 1,
-            started_at: 0,
-            taken_at: 0,
+            started_at: Epoch::default(),
+            taken_at: Epoch::default(),
             account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by,
@@ -1075,17 +1067,17 @@ mod tests {
     /// the alternative is a message with a hole in the middle of it.
     #[test]
     fn a_date_out_of_range_still_reads_as_something() {
-        assert_eq!(stored_on(i64::MAX), "earlier");
-        assert_eq!(cooldown_ends_at(i64::MAX), "later");
+        assert_eq!(stored_on(Epoch::new(i64::MAX)), "earlier");
+        assert_eq!(cooldown_ends_at(EpochMs::new(i64::MAX)), "later");
         assert_eq!(
-            format_epoch_in(1_722_700_000, "earlier", &chrono::Utc),
+            format_epoch_in(Epoch::new(1_722_700_000), "earlier", &chrono::Utc),
             "Aug 3 at 15:46"
         );
-        // Milliseconds, and a negative one must not round towards zero into a
-        // different second than it belongs to.
+        // The same moment in milliseconds reads as the same second, which is
+        // what `EpochMs::to_epoch` is for.
         assert_eq!(
             format_epoch_in(
-                cooldown_ends_at_secs(1_722_700_000_000),
+                EpochMs::new(1_722_700_000_000).to_epoch(),
                 "later",
                 &chrono::Utc
             ),
@@ -1098,7 +1090,7 @@ mod tests {
     fn a_moment_is_printed_in_the_zone_the_reader_is_in() {
         let madrid_in_august = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
         assert_eq!(
-            format_epoch_in(1_722_700_000, "earlier", &madrid_in_august),
+            format_epoch_in(Epoch::new(1_722_700_000), "earlier", &madrid_in_august),
             "Aug 3 at 17:46"
         );
     }
@@ -1223,15 +1215,24 @@ mod tests {
     /// cooldown they are not in is worse than saying nothing.
     #[test]
     fn different_moments_are_explained_by_why_nobody_checked() {
-        let throttled = refuse_different_moments(Provenance::Cooldown, Provenance::Cooldown, 0, 1);
+        let throttled = refuse_different_moments(
+            Provenance::Cooldown,
+            Provenance::Cooldown,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         assert!(hint_of(&throttled).unwrap().contains("cooldown lifts"));
         assert_eq!(
             ExitCode::from_chain(&throttled),
             Some(ExitCode::RateLimited)
         );
 
-        let asked_for =
-            refuse_different_moments(Provenance::CacheFlag, Provenance::CacheFlag, 0, 1);
+        let asked_for = refuse_different_moments(
+            Provenance::CacheFlag,
+            Provenance::CacheFlag,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         let hint = hint_of(&asked_for).unwrap();
         assert!(hint.contains("--cache"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
@@ -1241,8 +1242,12 @@ mod tests {
         // request to check went out and did not come back — so it used to be
         // told to drop a flag it never passed, which sends somebody looking for
         // something that is not in their command line.
-        let nobody_could_check =
-            refuse_different_moments(Provenance::PollFailed, Provenance::PollFailed, 0, 1);
+        let nobody_could_check = refuse_different_moments(
+            Provenance::PollFailed,
+            Provenance::PollFailed,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         let hint = hint_of(&nobody_could_check).unwrap();
         assert!(!hint.contains("--cache"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
@@ -1268,7 +1273,7 @@ mod tests {
             (Blocked::NothingStored(ListKind::Followers), "followers"),
         ];
         for (blocked, expected) in cases {
-            let error = refuse_in_cooldown(1_722_700_000_000, blocked);
+            let error = refuse_in_cooldown(EpochMs::new(1_722_700_000_000), blocked);
             let text = error.to_string();
             assert!(text.contains(expected), "{text}");
             assert!(text.contains("in cooldown until"), "{text}");

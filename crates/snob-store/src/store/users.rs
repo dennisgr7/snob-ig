@@ -25,7 +25,7 @@ use snob_core::model::User;
 /// last. [`upsert`] reads it as never having known rather than as a name that
 /// changed.
 pub fn ensure(conn: &Connection, pk: Pk) -> Result<(), StoreError> {
-    let now = now();
+    let now = now().get();
     conn.execute(
         "INSERT INTO users (pk, username, first_seen, last_seen)
          VALUES (?1, '', ?2, ?2)
@@ -53,7 +53,7 @@ pub fn ensure(conn: &Connection, pk: Pk) -> Result<(), StoreError> {
 /// transactions.
 pub fn upsert(conn: &Connection, u: &User) -> Result<Option<String>, StoreError> {
     let pk = pk_to_sql(u.pk);
-    let now = now();
+    let now = now().get();
 
     let previous: Option<String> = conn
         .prepare_cached("SELECT username FROM users WHERE pk = ?1")?

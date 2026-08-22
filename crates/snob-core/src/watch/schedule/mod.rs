@@ -33,6 +33,8 @@ use std::time::Duration;
 
 use chrono::TimeZone;
 
+use crate::Epoch;
+
 use calendar::{Calendar, Times};
 use next::{next_after, next_local_midnight};
 use parse::{FieldSet, parse_cron};
@@ -376,7 +378,7 @@ impl Schedule {
     /// run landed rather than from a moment — the whole schedule slides, so
     /// there is nothing to take off. Unbounded here, and bounded as before by
     /// `room_for_jitter`.
-    fn room_at<Tz: TimeZone>(&self, due_at: i64, zone: &Tz) -> Duration {
+    fn room_at<Tz: TimeZone>(&self, due_at: Epoch, zone: &Tz) -> Duration {
         let Some(calendar) = &self.calendar else {
             return Duration::MAX;
         };
@@ -472,8 +474,8 @@ impl Schedule {
 /// reordering away. As a variant, the compiler asks for the arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
-    /// Nothing yet. Sleep until this instant, an epoch in seconds.
-    At(i64),
+    /// Nothing yet. Sleep until this instant.
+    At(Epoch),
     /// Run now. `missed` counts the scheduled runs being folded into this one.
     Now { missed: u32 },
     /// The schedule names no moment at all — `0 0 31 2 *`, and nothing else this
@@ -501,12 +503,21 @@ mod tests {
         assert_eq!((day.hour(), day.minute()), (0, 0));
     }
 
-    pub(super) fn at(offset_secs: i64) -> i64 {
-        MONDAY_0000 + offset_secs
+    /// A moment, as an offset from the fixture Monday. The offset is a length
+    /// of time and stays a number; what comes back is a moment and says so.
+    pub(super) fn at(offset_secs: i64) -> Epoch {
+        Epoch::new(MONDAY_0000 + offset_secs)
     }
 
     pub(super) fn hours(n: i64) -> i64 {
         n * 3_600
+    }
+
+    /// A length of time, for the offsets these tests add to a moment. Written
+    /// out rather than left as a number, because a moment takes a length of
+    /// time and not a count -- which is the whole of what [`Epoch`] is for.
+    pub(super) fn secs(n: i64) -> Duration {
+        Duration::from_secs(n.max(0) as u64)
     }
 
     /// A jitter larger than the room it is jittering within is not a jitter.
@@ -567,7 +578,7 @@ mod tests {
         let due_at = at(hours(9));
         let woken = with_jitter(due_at, schedule.jitter(), 0.999_999);
 
-        let landed = DateTime::from_timestamp(woken, 0).unwrap();
+        let landed = DateTime::from_timestamp(woken.get(), 0).unwrap();
         assert_eq!(
             landed.weekday(),
             chrono::Weekday::Mon,
