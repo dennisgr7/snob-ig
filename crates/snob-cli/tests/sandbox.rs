@@ -843,6 +843,152 @@ fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> 
     command.output().expect("the binary runs")
 }
 
+/// The whole tool, end to end, in the order a person meets it.
+///
+/// One session, one fake Instagram, every read command the binary has, each
+/// asserted on what it printed, what it wrote and what it exited with -- and
+/// then the two commands that take it all away again. The other tests here
+/// each pin one behavior; this one pins that the commands agree with each
+/// other over one store: the crossings add up to the lists, the export on
+/// disk is the list on screen, and `purge` leaves nothing of any of it.
+///
+/// The fixture serves the same made-up accounts for both lists: followers
+/// `user0..user2`, following `user0..user1`. So `fans` is `user2`, `friends`
+/// is `user0` and `user1`, and nobody is an unfollower.
+#[tokio::test]
+async fn the_whole_tool_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+    let run = |args: &[&str]| snob_from(&here, tmp.path(), &instagram, args);
+    let json = |out: &Output| -> serde_json::Value {
+        serde_json::from_str(&stdout(out))
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}{}", stdout(out), stderr(out)))
+    };
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|u| u["username"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Nothing yet: every command that needs a session says so, with the code.
+    let out = run(&["followers"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+
+    log_in(tmp.path(), &instagram);
+
+    let out = run(&["whoami", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json(&out)["username"], "me");
+
+    // The two lists, walked. Down a pipe the format is JSON on its own.
+    let out = run(&["followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(names(&json(&out)), ["user0", "user1", "user2"]);
+    let out = run(&["following"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(names(&json(&out)), ["user0", "user1"]);
+
+    // The crossings, served out of what was just stored. The arithmetic is
+    // the one AGENTS.md says a test asserts: unfollowers + friends is
+    // everyone you follow, fans + friends everyone who follows you.
+    let out = run(&["unfollowers", "--cache"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(names(&json(&out)).is_empty(), "{}", stdout(&out));
+    let out = run(&["fans", "--cache"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(names(&json(&out)), ["user2"]);
+    let out = run(&["friends", "--cache"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(names(&json(&out)), ["user0", "user1"]);
+
+    let out = run(&["scan", "--cache", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let scan = json(&out);
+    assert_eq!(scan["counts"]["followers"], 3, "{scan}");
+    assert_eq!(scan["counts"]["following"], 2, "{scan}");
+    assert_eq!(scan["counts"]["fans"], 1, "{scan}");
+    assert_eq!(scan["counts"]["friends"], 2, "{scan}");
+    assert_eq!(scan["counts"]["unfollowers"], 0, "{scan}");
+    assert_eq!(scan["lists"]["followers"]["source"], "cached", "{scan}");
+
+    // The filters, on the list with the most in it.
+    let out = run(&["followers", "--cache", "--limit", "1"]);
+    assert_eq!(names(&json(&out)), ["user0"]);
+    std::fs::write(here.join("skip.txt"), "@ user1\n# a comment\nUSER0\n").unwrap();
+    let out = run(&["followers", "--cache", "--exclude-list", "skip.txt"]);
+    assert_eq!(names(&json(&out)), ["user2"], "{}", stderr(&out));
+
+    // Every export format, to a file whose extension chooses it.
+    for (file, expect) in [
+        ("list.csv", "user0"),
+        ("list.md", "| [user0](https://www.instagram.com/user0/)"),
+        ("list.ndjson", "\"username\":\"user0\""),
+        ("list.json", "\"username\": \"user0\""),
+    ] {
+        let out = run(&["followers", "--cache", "-o", file]);
+        assert!(out.status.success(), "{file}: {}", stderr(&out));
+        let written = std::fs::read_to_string(here.join(file)).expect(file);
+        assert!(written.contains(expect), "{file}: {written}");
+        assert_eq!(
+            stdout(&out),
+            "",
+            "{file}: the result went to the file, not the screen"
+        );
+    }
+    let out = run(&["followers", "--cache", "-o", "list.xlsx"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let workbook = std::fs::read(here.join("list.xlsx")).unwrap();
+    assert_eq!(&workbook[..2], b"PK", "an xlsx is a zip");
+    // A name this program did not choose is not written over twice: the
+    // user named it, so the second run replaces it without complaint.
+    assert!(
+        run(&["followers", "--cache", "-o", "list.csv"])
+            .status
+            .success()
+    );
+
+    // The session, taken away, and the command that needed it says so again.
+    let out = run(&["logout"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("Session deleted"), "{}", stdout(&out));
+    let out = run(&["followers", "--cache"]);
+    assert_eq!(out.status.code(), Some(3));
+
+    // And everything else: shown first, then removed, only on --yes.
+    let out = run(&["purge", "--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("Nothing was deleted"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        tmp.path().join("data").is_dir(),
+        "a dry run deletes nothing"
+    );
+    let out = run(&["purge"]);
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "a question nobody could answer is not a yes: {}",
+        stderr(&out)
+    );
+    assert!(tmp.path().join("data").is_dir());
+    let out = run(&["purge", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !tmp.path().join("data").exists(),
+        "purge left the data directory behind"
+    );
+    // The exports are the user's, in the user's directory, and stay.
+    assert!(here.join("list.csv").is_file());
+}
+
 /// A failure is told in the language the answer was going to be in.
 ///
 /// `snob followers --format json` against nothing stored used to print
