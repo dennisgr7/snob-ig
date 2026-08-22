@@ -211,15 +211,20 @@ async fn by_browser(
     // one rather than as a failure, so the result is held rather than unwrapped
     // until the browser has been shut down.
     let captured = capture(&found, args.user_agent.clone(), paths, &cancel).await;
+    // Whatever `capture` came back with. The profile holds a live session
+    // from the moment the form was submitted, and a Ctrl+C or a failure
+    // after that moment used to leave it on disk indefinitely, with nothing
+    // said -- the two exits below went round this line, so the default of
+    // "the profile does not outlive the login" held only on the path that
+    // succeeded.
+    if !args.keep_profile {
+        discard_profile(&profile);
+    }
     if cancel.is_canceled() {
         ui::info("Login canceled.");
         return Ok(ExitCode::Interrupted);
     }
     let (cookies, user_agent) = captured?;
-
-    if !args.keep_profile {
-        discard_profile(&profile);
-    }
 
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
