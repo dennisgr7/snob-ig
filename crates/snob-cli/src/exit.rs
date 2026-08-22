@@ -4,6 +4,7 @@
 //! apart from "wait a while" without parsing message text.
 
 use snob_core::model::StopReason;
+use snob_core::watch::{RecordedOutcome, RunOutcome};
 use snob_ig::error::IgError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,45 +33,36 @@ impl ExitCode {
         Self::Interrupted,
     ];
 
-    /// The code a stored token names, or `None` for a token this build does not
-    /// write.
+    /// What a run that ended this way came to, which is the same fact without
+    /// the number on it.
     ///
-    /// The other direction of [`ExitCode::as_str`], and it exists because
-    /// `watch_runs.outcome` is read back. `watch::status::health` matched the
-    /// literals `"ok"`, `"rate_limited"` and `"interrupted"` inline — which is
-    /// precisely what `as_str`'s own doc says this vocabulary exists to stop.
-    /// Respell one there and every recorded cooldown falls through to the
-    /// failing arm, so `status` exits 1 for a monitor that will resume on its
-    /// own; and the fixture those tests build their rows from spelled the same
-    /// literals, so the suite would have moved with the defect rather than
-    /// caught it.
-    ///
-    /// Derived from [`ExitCode::as_str`] rather than written as a second match,
-    /// so the two cannot disagree at all: there is one spelling of each token in
-    /// the program.
-    ///
-    /// `None` rather than a default, because a token this build does not
-    /// recognize came from a newer one, and guessing at what it meant is how a
-    /// probe learns to lie. What to do about it is the caller's decision.
-    pub fn from_token(token: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|code| code.as_str() == token)
+    /// The number is this crate's business — it is what a shell reads — and the
+    /// word is the domain's, because `watch_runs.outcome` and the `--json`
+    /// documents keep it too. This mapping is the only place the two are tied
+    /// together, and [`ExitCode::as_str`] goes through it rather than spelling a
+    /// second set of tokens.
+    pub fn outcome(self) -> RunOutcome {
+        match self {
+            Self::Ok => RunOutcome::Ok,
+            Self::Error => RunOutcome::Error,
+            Self::NoSession => RunOutcome::NoSession,
+            Self::Challenge => RunOutcome::Challenge,
+            Self::RateLimited => RunOutcome::RateLimited,
+            Self::Interrupted => RunOutcome::Interrupted,
+        }
     }
 
     /// The stable token for this code, for machine-readable output.
     ///
-    /// The same vocabulary as the table in the README, so a caller reading the
-    /// JSON and a caller reading `$?` are told the same thing by the same name.
-    /// It exists so nothing has to invent tokens inline, which is how two
-    /// spellings of one condition get shipped.
+    /// [`RunOutcome::as_str`], reached through [`ExitCode::outcome`] rather than
+    /// written out again here: there is one spelling of each token in the
+    /// program, and it is in `snob-core` because the store has to name it too
+    /// and cannot name this type. It exists so nothing has to invent tokens
+    /// inline, which is how two spellings of one condition get shipped —
+    /// `watch::status::health` invented three, and the recorded outcome it was
+    /// matching against is a [`RunOutcome`] now rather than a string.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Error => "error",
-            Self::NoSession => "no_session",
-            Self::Challenge => "challenge",
-            Self::RateLimited => "rate_limited",
-            Self::Interrupted => "interrupted",
-        }
+        self.outcome().as_str()
     }
 
     /// The code for what Instagram said, when a walk stopped because it said
@@ -161,6 +153,17 @@ pub fn exit_code_for(error: &anyhow::Error) -> ExitCode {
         .unwrap_or(ExitCode::Error)
 }
 
+/// What the run log records for a run that ended this way.
+///
+/// Here rather than at the two call sites that write a row, so neither of them
+/// converts by hand — that is the seam the column's `Option<String>` used to
+/// leave open, and the one place a token could be spelled a second time.
+impl From<ExitCode> for RecordedOutcome {
+    fn from(code: ExitCode) -> Self {
+        Self::Known(code.outcome())
+    }
+}
+
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
         std::process::ExitCode::from(code as u8)
@@ -224,28 +227,50 @@ impl std::error::Error for ExitError {}
 mod tests {
     use super::*;
 
-    /// The token a code writes is the token that reads back as that code.
+    /// The token a code writes is the token that reads back as its outcome.
     ///
-    /// `as_str` exists "so nothing has to invent tokens inline"; `from_token` is
-    /// the direction that was missing, and `watch::status::health` had invented
-    /// three literals for want of it. Walked over `ALL` and counted, because a
-    /// variant dropped from that list quietly narrows every caller that walks it
-    /// -- and this is the caller where it is cheapest to notice.
+    /// `as_str` exists "so nothing has to invent tokens inline", and reading a
+    /// recorded run back was the direction that was missing —
+    /// `watch::status::health` had invented three literals for want of it. The
+    /// vocabulary is `RunOutcome`'s now, because the store keeps the column and
+    /// cannot name this type; what this asserts is that the two faces of one
+    /// outcome have not come apart.
+    ///
+    /// Walked over `ALL` and counted, because a variant dropped from that list
+    /// quietly narrows every caller that walks it -- and this is the caller
+    /// where it is cheapest to notice. Counted for distinctness too: two codes
+    /// mapped to one outcome round-trip perfectly and are still a build that
+    /// cannot tell a challenge from a plain failure.
     #[test]
     fn every_exit_code_reads_back_from_the_token_it_writes() {
         assert_eq!(ExitCode::ALL.len(), 6, "a code was added or dropped");
         for code in ExitCode::ALL {
             assert_eq!(
-                ExitCode::from_token(code.as_str()),
-                Some(code),
+                RunOutcome::from_token(code.as_str()),
+                Some(code.outcome()),
                 "{code:?} writes {:?} and does not read back from it",
                 code.as_str()
             );
+            assert_eq!(
+                RecordedOutcome::from(code),
+                code.outcome(),
+                "{code:?} records an outcome that is not its own"
+            );
         }
+
+        let mut outcomes: Vec<&str> = ExitCode::ALL.iter().map(|c| c.as_str()).collect();
+        outcomes.sort_unstable();
+        outcomes.dedup();
         assert_eq!(
-            ExitCode::from_token("rate-limited"),
+            outcomes.len(),
+            ExitCode::ALL.len(),
+            "two codes share one outcome"
+        );
+
+        assert_eq!(
+            RunOutcome::from_token("rate-limited"),
             None,
-            "a spelling this build does not write is not a code it knows"
+            "a spelling this build does not write is not an outcome it knows"
         );
     }
 

@@ -307,7 +307,7 @@ pub fn commit(
             started_at: at,
             finished_at: Some(snob_core::clock::now()),
             requests: tick.requests,
-            outcome: Some(tick.outcome().as_str().to_string()),
+            outcome: Some(tick.outcome().into()),
             changes: tick.report.changes().len() as u32,
         },
     );

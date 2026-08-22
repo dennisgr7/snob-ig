@@ -368,8 +368,8 @@ async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
         .expect("a run that concluded nothing still ran");
 
     assert_eq!(
-        last.outcome.as_deref(),
-        Some("rate_limited"),
+        last.outcome,
+        Some(snob_core::watch::RunOutcome::RateLimited.into()),
         "it has to say why it could not look, not merely that it was quiet"
     );
     assert_eq!(last.changes, 0);

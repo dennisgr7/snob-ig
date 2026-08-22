@@ -60,9 +60,11 @@ CREATE TABLE watch_runs (
   started_at  INTEGER NOT NULL,
   finished_at INTEGER,            -- NULL while the tick is still running
   requests    INTEGER NOT NULL DEFAULT 0,
-  -- Mirrors ExitCode::as_str(). The same vocabulary as the README's table, so a
+  -- Mirrors snob_core::watch::RunOutcome::as_str(), which is also what
+  -- ExitCode::as_str() writes. The same vocabulary as the README's table, so a
   -- caller reading this column and a caller reading $? are told the same thing
-  -- by the same name.
+  -- by the same name. A row spelled outside this list can only have been
+  -- written by a newer build, and is read back as RecordedOutcome::Unknown.
   outcome     TEXT CHECK (outcome IS NULL OR outcome IN
                 ('ok', 'error', 'no_session', 'challenge', 'rate_limited',
                  'interrupted')),

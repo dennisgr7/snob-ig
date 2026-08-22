@@ -8,10 +8,12 @@
 //! presented.
 
 pub mod diff;
+pub mod outcome;
 pub mod schedule;
 pub mod sign;
 
 pub use diff::{Basis, ListDiff, Rename};
+pub use outcome::{RecordedOutcome, RunOutcome};
 pub use schedule::{Due, Schedule, ScheduleError, Weekday};
 
 /// Everything one run found about one account.

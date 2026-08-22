@@ -117,7 +117,12 @@ impl Printing {
 }
 
 /// What a run over several accounts came to.
-pub(super) struct RunOutcome {
+///
+/// Not `snob_core::watch::RunOutcome`, which is what *one* run of *one* account
+/// came to and is the vocabulary `watch_runs.outcome` is kept in. This is the
+/// summary of a whole pass over the file: the requests it spent, the first
+/// reason any of its ticks gave, and the one failure nobody has printed yet.
+pub(super) struct RunSummary {
     /// Requests spent by every account that got as far as spending any.
     pub(super) spent: u32,
     /// The first non-`Ok` verdict a tick reported, the accounts being in the
@@ -151,7 +156,7 @@ pub(super) async fn run_accounts(
     watched: &[Watched],
     delivery: Option<&Delivery>,
     printing: Printing,
-) -> RunOutcome {
+) -> RunSummary {
     let mut spent = 0;
     let mut code = ExitCode::Ok;
     let mut failures = Vec::new();
@@ -250,7 +255,7 @@ pub(super) async fn run_accounts(
         report::print_error(&earlier, printing.wording());
     }
 
-    RunOutcome {
+    RunSummary {
         spent,
         code,
         failed,
@@ -295,7 +300,7 @@ fn record_failed_run(
             started_at: at,
             finished_at: Some(at),
             requests,
-            outcome: Some(outcome.as_str().to_string()),
+            outcome: Some(outcome.into()),
             changes: 0,
         },
     );
@@ -336,7 +341,7 @@ fn to_print_and_to_return(
 ///
 /// So the rule is the order the accounts are already in, and the earliest reason
 /// wins. A tick that failed outright is not here at all — it leaves through
-/// `RunOutcome::failed`, and `once` returns this only when nothing failed.
+/// `RunSummary::failed`, and `once` returns this only when nothing failed.
 fn first_reason(so_far: ExitCode, tick: ExitCode) -> ExitCode {
     match so_far {
         ExitCode::Ok => tick,
@@ -443,8 +448,8 @@ mod tests {
             .find(|r| r.account_pk == 99)
             .expect("a tick that failed is a tick that happened");
         assert_ne!(
-            recorded.outcome.as_deref(),
-            Some("ok"),
+            recorded.outcome,
+            Some(ExitCode::Ok.into()),
             "and it must not read as a run that worked"
         );
         assert!(

@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, printable};
-use snob_core::watch::schedule;
+use snob_core::watch::{RunOutcome, schedule};
 use snob_store::config::{self, WatchConfig};
 use snob_store::paths::AppPaths;
 use snob_store::store::{Store, deliveries, watch as watch_store};
@@ -136,7 +136,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 
             let mut line = format!("{who} last ran on {}", report::stored_on(run.started_at));
             if let Some(outcome) = &run.outcome
-                && outcome != ExitCode::Ok.as_str()
+                && *outcome != RunOutcome::Ok
             {
                 line.push_str(&format!(" and could not look ({outcome})"));
             } else if run.changes == 0 {
@@ -506,11 +506,7 @@ fn health(
     // the line names the account: the note used to omit it, so several accounts
     // printed the identical sentence N times.
     for RunOf { run, who, watched } in runs {
-        let Some(code) = run
-            .outcome
-            .as_deref()
-            .filter(|c| *c != ExitCode::Ok.as_str())
-        else {
+        let Some(code) = run.outcome.as_ref().filter(|c| **c != RunOutcome::Ok) else {
             continue;
         };
         if !watched {
@@ -519,21 +515,25 @@ fn health(
             ));
             continue;
         }
-        // **Read as an `ExitCode`, not against three literals spelled again
+        // **Matched as an outcome, not against three literals spelled again
         // here.** `as_str`'s own doc says the vocabulary exists "so nothing has
         // to invent tokens inline, which is how two spellings of one condition
         // get shipped", and this was the place that invented them. Respell
         // `rate_limited` there and every recorded cooldown lands in the arm
         // below, so `status` exits 1 for a monitor that will resume on its own —
         // and the fixture these tests build their rows from spelled the same
-        // literals, so it would have moved with the defect.
+        // literals, so it would have moved with the defect. The row arrives
+        // typed now, parsed at the store, so there is nothing here to respell.
         //
-        // A token this build does not know is a failure it cannot explain, which
-        // is the direction a probe should be wrong in.
-        match ExitCode::from_token(code) {
+        // A token this build does not know is `None` and falls to the arm below:
+        // a failure it cannot explain, which is the direction a probe should be
+        // wrong in. It is still printed as the word the row holds, because
+        // "ended in something this build does not know" is less use to whoever
+        // has to look than the word itself.
+        match code.known() {
             // A cooldown lifts by itself and an interrupt was the user. Neither
             // is a monitor that needs anybody.
-            Some(ExitCode::RateLimited | ExitCode::Interrupted) => {
+            Some(RunOutcome::RateLimited | RunOutcome::Interrupted) => {
                 at_least(Verdict::Warned);
                 notes.push(format!("{who}'s last run ended in {code}"));
             }
@@ -713,6 +713,7 @@ pub(super) fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::watch::RecordedOutcome;
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
@@ -933,10 +934,11 @@ target = \"someone\"
             started_at: NOW - 60,
             finished_at: Some(NOW - 60),
             requests: 1,
-            // `as_str`, which is what `commit` writes. It took a `&str` and
-            // every call site spelled a token -- the same literals `health` was
-            // matching on, so the fixture and the defect moved together.
-            outcome: Some(outcome.as_str().to_string()),
+            // The conversion `commit` writes through. This helper took a
+            // `&str` and every call site spelled a token -- the same literals
+            // `health` was matching on, so the fixture and the defect moved
+            // together.
+            outcome: Some(outcome.into()),
             changes: 0,
         }
     }
@@ -1184,9 +1186,11 @@ url = \"https://example.com/hook\"
         );
 
         // And a row spelled by something that is not this build is a failure it
-        // cannot explain, rather than a quiet `Ok`.
+        // cannot explain, rather than a quiet `Ok`. It is an `Unknown` and not a
+        // near miss for `rate_limited`: nothing here guesses at a token a newer
+        // build wrote.
         let unknown = watch_store::Run {
-            outcome: Some("rate-limited".to_string()),
+            outcome: Some(RecordedOutcome::Unknown("rate-limited".into())),
             ..ran(ExitCode::Ok)
         };
         assert_eq!(

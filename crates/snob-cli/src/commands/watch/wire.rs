@@ -148,7 +148,10 @@ pub(super) fn status_json(
         "last_runs": last_runs.iter().map(|run| serde_json::json!({
             "pk": run.account_pk,
             "at": run.started_at,
-            "outcome": run.outcome,
+            // The token, which is the string this field has always carried —
+            // including for a row spelled by a build that is not this one,
+            // which is printed back as it was rather than as "unknown".
+            "outcome": run.outcome.as_ref().map(|outcome| outcome.as_str()),
             "requests": run.requests,
             "changes": run.changes,
         })).collect::<Vec<_>>(),

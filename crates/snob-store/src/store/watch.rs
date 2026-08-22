@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{StoreError, pk_from_sql, pk_to_sql};
 use snob_core::Pk;
 use snob_core::model::ListKind;
-use snob_core::watch::Rename;
+use snob_core::watch::{RecordedOutcome, Rename};
 
 /// The receipt for one account and list: what was reported, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,10 +162,20 @@ pub struct Run {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub requests: u32,
-    /// `ExitCode::as_str()`: the same vocabulary as the README's table and as
-    /// `$?`, so a caller is told the same thing by the same name wherever it
-    /// reads it.
-    pub outcome: Option<String>,
+    /// What came of it: the same vocabulary as the README's table and as `$?`,
+    /// so a caller is told the same thing by the same name wherever it reads
+    /// it. `snob-cli`'s `ExitCode` is the other face of it, which is why the
+    /// vocabulary is `snob_core::watch` and not either end.
+    ///
+    /// Typed here rather than at each reader. The column was an
+    /// `Option<String>` written from `as_str()` and compared back against
+    /// string literals, so one respelling made every recorded cooldown match
+    /// nothing — silently, because a string that matches nothing is a perfectly
+    /// good string. It is parsed once, in the row mapping below, and a token
+    /// this build does not know arrives as
+    /// [`RecordedOutcome::Unknown`](snob_core::watch::RecordedOutcome::Unknown)
+    /// rather than as a value that quietly compares unequal to everything.
+    pub outcome: Option<RecordedOutcome>,
     pub changes: u32,
 }
 
@@ -187,7 +197,10 @@ pub fn record_run(conn: &Connection, run: &Run) -> Result<i64, StoreError> {
             run.started_at,
             run.finished_at,
             run.requests,
-            run.outcome,
+            // The token the enum spells, which is what the column's CHECK
+            // constraint accepts. An `Unknown` only ever arrives by being read
+            // back, so writing one is a row this build did not invent.
+            run.outcome.as_ref().map(RecordedOutcome::as_str),
             run.changes,
         ],
     )?;
@@ -222,7 +235,11 @@ pub fn last_runs(conn: &Connection) -> Result<Vec<Run>, StoreError> {
             started_at: row.get(1)?,
             finished_at: row.get(2)?,
             requests: row.get(3)?,
-            outcome: row.get(4)?,
+            // Parsed here, once, so no reader has to know the column is text.
+            outcome: row
+                .get::<_, Option<String>>(4)?
+                .as_deref()
+                .map(RecordedOutcome::from_token),
             changes: row.get(5)?,
         })
     })?;
@@ -668,6 +685,7 @@ mod tests {
     use super::*;
     use crate::store::{Store, accounts, snapshots, users};
     use snob_core::model::User;
+    use snob_core::watch::RunOutcome;
 
     /// The newest run of one account, read out of the answer the production
     /// code reads. `last_run` used to be a second query for this, with a row
@@ -800,7 +818,7 @@ mod tests {
                     started_at: long_ago,
                     finished_at: Some(long_ago),
                     requests: 1,
-                    outcome: Some("ok".to_string()),
+                    outcome: Some(RunOutcome::Ok.into()),
                     changes: 0,
                 },
             )
@@ -1094,7 +1112,7 @@ mod tests {
                     started_at,
                     finished_at: Some(started_at),
                     requests: 0,
-                    outcome: Some("no_session".to_string()),
+                    outcome: Some(RunOutcome::NoSession.into()),
                     changes: 0,
                 },
             )
@@ -1107,8 +1125,8 @@ mod tests {
         assert_eq!(runs.len(), 1, "the newest one stays: {runs:?}");
         assert_eq!(runs[0].started_at, long_ago + 1);
         assert_eq!(
-            runs[0].outcome.as_deref(),
-            Some("no_session"),
+            runs[0].outcome,
+            Some(RunOutcome::NoSession.into()),
             "and it still says what stopped it, which is the whole point"
         );
     }
@@ -1325,7 +1343,7 @@ mod tests {
                     started_at: now - age,
                     finished_at: Some(now - age),
                     requests: 1,
-                    outcome: Some("ok".to_string()),
+                    outcome: Some(RunOutcome::Ok.into()),
                     changes: 0,
                 },
             )
@@ -1365,7 +1383,7 @@ mod tests {
                     started_at: now,
                     finished_at: Some(now),
                     requests: 1,
-                    outcome: Some("ok".to_string()),
+                    outcome: Some(RunOutcome::Ok.into()),
                     changes,
                 },
             )
