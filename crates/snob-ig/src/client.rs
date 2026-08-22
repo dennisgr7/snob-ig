@@ -308,11 +308,27 @@ const INITIAL_CLAIM: &str = "0";
 /// it no longer serves under that identifier, and the discovery walk costs it
 /// nothing: it reads the CDN, not the API, so a wrong guess is bytes rather
 /// than a request against the account's budget.
+///
+/// **And narrow in a second direction, which is the one that matters for a
+/// write.** The walk ends in a second `mutate`, and a second mutation is only
+/// safe when the first is known not to have happened. A 4xx and a 404 say
+/// so; a 200 carrying `errors` says so -- that is a GraphQL refusal, and the
+/// shape a stale identifier actually arrives in. A 5xx does not: an edge
+/// that answers 502 may have forwarded the request before it failed. Nor
+/// does the redirect `post` reports as an `Unexpected` 3xx, nor a 200 whose
+/// body would not decode, which is a write that very probably happened and
+/// an answer this program could not read. Any of those used to pass, and
+/// the recovery then sent the follow again on a budget paid once and a
+/// confirmation given once -- the replay the redirect policy exists to
+/// prevent, arriving by another road.
 fn worth_rediscovering(error: &IgError) -> bool {
-    matches!(
-        error,
-        IgError::Decode(_) | IgError::Unexpected { .. } | IgError::NotFound { .. }
-    )
+    match error {
+        IgError::NotFound { .. } => true,
+        IgError::Unexpected { status, .. } => {
+            (200..300).contains(status) || (400..500).contains(status)
+        }
+        _ => false,
+    }
 }
 
 /// Which of the two things a browser does on instagram.com a request is.
@@ -2957,6 +2973,40 @@ mod tests {
             assert!(
                 !refused.worth_a_second_route(),
                 "{refused:?} would be worked around"
+            );
+        }
+    }
+
+    /// A second mutation is sent only after an answer that says the first
+    /// did not happen.
+    ///
+    /// The ambiguous ones are the point: a 502 from an edge that may already
+    /// have forwarded the write, the redirect `post` refuses to follow, and a
+    /// 200 this program could not read. Each used to earn a discovery walk
+    /// and then a second `mutate` on the identifier it found.
+    #[test]
+    fn a_write_is_rediscovered_only_after_a_refusal_that_says_it_did_not_happen() {
+        let unexpected = |status: u16| IgError::Unexpected {
+            status,
+            body: String::new(),
+        };
+        for refused in [unexpected(400), unexpected(200), IgError::NotFound { what: None }] {
+            assert!(worth_rediscovering(&refused), "{refused:?}");
+        }
+        for ambiguous in [
+            unexpected(502),
+            unexpected(302),
+            unexpected(0),
+            IgError::Decode("an answer that would not parse".into()),
+            IgError::RateLimited,
+            IgError::FeedbackRequired,
+            IgError::SessionExpired,
+            IgError::Canceled,
+            IgError::NoCsrfToken,
+        ] {
+            assert!(
+                !worth_rediscovering(&ambiguous),
+                "{ambiguous:?} would have the write sent twice"
             );
         }
     }
