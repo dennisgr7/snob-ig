@@ -47,8 +47,14 @@ brew install snob
 # Check it against the published sums first, as every other channel here does.
 curl -fsSLO https://github.com/dennisgr7/snob-ig/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
+# And, with GitHub CLI, that it came out of this repository's release pipeline:
+gh attestation verify snob-v<version>-x86_64-unknown-linux-musl.deb --repo dennisgr7/snob-ig
 sudo apt install ./snob-v<version>-x86_64-unknown-linux-musl.deb
 ```
+
+The sums say a file is the one the release page lists; the attestation says
+who built it, which the sums cannot, because they are published on the same
+page. The install scripts below run the same check when `gh` is installed.
 
 The Linux builds are statically linked, so they carry no glibc version
 requirement and run on any distribution.

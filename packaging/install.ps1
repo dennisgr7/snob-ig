@@ -49,6 +49,21 @@ try {
     $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     if ($expected -ne $actual) { throw "checksum mismatch: expected $expected, got $actual" }
 
+    # The checksum says the file is the one the release page lists, not who
+    # built it: SHA256SUMS comes from the same page as the archive. The release
+    # workflow signs build provenance through Sigstore, and gh is the client
+    # that reads it. Skipped, out loud, when gh is not here.
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        & gh attestation verify $zip --repo $repo `
+            --signer-workflow "$repo/.github/workflows/release.yml" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "$name.zip does not carry a valid build provenance from $repo's release workflow"
+        }
+        Write-Host "Build provenance verified"
+    } else {
+        Write-Host "note: gh is not installed, so the build provenance was not verified (the checksum was)."
+    }
+
     Expand-Archive $zip -DestinationPath $work -Force
     New-Item -ItemType Directory -Force $installDir | Out-Null
     Copy-Item (Join-Path $work "$name\*") $installDir -Force
