@@ -77,6 +77,10 @@ place is a regime rather than permission.
 - **Lighter.** The log filter no longer links a regular-expression engine:
   327,680 bytes off the Windows binary, 4.4%. `SNOB_LOG` still reads
   `target=level` lists. Two duplicate crates left the tree.
+- **Building from source can leave the `.xlsx` export out**: `cargo build
+  --no-default-features` is 656 KB and six crates lighter. The released binary
+  is unchanged, and a build without the feature refuses `--format xlsx` before
+  a walk is paid for, naming the formats it has.
 - **`bash ci/local/run.sh`** runs the Linux CI job — musl, a real keyring behind
   a session bus — in a container on the development machine, in under a minute
   once warm.
