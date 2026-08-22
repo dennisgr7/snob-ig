@@ -99,13 +99,20 @@ impl Filter {
 /// after it worked, so the file looked right: exit 0, no warning, and the one
 /// person it was written to hide in the answer. Stripped here rather than in
 /// the reader so the next caller inherits it.
+///
+/// The `@` comes off **before** the last trim, not after it. Stripped last,
+/// `@ alice` produced the key `" alice"`, which no username can equal -- the
+/// same silent miss as the byte-order mark above, exit 0 and the name in the
+/// answer -- and an entry that is nothing but the sign is dropped rather than
+/// kept as an empty key.
 pub fn parse_username_list(contents: &str) -> HashSet<String> {
     contents
         .trim_start_matches('\u{feff}')
         .lines()
         .map(|l| l.trim().trim_matches('\u{feff}').trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.trim_start_matches('@').to_lowercase())
+        .map(|l| l.trim_start_matches('@').trim().to_lowercase())
+        .filter(|l| !l.is_empty())
         .collect()
 }
 
@@ -227,12 +234,18 @@ mod tests {
              @one\n\
              \n\
                two  \n\
-             THREE\n",
+             THREE\n\
+             @ four\n\
+             @\n",
         );
-        assert_eq!(read.len(), 3);
+        assert_eq!(read.len(), 4, "{read:?}");
         assert!(read.contains("one"));
         assert!(read.contains("two"));
         assert!(read.contains("three"));
+        // A space after the sign is how it is typed when the sign is an
+        // afterthought; stripped after the trim, the key was " four".
+        assert!(read.contains("four"), "{read:?}");
+        assert!(!read.contains(""), "a bare sign is not an account");
     }
 
     /// The file the tool is handed on Windows most of the time.
