@@ -36,6 +36,56 @@ place is a regime rather than permission.
   build rather than a code review somebody has to catch.
 - A write follows no redirect. Instagram redirecting a POST would mean doing the
   thing twice, and the HTTP client replays the method and the body on a 307.
+- **`snob stories --download` and `--all` can save a file.** They could not: the
+  name the command invents carries a hyphen, the name check did not allow one,
+  and every download fetched the bytes and then refused its own name. `--all -o
+  somewhere` also put the files next to the directory rather than in it, a
+  failed write stopped the loop at story one, and a Ctrl+C exited 1 instead of
+  130. The interactive `D` key no longer writes over a file it did not name.
+- **A write is never sent twice.** A 5xx, a redirect, or a 200 the client could
+  not read on `follow` or `unfollow` used to trigger the `doc_id` rediscovery and
+  a second mutation — a follow sent twice on one confirmation. Only an answer
+  that says the first did not happen earns a second attempt now.
+- **A failure is told in JSON when the answer was going to be.** With `--format
+  json`, `--json`, or standard output down a pipe, an error on standard error is
+  one object: `{"error": {"code", "exit", "message", "causes", "hint", "url",
+  "cooldown_until"}}`, where `code` is the same token the exit status names.
+  "No session stored" went round the printer entirely in five commands; it is an
+  error with a hint like every other refusal.
+- **The reader leaving is not an error.** `snob watch status | head -1` used to
+  end in a panic the moment `head` had read its line; every line of prose on
+  standard output now survives a closed pipe, as the lists always did.
+- **Every printed moment is in your zone.** "stored on", "until" and "last ran"
+  were UTC with no label while the schedule runs on local time, so a monitor on
+  `--at 09:00` in Madrid reported having last run at 07:00.
+- **A tick the monitor could not look at is reported under the account it was
+  for**, or refused by name — not under the session's own account, which is what
+  a cooldown on a freshly added account used to write into `watch_runs`.
+- **Security.** The interactive story browser built its scratch file's name
+  from the username Instagram sent and wrote it with `fs::write`; a crafted
+  reply chose where the bytes landed. It goes through the same name check and
+  create-only open as every other write. The scratch directory under `/tmp` is
+  made fresh under a private parent rather than adopted, so a planted link is
+  refused. `snob watch status` printed a `user:pass@` webhook address on its
+  second line after hiding it on the first. A login canceled or failed after
+  the form was submitted left the browser profile — and the session in it — on
+  disk. Slack and Discord webhook addresses are shown without their path, which
+  is their credential. `--csrftoken` and `--sign-with` can come from
+  `SNOB_CSRFTOKEN` and `SNOB_SIGNING_KEY` instead of the command line, which
+  `ps` shows to every local user. The install scripts verify the Sigstore build
+  provenance the release has signed all along, when `gh` is installed.
+- **Lighter.** The log filter no longer links a regular-expression engine:
+  327,680 bytes off the Windows binary, 4.4%. `SNOB_LOG` still reads
+  `target=level` lists. Two duplicate crates left the tree.
+- **`bash ci/local/run.sh`** runs the Linux CI job — musl, a real keyring behind
+  a session bus — in a container on the development machine, in under a minute
+  once warm.
+- Smaller: `@ alice` in an `--exclude-list` now matches; `watch diff --json`
+  carries `schema` like its siblings; `snob stories -o out.xlsx` is refused
+  rather than written as text under that name; a push-back on the login's
+  follow-up request is said out loud instead of logged at debug; a control
+  character pasted into `snob watch setup` no longer makes `watch.toml`
+  unreadable; "24 is not a hour" reads as it should.
 
 ## 0.2.0 — 2026-08-21
 
