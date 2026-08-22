@@ -89,34 +89,6 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
     if json { Wording::Json } else { Wording::Prose }
 }
 
-/// Where this run keeps its files, whether the keyring is off, and — for a
-/// sandbox — the keyring namespace it is confined to.
-///
-/// One place, so the sandbox seam is one `cfg` block rather than a condition at
-/// every site that opens something. In a release build it is
-/// `AppPaths::discover()` and the flag the user typed, and nothing else exists.
-///
-/// A sandbox forces the file backend as well as the directory. Not a
-/// convenience: the keyring is per user and not per directory, so a sandbox run
-/// that used it would read, overwrite and — through `purge` — delete the real
-/// stored session of whoever is running the tests. The same rule
-/// `crates/snob-core/tests/keyring.rs` holds the test suite to, applied to the
-/// binary.
-///
-/// **Forcing the backend is not enough on its own, and believing it was is what
-/// made this the one place the sandbox leaked.** `SecretStore` keeps talking to
-/// the keyring whatever backend it is on, and it must: `save` deletes the
-/// keyring entry so that `load`, which reads the keyring first, cannot go on
-/// serving a session the file has replaced, and the two watch secrets have no
-/// file form at all, so they never consult the backend. Every one of those
-/// entries is named by the service, and the service was the real one — so a
-/// sandbox `login` deleted the developer's session, a sandbox `purge` took the
-/// webhook secrets with it, and a sandbox that had not logged in yet loaded the
-/// real cookie and would have carried it to the redirected server. That last
-/// one is precisely the thing the flag pairing is documented to make
-/// impossible. The third element closes it: the sandbox gets a keyring
-/// namespace of its own, so every one of those operations lands on entries
-/// nothing outside the sandbox can see.
 /// Whether a file really holds PEM certificates.
 ///
 /// **Emptiness is the case that matters**, and it is why this is not a bare
@@ -162,11 +134,49 @@ fn trust_from(cli: &Cli) -> anyhow::Result<snob_ig::http::Trust> {
     Ok(snob_ig::http::Trust::Narrow { extra })
 }
 
+/// Where this run keeps its files, whether the keyring is off, and — for a
+/// sandbox — the keyring namespace it is confined to.
+///
+/// One place, so the sandbox seam is one `cfg` block rather than a condition at
+/// every site that opens something. In a release build it is
+/// `AppPaths::discover()` and the flag the user typed, and nothing else exists.
+///
+/// A sandbox forces the file backend as well as the directory. Not a
+/// convenience: the keyring is per user and not per directory, so a sandbox run
+/// that used it would read, overwrite and — through `purge` — delete the real
+/// stored session of whoever is running the tests. The same rule
+/// `crates/snob-core/tests/keyring.rs` holds the test suite to, applied to the
+/// binary.
+///
+/// **Forcing the backend is not enough on its own, and believing it was is what
+/// made this the one place the sandbox leaked.** `SecretStore` keeps talking to
+/// the keyring whatever backend it is on, and it must: `save` deletes the
+/// keyring entry so that `load`, which reads the keyring first, cannot go on
+/// serving a session the file has replaced, and the two watch secrets have no
+/// file form at all, so they never consult the backend. Every one of those
+/// entries is named by the service, and the service was the real one — so a
+/// sandbox `login` deleted the developer's session, a sandbox `purge` took the
+/// webhook secrets with it, and a sandbox that had not logged in yet loaded the
+/// real cookie and would have carried it to the redirected server. That last
+/// one is precisely the thing the flag pairing is documented to make
+/// impossible. The third element closes it: the sandbox gets a keyring
+/// namespace of its own, so every one of those operations lands on entries
+/// nothing outside the sandbox can see.
 fn wiring(cli: &Cli) -> anyhow::Result<(AppPaths, bool, Option<String>)> {
     // Before any client exists, which is what `use_trust` requires: a run
-    // cannot change what it trusts halfway through.
+    // cannot change what it trusts halfway through. A second answer is an
+    // error and not a shrug: `http.rs` says a security option that silently
+    // does nothing is worse than one that is not offered, and `let _ =` on
+    // this line was exactly that -- nine lines under the redirect flag, whose
+    // identical set-once shape is handled with a `?`. The same value twice
+    // is accepted, because the tests below call this more than once in one
+    // process and a repeat of the same answer changes nothing.
     let trust = trust_from(cli)?;
-    let _ = snob_ig::http::use_trust(trust);
+    if let Err(already) = snob_ig::http::use_trust(trust.clone())
+        && already != trust
+    {
+        anyhow::bail!("the trust store was already decided for this run");
+    }
 
     #[cfg(feature = "testing")]
     if let Some(root) = &cli.sandbox_root {

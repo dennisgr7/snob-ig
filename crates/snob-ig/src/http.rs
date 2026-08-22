@@ -51,7 +51,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// private root and no others should be able to say so without giving the whole
 /// store back, so `--tls-extra-root` is part of the same value rather than a
 /// second switch that could be set without this one.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Trust {
     /// The platform's store, enterprise roots included.
     #[default]
@@ -82,10 +82,10 @@ static TRUST: std::sync::OnceLock<Trust> = std::sync::OnceLock::new();
 
 /// Narrows the trust store for every Instagram client built after this call.
 ///
-/// `Err` carries the value back on a second call, so a run cannot change what
-/// it trusts halfway through.
+/// `Err` carries the value **already chosen** back on a second call, so the
+/// caller can tell a repeat of the same answer from a change of mind.
 pub fn use_trust(trust: Trust) -> Result<(), Trust> {
-    TRUST.set(trust)
+    TRUST.set(trust).map_err(|_| chosen_trust())
 }
 
 /// What was chosen, or the platform's store.
