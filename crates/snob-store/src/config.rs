@@ -443,6 +443,12 @@ fn quote(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Every other control character, as the unicode escape TOML
+            // defines for it. Only five were escaped, and any other one --
+            // a form feed pasted into a webhook header, say -- made the file
+            // unparseable after setup had reported success and put both
+            // secrets in the keyring.
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
             c => out.push(c),
         }
     }
@@ -453,6 +459,26 @@ fn quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What setup writes has to read back, whatever was pasted into it.
+    #[test]
+    fn a_quoted_value_with_any_control_character_reads_back() {
+        let pasted = "a\u{0c}b\"c\\d\ne\u{1b}[2K";
+        let text = format!(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://h.test/x\"\n[webhook.headers]\nX-Note = {}\n",
+            quote(pasted)
+        );
+        let config = parse(&text, std::path::Path::new("watch.toml")).expect("it parses");
+        assert_eq!(
+            config
+                .webhook
+                .unwrap()
+                .headers
+                .get("X-Note")
+                .map(String::as_str),
+            Some(pasted)
+        );
+    }
 
     fn at(text: &str) -> Result<WatchConfig, ConfigError> {
         parse(text, Path::new("watch.toml"))
