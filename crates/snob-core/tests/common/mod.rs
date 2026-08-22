@@ -118,7 +118,7 @@ fn the_walk_reaches_the_source_it_is_meant_to_read() {
         // reach it or it is checking three quarters of the tree.
         "crates/snob-store/src/lib.rs",
         "crates/snob-cli/src/main.rs",
-        "crates/snob-ig/src/client.rs",
+        "crates/snob-ig/src/client/mod.rs",
     ] {
         assert!(
             found.iter().any(|f| f == anchor),

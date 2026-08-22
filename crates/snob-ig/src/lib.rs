@@ -26,7 +26,8 @@
 //! of words contains a number — which is why the line above it, the one that
 //! makes a third mutation fail to compile, is the rule and this is the net.
 //!
-//! Each endpoint is documented above the method that calls it, in `client.rs`.
+//! Each endpoint is documented above the method that calls it, in
+//! `client/read.rs` and `client/write.rs`.
 
 pub mod client;
 pub mod client_hints;

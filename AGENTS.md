@@ -737,10 +737,11 @@ is what meeting Instagram taught, including the parts that are still open:
 - **`snob stories` works and has been run against Instagram.**
   `GET /api/v1/feed/reels_media/?reel_ids=` answers on **`www.instagram.com`**
   with a web session — which was the open question, because every write-up
-  documents that path against `i.instagram.com` and the header of `client.rs`
-  says why this crate does not go there. Confirmed in August 2026 against a real
-  account with stories up: the items, their sizes, `taken_at` and `expiring_at`
-  all arrive, and the largest candidate is the one taken.
+  documents that path against `i.instagram.com` and the header of
+  `client/mod.rs` says why this crate does not go there. Confirmed in August
+  2026 against a real account with stories up: the items, their sizes,
+  `taken_at` and `expiring_at` all arrive, and the largest candidate is the one
+  taken.
 - **`snob follow` and `snob unfollow` work, and have been run against
   Instagram.** The route is `POST /api/graphql` with a Relay operation name and
   a `doc_id`; the word "friendship" appears nowhere in what a browser sends.

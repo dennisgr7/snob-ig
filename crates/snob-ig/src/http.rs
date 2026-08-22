@@ -29,10 +29,10 @@ pub use reqwest;
 /// How long a request may take in total, and how long the connection may take
 /// to establish.
 ///
-/// Not optional, for the reason `client.rs` gives about its own: without them, a
-/// server that accepts the connection and then says nothing hangs the process
-/// for good, and neither a cancel token nor any deadline above reaches a socket
-/// that is simply waiting.
+/// Not optional, for the reason `client/transport.rs` gives about its own:
+/// without them, a server that accepts the connection and then says nothing
+/// hangs the process for good, and neither a cancel token nor any deadline
+/// above reaches a socket that is simply waiting.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -95,9 +95,9 @@ pub(crate) fn chosen_trust() -> Trust {
 
 /// The builder every client in this program starts from.
 ///
-/// Shared rather than written twice, which it was: `client::build_client` was
-/// this statement for statement, differing only in its two numbers and in the
-/// error it returns. A setting that has to hold for every client this program
+/// Shared rather than written twice, which it was:
+/// `client::transport::build_client` was this statement for statement,
+/// differing only in its two numbers and in the error it returns. A setting that has to hold for every client this program
 /// makes now has one place to go, instead of two that can be half updated.
 ///
 /// The timeouts are arguments rather than constants here because the two callers
@@ -228,8 +228,9 @@ pub fn plain_direct(
 
 /// Reads a response body, stopping at `cap`.
 ///
-/// The same reasoning as the reader in `client.rs`: `text()` buffers whatever
-/// arrives, which lets the far end decide how much memory this process uses.
+/// The same reasoning as the reader in `client/transport.rs`: `text()` buffers
+/// whatever arrives, which lets the far end decide how much memory this
+/// process uses.
 /// Reading in chunks bounds a response with no `Content-Length` too, which is
 /// most of them.
 ///
