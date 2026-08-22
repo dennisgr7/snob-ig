@@ -93,51 +93,15 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     );
 
     if args.json {
-        crate::ui::say!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "configured": config.is_some(),
-                "config_path": config::path(paths).display().to_string(),
-                // The whole queue, unchanged, so a probe reading this field
-                // still gets what it always did — and beside it the split,
-                // because "the next run tries these" and "nothing here can send
-                // these" are two facts and this was one number.
-                "pending_deliveries": owed.waiting + owed.elsewhere,
-                "deliveries": {
-                    "waiting": owed.waiting,
-                    "elsewhere": owed.elsewhere,
-                    // Not owed -- owing has ended. Deliberately outside
-                    // `pending_deliveries`, which counts work still to do:
-                    // this is work that will never be done, and a probe that
-                    // added it to the queue length would report a backlog
-                    // that no run can shorten.
-                    "given_up": owed.given_up,
-                },
-                // The verdict, so a caller reading this does not have to
-                // reimplement which combinations of the fields below mean the
-                // monitor has stopped doing its job.
-                "health": {
-                    "verdict": health.verdict.as_str(),
-                    "notes": health.notes,
-                },
-                // Told apart from the marks below on purpose. A run that could
-                // not look moves no mark, so without this a monitor sitting in
-                // a cooldown is indistinguishable from one that was killed.
-                "last_runs": last_runs.iter().map(|run| serde_json::json!({
-                    "pk": run.account_pk,
-                    "at": run.started_at,
-                    "outcome": run.outcome,
-                    "requests": run.requests,
-                    "changes": run.changes,
-                })).collect::<Vec<_>>(),
-                "accounts": marks.iter().map(|m| serde_json::json!({
-                    "pk": m.account_pk,
-                    "kind": m.kind.as_str(),
-                    "last_reported_at": m.compared_at,
-                    "has_baseline": m.snapshot_id.is_some(),
-                })).collect::<Vec<_>>(),
-            }))?
+        let document = super::wire::status_json(
+            config.is_some(),
+            &config::path(paths),
+            &owed,
+            &health,
+            &last_runs,
+            &marks,
         );
+        crate::ui::say!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(health.verdict.exit_code());
     }
 
@@ -280,9 +244,9 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 ///
 /// Pure, and separate from the printing, because the interesting part is which
 /// states count as broken and that is a thing worth pinning.
-struct Health {
-    verdict: Verdict,
-    notes: Vec<String>,
+pub(super) struct Health {
+    pub(super) verdict: Verdict,
+    pub(super) notes: Vec<String>,
 }
 
 /// The accounts the configuration names right now, as ids.

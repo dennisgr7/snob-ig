@@ -102,6 +102,65 @@ pub(super) fn as_json(report: &WatchReport) -> serde_json::Value {
     })
 }
 
+/// What `snob watch status --json` prints.
+///
+/// Here and not in `status`, for the reason the header of this file gives:
+/// everything a receiver may rely on is in one place, so "did this change
+/// break somebody's integration" is a question about one file. `check` and
+/// `diff` went through here and `status` built its document inline, which
+/// made the header's claim untrue for the one output a monitoring system is
+/// most likely to parse.
+pub(super) fn status_json(
+    configured: bool,
+    config_path: &std::path::Path,
+    owed: &snob_store::store::deliveries::Owed,
+    health: &super::status::Health,
+    last_runs: &[snob_store::store::watch::Run],
+    marks: &[snob_store::store::watch::AccountMark],
+) -> serde_json::Value {
+    serde_json::json!({
+        "configured": configured,
+        "config_path": config_path.display().to_string(),
+        // The whole queue, unchanged, so a probe reading this field still
+        // gets what it always did — and beside it the split, because "the
+        // next run tries these" and "nothing here can send these" are two
+        // facts and this was one number.
+        "pending_deliveries": owed.waiting + owed.elsewhere,
+        "deliveries": {
+            "waiting": owed.waiting,
+            "elsewhere": owed.elsewhere,
+            // Not owed -- owing has ended. Deliberately outside
+            // `pending_deliveries`, which counts work still to do: this is
+            // work that will never be done, and a probe that added it to the
+            // queue length would report a backlog that no run can shorten.
+            "given_up": owed.given_up,
+        },
+        // The verdict, so a caller reading this does not have to reimplement
+        // which combinations of the fields below mean the monitor has stopped
+        // doing its job.
+        "health": {
+            "verdict": health.verdict.as_str(),
+            "notes": health.notes,
+        },
+        // Told apart from the marks below on purpose. A run that could not
+        // look moves no mark, so without this a monitor sitting in a cooldown
+        // is indistinguishable from one that was killed.
+        "last_runs": last_runs.iter().map(|run| serde_json::json!({
+            "pk": run.account_pk,
+            "at": run.started_at,
+            "outcome": run.outcome,
+            "requests": run.requests,
+            "changes": run.changes,
+        })).collect::<Vec<_>>(),
+        "accounts": marks.iter().map(|m| serde_json::json!({
+            "pk": m.account_pk,
+            "kind": m.kind.as_str(),
+            "last_reported_at": m.compared_at,
+            "has_baseline": m.snapshot_id.is_some(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// A tick's answer, which is the report plus what the run itself did.
 ///
 /// `looked` is the field an automation branches on and the one that cannot be
