@@ -358,7 +358,7 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | What a receiver deduplicates on is unique | `run_id`, which is `UNIQUE` — not the rowid, which SQLite reuses |
 | A configured header cannot be one the request could not carry | `webhook::check`, which builds every name and value before accepting the address |
 | A configured header cannot frame the message or forge the protocol | `webhook::check` refuses `Content-Length` and the rest of the framing set, and the whole `X-Snob-` prefix |
-| A walk in progress has exactly one writer | `snapshots::save_page` **and** `snapshots::close` both refuse a snapshot this process does not hold; `is_resumable` asks without claiming. `close` had no guard and releases the claim, so a process whose lease had gone stale killed the walk that adopted it |
+| A walk in progress has exactly one writer | `snapshots::save_page` **and** `snapshots::close` both refuse a snapshot this process does not hold, and both **say so** with `ClaimTaken`; `is_resumable` asks without claiming. `close` had no guard and releases the claim, so a process whose lease had gone stale killed the walk that adopted it — and once guarded it dropped the row count and answered `Ok`, so that process reported a finished capture it did not own and the monitor's mark pointed at a row `usable_snapshots` never returns |
 | Two processes never walk into one capture | `snapshots::resumable`, which takes the claim in the statement that finds the row |
 | A finished capture is never unfinished again | `snapshots::close`, whose `WHERE` carries `complete = 0` |
 | No request is sent after the user asks it to stop | `Pacer::clear_to_send`, which reads the token before it reserves — it was read only inside the wait, so with nothing owed a canceled run kept sending |
@@ -378,6 +378,12 @@ forgotten at least once. They now live in the one place that cannot be bypassed:
 | A write in flight is the one thing Ctrl+C does not abandon | `IgClient::post` sends and reads without racing the cancel token, unlike every read. Giving up on a read costs nothing; giving up on a write costs knowing whether it happened. `Pacer::clear_to_send_write` still reads the token before reserving and inside the wait, so a write is cancelable up to the moment it is sent and not after it |
 | A write is never replayed by a redirect | the POST client is built on `redirect::Policy::none()` — following a hop on a write means doing the thing twice, which is not what "follow the redirect" costs on a read |
 | A write without a CSRF token is refused before it is sent | `IgClient::post` returns `IgError::NoCsrfToken` on an absent token rather than sending a request that will fail, so a `--paste` session cannot spend budget discovering it cannot write |
+| A file named by a server is created, never written over, wherever it lands | `output::create_new`, which `write_new` and both story writes in the browser go through. The browser's scratch write built its name from the username Instagram sent, filtered for the terminal and nothing else, and wrote it with `fs::write`: `printable` leaves `..`, a drive letter and a UNC share alone, `Path::join` hands an absolute name the whole path, and `fs::write` follows a link |
+| A scratch directory with a guessable name is made, never adopted | `paths::create_fresh_private_dir` — the parent restricted first, the leaf with `create_dir` so a planted link fails instead of being followed, a leftover removed as a link and never through it. `create_dir_all` answered `Ok` on a link planted under `/tmp/snob-ig-stories/run-<pid>` and the `0700` landed on the target |
+| A write is sent again only after an answer that says it did not happen | `client::worth_rediscovering`: a 4xx, a 404, or a 200 carrying `errors`. A 5xx, the redirect `post` refuses, and a 200 that would not decode are ambiguous — the write may have happened — and each used to earn a discovery walk and a second `mutate` |
+| A tick is reported under the account it looked at, or under nobody | `engine::watch::tick` starts with no id and takes the engine's; when both lists were refused before either answered, what is stored about the name is the fallback and with nothing stored the run refuses by name. It started at the viewer's id, so a cooldown on a freshly added account reported `account.pk 42` to the stream and wrote a `rate_limited` row against the viewer |
+| A failure is told in the language the answer was going to be in | `report::Wording`, decided once in `main::wording_for` from the same rule the command applies to its result. `report::error_json` is the one shape: the code the exit status names, message, causes, hint, challenge address, when a cooldown lifts |
+| The reader leaving is not an error of this program's | `ui::say!`, which every line of prose on standard output goes through — `println!` panics on a closed pipe and Rust ignores `SIGPIPE`, so `snob watch status \| head -1` aborted |
 | Nothing tells anybody you looked at their story | The row above is what holds this: registering a view is a write, and there is no variant for one. `crates/snob-core/tests/no_seen.rs` is the backstop, reading all four crates for `media/seen` and its spellings — including the Relay operation the web client really sends, which a capture turned up in August 2026. It is a denylist and it says so: the identifier Instagram acts on is a `doc_id`, and no list of words contains a number |
 
 ## Running headless
@@ -394,6 +400,12 @@ of it is a working session anywhere. That is why the fallback is never silent:
 the command says which backend it landed on, because a session stored somewhere
 less protected than the user expected is its own kind of failure. `--no-keyring`
 still forces the file directly.
+
+`SNOB_LOG` is a list of `target=level` directives — `snob_ig=debug,warn` — read
+by `tracing_subscriber::filter::Targets`, not `EnvFilter`: that one parses span
+and field matchers and links a regular-expression engine to do it, and nothing
+here logs a span. A value that does not parse is said so once on standard error
+and read as `warn`. `--verbose` is `debug` for this workspace's crates alone.
 
 Everything else already works without a terminal: `prompt_secret` reads a plain
 line when either stream it uses is not a TTY, the progress bar hides itself, `table`
@@ -1001,6 +1013,7 @@ against.
 | Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
 | `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats |
 | Static CRT on Windows | +126,976 B per binary |
+| `tracing-subscriber`'s `env-filter`, replaced by `Targets` | **−327,680 B, 4.4%**, −3 crates (`matchers`, `regex-automata`, `regex-syntax`), measured on x86_64 Windows release either side of the change |
 | Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
 | `ratatui` + `crossterm` for the same browser | +106,496 B, 1.32%, +27 crates — rejected |
 | `image` with only `jpeg`+`png`, the floor under any terminal image | +312,320 B, 3.9%, +17 crates — rejected |
