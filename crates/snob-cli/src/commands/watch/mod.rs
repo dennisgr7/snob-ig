@@ -1377,7 +1377,12 @@ fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<E
     let report = crate::engine::watch::from_store(&app, args.target.as_deref())?;
 
     if args.json {
-        crate::ui::say!("{}", serde_json::to_string_pretty(&as_json(&report))?);
+        // With `schema`, like every other message: this was the one JSON this
+        // command family emits with no version on it, while the README says
+        // each one carries it.
+        let mut out = as_json(&report);
+        out["schema"] = serde_json::json!(wire::SCHEMA);
+        crate::ui::say!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(ExitCode::Ok);
     }
 
