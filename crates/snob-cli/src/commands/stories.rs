@@ -208,6 +208,15 @@ fn list(
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = output::effective_format(format.map(Into::into), destination);
+    // `StoryFormat` keeps `--format` to the three forms a listing has, and
+    // the extension of `-o` went round it: `-o out.xlsx` fell through to the
+    // table and reported "Written to out.xlsx" over a box-drawing text file.
+    if matches!(format, Format::Csv | Format::Xlsx | Format::Md) {
+        anyhow::bail!(
+            "a story listing has no {} form; it can be a table, json or ndjson",
+            format!("{format:?}").to_ascii_lowercase()
+        );
+    }
     output::check_destination(format, destination)?;
 
     // Every rendering ends in a newline, like `output::render`'s do. Neither
