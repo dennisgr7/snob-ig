@@ -1059,6 +1059,22 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
     );
 }
 
+/// A check line that says a standing cooldown is why nothing was asked.
+///
+/// Two shapes, because a cooldown reaches a line two ways: nothing was asked
+/// about this at all, or an account that also has no recorded consent, whose
+/// line is the consent sentence with the cooldown as a clause after it.
+/// Matched on the reason rather than searched for a word, because the reason is
+/// what `engine::check` answers with -- the sentence is
+/// `commands::watch::say`'s and is not reachable from here.
+fn blames_the_cooldown(checked: &snob_cli::engine::check::Checked) -> bool {
+    use snob_cli::engine::check::Problem;
+    matches!(
+        checked.problem,
+        Some(Problem::InCooldown { .. }) | Some(Problem::NoRecordedConsent { in_cooldown: true })
+    )
+}
+
 /// `snob watch check` spends nothing while the account is in cooldown.
 ///
 /// It is built to be polled, and it was the one request path in the tool with
@@ -1104,10 +1120,7 @@ async fn watch_check_spends_nothing_during_a_cooldown() {
         "a cooldown lifts on its own, so it is not a failure"
     );
     assert!(
-        report
-            .checked
-            .iter()
-            .all(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown"))),
+        report.checked.iter().all(blames_the_cooldown),
         "and every line has to say why it was not checked: {:?}",
         report.checked
     );
@@ -1173,7 +1186,7 @@ async fn check_stops_asking_once_an_account_earns_a_cooldown() {
         report
             .checked
             .iter()
-            .filter(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown")))
+            .filter(|c| blames_the_cooldown(c))
             .count()
             >= 2,
         "and the ones that were not asked about say why: {:?}",

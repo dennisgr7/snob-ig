@@ -18,8 +18,9 @@
 //! and one per configured account for its counters. A `POST` to the user's own
 //! webhook is not an Instagram request at all.
 //!
-//! It returns facts. Which of them is worth a red line, and what the sentence
-//! says, is `commands::watch::status`'s question.
+//! It returns facts. What the sentence says is `commands::watch::say`'s
+//! question, and whether a monitoring system should go red about it is
+//! `commands::watch::status`'s.
 
 use snob_core::Pk;
 use snob_store::secrets::SecretStore;
@@ -75,15 +76,68 @@ impl Verdict {
 
 /// One thing that was checked.
 ///
-/// `problem` carries the underlying error as it was reported, which is data
-/// rather than wording: it is whatever the schedule parser, Instagram or the
-/// user's own server said, and inventing a sentence for it here would lose the
-/// only detail that identifies the cause.
+/// `problem` says what is wrong and never how it reads.
+/// `commands::watch::say::problem_line` turns it into the sentence, the same
+/// way that module turns a [`super::watch::Skipped`] into one.
 #[derive(Debug, Clone)]
 pub struct Checked {
     pub what: What,
     pub verdict: Verdict,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
+}
+
+/// What is wrong with something that was checked.
+///
+/// Nine of these were English sentences built inside this module, which is the
+/// module rule the wrong way round: `engine` returns data and where the data
+/// came from, and never decides how anything looks. They are variants now and
+/// the words are `commands::watch::say`'s, so `check`'s terminal output and its
+/// `--json` are two renderings of one answer rather than one rendering and a
+/// copy of it.
+///
+/// [`Problem::Foreign`] is what stopped this being done for a long time: some
+/// of these lines carry text this program did not write — what the schedule
+/// parser refused, what Instagram answered, what the user's own receiver said —
+/// and inventing a sentence for those would lose the only detail that
+/// identifies the cause. It is one variant among twelve rather than a reason
+/// for the other eleven to be strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// There is no `watch.toml`, so a bare `snob watch` has nothing to run on.
+    NothingConfigured,
+    /// The schedule is well formed and names no moment that exists. `0 0 31 2
+    /// *` is the standing example.
+    NeverFires,
+    /// The scheduler refused the file, and said why. The text is the
+    /// scheduler's.
+    Unbuildable(String),
+    /// Nothing was asked about this, because the account is in cooldown until
+    /// then. The moment is an epoch in milliseconds; turning it into a date is
+    /// `report`'s job, like every other date the tool prints.
+    InCooldown { until_ms: i64 },
+    /// An unattended run may not read this account, which is a fact about the
+    /// file and not about the network. `in_cooldown` is the line for an account
+    /// a cooldown also stopped anything else being checked about — the same
+    /// condition, with one clause more.
+    NoRecordedConsent { in_cooldown: bool },
+    /// The session did not answer, so nothing could be asked about anybody.
+    SessionSilent,
+    /// There is no session at all.
+    NoSession,
+    /// The session carries no username and Instagram did not name the account
+    /// either, so there is nothing to ask the profile endpoint with.
+    NoUsername,
+    /// The id came from search, which carries no counters — so this run cannot
+    /// tell a truncated list from a complete one.
+    CountersUnknowable,
+    /// Nothing has been reported on yet, so the first scheduled run has nothing
+    /// to compare against and will say nothing.
+    FirstRunLaysTheBaseline,
+    /// `--no-webhook`, so the address was checked and not used.
+    NotPosted,
+    /// Whatever the schedule parser, the store, Instagram or the user's own
+    /// server said, carried through unchanged.
+    Foreign(String),
 }
 
 /// What was checked, and what was learned about it.
@@ -154,7 +208,7 @@ impl CheckReport {
         self.checked.iter().any(|c| wants_a_baseline(&c.what))
     }
 
-    fn push(&mut self, what: What, verdict: Verdict, problem: Option<String>) {
+    fn push(&mut self, what: What, verdict: Verdict, problem: Option<Problem>) {
         self.checked.push(Checked {
             what,
             verdict,
@@ -191,9 +245,7 @@ pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
     } else {
         Verdict::Ok
     };
-    let problem = next
-        .is_empty()
-        .then(|| "this schedule never fires: no moment it names exists".to_string());
+    let problem = next.is_empty().then_some(Problem::NeverFires);
 
     Checked {
         what: What::Schedule { next },
@@ -219,7 +271,7 @@ pub fn without_a_session(
         report.push(
             What::NotConfigured,
             Verdict::Warned,
-            Some(crate::report::NOTHING_CONFIGURED.to_string()),
+            Some(Problem::NothingConfigured),
         );
     }
 
@@ -228,7 +280,7 @@ pub fn without_a_session(
         Some(Err(why)) => report.push(
             What::Schedule { next: Vec::new() },
             Verdict::Failed,
-            Some(format!("this schedule cannot be built: {why}")),
+            Some(Problem::Unbuildable(why.clone())),
         ),
         None => {}
     }
@@ -285,7 +337,7 @@ pub async fn with_a_session(
                     backend: secrets.backend().as_str(),
                 },
                 verdict: Verdict::Failed,
-                problem: Some(e.to_string()),
+                problem: Some(Problem::Foreign(e.to_string())),
             });
             return;
         }
@@ -306,7 +358,7 @@ pub async fn with_a_session(
                 backend: secrets.backend().as_str(),
             },
             verdict: Verdict::Failed,
-            problem: Some(crate::report::what_instagram_said(&e)),
+            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
         },
     };
     let session_works = session.verdict == Verdict::Ok;
@@ -362,10 +414,7 @@ fn waiting_out(what: What, until_ms: i64) -> Checked {
     Checked {
         what,
         verdict: Verdict::Warned,
-        problem: Some(format!(
-            "not checked: the account is in cooldown until {}",
-            crate::report::cooldown_ends_at(until_ms)
-        )),
+        problem: Some(Problem::InCooldown { until_ms }),
     }
 }
 
@@ -394,10 +443,7 @@ fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
     Checked {
         what,
         verdict: Verdict::Failed,
-        problem: Some(format!(
-            "{} (and it is in cooldown, so nothing else was checked)",
-            crate::report::NO_RECORDED_CONSENT
-        )),
+        problem: Some(Problem::NoRecordedConsent { in_cooldown: true }),
     }
 }
 
@@ -432,7 +478,7 @@ async fn account_of(
             Checked {
                 what,
                 verdict: Verdict::Warned,
-                problem: Some("not checked: the session is not responding".to_string()),
+                problem: Some(Problem::SessionSilent),
             },
             None,
         );
@@ -475,11 +521,7 @@ async fn account_of(
                         Checked {
                             what,
                             verdict: Verdict::Warned,
-                            problem: Some(
-                                "not checked: the session carries no username, and Instagram \
-                                 did not name the account either"
-                                    .to_string(),
-                            ),
+                            problem: Some(Problem::NoUsername),
                         },
                         None,
                     );
@@ -489,7 +531,7 @@ async fn account_of(
                         Checked {
                             what,
                             verdict: Verdict::Failed,
-                            problem: Some(crate::report::what_instagram_said(&e)),
+                            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
                         },
                         None,
                     );
@@ -524,14 +566,9 @@ async fn account_of(
                 Verdict::Ok
             };
             let problem = if !may_run_unattended {
-                Some(crate::report::NO_RECORDED_CONSENT.to_string())
+                Some(Problem::NoRecordedConsent { in_cooldown: false })
             } else if counters_unknown {
-                Some(
-                    "Instagram would not serve this account's profile, so its id came from \
-                     search, which carries no counters. A scheduled run will work, but it \
-                     cannot tell a truncated list from a complete one."
-                        .to_string(),
-                )
+                Some(Problem::CountersUnknowable)
             } else {
                 None
             };
@@ -548,7 +585,7 @@ async fn account_of(
             Checked {
                 what,
                 verdict: Verdict::Failed,
-                problem: Some(crate::report::what_instagram_said(&e)),
+                problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
             },
             None,
         ),
@@ -623,7 +660,7 @@ pub async fn webhook_of(
                 signed,
             },
             verdict: Verdict::Failed,
-            problem: Some(other.error().to_string()),
+            problem: Some(Problem::Foreign(other.error().to_string())),
         },
     }
 }
@@ -686,7 +723,7 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
                 return Checked {
                     what: What::Baseline { taken_at },
                     verdict: Verdict::Warned,
-                    problem: Some(e.to_string()),
+                    problem: Some(Problem::Foreign(e.to_string())),
                 };
             }
         }
@@ -697,11 +734,7 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
     Checked {
         what,
         verdict: if wants { Verdict::Warned } else { Verdict::Ok },
-        problem: wants.then(|| {
-            "the first scheduled run lays the baseline down and reports no changes; \
-             the second one onwards reports them"
-                .to_string()
-        }),
+        problem: wants.then_some(Problem::FirstRunLaysTheBaseline),
     }
 }
 
@@ -731,10 +764,10 @@ mod tests {
         assert_eq!(report.verdict(), Verdict::Failed);
         assert_eq!(report.checked.len(), 1, "{:?}", report.checked);
         assert!(
-            report.checked[0]
-                .problem
-                .as_deref()
-                .is_some_and(|p| p.contains("5m is too often")),
+            matches!(
+                &report.checked[0].problem,
+                Some(Problem::Unbuildable(why)) if why.contains("5m is too often")
+            ),
             "the line has to carry what the scheduler said: {:?}",
             report.checked
         );

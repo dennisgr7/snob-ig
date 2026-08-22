@@ -61,7 +61,11 @@ pub(super) fn check_json(report: &crate::engine::check::CheckReport) -> serde_js
                 "what": what,
                 "verdict": checked.verdict.as_str(),
                 "detail": detail,
-                "problem": checked.problem,
+                // The sentence a person reads, so it comes from where the
+                // sentences are. It used to be built in `engine::check` and
+                // read out here as a string, which made this and the terminal
+                // report agree by copying rather than by construction.
+                "problem": checked.problem.as_ref().map(super::say::problem_line),
             })
         }).collect::<Vec<_>>(),
     })

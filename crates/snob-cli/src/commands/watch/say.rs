@@ -14,6 +14,7 @@ use snob_core::model::{ListKind, User, printable};
 use snob_core::watch::{Basis, ListDiff};
 
 use crate::engine::Provenance;
+use crate::engine::check::Problem;
 use crate::engine::watch::{Skipped, WatchReport};
 use crate::report;
 
@@ -41,6 +42,65 @@ pub(super) fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
              accounts missing from it would have been reported as people who left",
             report::why_incomplete(reason).unwrap_or("it stopped early")
         ),
+    }
+}
+
+/// What is wrong with something `snob watch check` looked at, said in a
+/// sentence.
+///
+/// The same split as [`refusal_line`] above, for the other half of the monitor:
+/// `engine::check` hands over what it found and this decides the words. Nine of
+/// these were written inside `engine`, which is where the rule says a sentence
+/// may not be — and being strings there, they were also the only thing the
+/// terminal report and `--json` shared, so the two agreed by copying rather
+/// than by construction. Both go through here now.
+///
+/// Two of them are consts in `report` rather than literals here.
+/// `NOTHING_CONFIGURED` because `watch::status` answers that same question
+/// about the same machine and the two probes must not disagree, and
+/// `NO_RECORDED_CONSENT` because two arms below are one condition with one
+/// clause between them.
+pub(super) fn problem_line(problem: &Problem) -> String {
+    match problem {
+        Problem::NothingConfigured => report::NOTHING_CONFIGURED.to_string(),
+        Problem::NeverFires => "this schedule never fires: no moment it names exists".to_string(),
+        Problem::Unbuildable(why) => format!("this schedule cannot be built: {why}"),
+        Problem::InCooldown { until_ms } => format!(
+            "not checked: the account is in cooldown until {}",
+            report::cooldown_ends_at(*until_ms)
+        ),
+        // One condition, one wording, and a clause for the account a cooldown
+        // stopped anything else being checked about.
+        Problem::NoRecordedConsent { in_cooldown: false } => {
+            report::NO_RECORDED_CONSENT.to_string()
+        }
+        Problem::NoRecordedConsent { in_cooldown: true } => format!(
+            "{} (and it is in cooldown, so nothing else was checked)",
+            report::NO_RECORDED_CONSENT
+        ),
+        Problem::SessionSilent => "not checked: the session is not responding".to_string(),
+        Problem::NoSession => "no session is stored; run \"snob login\"".to_string(),
+        Problem::NoUsername => "not checked: the session carries no username, and Instagram \
+             did not name the account either"
+            .to_string(),
+        Problem::CountersUnknowable => {
+            "Instagram would not serve this account's profile, so its id came from \
+             search, which carries no counters. A scheduled run will work, but it \
+             cannot tell a truncated list from a complete one."
+                .to_string()
+        }
+        Problem::FirstRunLaysTheBaseline => {
+            "the first scheduled run lays the baseline down and reports no changes; \
+             the second one onwards reports them"
+                .to_string()
+        }
+        Problem::NotPosted => "--no-webhook, so nothing was posted; the address and the headers \
+             were still checked"
+            .to_string(),
+        // Not this module's sentence and not rewritten into one: it is what the
+        // schedule parser, the store, Instagram or the user's own receiver
+        // said, and that text is the only thing identifying the cause.
+        Problem::Foreign(said) => said.clone(),
     }
 }
 
@@ -265,6 +325,61 @@ mod tests {
     use snob_core::Pk;
     use snob_core::model::ListKind;
     use snob_core::watch::{Basis, ListDiff, Rename};
+
+    /// Every reason a check can give says something.
+    ///
+    /// A variant added to [`Problem`] with no arm here is a compile error; one
+    /// added with an empty arm is not, and an empty problem column is a line
+    /// saying something is wrong without saying what. The foreign one is the
+    /// exception on purpose: it is somebody else's text and this only carries
+    /// it.
+    #[test]
+    fn every_reason_a_check_can_give_says_something() {
+        for problem in [
+            Problem::NothingConfigured,
+            Problem::NeverFires,
+            Problem::Unbuildable("5m is too often".to_string()),
+            Problem::InCooldown {
+                until_ms: 1_722_700_000_000,
+            },
+            Problem::NoRecordedConsent { in_cooldown: false },
+            Problem::NoRecordedConsent { in_cooldown: true },
+            Problem::SessionSilent,
+            Problem::NoSession,
+            Problem::NoUsername,
+            Problem::CountersUnknowable,
+            Problem::FirstRunLaysTheBaseline,
+            Problem::NotPosted,
+        ] {
+            assert!(!problem_line(&problem).is_empty(), "{problem:?}");
+        }
+
+        // What the scheduler, Instagram or the user's own receiver said is the
+        // only thing identifying the cause, so it survives whole.
+        assert_eq!(
+            problem_line(&Problem::Foreign("404 Not Found".to_string())),
+            "404 Not Found"
+        );
+        assert!(
+            problem_line(&Problem::Unbuildable("5m is too often".into()))
+                .contains("5m is too often")
+        );
+    }
+
+    /// One condition, one wording.
+    ///
+    /// The account nothing else was asked about because a cooldown was standing
+    /// gets the consent sentence with a clause after it. They were two lines in
+    /// `engine::check` sharing one const, which is the arrangement that lets
+    /// them drift into two descriptions of one situation.
+    #[test]
+    fn a_missing_consent_reads_the_same_whether_or_not_a_cooldown_stands() {
+        let plain = problem_line(&Problem::NoRecordedConsent { in_cooldown: false });
+        let waiting = problem_line(&Problem::NoRecordedConsent { in_cooldown: true });
+
+        assert!(waiting.starts_with(&plain), "{waiting}");
+        assert!(waiting.contains("in cooldown"), "{waiting}");
+    }
 
     /// Somebody who has never run the tool is told to run it, not told that
     /// nothing changed — which would be true and useless.

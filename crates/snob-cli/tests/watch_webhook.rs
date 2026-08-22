@@ -477,7 +477,7 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
 /// A receiver that is not there is a failure worth a red line, not a warning.
 #[tokio::test]
 async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
-    use snob_cli::engine::check::{Verdict, What};
+    use snob_cli::engine::check::{Problem, Verdict, What};
 
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::method("POST"))
@@ -518,7 +518,11 @@ async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
          it answered from is the other half: {:?}",
         checked.what
     );
-    let problem = checked.problem.expect("it has to say what went wrong");
+    // `Foreign` and not a variant of its own: this is what the user's own
+    // receiver said, and that text is the only thing identifying the cause.
+    let Some(Problem::Foreign(problem)) = checked.problem else {
+        panic!("it has to say what went wrong: {:?}", checked.problem);
+    };
     assert!(
         !problem.contains("Failed {"),
         "Rust struct syntax in front of the person the command exists to help: {problem}"

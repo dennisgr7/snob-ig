@@ -64,7 +64,7 @@ pub(super) async fn preflight(
                     signed: false,
                 },
                 verdict: Verdict::Failed,
-                problem: Some(e.to_string()),
+                problem: Some(check::Problem::Foreign(e.to_string())),
             });
             None
         }
@@ -81,7 +81,7 @@ pub(super) async fn preflight(
                 backend: secrets.backend().as_str(),
             },
             verdict: Verdict::Failed,
-            problem: Some("no session is stored; run \"snob login\"".to_string()),
+            problem: Some(check::Problem::NoSession),
         }),
     }
 
@@ -134,7 +134,7 @@ fn not_posted(
     webhook: Option<(&str, bool)>,
     no_webhook: bool,
 ) -> Option<crate::engine::check::Checked> {
-    use crate::engine::check::{Checked, Verdict, What};
+    use crate::engine::check::{Checked, Problem, Verdict, What};
 
     let (destination, signed) = webhook.filter(|_| no_webhook)?;
     Some(Checked {
@@ -144,11 +144,7 @@ fn not_posted(
             signed,
         },
         verdict: Verdict::Ok,
-        problem: Some(
-            "--no-webhook, so nothing was posted; the address and the headers were still \
-             checked"
-                .to_string(),
-        ),
+        problem: Some(Problem::NotPosted),
     })
 }
 
@@ -235,6 +231,10 @@ pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<
             .trim_end()
             .to_string();
         if let Some(problem) = &checked.problem {
+            // The sentence is `say`'s, and it is the same one `check --json`
+            // carries: two renderings of one answer rather than one rendering
+            // and a copy of it.
+            let problem = super::say::problem_line(problem);
             // Under the detail column rather than at column zero, so a reason
             // reads as belonging to the line above it. Named rather than
             // written inline: a run of spaces inside a string literal is what
@@ -243,7 +243,7 @@ pub(super) fn describe_check(report: &crate::engine::check::CheckReport) -> Vec<
             const UNDER_THE_LABEL: &str = "            ";
             line.push('\n');
             line.push_str(UNDER_THE_LABEL);
-            line.push_str(&printable(problem));
+            line.push_str(&printable(&problem));
         }
         lines.push(line);
     }
@@ -279,13 +279,15 @@ mod tests {
             checked.what
         );
         assert_eq!(checked.verdict, Verdict::Ok);
+        assert_eq!(
+            checked.problem,
+            Some(crate::engine::check::Problem::NotPosted),
+            "and the line has to say why nothing was posted"
+        );
         assert!(
-            checked
-                .problem
-                .as_deref()
-                .is_some_and(|p| p.contains("--no-webhook")),
-            "and the line has to say why nothing was posted: {:?}",
-            checked.problem
+            super::super::say::problem_line(&crate::engine::check::Problem::NotPosted)
+                .contains("--no-webhook"),
+            "which is the flag it has to name"
         );
 
         // A run that is going to post reports what came back instead, and an

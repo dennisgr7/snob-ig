@@ -1223,10 +1223,12 @@ url = \"https://example.com/hook\"
 
         assert_eq!(
             status.notes[0],
-            check.checked[0]
-                .problem
-                .clone()
-                .expect("the check has to say why nothing is configured"),
+            super::super::say::problem_line(
+                check.checked[0]
+                    .problem
+                    .as_ref()
+                    .expect("the check has to say why nothing is configured")
+            ),
             "two probes somebody runs one after the other, disagreeing about one machine"
         );
     }

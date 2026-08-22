@@ -14,12 +14,12 @@ use crate::exit::{ExitCode, ExitError};
 
 /// What a machine with no `watch.toml` is told, by both things that look.
 ///
-/// `engine::check::without_a_session` decides it for `snob watch check` and
-/// `watch::status::health` decides it for `snob watch status`, and the two spelled
-/// it out separately, character for character. It is the advice a newly
-/// installed tool gives, so it is the sentence somebody edits — and an edit to
-/// one copy leaves two probes a person runs one after the other saying different
-/// things about the same machine, each with a test asserting it is right.
+/// `snob watch check` reaches it through `commands::watch::say::problem_line`
+/// and `watch::status::health` reads it directly, and the two spelled it out
+/// separately, character for character. It is the advice a newly installed tool
+/// gives, so it is the sentence somebody edits — and an edit to one copy leaves
+/// two probes a person runs one after the other saying different things about
+/// the same machine, each with a test asserting it is right.
 pub const NOTHING_CONFIGURED: &str =
     "nothing is configured, so a bare \"snob watch\" has no schedule to run on";
 
@@ -36,13 +36,20 @@ pub const NOTHING_CONFIGURED: &str =
 /// `snob watch setup`, and that is the refusal itself rather than a report about
 /// one.
 ///
-/// A `const` and not a typed reason on `Checked`. The wording being decided
-/// inside `engine` is the architecture rule, and moving it out is the right
-/// shape — but `Checked::problem` is a pass-through for whatever the schedule
-/// parser, Instagram or the user's own server said, so a typed reason needs a
-/// free-string variant anyway and every consumer still handles one. That trade
-/// is worth revisiting the day `problem` stops carrying foreign text; it is not
-/// worth nine sentences and a byte-identity promise across two renderers today.
+/// A `const` here rather than a sentence inside `engine::check`, which is where
+/// both of these lines used to be written. `Checked::problem` is
+/// [`crate::engine::check::Problem`] now — a variant per decided reason,
+/// rendered by `commands::watch::say::problem_line` — so this is what that
+/// renderer and `watch::status::health` share.
+///
+/// What held the typed reason up was `Problem::Foreign`: some of those lines
+/// carry text this program did not write, so a typed reason needs a free-string
+/// variant whatever else it has, and the trade looked like nine sentences and a
+/// byte-identity promise across two renderers for one variant less. It is one
+/// variant among twelve now rather than a reason for the other eleven to be
+/// strings, and the two renderers are the point rather than the price: the
+/// terminal report and `check --json` agreed by copying a string and agree by
+/// construction instead.
 pub const NO_RECORDED_CONSENT: &str =
     "no recorded consent, so an unattended run will refuse to read it";
 
