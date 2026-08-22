@@ -162,6 +162,17 @@ walk it produced would be a real account read with no waits between pages.
 `cargo install --path crates/snob-cli` puts a release `snob` on the PATH, but it
 has to be repeated after every change; for iterating, `cargo run` is the one.
 
+**The Linux job runs on this machine too**, in a container: `bash
+ci/local/run.sh`. It is the job that differs most from a developer's host —
+musl, a real Secret Service keyring behind a session bus, a static link — and
+the one worth not waiting ten minutes on. The first run builds the image and
+compiles from cold; after that the two named volumes keep the registry and the
+target directory, and a run is under a minute. `ci/local/ci.sh` is the four
+commands the remote job runs and has to be kept in step with `ci.yml`; the
+image pins the compiler `rust-toolchain.toml` pins, so bump the two together.
+The Windows and macOS jobs are not there because a container cannot run either;
+the host is the Windows job.
+
 CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
 targets. Three things there are deliberate, and all three are the same idea:
 what is tested has to be what ships. The Linux job installs a keyring daemon,
