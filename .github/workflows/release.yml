@@ -191,8 +191,16 @@ jobs:
       # The `.deb` needs nothing -- `cargo-deb` is already reproducible.
       - name: Package
         shell: bash
+        # Through `env`, never interpolated into the script. `check` proves
+        # the value is the literal in Cargo.toml at an ancestor of main, so
+        # this is not exploitable today -- but that is a content check
+        # guarding a shell-injection shape, and the workflow already does it
+        # the right way for `$GITHUB_REF_NAME`.
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
-          name="snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          name="snob-v$VERSION-$TARGET"
           # The tag's own commit date. `%ct` is seconds since the epoch, which
           # is what every tool below wants.
           epoch=$(git log -1 --format=%ct)
@@ -229,6 +237,9 @@ jobs:
       # and tested rather than compiling a second, unverified one.
       - name: Debian package
         if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           # Pinned. The comment below says this is the line the release runs,
           # and that is only true if both resolve the same tool: unpinned, CI
@@ -236,8 +247,8 @@ jobs:
           # with a different one on Wednesday.
           cargo install cargo-deb@3.7.0 --locked
           cargo deb --no-build --no-strip -p snob-cli \
-            --target ${{ matrix.target }} \
-            --output "snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}.deb"
+            --target "$TARGET" \
+            --output "snob-v$VERSION-$TARGET.deb"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -293,8 +304,10 @@ jobs:
           subject-checksums: artifacts/SHA256SUMS
 
       - name: Release notes
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          version="${{ needs.check.outputs.version }}"
+          version="$VERSION"
           # The changelog entry for this version, up to the next heading.
           awk -v h="## ${version} " '
             index($0, h) == 1 { flag = 1; next }
@@ -340,6 +353,8 @@ jobs:
           ref: main
 
       - name: Render
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           curl -fsSL -o /tmp/SHA256SUMS \
             "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
@@ -348,7 +363,7 @@ jobs:
           # by default, so an edit from there can quietly drop it again -- and
           # this job is the last one in a release, where the failure is most
           # expensive to discover.
-          bash packaging/render.sh "${{ needs.check.outputs.version }}" /tmp/SHA256SUMS
+          bash packaging/render.sh "$VERSION" /tmp/SHA256SUMS
 
       - name: Commit
         run: |
