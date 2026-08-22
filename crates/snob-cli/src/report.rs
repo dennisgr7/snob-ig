@@ -186,9 +186,24 @@ pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
 /// month removes the ambiguity for everybody instead of moving it from one half
 /// of the readership to the other; `%-d` rather than `%d` because "Aug 3" is
 /// how the date is said.
+///
+/// **In the local zone**, because everything else the person reads is. The
+/// schedule is evaluated in `chrono::Local`, the README says "times are
+/// your local ones", and a cooldown "until 15:46" is read against the clock
+/// on the wall -- while this printed UTC with no label, so a monitor on
+/// `--at 09:00` in Madrid reported having "last run on Aug 22 at 07:00",
+/// and a cooldown ending at four looked like it ended at two. The zone is
+/// taken at the call, so the test can pin the arithmetic with a fixed one.
 fn format_epoch(seconds: i64, unknown: &str) -> String {
+    format_epoch_in(seconds, unknown, &chrono::Local)
+}
+
+fn format_epoch_in<Z: chrono::TimeZone>(seconds: i64, unknown: &str, zone: &Z) -> String
+where
+    Z::Offset: std::fmt::Display,
+{
     chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|t| t.format("%b %-d at %H:%M").to_string())
+        .map(|t| t.with_timezone(zone).format("%b %-d at %H:%M").to_string())
         .unwrap_or_else(|| unknown.to_string())
 }
 
@@ -725,10 +740,30 @@ mod tests {
     fn a_date_out_of_range_still_reads_as_something() {
         assert_eq!(stored_on(i64::MAX), "earlier");
         assert_eq!(cooldown_ends_at(i64::MAX), "later");
-        assert_eq!(stored_on(1_722_700_000), "Aug 3 at 15:46");
+        assert_eq!(
+            format_epoch_in(1_722_700_000, "earlier", &chrono::Utc),
+            "Aug 3 at 15:46"
+        );
         // Milliseconds, and a negative one must not round towards zero into a
         // different second than it belongs to.
-        assert_eq!(cooldown_ends_at(1_722_700_000_000), "Aug 3 at 15:46");
+        assert_eq!(
+            format_epoch_in(
+                cooldown_ends_at_secs(1_722_700_000_000),
+                "later",
+                &chrono::Utc
+            ),
+            "Aug 3 at 15:46"
+        );
+    }
+
+    /// What is printed is the wall clock, not UTC with no label.
+    #[test]
+    fn a_moment_is_printed_in_the_zone_the_reader_is_in() {
+        let madrid_in_august = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(
+            format_epoch_in(1_722_700_000, "earlier", &madrid_in_august),
+            "Aug 3 at 17:46"
+        );
     }
 
     /// The refusal has to name the mistake the caller would otherwise have
