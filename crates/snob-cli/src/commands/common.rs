@@ -71,6 +71,31 @@ pub fn open_with_progress(
     }
 }
 
+/// What is left of a list after the filter and the cap, and how many there
+/// were at each step -- the three numbers the summary line is built from.
+///
+/// Four lines, written twice, in the two commands that print a list. The
+/// numbers have to be taken in this order -- total before the filter, kept
+/// after it, shown after the cap -- and two copies of an order are two
+/// places to get it wrong.
+pub struct Narrowed {
+    pub shown: Vec<User>,
+    /// After the filter, before the cap.
+    pub kept: usize,
+    /// Before the filter.
+    pub total: usize,
+}
+
+pub fn narrow(users: Vec<User>, filter: &Filter, limit: Option<usize>) -> Narrowed {
+    let total = users.len();
+    let mut shown = filter.apply(users);
+    let kept = shown.len();
+    if let Some(cap) = limit {
+        shown.truncate(cap);
+    }
+    Narrowed { shown, kept, total }
+}
+
 /// Refuses a command outright while the account is in cooldown.
 ///
 /// For the commands that have nothing stored to serve instead -- a picture,

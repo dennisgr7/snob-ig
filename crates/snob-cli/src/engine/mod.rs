@@ -195,6 +195,26 @@ impl ListOutcome {
             .unwrap_or_else(|| ExitCode::from_stop_reason(self.reason))
     }
 
+    /// The code for a result that **was printed** out of this list, short or
+    /// not.
+    ///
+    /// A cap the user asked for is not a failure, so `PageLimit` sits with
+    /// `Completed`; everything else keeps the code that says what stopped the
+    /// walk, so a script can tell "wait" from "log in again". It was written
+    /// out in `lists` and again in `sets`, and the two disagreed once: `snob
+    /// unfollowers --max-pages 2` exited 1 while `snob following --max-pages
+    /// 2` exited 0 for the identical stop reason. One function, two callers.
+    ///
+    /// A stored list needs no arm of its own. `ListOutcome::cached` is the
+    /// only way to a provenance other than `Walked` and it records
+    /// `Completed`, so anything out of storage arrives at the first arm.
+    pub fn exit_code_for_a_printed_result(&self) -> ExitCode {
+        match self.reason {
+            StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
+            _ => self.exit_code(),
+        }
+    }
+
     /// Whether this is the list of the account the run acts as.
     pub fn is_own(&self, viewer: &crate::app::Viewer) -> bool {
         self.account_pk == viewer.pk

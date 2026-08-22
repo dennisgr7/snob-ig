@@ -6,7 +6,7 @@
 //! and costs two requests.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, StopReason, User};
+use snob_core::model::{ListKind, User};
 use snob_core::sets;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
@@ -105,17 +105,16 @@ pub async fn run(
 
     engine::cooldown::check_same_moment(&against_outcome, &base_outcome)?;
 
-    let mut result = match op {
+    let result = match op {
         SetOp::Unfollowers | SetOp::Fans => sets::difference(&base, &against),
         SetOp::Friends => sets::intersection(&base, &against),
     };
 
-    let total = result.len();
-    result = filter.apply(result);
-    let kept = result.len();
-    if let Some(cap) = args.limit {
-        result.truncate(cap);
-    }
+    let common::Narrowed {
+        shown: result,
+        kept,
+        total,
+    } = common::narrow(result, &filter, args.limit);
 
     destination.write(&result)?;
 
@@ -129,7 +128,10 @@ pub async fn run(
         &against_outcome,
     );
 
-    Ok(exit_code(&base_outcome))
+    // Decided by what stopped the **base** list alone. The list crossed
+    // against is not consulted: it was refused outright by
+    // `check_against_list`, well before there was a result to code.
+    Ok(base_outcome.exit_code_for_a_printed_result())
 }
 
 /// The check that stops a false result from being reported.
@@ -152,25 +154,6 @@ fn check_against_list(op: SetOp, outcome: &ListOutcome) -> Result<()> {
         outcome,
         op.misreads_as(),
     ))
-}
-
-/// What a crossing exits with, decided by what stopped the **base** list.
-///
-/// The list crossed *against* is not consulted here at all: it is refused
-/// outright by `check_against_list`, well before there is a result to code.
-///
-/// `PageLimit` sits with `Completed` for the reason `cli.rs` gives at the top
-/// of its exit table — a cap the user asked for is not a failure — and for the
-/// reason this very function's caller already acts on: the result was written
-/// and the shortfall was warned about, not refused. Left to `is_complete` the
-/// two disagreed, so `snob unfollowers --max-pages 2` exited 1 while
-/// `snob following --max-pages 2` exited 0 for the identical stop reason. The
-/// arm is the same one `lists::exit_code` spells out.
-fn exit_code(base: &ListOutcome) -> ExitCode {
-    match base.reason {
-        StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        _ => base.exit_code(),
-    }
 }
 
 fn print_summary(
@@ -262,6 +245,7 @@ fn proportion(part: usize, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::model::StopReason;
 
     fn outcome(reason: StopReason) -> ListOutcome {
         ListOutcome {
@@ -289,11 +273,13 @@ mod tests {
     /// A cap the user asked for is not a failure, on either side of a crossing.
     ///
     /// The result is written and the shortfall warned about, `cli.rs` promises
-    /// 0 for it in as many words, and `lists::exit_code` has the arm — so
-    /// `snob unfollowers --max-pages 2` exiting 1 while `snob following
-    /// --max-pages 2` exits 0 was two answers to one stop reason.
+    /// 0 for it in as many words — so `snob unfollowers --max-pages 2` exiting
+    /// 1 while `snob following --max-pages 2` exits 0 was two answers to one
+    /// stop reason. The two commands ask one method now; this pins the
+    /// crossing's side of it.
     #[test]
     fn a_base_list_stopped_by_the_page_cap_still_exits_zero() {
+        let exit_code = ListOutcome::exit_code_for_a_printed_result;
         assert_eq!(exit_code(&outcome(StopReason::PageLimit)), ExitCode::Ok);
         assert_eq!(exit_code(&outcome(StopReason::Completed)), ExitCode::Ok);
 

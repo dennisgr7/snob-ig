@@ -5,7 +5,7 @@
 //! cooldown — happens there.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, StopReason, User};
+use snob_core::model::{ListKind, User};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
@@ -35,32 +35,14 @@ pub async fn run(
     app.progress().finish();
     let (found, outcome) = result?;
 
-    let total = found.len();
-    let mut found = filter.apply(found);
-    let kept = found.len();
-    if let Some(cap) = args.limit {
-        found.truncate(cap);
-    }
+    let common::Narrowed { shown, kept, total } = common::narrow(found, &filter, args.limit);
 
-    destination.write(&found)?;
-    print_summary(&found, kept, total, &outcome, kind);
-    Ok(exit_code(&outcome))
-}
-
-/// A plain list is the one place a partial answer is still worth having: every
-/// account in it really is in the list, only some are missing. So it prints,
-/// says so, and reports what stopped it.
-///
-/// A stored list needs no arm of its own. `ListOutcome::cached` is the only way
-/// to a provenance other than `Walked` and it records `Completed`, so anything
-/// out of storage arrives at the first arm anyway — and an arm that reads as
-/// policy while deciding nothing is one a later change would edit to no effect.
-fn exit_code(outcome: &ListOutcome) -> ExitCode {
-    match outcome.reason {
-        // A cap was asked for by the user, so it is not a failure.
-        StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        _ => outcome.exit_code(),
-    }
+    destination.write(&shown)?;
+    print_summary(&shown, kept, total, &outcome, kind);
+    // A plain list is the one place a partial answer is still worth having:
+    // every account in it really is in the list, only some are missing. So it
+    // prints, says so, and exits with what stopped it.
+    Ok(outcome.exit_code_for_a_printed_result())
 }
 
 /// The singular of a list's name. `Display` gives the plural, and for
@@ -109,6 +91,7 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::model::StopReason;
 
     fn outcome(source: ResultSource, reason: StopReason) -> ListOutcome {
         ListOutcome {
@@ -132,6 +115,7 @@ mod tests {
     /// happened, so a script can tell "wait" from "log in again".
     #[test]
     fn the_exit_code_reports_what_stopped_the_walk() {
+        let exit_code = ListOutcome::exit_code_for_a_printed_result;
         for reason in [StopReason::Completed, StopReason::PageLimit] {
             assert_eq!(
                 exit_code(&outcome(ResultSource::Fetched, reason)),
