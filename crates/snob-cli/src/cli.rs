@@ -279,7 +279,16 @@ pub struct LoginArgs {
     /// do not. "--browser" picks it up on its own, so this is for the machine
     /// with no browser to launch — the headless case this tool supports on
     /// purpose — where the two cookies have to be copied by hand.
-    #[arg(long, value_name = "TOKEN", requires = "paste")]
+    ///
+    /// A value typed here lands in the shell history and in "ps"; the
+    /// SNOB_CSRFTOKEN environment variable is read instead when it is set.
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        requires = "paste",
+        env = "SNOB_CSRFTOKEN",
+        hide_env_values = true
+    )]
     pub csrftoken: Option<String>,
 
     /// Keep the browser profile "--browser" creates, so a later login skips
@@ -482,7 +491,19 @@ pub struct WebhookArgs {
     /// is deliberate: a report is queued before it is delivered, so refusing a
     /// weak key at send time would strand one that had already been made.
     /// Here, nothing has been queued yet.
-    #[arg(long, value_name = "SECRET", value_parser = signing_secret)]
+    ///
+    /// A value typed here lands in the shell history and in "ps", where on
+    /// Linux every local user can read it for as long as the run lasts; the
+    /// SNOB_SIGNING_KEY environment variable is read instead when it is set,
+    /// which is also the shape a systemd unit wants. "snob watch setup" puts
+    /// the key in the keyring, and then neither is needed.
+    #[arg(
+        long,
+        value_name = "SECRET",
+        value_parser = signing_secret,
+        env = "SNOB_SIGNING_KEY",
+        hide_env_values = true
+    )]
     pub sign_with: Option<String>,
 
     /// Send a report even when nothing changed, so something watching for

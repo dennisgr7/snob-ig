@@ -59,7 +59,11 @@ rustls = { version = "0.23", default-features = false, features = ["prefer-post-
 # takes certificates. Only compiled for the four rustls targets -- the schannel
 # one has no way to say "these roots and no others", and refuses the flag.
 webpki-root-certs = "1"
-clap = { version = "4", features = ["derive"] }
+# `env` so the two secrets a command line can carry -- the CSRF token and the
+# webhook signing key -- can come from the environment instead of argv, where
+# every local user can read them. It costs nothing: the feature is a few
+# lines in clap_builder.
+clap = { version = "4", features = ["derive", "env"] }
 # No `fallible_uint` on purpose: without that feature `params![pk]` does not
 # compile for a u64, so the compiler forces everything through pk_to_sql.
 rusqlite = { version = "0.40", features = ["bundled"] }
