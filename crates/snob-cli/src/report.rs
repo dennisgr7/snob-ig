@@ -211,8 +211,8 @@ fn filtered(text: &str, join: &str) -> String {
         .join(join)
 }
 
-/// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
-/// timestamp the tool prints.
+/// "Aug 3 at 14:12", from a timestamp in epoch seconds, in the local zone like
+/// every other moment the tool prints.
 pub fn stored_on(taken_at: i64) -> String {
     format_epoch(taken_at, "earlier")
 }
