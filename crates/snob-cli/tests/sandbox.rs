@@ -843,6 +843,39 @@ fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> 
     command.output().expect("the binary runs")
 }
 
+/// A reader that leaves early is not an error of this program's.
+///
+/// `println!` panics on a closed pipe, and with `panic = "abort"` a release
+/// binary died with a message and whatever status an abort gets the moment
+/// `head` had read its line. The lists went through a writer that tolerated
+/// it; the prose did not.
+#[test]
+fn a_closed_pipe_ends_the_output_and_not_the_program() {
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snob"))
+        .arg("--sandbox-root")
+        .arg(tmp.path())
+        .args(["watch", "status"])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    // Close the reading end before the program has written anything.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("the binary finishes");
+
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!said.contains("panicked"), "{said}");
+    assert!(
+        out.status.code().is_some_and(|code| code <= 1),
+        "a closed pipe exited {:?}: {said}",
+        out.status
+    );
+}
+
 /// **A story can actually be saved.** The name this command invents carries
 /// a hyphen, and the allowlist the name is checked against did not -- so
 /// every `--download` fetched the bytes and then refused its own name. No

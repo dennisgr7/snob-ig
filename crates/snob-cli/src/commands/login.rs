@@ -431,14 +431,14 @@ async fn finish(
 
     match outcome {
         ValidationOutcome::Confirmed => {
-            println!(
+            crate::ui::say!(
                 "Session stored for {} in the {}.",
                 who(&session),
                 store.describe()
             );
         }
         ValidationOutcome::Unconfirmed => {
-            println!("Session stored in the {}.", store.describe());
+            crate::ui::say!("Session stored in the {}.", store.describe());
             ui::warn(
                 "it could not be confirmed with Instagram because it is throttling \
                  requests. The session is probably valid; check in a few minutes \
@@ -446,7 +446,7 @@ async fn finish(
             );
         }
         ValidationOutcome::Skipped { until_ms } => {
-            println!("Session stored in the {}.", store.describe());
+            crate::ui::say!("Session stored in the {}.", store.describe());
             ui::warn(&format!(
                 "it was not checked: the account is in cooldown until {}, and during one \
                  nothing is spent — not even the single request this would cost. \

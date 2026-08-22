@@ -223,18 +223,18 @@ pub fn run_with(
     let plan = survey(&store, app_paths);
 
     if plan.is_empty() {
-        println!("There is nothing of snob's stored on this computer.");
+        crate::ui::say!("There is nothing of snob's stored on this computer.");
         report_the_binary();
         return Ok(ExitCode::Ok);
     }
 
-    println!("This will delete, from this computer:");
+    crate::ui::say!("This will delete, from this computer:");
     for line in plan.lines() {
-        println!("  {line}");
+        crate::ui::say!("  {line}");
     }
 
     if args.dry_run {
-        println!("\nNothing was deleted (--dry-run).");
+        crate::ui::say!("\nNothing was deleted (--dry-run).");
         return Ok(ExitCode::Ok);
     }
 
@@ -272,14 +272,14 @@ pub fn run_with(
     }
 
     if !args.yes && !ui::confirm("\nDelete all of it?", false)? {
-        println!("Nothing was deleted.");
+        crate::ui::say!("Nothing was deleted.");
         return Ok(ExitCode::Ok);
     }
 
     let failures = execute(&plan, &store);
 
     if failures.is_empty() {
-        println!("Done.");
+        crate::ui::say!("Done.");
         // Said rather than implied. Removing a file unlinks it; on any modern
         // filesystem the bytes may survive in a journal, a shadow copy, a
         // snapshot, or — on flash — in a block the drive has not yet erased.

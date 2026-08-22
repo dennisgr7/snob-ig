@@ -89,7 +89,7 @@ pub async fn setup(
         .context("the configuration this produced could not be read back; this is a bug")?;
 
     if args.dry_run {
-        println!("{text}");
+        crate::ui::say!("{text}");
         ui::info("Nothing was written.");
         return Ok(ExitCode::Ok);
     }
@@ -113,10 +113,10 @@ pub async fn setup(
     // point: a name with a typo, a token the receiver rejects or a session that
     // has gone are all cheap to fix now and expensive to discover from an
     // unattended run's log a week later.
-    println!();
+    crate::ui::say!();
     let report = super::preflight(&Default::default(), &secrets, paths).await?;
     for line in super::describe_check(&report) {
-        println!("{line}");
+        crate::ui::say!("{line}");
     }
 
     offer_the_baseline(&report, &secrets, paths).await?;
@@ -284,7 +284,7 @@ async fn offer_the_baseline(
         return Ok(());
     }
 
-    println!();
+    crate::ui::say!();
     ui::info(&format!(
         "There is no capture to compare against yet, so the first scheduled run \
          will lay one down and report nothing.\n{}",

@@ -18,7 +18,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
         // nothing to read. Every field the object always carries is here;
         // everything that describes a session that does not exist is null.
         if args.json {
-            println!(
+            crate::ui::say!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "pk": serde_json::Value::Null,
@@ -146,9 +146,9 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
             "cooldown_until": cooldown_until,
             "error": failure,
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::ui::say!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("{}", describe(&session, alive));
+        crate::ui::say!("{}", describe(&session, alive));
     }
 
     Ok(code)

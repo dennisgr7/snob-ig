@@ -297,6 +297,41 @@ pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }
 
+/// A line of the result, on standard output -- `println!` that survives the
+/// reader leaving.
+///
+/// `println!` panics on a closed pipe, and Rust ignores `SIGPIPE`, so
+/// `snob watch status | head -1` and `snob whoami --json | jq -r .username`
+/// ended with a panic message and an undocumented exit status the moment the
+/// far end had read enough. `output::write_rendered` has tolerated a broken
+/// pipe for the lists since the start; the fifty-odd lines of prose that go
+/// to standard output did not. A closed pipe is the reader saying it has
+/// seen what it wanted, which is not an error of this program's.
+pub fn say_line(line: std::fmt::Arguments<'_>) {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    for step in [locked.write_fmt(line), locked.write_all(b"\n")] {
+        match step {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return,
+            // Anything else on standard output is the terminal going away,
+            // and there is nobody left to tell.
+            Err(_) => return,
+            Ok(()) => {}
+        }
+    }
+}
+
+/// `println!`, through [`say_line`]. Same arguments, same shape, one difference.
+macro_rules! say {
+    () => {
+        $crate::ui::say_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::ui::say_line(format_args!($($arg)*))
+    };
+}
+pub(crate) use say;
+
 pub fn info(message: &str) {
     eprintln!("{message}");
 }

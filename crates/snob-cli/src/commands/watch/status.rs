@@ -93,7 +93,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     );
 
     if args.json {
-        println!(
+        crate::ui::say!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "configured": config.is_some(),
@@ -143,24 +143,24 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
 
     match &config {
         Some(config) => {
-            println!("Configured in {}", config::path(paths).display());
+            crate::ui::say!("Configured in {}", config::path(paths).display());
             for line in describe_config(config) {
-                println!("  {line}");
+                crate::ui::say!("  {line}");
             }
         }
-        None => println!(
+        None => crate::ui::say!(
             "Nothing is configured. Run \"snob watch setup\", or pass the schedule on the \
              command line."
         ),
     }
 
-    println!();
+    crate::ui::say!();
     // Said before the marks, because it answers the question somebody opening
     // `status` actually has. A run that could not look moves no mark, so a
     // monitor that has been in a cooldown since Monday looks, from the marks
     // alone, exactly like one that was killed on Monday.
     if last_runs.is_empty() {
-        println!("It has not run yet.");
+        crate::ui::say!("It has not run yet.");
     } else {
         for run in &last_runs {
             let pk = run.account_pk;
@@ -181,18 +181,18 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                     if run.changes == 1 { "" } else { "s" }
                 ));
             }
-            println!("{line}.");
+            crate::ui::say!("{line}.");
         }
     }
 
-    println!();
+    crate::ui::say!();
     if marks.is_empty() {
-        println!("The monitor has not reported on anything yet.");
+        crate::ui::say!("The monitor has not reported on anything yet.");
     } else {
         for mark in &marks {
             let name = snob_store::store::users::name(db.conn(), mark.account_pk)?;
             let who = crate::app::label(mark.account_pk, name.as_deref());
-            println!(
+            crate::ui::say!(
                 "{who}: {} last reported on {}",
                 mark.kind,
                 report::stored_on(mark.compared_at)
@@ -215,7 +215,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     // longer. A test walks the source for that shape now, because two rounds of
     // reading it did not.
     if owed.waiting > 0 || owed.elsewhere > 0 || owed.given_up > 0 {
-        println!();
+        crate::ui::say!();
     }
     if owed.given_up > 0 {
         let (subject, what) = if owed.given_up == 1 {
@@ -223,7 +223,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         } else {
             ("reports were", "What they said is")
         };
-        println!(
+        crate::ui::say!(
             "{} {subject} given up on for being too old to be news. {what} not reported \
              a second time.",
             owed.given_up
@@ -235,7 +235,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         } else {
             ("reports are", "them")
         };
-        println!(
+        crate::ui::say!(
             "{} {subject} waiting to be delivered; the next run tries {it}.",
             owed.waiting
         );
@@ -251,7 +251,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         } else {
             ("reports are", "They", "expire", "their", "them")
         };
-        println!(
+        crate::ui::say!(
             "{} {subject} addressed to a webhook this configuration does not send to, so \
              nothing here will try {it}. {they} {expire} on {their} own.",
             owed.elsewhere
@@ -259,10 +259,10 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     }
 
     if !health.notes.is_empty() {
-        println!();
-        println!("Health: {}", health.verdict.as_str());
+        crate::ui::say!();
+        crate::ui::say!("Health: {}", health.verdict.as_str());
         for note in &health.notes {
-            println!("  {note}");
+            crate::ui::say!("  {note}");
         }
     }
 

@@ -556,7 +556,7 @@ async fn run_accounts(
                     // after the `?` in `tick_one`, there was none: the failure
                     // went to standard error as prose and `events.ndjson` had
                     // nothing at all for that run.
-                    println!("{}", json_line(&failed_tick_json(account, &e, at, charged)));
+                    crate::ui::say!("{}", json_line(&failed_tick_json(account, &e, at, charged)));
                 }
                 failures.push(e);
             }
@@ -697,10 +697,10 @@ async fn tick_one(
     let tick = tick?;
 
     if printing.json {
-        println!("{}", json_line(&tick_json(&tick)));
+        crate::ui::say!("{}", json_line(&tick_json(&tick)));
     } else if printing.watching || !tick.report.changes().is_empty() {
         for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
-            println!("{line}");
+            crate::ui::say!("{line}");
         }
     }
 
@@ -1116,10 +1116,10 @@ async fn check(args: WatchCheckArgs, secrets: SecretStore, paths: &AppPaths) -> 
     let report = preflight(&args, &secrets, paths).await?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&check_json(&report))?);
+        crate::ui::say!("{}", serde_json::to_string_pretty(&check_json(&report))?);
     } else {
         for line in describe_check(&report) {
-            println!("{line}");
+            crate::ui::say!("{line}");
         }
     }
 
@@ -1372,12 +1372,12 @@ fn diff(args: WatchDiffArgs, secrets: SecretStore, paths: &AppPaths) -> Result<E
     let report = crate::engine::watch::from_store(&app, args.target.as_deref())?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&as_json(&report))?);
+        crate::ui::say!("{}", serde_json::to_string_pretty(&as_json(&report))?);
         return Ok(ExitCode::Ok);
     }
 
     for line in describe(&report, false) {
-        println!("{line}");
+        crate::ui::say!("{line}");
     }
     Ok(ExitCode::Ok)
 }
