@@ -427,6 +427,8 @@ pub fn mutation_body(
 
 #[cfg(test)]
 mod tests {
+    use snob_core::Pk;
+
     use super::*;
 
     /// **There are two writes, and there is no third.**
@@ -681,7 +683,7 @@ mod tests {
             fb_dtsg: Secret::new("TOKEN".to_string()),
             lsd: Secret::new("LSD".to_string()),
         };
-        let body = mutation_body(&tokens, Mutation::Unfollow, "27789106940691111", 7);
+        let body = mutation_body(&tokens, Mutation::Unfollow, "27789106940691111", Pk::new(7));
         let field = |name: &str| {
             body.iter()
                 .find(|(k, _)| k == name)
@@ -708,7 +710,7 @@ mod tests {
             fb_dtsg: Secret::new("TOKEN".to_string()),
             lsd: Secret::new("LSD".to_string()),
         };
-        let body = mutation_body(&tokens, Mutation::Follow, "1", 7);
+        let body = mutation_body(&tokens, Mutation::Follow, "1", Pk::new(7));
         for invented in ["__dyn", "__csr", "__hsdp", "__hblp", "__sjsp", "__spin_t"] {
             assert!(
                 !body.iter().any(|(k, _)| k == invented),
@@ -719,7 +721,7 @@ mod tests {
 
     #[test]
     fn the_variables_name_the_account_and_the_screen() {
-        let vars = variables(528817151);
+        let vars = variables(Pk::new(528817151));
         assert!(vars.contains(r#""target_user_id":"528817151""#), "{vars}");
         assert!(vars.contains(r#""container_module":"profile""#), "{vars}");
     }

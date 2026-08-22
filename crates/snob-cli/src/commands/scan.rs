@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn the_heading_is_filtered_whoever_the_name_came_from() {
         let viewer = crate::app::Viewer {
-            pk: 7,
+            pk: Pk::new(7),
             username: Some("me\u{1b}[2K".into()),
         };
 
@@ -541,7 +541,7 @@ mod tests {
 
         // No name learned yet, so the id stands in for one.
         let nameless = crate::app::Viewer {
-            pk: 7,
+            pk: Pk::new(7),
             username: None,
         };
         assert_eq!(summary_target(None, &nameless), "7");
@@ -549,7 +549,7 @@ mod tests {
 
     fn user(pk: u64, name: &str) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: name.into(),
             full_name: None,
             is_private: None,
@@ -590,7 +590,7 @@ mod tests {
             requests: 3,
             started_at: 1_722_699_000,
             taken_at: 1_722_700_000,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,

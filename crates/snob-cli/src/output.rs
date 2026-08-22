@@ -334,11 +334,12 @@ fn render(users: &[User], format: Format, presentation: Presentation) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn users() -> Vec<User> {
         vec![
             User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one".into(),
                 full_name: Some("One".into()),
                 is_private: None,
@@ -346,7 +347,7 @@ mod tests {
                 pfp_url: None,
             },
             User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two".into(),
                 full_name: None,
                 is_private: None,

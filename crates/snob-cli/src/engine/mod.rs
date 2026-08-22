@@ -493,7 +493,7 @@ mod tests {
     fn a_cached_outcome_is_complete_by_construction() {
         let snapshot = snapshots::Snapshot {
             id: 1,
-            account_pk: 7,
+            account_pk: Pk::new(7),
             kind: ListKind::Followers,
             started_at: 0,
             taken_at: Some(0),
@@ -506,6 +506,6 @@ mod tests {
         assert_eq!(outcome.source(), ResultSource::Cached);
         // Both ends of the interval come off the row, so they cannot disagree
         // with the members read from the same one.
-        assert_eq!(outcome.account_pk, 7);
+        assert_eq!(outcome.account_pk, Pk::new(7));
     }
 }

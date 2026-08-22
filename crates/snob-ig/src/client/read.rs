@@ -133,7 +133,10 @@ impl IgClient {
 
         match self.search_user_id(username).await {
             Ok(Some(user)) => {
-                tracing::debug!(pk = user.pk, "search resolved the account the profile lost");
+                tracing::debug!(
+                    pk = user.pk.get(),
+                    "search resolved the account the profile lost"
+                );
                 Ok(WebProfileInfo::from_search(user))
             }
             // Search answered and knows no such account. The original failure
@@ -322,7 +325,7 @@ mod tests {
 
         client(&server)
             .await
-            .friendships_page(7, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(7), "someone", Direction::Followers, 50, None)
             .await
             .unwrap();
 
@@ -402,7 +405,7 @@ mod tests {
 
         let page = client(&server)
             .await
-            .friendships_page(42, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(42), "someone", Direction::Followers, 50, None)
             .await
             .unwrap();
 
@@ -424,7 +427,13 @@ mod tests {
 
         client(&server)
             .await
-            .friendships_page(42, "someone", Direction::Following, 50, Some("QVFB"))
+            .friendships_page(
+                Pk::new(42),
+                "someone",
+                Direction::Following,
+                50,
+                Some("QVFB"),
+            )
             .await
             .unwrap();
     }
@@ -441,7 +450,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let name = client(&server).await.resolve_username(42).await.unwrap();
+        let name = client(&server)
+            .await
+            .resolve_username(Pk::new(42))
+            .await
+            .unwrap();
         assert_eq!(name.as_deref(), Some("whoever"));
     }
 
@@ -533,7 +546,7 @@ mod tests {
         let client = client(&server).await;
         let profile = client.web_profile_info("ann").await.unwrap();
 
-        assert_eq!(profile.id, 7);
+        assert_eq!(profile.id, Pk::new(7));
         assert_eq!(profile.via, crate::model::Via::Profile);
         assert!(profile.counters_are_knowable());
         assert_eq!(profile.follower_count(), Some(10));
@@ -566,7 +579,7 @@ mod tests {
         let client = client(&server).await;
         let profile = client.web_profile_info("rubius").await.unwrap();
 
-        assert_eq!(profile.id, 1506);
+        assert_eq!(profile.id, Pk::new(1506));
         assert_eq!(profile.username, "rubius");
         assert_eq!(profile.via, crate::model::Via::Search);
 
@@ -710,7 +723,7 @@ mod tests {
 
         let client = client(&server).await;
         let profile = client.web_profile_info("rubius").await.unwrap();
-        assert_eq!(profile.id, 12);
+        assert_eq!(profile.id, Pk::new(12));
     }
 
     /// When the fallback is the one that hits the wall, the wall is what gets
@@ -761,7 +774,7 @@ mod tests {
 
             let reel = client(&server)
                 .await
-                .stories(42, "someone")
+                .stories(Pk::new(42), "someone")
                 .await
                 .unwrap()
                 .expect("a reel");
@@ -789,7 +802,7 @@ mod tests {
         assert!(
             client(&server)
                 .await
-                .stories(42, "someone")
+                .stories(Pk::new(42), "someone")
                 .await
                 .unwrap()
                 .is_none()

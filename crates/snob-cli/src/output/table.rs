@@ -173,10 +173,11 @@ pub(crate) fn plain(users: &[User]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn user() -> User {
         User {
-            pk: 1,
+            pk: Pk::new(1),
             username: "one".into(),
             full_name: Some("One Person".into()),
             is_private: None,

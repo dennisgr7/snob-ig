@@ -260,11 +260,12 @@ fn outcome(verb: Verb, status: &FriendshipStatus, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
     use snob_ig::model::WebProfileInfo;
 
     fn profile(followed: Option<bool>, requested: Option<bool>) -> WebProfileInfo {
         WebProfileInfo {
-            id: 7,
+            id: Pk::new(7),
             username: "someone".into(),
             full_name: None,
             is_private: None,

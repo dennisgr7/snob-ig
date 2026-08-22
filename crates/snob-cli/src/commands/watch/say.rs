@@ -441,7 +441,7 @@ mod tests {
             total: 309,
         };
         let report = WatchReport {
-            account_pk: 42,
+            account_pk: Pk::new(42),
             username: Some("me".into()),
             is_self: true,
             followers: Some(baseline(ListKind::Followers)),
@@ -531,8 +531,8 @@ mod tests {
     #[test]
     fn an_arrival_and_a_departure_are_both_named() {
         let diff = ListDiff {
-            gained: vec![user(1, "arrived")],
-            lost: vec![user(2, "left")],
+            gained: vec![user(Pk::new(1), "arrived")],
+            lost: vec![user(Pk::new(2), "left")],
         };
         let lines = describe(
             &report_with(
@@ -571,7 +571,7 @@ mod tests {
                     Some(1_000),
                 )),
                 vec![Rename {
-                    pk: 7,
+                    pk: Pk::new(7),
                     history_id: 7,
                     from: "before".into(),
                     to: "after".into(),
@@ -609,7 +609,7 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(n, (from, to))| Rename {
-                            pk: n as Pk,
+                            pk: Pk::new(n as u64),
                             history_id: n as i64,
                             from: (*from).into(),
                             to: (*to).into(),
@@ -641,7 +641,7 @@ mod tests {
                         after: 2,
                     },
                     ListDiff {
-                        gained: vec![user(1, "bad\u{202e}name")],
+                        gained: vec![user(Pk::new(1), "bad\u{202e}name")],
                         lost: vec![],
                     },
                     Some(1_000),

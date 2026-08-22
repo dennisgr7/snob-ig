@@ -32,6 +32,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use snob_core::Pk;
 use wiremock::matchers::{method, path as url_path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -45,7 +46,7 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 /// The account the fake Instagram answers about, and the one the session is.
-const PK: u64 = 42;
+const PK: Pk = Pk::new(42);
 
 /// Runs the real binary against one sandbox, and says what it did.
 ///
@@ -225,7 +226,7 @@ async fn a_sandbox_run_keeps_its_session_in_the_sandbox() {
     assert!(out.status.success(), "{}", stderr(&out));
     let said: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("--json prints one JSON object");
-    assert_eq!(said["pk"], PK, "{said}");
+    assert_eq!(said["pk"], PK.get(), "{said}");
     assert_eq!(
         said["storage"], "file",
         "a sandbox run must not reach the operating system's store: {said}"

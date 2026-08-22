@@ -491,6 +491,7 @@ mod tests {
     use crate::commands::watch::fixtures::{list, report_with, user};
     use crate::engine::Provenance;
     use crate::engine::watch::TickList;
+    use snob_core::Pk;
     use snob_core::model::ListKind;
     use snob_core::watch::{Basis, ListDiff, Rename};
 
@@ -683,7 +684,7 @@ mod tests {
                             after: 2,
                         },
                         ListDiff {
-                            gained: vec![user(1, "arrived")],
+                            gained: vec![user(Pk::new(1), "arrived")],
                             lost: vec![],
                         },
                         Some(1_000),
@@ -847,13 +848,13 @@ mod tests {
                         after: 2,
                     },
                     ListDiff {
-                        gained: vec![user(1, "arrived")],
-                        lost: vec![user(2, "left")],
+                        gained: vec![user(Pk::new(1), "arrived")],
+                        lost: vec![user(Pk::new(2), "left")],
                     },
                     Some(1_000),
                 )),
                 vec![Rename {
-                    pk: 7,
+                    pk: Pk::new(7),
                     history_id: 7,
                     from: "before".into(),
                     to: "after".into(),

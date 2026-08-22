@@ -5,6 +5,7 @@
 //! them answered rather than the first failure.
 
 use anyhow::Result;
+use snob_core::Pk;
 use snob_core::model::printable;
 use snob_store::config::{self, WatchConfig};
 use snob_store::paths::AppPaths;
@@ -95,7 +96,7 @@ pub(super) async fn preflight(
         // all the two were the same report.
         report.checked.push(line);
     } else if let Some(delivery) = delivery.as_ref() {
-        let id = run_id(now, 0);
+        let id = run_id(now, Pk::new(0));
         let body = serde_json::to_string(&preflight_body(&id, now))?;
         report.checked.push(
             check::webhook_of(

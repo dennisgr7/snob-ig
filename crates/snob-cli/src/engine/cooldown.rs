@@ -140,6 +140,7 @@ fn gap_between(a: &ListOutcome, b: &ListOutcome) -> i64 {
 mod tests {
     use super::*;
     use crate::exit::ExitCode;
+    use snob_core::Pk;
 
     /// The drift two stored lists may have between them, written out.
     ///
@@ -161,7 +162,7 @@ mod tests {
     fn stored(started_at: i64, taken_at: i64) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             kind: ListKind::Followers,
             started_at,
             taken_at: Some(taken_at),

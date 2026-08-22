@@ -119,10 +119,11 @@ pub fn parse_username_list(contents: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Pk;
 
     fn user(name: &str) -> User {
         User {
-            pk: 1,
+            pk: Pk::new(1),
             username: name.into(),
             full_name: None,
             is_private: None,

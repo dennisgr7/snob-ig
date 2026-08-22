@@ -288,7 +288,7 @@ mod tests {
 
     fn named(username: &str) -> User {
         User {
-            pk: 1,
+            pk: Pk::new(1),
             username: username.to_string(),
             full_name: None,
             is_private: None,
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_user_serializes_without_its_empty_fields() {
         let u = User {
-            pk: 42,
+            pk: Pk::new(42),
             username: "someone".into(),
             full_name: None,
             is_private: None,

@@ -150,9 +150,9 @@ mod tests {
     #[test]
     fn a_new_account_has_no_counters() {
         let db = Store::in_memory().unwrap();
-        with_account(&db, 1);
+        with_account(&db, Pk::new(1));
 
-        let a = find(db.conn(), 1).unwrap().unwrap();
+        let a = find(db.conn(), Pk::new(1)).unwrap().unwrap();
         assert!(a.is_self);
         assert_eq!(a.polled_at, None);
         assert_eq!(a.counter(ListKind::Followers), None);
@@ -161,10 +161,10 @@ mod tests {
     #[test]
     fn a_poll_stores_both_counters() {
         let db = Store::in_memory().unwrap();
-        with_account(&db, 1);
-        record_poll(db.conn(), 1, Some(1200), Some(340)).unwrap();
+        with_account(&db, Pk::new(1));
+        record_poll(db.conn(), Pk::new(1), Some(1200), Some(340)).unwrap();
 
-        let a = find(db.conn(), 1).unwrap().unwrap();
+        let a = find(db.conn(), Pk::new(1)).unwrap().unwrap();
         assert_eq!(a.counter(ListKind::Followers), Some(1200));
         assert_eq!(a.counter(ListKind::Following), Some(340));
         assert!(a.polled_at.is_some());
@@ -173,11 +173,11 @@ mod tests {
     #[test]
     fn a_partial_poll_does_not_wipe_the_counter_it_omits() {
         let db = Store::in_memory().unwrap();
-        with_account(&db, 1);
-        record_poll(db.conn(), 1, Some(1200), Some(340)).unwrap();
-        record_poll(db.conn(), 1, Some(1201), None).unwrap();
+        with_account(&db, Pk::new(1));
+        record_poll(db.conn(), Pk::new(1), Some(1200), Some(340)).unwrap();
+        record_poll(db.conn(), Pk::new(1), Some(1201), None).unwrap();
 
-        let a = find(db.conn(), 1).unwrap().unwrap();
+        let a = find(db.conn(), Pk::new(1)).unwrap().unwrap();
         assert_eq!(a.counter(ListKind::Followers), Some(1201));
         assert_eq!(a.counter(ListKind::Following), Some(340));
     }
@@ -186,15 +186,18 @@ mod tests {
     fn an_account_requires_its_user_to_exist() {
         let db = Store::in_memory().unwrap();
         // Without the users row, the foreign key must refuse it.
-        assert!(upsert(db.conn(), 999, false).is_err());
+        assert!(upsert(db.conn(), Pk::new(999), false).is_err());
     }
 
     #[test]
     fn find_pk_by_username_ignores_case() {
         let db = Store::in_memory().unwrap();
-        with_account(&db, 7);
+        with_account(&db, Pk::new(7));
 
-        assert_eq!(find_pk_by_username(db.conn(), "ACCOUNT7").unwrap(), Some(7));
+        assert_eq!(
+            find_pk_by_username(db.conn(), "ACCOUNT7").unwrap(),
+            Some(Pk::new(7))
+        );
     }
 
     #[test]
@@ -209,7 +212,7 @@ mod tests {
         users::upsert(
             db.conn(),
             &User {
-                pk: 5,
+                pk: Pk::new(5),
                 username: "loose".into(),
                 full_name: None,
                 is_private: None,
@@ -227,7 +230,7 @@ mod tests {
     #[test]
     fn a_duplicated_username_prefers_the_polled_account() {
         let db = Store::in_memory().unwrap();
-        for pk in [1, 2] {
+        for pk in [Pk::new(1), Pk::new(2)] {
             users::upsert(
                 db.conn(),
                 &User {
@@ -242,8 +245,11 @@ mod tests {
             .unwrap();
             upsert(db.conn(), pk, false).unwrap();
         }
-        record_poll(db.conn(), 2, Some(10), None).unwrap();
+        record_poll(db.conn(), Pk::new(2), Some(10), None).unwrap();
 
-        assert_eq!(find_pk_by_username(db.conn(), "ghost").unwrap(), Some(2));
+        assert_eq!(
+            find_pk_by_username(db.conn(), "ghost").unwrap(),
+            Some(Pk::new(2))
+        );
     }
 }

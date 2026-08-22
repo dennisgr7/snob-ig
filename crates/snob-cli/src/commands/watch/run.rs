@@ -394,6 +394,7 @@ fn warn_about_refusals(tick: &TickReport) {
 mod tests {
     use super::*;
     use crate::commands::watch::fixtures::{app_posting_to, owed_long_ago, user};
+    use snob_core::Pk;
     use snob_store::store::deliveries;
 
     /// A tick that failed is still a tick that happened, and it still spent.
@@ -421,8 +422,8 @@ mod tests {
         let (mut app, _delivery) = app_posting_to(&server);
         // The account has to be known locally, or the foreign key has nothing
         // to point at — which is its own gap, written down at the call site.
-        snob_store::store::users::upsert(app.db().conn(), &user(99, "friend")).unwrap();
-        snob_store::store::accounts::upsert(app.db().conn(), 99, false).unwrap();
+        snob_store::store::users::upsert(app.db().conn(), &user(Pk::new(99), "friend")).unwrap();
+        snob_store::store::accounts::upsert(app.db().conn(), Pk::new(99), false).unwrap();
 
         let watched = [Watched::consented(
             "friend".into(),
@@ -445,7 +446,7 @@ mod tests {
         let runs = snob_store::store::watch::last_runs(app.db().conn()).unwrap();
         let recorded = runs
             .iter()
-            .find(|r| r.account_pk == 99)
+            .find(|r| r.account_pk == Pk::new(99))
             .expect("a tick that failed is a tick that happened");
         assert_ne!(
             recorded.outcome,

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use snob_core::Pk;
 use snob_core::budget::{RateBudget, UnlimitedRateBudget};
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
@@ -39,7 +40,7 @@ fn app_with(server: &MockServer, db: Store, budget: Arc<dyn RateBudget>) -> App 
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     )
@@ -184,7 +185,7 @@ async fn a_capture_nobody_reported_is_not_a_baseline() {
     // what makes this what a hand-run of the list commands leaves behind.
     let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
 
-    let before = baseline_of(&app, 42);
+    let before = baseline_of(&app, Pk::new(42));
     assert_eq!(
         before.verdict,
         Verdict::Warned,
@@ -198,7 +199,7 @@ async fn a_capture_nobody_reported_is_not_a_baseline() {
     // One run of the monitor, and now there is one.
     watch::commit(&mut app, &tick, None).unwrap();
 
-    let after = baseline_of(&app, 42);
+    let after = baseline_of(&app, Pk::new(42));
     assert_eq!(after.verdict, Verdict::Ok, "{:?}", after.problem);
     assert!(after.problem.is_none());
 }
@@ -322,7 +323,7 @@ async fn a_refused_run_does_not_move_the_monitor_on() {
     // The arrival was reported by the run that could see, and the refused run
     // in between neither repeated it nor swallowed it.
     let db = Store::open(&paths).unwrap();
-    let mark = snob_store::store::watch::mark(db.conn(), 42, ListKind::Followers)
+    let mark = snob_store::store::watch::mark(db.conn(), Pk::new(42), ListKind::Followers)
         .unwrap()
         .expect("the run that could see left a receipt");
     assert!(mark.snapshot_id.is_some());
@@ -364,7 +365,7 @@ async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
     let runs = snob_store::store::watch::last_runs(db.conn()).unwrap();
     let last = runs
         .iter()
-        .find(|run| run.account_pk == 42)
+        .find(|run| run.account_pk == Pk::new(42))
         .expect("a run that concluded nothing still ran");
 
     assert_eq!(
@@ -427,7 +428,7 @@ async fn a_second_watched_account_is_walked_as_itself() {
 
     assert_eq!(
         seen,
-        vec![42, 99],
+        vec![Pk::new(42), Pk::new(99)],
         "the second account was handed the first one's target"
     );
 
@@ -513,7 +514,7 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
     snob_store::store::users::upsert(
         app.db().conn(),
         &snob_core::model::User {
-            pk: 42,
+            pk: Pk::new(42),
             username: "me".into(),
             full_name: None,
             is_private: None,
@@ -522,10 +523,16 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
         },
     )
     .unwrap();
-    snob_store::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
-    let id =
-        snob_store::store::deliveries::enqueue(app.db().conn(), "run-1", 42, "{}", long_ago, None)
-            .unwrap();
+    snob_store::store::accounts::upsert(app.db().conn(), Pk::new(42), true).unwrap();
+    let id = snob_store::store::deliveries::enqueue(
+        app.db().conn(),
+        "run-1",
+        Pk::new(42),
+        "{}",
+        long_ago,
+        None,
+    )
+    .unwrap();
 
     assert!(
         snob_store::store::deliveries::due(app.db().conn(), now, 10, "https://receiver.example")
@@ -686,7 +693,7 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
         snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -743,7 +750,7 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
             1,
             "a rename in a list that was refused is owed, not lost: {renamed:?}"
         );
-        assert_eq!(renamed[0].pk, 2);
+        assert_eq!(renamed[0].pk, Pk::new(2));
         assert_eq!(renamed[0].from, "two");
         assert_eq!(renamed[0].to, "two_renamed");
     }
@@ -803,9 +810,13 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
         let mut app = app(&server, open_db(tmp.path()));
         run(&mut app, &Watched::own()).await;
         assert!(
-            snob_store::store::snapshots::latest_complete(app.db().conn(), 42, ListKind::Following)
-                .unwrap()
-                .is_none(),
+            snob_store::store::snapshots::latest_complete(
+                app.db().conn(),
+                Pk::new(42),
+                ListKind::Following
+            )
+            .unwrap()
+            .is_none(),
             "the fixture depends on following having nothing stored"
         );
     }
@@ -865,7 +876,7 @@ async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
         snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -894,7 +905,7 @@ async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
         let tick = run(&mut app, &Watched::own()).await;
         let renamed = tick.report.changes().renamed;
         assert_eq!(renamed.len(), 1, "announced once: {renamed:?}");
-        assert_eq!(renamed[0].pk, 1);
+        assert_eq!(renamed[0].pk, Pk::new(1));
     }
 
     // Run three: both counters match what is stored, so both lists are verified
@@ -950,7 +961,7 @@ async fn a_rename_seen_by_a_walk_that_stopped_short_is_not_stepped_over() {
         snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -1013,13 +1024,13 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
     // somebody in it changed their name.
     {
         let db = open_db(tmp.path());
-        snob_store::store::users::ensure(db.conn(), 42).unwrap();
-        snob_store::store::accounts::upsert(db.conn(), 42, true).unwrap();
+        snob_store::store::users::ensure(db.conn(), Pk::new(42)).unwrap();
+        snob_store::store::accounts::upsert(db.conn(), Pk::new(42), true).unwrap();
         for name in ["before", "after"] {
             snob_store::store::users::upsert(
                 db.conn(),
                 &snob_core::model::User {
-                    pk: 1,
+                    pk: Pk::new(1),
                     username: name.into(),
                     full_name: None,
                     is_private: None,
@@ -1278,7 +1289,7 @@ async fn a_session_with_no_stored_username_is_resolved_rather_than_waved_through
         client,
         Store::open(&paths).unwrap(),
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: None,
         },
     );
@@ -1303,7 +1314,7 @@ async fn a_session_with_no_stored_username_is_resolved_rather_than_waved_through
         .expect("the account is checked");
     assert_eq!(
         account,
-        (Some(42), Some(7), Some(3)),
+        (Some(Pk::new(42)), Some(7), Some(3)),
         "the account line has to carry what was really checked: {:?}",
         report.checked
     );

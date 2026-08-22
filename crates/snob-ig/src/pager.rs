@@ -730,7 +730,7 @@ mod tests {
 
     fn request<'a>() -> ListRequest<'a> {
         ListRequest {
-            pk: 42,
+            pk: Pk::new(42),
             username: "someone",
             direction: Direction::Followers,
             from: None,
@@ -762,12 +762,12 @@ mod tests {
     async fn walk(
         server: &MockServer,
         request: ListRequest<'_>,
-    ) -> (WalkSummary, Vec<Event>, Vec<u64>) {
+    ) -> (WalkSummary, Vec<Event>, Vec<Pk>) {
         let client = client(server);
         let walker = ListWalker::new(&client);
 
         let mut events = Vec::new();
-        let mut seen: Vec<u64> = Vec::new();
+        let mut seen: Vec<Pk> = Vec::new();
 
         let summary = walker
             .walk(
@@ -1391,6 +1391,6 @@ mod tests {
 
         let (summary, _, seen) = walk(&server, request()).await;
         assert_eq!(summary.users, 3);
-        assert_eq!(seen, vec![1, 2, 3]);
+        assert_eq!(seen, vec![Pk::new(1), Pk::new(2), Pk::new(3)]);
     }
 }

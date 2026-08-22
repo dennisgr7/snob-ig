@@ -3,6 +3,7 @@
 //! It is what decides how many requests each invocation costs, so it is checked
 //! by counting what reaches the mock server rather than by looking at output.
 
+use snob_core::Pk;
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
 use snob_ig::client::IgClient;
@@ -35,7 +36,7 @@ fn app(server: &MockServer, db: Store) -> App {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     )
@@ -476,7 +477,7 @@ async fn the_page_cap_leaves_the_list_marked_incomplete() {
     assert!(
         snob_store::store::snapshots::latest_complete(
             open_db(tmp.path()).conn(),
-            42,
+            Pk::new(42),
             ListKind::Followers
         )
         .unwrap()

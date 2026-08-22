@@ -1019,7 +1019,7 @@ mod tests {
             requests: 0,
             started_at: 1_000,
             taken_at: 1_100,
-            account_pk: 42,
+            account_pk: Pk::new(42),
             snapshot_id: 7,
             stopped_by: None,
             resumable: false,
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn a_run_whose_lists_all_came_back_short_does_not_exit_zero() {
         let report = WatchReport {
-            account_pk: 42,
+            account_pk: Pk::new(42),
             username: None,
             is_self: true,
             followers: None,
@@ -1119,7 +1119,7 @@ mod tests {
     fn a_challenge_keeps_its_own_code_through_a_tick() {
         let short = |said| TickReport {
             report: WatchReport {
-                account_pk: 42,
+                account_pk: Pk::new(42),
                 username: None,
                 is_self: true,
                 followers: None,

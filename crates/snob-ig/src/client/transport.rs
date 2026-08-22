@@ -384,6 +384,7 @@ impl IgClient {
 mod tests {
     use std::sync::Arc;
 
+    use snob_core::Pk;
     use snob_core::session::{Session, SessionOrigin};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -504,7 +505,7 @@ mod tests {
 
         let client = client(&server).await;
         let page = client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect("the chain ends in an answer");
         assert!(page.users.is_empty());
@@ -540,7 +541,7 @@ mod tests {
 
         let client = client(&server).await;
         let error = client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect_err("it must not follow that");
 
@@ -576,7 +577,7 @@ mod tests {
 
         let client = client(&server).await;
         let error = client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect_err("a loop is not an answer");
 
@@ -619,7 +620,7 @@ mod tests {
 
         let client = client(&server).await;
         client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect("the hop's own query is the one that travels");
     }
@@ -637,7 +638,7 @@ mod tests {
 
         let client = client(&server).await;
         let error = client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect_err("there is nowhere to go");
         assert!(
@@ -679,7 +680,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = client
-            .friendships_page(1, "someone", Direction::Followers, 50, None)
+            .friendships_page(Pk::new(1), "someone", Direction::Followers, 50, None)
             .await
             .expect_err("the run was canceled");
 

@@ -116,11 +116,12 @@ fn clean(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn users() -> Vec<User> {
         vec![
             User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one".into(),
                 full_name: Some("One Person".into()),
                 is_private: Some(false),
@@ -128,7 +129,7 @@ mod tests {
                 pfp_url: Some("https://example.test/a.jpg".into()),
             },
             User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two".into(),
                 full_name: None,
                 is_private: None,

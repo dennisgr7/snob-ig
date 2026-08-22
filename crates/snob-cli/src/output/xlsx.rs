@@ -17,6 +17,7 @@
 
 use anyhow::{Context, Result};
 use rust_xlsxwriter::{ExcelDateTime, Format, FormatAlign, Workbook, Worksheet};
+use snob_core::Pk;
 use snob_core::model::{User, printable};
 
 /// The column names. The same six frozen keys the csv uses.
@@ -98,9 +99,9 @@ fn rows_with_url_cap(users: &[User], cap: usize) -> Vec<[Cell; 6]> {
         .collect()
 }
 
-fn number(pk: u64) -> Cell {
-    if pk < MAX_EXACT_INTEGER {
-        Cell::Number(pk as f64)
+fn number(pk: Pk) -> Cell {
+    if pk.get() < MAX_EXACT_INTEGER {
+        Cell::Number(pk.get() as f64)
     } else {
         Cell::Text(pk.to_string())
     }
@@ -225,7 +226,7 @@ mod tests {
     fn users() -> Vec<User> {
         vec![
             User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one".into(),
                 full_name: Some("One Person".into()),
                 is_private: Some(false),
@@ -233,7 +234,7 @@ mod tests {
                 pfp_url: Some("https://example.test/a.jpg".into()),
             },
             User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two".into(),
                 full_name: None,
                 is_private: None,
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn a_name_that_would_break_the_file_is_filtered_before_it_is_written() {
         let rows = rows(&[User {
-            pk: 1,
+            pk: Pk::new(1),
             username: format!("one{esc}[2K", esc = '\x1b'),
             full_name: Some(format!("A{esc}[A Person", esc = '\x1b')),
             is_private: None,
@@ -299,7 +300,7 @@ mod tests {
     #[test]
     fn an_id_too_large_for_a_float_goes_in_as_text() {
         let user = User {
-            pk: (1 << 53) + 1,
+            pk: Pk::new((1 << 53) + 1),
             ..users()[0].clone()
         };
         assert_eq!(rows(&[user])[0][0], Cell::Text("9007199254740993".into()));

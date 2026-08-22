@@ -743,6 +743,7 @@ fn consent_question(name: &str, webhook: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn config(text: &str) -> WatchConfig {
         config::parse(text, std::path::Path::new("watch.toml")).unwrap()
@@ -802,7 +803,7 @@ evry = \"6h\"
         let account = |followers, following| Checked {
             what: What::Account {
                 target: None,
-                pk: Some(1),
+                pk: Some(Pk::new(1)),
                 followers,
                 following,
                 may_run_unattended: true,

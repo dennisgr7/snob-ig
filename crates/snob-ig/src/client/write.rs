@@ -424,7 +424,7 @@ mod tests {
 
         let status = writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap();
         assert!(status.following);
@@ -455,7 +455,7 @@ mod tests {
         let server = instagram_that_takes_a_write(FOLLOWED).await;
         writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap();
 
@@ -482,7 +482,7 @@ mod tests {
 
         let error = writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap_err();
         assert!(matches!(error, IgError::SessionExpired), "{error:?}");
@@ -504,7 +504,7 @@ mod tests {
             let server = instagram_that_takes_a_write(body).await;
             let status = writer(&server)
                 .await
-                .follow(7, "someone", &Known)
+                .follow(Pk::new(7), "someone", &Known)
                 .await
                 .unwrap();
             assert!(status.following, "{body}");
@@ -519,7 +519,7 @@ mod tests {
 
         let status = writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap();
         assert!(status.outgoing_request);
@@ -533,7 +533,7 @@ mod tests {
         let server = instagram_that_takes_a_write(FOLLOWED).await;
         writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap();
 
@@ -578,7 +578,7 @@ mod tests {
         // `client` builds a pasted session, which has no token.
         let error = client(&server)
             .await
-            .follow(7, "someone", &graphql::NoDocIds)
+            .follow(Pk::new(7), "someone", &graphql::NoDocIds)
             .await
             .unwrap_err();
         assert!(matches!(error, IgError::NoCsrfToken), "{error:?}");
@@ -606,7 +606,7 @@ mod tests {
 
         let error = writer(&server)
             .await
-            .unfollow(7, "someone", &Known)
+            .unfollow(Pk::new(7), "someone", &Known)
             .await
             .unwrap_err();
         assert!(
@@ -650,7 +650,10 @@ mod tests {
 
         let (client, budget) = watching_as(&server.uri(), true);
 
-        let error = client.follow(7, "someone", &Known).await.unwrap_err();
+        let error = client
+            .follow(Pk::new(7), "someone", &Known)
+            .await
+            .unwrap_err();
         assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
         assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
     }
@@ -684,7 +687,10 @@ mod tests {
 
         let (client, budget) = watching_as(&server.uri(), true);
 
-        let error = client.follow(7, "someone", &Known).await.unwrap_err();
+        let error = client
+            .follow(Pk::new(7), "someone", &Known)
+            .await
+            .unwrap_err();
         assert!(matches!(error, IgError::FeedbackRequired), "{error:?}");
         assert_eq!(budget.calls().len(), 1, "the cooldown was not written down");
     }
@@ -740,7 +746,10 @@ mod tests {
             .await;
 
         let (client, _) = watching_as(&server.uri(), true);
-        let error = client.follow(7, "someone", &Known).await.unwrap_err();
+        let error = client
+            .follow(Pk::new(7), "someone", &Known)
+            .await
+            .unwrap_err();
         assert!(matches!(error, IgError::RateLimited), "{error:?}");
     }
 }

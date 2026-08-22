@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use snob_core::Pk;
 use snob_core::budget::UnlimitedRateBudget;
 use snob_core::secret::Secret;
 use snob_core::session::{Session, SessionOrigin};
@@ -37,7 +38,7 @@ fn app(server: &MockServer, db: Store) -> App {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     )
@@ -346,13 +347,14 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let db = open_db(tmp.path());
     let app = app(&ig, db);
 
-    snob_store::store::users::ensure(app.db().conn(), 42).unwrap();
-    snob_store::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
+    snob_store::store::users::ensure(app.db().conn(), Pk::new(42)).unwrap();
+    snob_store::store::accounts::upsert(app.db().conn(), Pk::new(42), true).unwrap();
     // A moment the report is still young at. The queue refuses to hand back a
     // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
     // so a synthetic timestamp from 1970 would simply never be due.
     let queued_at = 1_000_000;
-    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, queued_at, None).unwrap();
+    let id =
+        deliveries::enqueue(app.db().conn(), "run-1", Pk::new(42), BODY, queued_at, None).unwrap();
 
     // First attempt: the receiver is down.
     let down = MockServer::start().await;

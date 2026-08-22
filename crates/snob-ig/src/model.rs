@@ -240,7 +240,7 @@ where
     }
 
     match Raw::deserialize(deserializer)? {
-        Raw::Number(n) => Ok(n),
+        Raw::Number(n) => Ok(Pk::new(n)),
         Raw::Text(s) => s.parse().map_err(D::Error::custom),
     }
 }
@@ -445,8 +445,8 @@ mod tests {
     fn the_id_is_accepted_as_a_number_or_as_text() {
         let as_text: UserSummary = serde_json::from_str(r#"{"pk":"123","username":"a"}"#).unwrap();
         let as_number: UserSummary = serde_json::from_str(r#"{"pk":123,"username":"a"}"#).unwrap();
-        assert_eq!(as_text.pk, 123);
-        assert_eq!(as_number.pk, 123);
+        assert_eq!(as_text.pk, Pk::new(123));
+        assert_eq!(as_number.pk, Pk::new(123));
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
         let json = r#"{"data":{"user":{"id":"42","username":"someone","edge_followed_by":{"count":1200},"edge_follow":{"count":340}}}}"#;
         let envelope: WebProfileInfoEnvelope = serde_json::from_str(json).unwrap();
         let u = envelope.data.user.unwrap();
-        assert_eq!(u.id, 42);
+        assert_eq!(u.id, Pk::new(42));
         assert_eq!(u.follower_count(), Some(1200));
         assert_eq!(u.following_count(), Some(340));
         assert_eq!(u.followed_by_viewer, None, "absent means unknown");
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn the_wire_model_converts_to_the_domain_one() {
         let wire = UserSummary {
-            pk: 7,
+            pk: Pk::new(7),
             username: "someone".into(),
             full_name: Some("Some One".into()),
             is_private: Some(false),
@@ -517,7 +517,7 @@ mod tests {
             profile_pic_url: Some("https://example/pic.jpg".into()),
         };
         let domain: snob_core::model::User = (&wire).into();
-        assert_eq!(domain.pk, 7);
+        assert_eq!(domain.pk, Pk::new(7));
         assert_eq!(domain.pfp_url.as_deref(), Some("https://example/pic.jpg"));
     }
 }

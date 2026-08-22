@@ -414,6 +414,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{Viewer, target_label};
+    use snob_core::Pk;
 
     /// The three copies of this rule all called `printable`, and none of them
     /// had anything watching that they did.
@@ -442,7 +443,7 @@ mod tests {
     #[test]
     fn a_viewer_label_does_not_carry_what_a_terminal_would_obey() {
         let viewer = Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some(format!("me{esc}[2K{esc}[A", esc = '\x1b')),
         };
 
@@ -455,7 +456,7 @@ mod tests {
     #[test]
     fn an_unnamed_viewer_is_still_nameable() {
         let viewer = Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: None,
         };
 

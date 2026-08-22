@@ -157,9 +157,9 @@ mod tests {
         rows.collect::<Result<_, _>>().unwrap()
     }
 
-    fn user(pk: Pk, name: &str) -> User {
+    fn user(pk: u64, name: &str) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: name.into(),
             full_name: Some("Full Name".into()),
             is_private: Some(false),
@@ -178,13 +178,16 @@ mod tests {
     fn a_run_that_does_not_know_the_name_never_overwrites_one() {
         let db = Store::in_memory().unwrap();
 
-        ensure(db.conn(), 7).unwrap();
+        ensure(db.conn(), Pk::new(7)).unwrap();
         upsert(db.conn(), &user(7, "realname")).unwrap();
-        ensure(db.conn(), 7).unwrap();
+        ensure(db.conn(), Pk::new(7)).unwrap();
 
-        assert_eq!(find(db.conn(), 7).unwrap().unwrap().username, "realname");
+        assert_eq!(
+            find(db.conn(), Pk::new(7)).unwrap().unwrap().username,
+            "realname"
+        );
         assert!(
-            previous_usernames(db.conn(), 7).is_empty(),
+            previous_usernames(db.conn(), Pk::new(7)).is_empty(),
             "nothing was renamed, so nothing may be filed as a rename"
         );
     }
@@ -194,10 +197,10 @@ mod tests {
     #[test]
     fn learning_a_name_for_the_first_time_is_not_a_rename() {
         let db = Store::in_memory().unwrap();
-        ensure(db.conn(), 7).unwrap();
+        ensure(db.conn(), Pk::new(7)).unwrap();
 
         assert_eq!(upsert(db.conn(), &user(7, "realname")).unwrap(), None);
-        assert!(previous_usernames(db.conn(), 7).is_empty());
+        assert!(previous_usernames(db.conn(), Pk::new(7)).is_empty());
 
         // A genuine rename still is one.
         assert_eq!(
@@ -211,8 +214,8 @@ mod tests {
     #[test]
     fn an_unnamed_account_cannot_be_looked_up_by_name() {
         let db = Store::in_memory().unwrap();
-        ensure(db.conn(), 7).unwrap();
-        crate::store::accounts::upsert(db.conn(), 7, true).unwrap();
+        ensure(db.conn(), Pk::new(7)).unwrap();
+        crate::store::accounts::upsert(db.conn(), Pk::new(7), true).unwrap();
 
         let found = crate::store::accounts::find_pk_by_username(db.conn(), "").unwrap();
         assert_eq!(found, None);
@@ -238,7 +241,7 @@ mod tests {
 
         let previous = upsert(db.conn(), &user(1, "new_name")).unwrap();
         assert_eq!(previous.as_deref(), Some("old_name"));
-        assert_eq!(previous_usernames(db.conn(), 1), vec!["old_name"]);
+        assert_eq!(previous_usernames(db.conn(), Pk::new(1)), vec!["old_name"]);
 
         let unchanged = upsert(db.conn(), &user(1, "new_name")).unwrap();
         assert_eq!(unchanged, None);
@@ -250,7 +253,7 @@ mod tests {
         upsert(db.conn(), &user(1, "one")).unwrap();
 
         let sparse = User {
-            pk: 1,
+            pk: Pk::new(1),
             username: "one".into(),
             full_name: None,
             is_private: None,
@@ -259,7 +262,7 @@ mod tests {
         };
         upsert(db.conn(), &sparse).unwrap();
 
-        let stored = find(db.conn(), 1).unwrap().unwrap();
+        let stored = find(db.conn(), Pk::new(1)).unwrap().unwrap();
         assert_eq!(stored.full_name.as_deref(), Some("Full Name"));
         assert_eq!(stored.is_verified, Some(false));
     }
@@ -287,6 +290,6 @@ mod tests {
     #[test]
     fn a_user_that_does_not_exist_returns_nothing() {
         let db = Store::in_memory().unwrap();
-        assert!(find(db.conn(), 999).unwrap().is_none());
+        assert!(find(db.conn(), Pk::new(999)).unwrap().is_none());
     }
 }

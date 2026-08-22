@@ -608,7 +608,11 @@ const DRAIN_LIMIT: usize = 10;
 /// for anything with arithmetic in it -- and here it is also what lets the
 /// uniqueness be tested without building a whole tick.
 pub(super) fn run_id(now: i64, account_pk: Pk) -> String {
-    format!("{}-{:08x}", now, fastrand::u32(..) ^ (account_pk as u32))
+    format!(
+        "{}-{:08x}",
+        now,
+        fastrand::u32(..) ^ (account_pk.get() as u32)
+    )
 }
 
 #[cfg(test)]
@@ -665,7 +669,7 @@ mod tests {
                     after: 2,
                 },
                 ListDiff {
-                    gained: vec![user(7, "newcomer")],
+                    gained: vec![user(Pk::new(7), "newcomer")],
                     lost: vec![],
                 },
                 Some(1_000),
@@ -696,13 +700,13 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1_000 {
             assert!(
-                seen.insert(run_id(1_700, 42)),
+                seen.insert(run_id(1_700, Pk::new(42))),
                 "the same second and the same account produced one id twice"
             );
         }
         // And two accounts in one second, which is one run of a monitor
         // watching more than one.
-        assert_ne!(run_id(1_700, 42), run_id(1_700, 43));
+        assert_ne!(run_id(1_700, Pk::new(42)), run_id(1_700, Pk::new(43)));
     }
 
     async fn accepting(server: &wiremock::MockServer) {
@@ -718,7 +722,7 @@ mod tests {
             deliveries::enqueue(
                 app.db().conn(),
                 &format!("run-{n}"),
-                42,
+                Pk::new(42),
                 r#"{"schema":1,"event":"watch.changes"}"#,
                 at,
                 Some(&delivery.destination),
@@ -809,7 +813,7 @@ mod tests {
         let id = deliveries::enqueue(
             app.db().conn(),
             "run-1",
-            42,
+            Pk::new(42),
             "{}",
             snob_core::clock::now(),
             Some(&delivery.destination),

@@ -245,6 +245,7 @@ fn proportion(part: usize, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
     use snob_core::model::StopReason;
 
     fn outcome(reason: StopReason) -> ListOutcome {
@@ -254,7 +255,7 @@ mod tests {
             requests: 1,
             started_at: 0,
             taken_at: 0,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use snob_core::Pk;
 use snob_core::budget::{RateBudget, RateBudgetError, UnlimitedRateBudget};
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
@@ -54,7 +55,7 @@ async fn mount_profile(server: &MockServer, user: &str) {
         .await;
 }
 
-async fn mount_list(server: &MockServer, pk: u64, how_many: u64) {
+async fn mount_list(server: &MockServer, pk: Pk, how_many: u64) {
     let users: Vec<String> = (0..how_many)
         .map(|i| format!(r#"{{"pk":{i},"username":"u{i}"}}"#))
         .collect();
@@ -83,7 +84,7 @@ async fn execute_with(
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -148,7 +149,7 @@ async fn during_a_cooldown_the_stored_list_is_served_without_requests() {
         r#"{"id":"42","username":"me","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
     )
     .await;
-    mount_list(&server, 42, 30).await;
+    mount_list(&server, Pk::new(42), 30).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -189,7 +190,7 @@ async fn an_old_snapshot_is_still_served_during_the_cooldown() {
         r#"{"id":"42","username":"me","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
     )
     .await;
-    mount_list(&server, 42, 30).await;
+    mount_list(&server, Pk::new(42), 30).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -263,7 +264,7 @@ async fn a_named_target_is_resolved_locally_and_case_insensitively() {
         r#"{"id":99,"username":"ghost","edge_followed_by":{"count":5},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&seed, 99, 5).await;
+    mount_list(&seed, Pk::new(99), 5).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -379,7 +380,7 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
         r#"{"id":99,"username":"ghost","edge_followed_by":{"count":5},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&seed, 99, 5).await;
+    mount_list(&seed, Pk::new(99), 5).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());

@@ -427,7 +427,7 @@ mod tests {
     use super::*;
     use crate::store::{Store, accounts, users};
 
-    const ME: Pk = 42;
+    const ME: Pk = Pk::new(42);
     /// The address these reports are addressed to.
     const HERE: &str = "https://receiver.example";
 

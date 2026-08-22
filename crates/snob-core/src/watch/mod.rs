@@ -50,9 +50,9 @@ mod tests {
     use crate::Pk;
     use crate::model::User;
 
-    fn user(pk: Pk) -> User {
+    fn user(pk: u64) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: format!("u{pk}"),
             full_name: None,
             is_private: None,
@@ -74,7 +74,7 @@ mod tests {
     fn a_rename_alone_still_counts_as_a_change() {
         let changes = Changes {
             renamed: vec![Rename {
-                pk: 7,
+                pk: Pk::new(7),
                 history_id: 7,
                 from: "before".into(),
                 to: "after".into(),

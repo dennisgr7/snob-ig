@@ -38,7 +38,7 @@ pub(in crate::commands::watch) fn report_with(
     renamed: Vec<Rename>,
 ) -> WatchReport {
     WatchReport {
-        account_pk: 42,
+        account_pk: Pk::new(42),
         username: Some("me".into()),
         is_self: true,
         followers,
@@ -77,14 +77,14 @@ pub(in crate::commands::watch) fn app_posting_to(
         .with_base_url(Url::parse(&server.uri()).unwrap());
 
     let db = snob_store::store::Store::in_memory().unwrap();
-    snob_store::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
-    snob_store::store::accounts::upsert(db.conn(), 42, true).unwrap();
+    snob_store::store::users::upsert(db.conn(), &user(Pk::new(42), "me")).unwrap();
+    snob_store::store::accounts::upsert(db.conn(), Pk::new(42), true).unwrap();
 
     let app = crate::app::App::for_test(
         client,
         db,
         crate::app::Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -117,12 +117,12 @@ pub(in crate::commands::watch) fn owed_long_ago(
     now: i64,
 ) -> i64 {
     let db = snob_store::store::Store::open(paths).unwrap();
-    snob_store::store::users::upsert(db.conn(), &user(42, "me")).unwrap();
-    snob_store::store::accounts::upsert(db.conn(), 42, true).unwrap();
+    snob_store::store::users::upsert(db.conn(), &user(Pk::new(42), "me")).unwrap();
+    snob_store::store::accounts::upsert(db.conn(), Pk::new(42), true).unwrap();
     deliveries::enqueue(
         db.conn(),
         "run-old",
-        42,
+        Pk::new(42),
         "{}",
         now - deliveries::MAX_AGE_SECS - 1,
         Some("https://receiver.example"),

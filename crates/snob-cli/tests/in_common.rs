@@ -5,6 +5,7 @@
 //! `following` list, with no request spent. A unit test over two vectors would
 //! prove the intersection and miss that entirely.
 
+use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::session::{Session, SessionOrigin};
 use snob_ig::client::IgClient;
@@ -19,11 +20,11 @@ use snob_cli::engine::people;
 mod common;
 use common::{SID, UA};
 
-const ME: u64 = 42;
+const ME: Pk = Pk::new(42);
 
 fn user(pk: u64, name: &str) -> User {
     User {
-        pk,
+        pk: Pk::new(pk),
         username: name.into(),
         full_name: None,
         is_private: None,
@@ -33,8 +34,12 @@ fn user(pk: u64, name: &str) -> User {
 }
 
 /// Stores a complete list for an account, the way a finished walk would.
-fn store_list(db: &mut Store, account: u64, kind: ListKind, members: &[User]) {
-    users::upsert(db.conn(), &user(account, &format!("account{account}"))).unwrap();
+fn store_list(db: &mut Store, account: Pk, kind: ListKind, members: &[User]) {
+    users::upsert(
+        db.conn(),
+        &user(account.get(), &format!("account{account}")),
+    )
+    .unwrap();
     accounts::upsert(db.conn(), account, account == ME).unwrap();
 
     let id = snapshots::begin(db.conn(), account, kind, Some(members.len() as u64))
@@ -46,8 +51,12 @@ fn store_list(db: &mut Store, account: u64, kind: ListKind, members: &[User]) {
 
 /// Stores a list and leaves it half-finished, which is what an interrupted
 /// walk produces.
-fn store_partial(db: &mut Store, account: u64, kind: ListKind, members: &[User]) {
-    users::upsert(db.conn(), &user(account, &format!("account{account}"))).unwrap();
+fn store_partial(db: &mut Store, account: Pk, kind: ListKind, members: &[User]) {
+    users::upsert(
+        db.conn(),
+        &user(account.get(), &format!("account{account}")),
+    )
+    .unwrap();
     accounts::upsert(db.conn(), account, account == ME).unwrap();
 
     let id = snapshots::begin(db.conn(), account, kind, Some(999))

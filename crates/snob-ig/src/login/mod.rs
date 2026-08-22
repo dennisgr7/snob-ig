@@ -179,7 +179,7 @@ mod tests {
     fn a_pasted_session_remembers_where_it_came_from() {
         let s = session_from_paste("42%3AAbCd%3A20", UA).unwrap();
         assert_eq!(s.origin, SessionOrigin::Paste);
-        assert_eq!(s.ds_user_id, 42);
+        assert_eq!(s.ds_user_id, Pk::new(42));
         assert!(s.validated_at.is_none());
     }
 
@@ -197,7 +197,7 @@ mod tests {
     fn a_browser_session_carries_every_cookie_it_was_given() {
         let s = session_from_cookies(&cookies(), UA).unwrap();
         assert_eq!(s.origin, SessionOrigin::Browser);
-        assert_eq!(s.ds_user_id, 42);
+        assert_eq!(s.ds_user_id, Pk::new(42));
         assert_eq!(s.csrftoken.as_ref().map(Secret::expose), Some("tok"));
         assert_eq!(
             s.cookie_header().as_str(),
@@ -227,7 +227,10 @@ mod tests {
             sessionid: "42%3AAbCd%3A20".into(),
             ..BrowserCookies::default()
         };
-        assert_eq!(session_from_cookies(&bare, UA).unwrap().ds_user_id, 42);
+        assert_eq!(
+            session_from_cookies(&bare, UA).unwrap().ds_user_id,
+            Pk::new(42)
+        );
     }
 
     #[test]

@@ -322,6 +322,8 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use snob_core::Pk;
+
     use super::*;
     use crate::client::harness::{
         FOLLOWED, Known, UA, client, instagram_that_takes_a_write, writer,
@@ -491,7 +493,7 @@ mod tests {
         let server = instagram_that_takes_a_write(FOLLOWED).await;
         writer(&server)
             .await
-            .follow(7, "someone", &Known)
+            .follow(Pk::new(7), "someone", &Known)
             .await
             .unwrap();
 

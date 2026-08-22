@@ -64,8 +64,14 @@ webpki-root-certs = "1"
 # every local user can read them. It costs nothing: the feature is a few
 # lines in clap_builder.
 clap = { version = "4", features = ["derive", "env"] }
-# No `fallible_uint` on purpose: without that feature `params![pk]` does not
-# compile for a u64, so the compiler forces everything through pk_to_sql.
+# No `fallible_uint` on purpose: without that feature no `u64` can be a
+# parameter or a column, so the compiler forces every one of them through a
+# named conversion rather than through a silent cast.
+# **An account id no longer depends on this**, and that is the stronger half:
+# `snob_core::Pk` is a newtype that implements neither `ToSql` nor `FromSql`,
+# so `params![pk]` does not compile whatever this feature says, and
+# `store::pk_to_sql` / `pk_from_sql` are the only road. The feature stays off
+# for everything else in the schema that is counted rather than identified.
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 fastrand = "2.5"

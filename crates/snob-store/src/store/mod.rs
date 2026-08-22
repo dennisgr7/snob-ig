@@ -81,17 +81,28 @@ pub use snob_core::clock::{now, now_ms};
 /// magnitude below the ceiling, so the round trip is exact for any value this
 /// tool will ever see.
 ///
-/// This is preferred over the `fallible_uint` feature because without it
-/// `params![pk]` simply does not compile: the discipline is enforced by the
-/// compiler rather than by code review.
+/// **These two functions are the only road, and nothing can be written that
+/// goes around them.** [`Pk`] implements neither `ToSql` nor `FromSql`, so
+/// `params![pk]` and `row.get::<_, Pk>(0)` do not compile at all: the
+/// discipline is the compiler's rather than code review's. It used to rest on
+/// leaving `rusqlite`'s `fallible_uint` feature off, which said the same thing
+/// about a bare `u64` — that is still true and still deliberate, for every
+/// other `u64` in the schema, and the manifest says so next to the dependency.
+///
+/// Implementing the two traits on [`Pk`] would be better still, because the
+/// bit-cast would live in one place instead of two functions that have to
+/// agree. It is not available: `snob-core` does **no I/O** and must not
+/// compile SQLite — that is what the crate split is for — and the orphan rule
+/// stops this crate writing an impl of `rusqlite`'s trait for a type it does
+/// not own. Two functions in one module is the closest reachable shape.
 #[inline]
 pub(crate) fn pk_to_sql(pk: Pk) -> i64 {
-    pk as i64
+    pk.get() as i64
 }
 
 #[inline]
 pub(crate) fn pk_from_sql(value: i64) -> Pk {
-    value as Pk
+    Pk::new(value as u64)
 }
 
 pub struct Store {
@@ -337,7 +348,8 @@ mod tests {
 
     #[test]
     fn an_id_survives_the_round_trip() {
-        for pk in [0, 1, 4_340_136_074, 71_234_567_890, i64::MAX as Pk] {
+        for n in [0, 1, 4_340_136_074, 71_234_567_890, i64::MAX as u64] {
+            let pk = Pk::new(n);
             assert_eq!(pk_from_sql(pk_to_sql(pk)), pk);
         }
     }

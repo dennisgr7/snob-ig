@@ -140,12 +140,13 @@ async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
     use snob_core::model::ListKind;
 
     fn snapshot(taken_at: i64, declared: Option<u64>) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             kind: ListKind::Followers,
             started_at: taken_at,
             taken_at: Some(taken_at),

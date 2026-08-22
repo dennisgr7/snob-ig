@@ -296,6 +296,8 @@ mod tests {
 
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "71234567890%3AAbCdEfGhIjKl%3A20%3AAYc123";
+    /// The account every `sessionid` in this module begins with.
+    const PK: Pk = Pk::new(71234567890);
 
     fn session() -> Session {
         Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap()
@@ -303,13 +305,13 @@ mod tests {
 
     #[test]
     fn the_account_id_is_taken_from_the_sessionid() {
-        assert_eq!(session().ds_user_id, 71234567890);
+        assert_eq!(session().ds_user_id, PK);
     }
 
     #[test]
     fn an_unescaped_colon_is_accepted() {
         let s = Session::from_sessionid("71234567890:AbCd:20", UA, SessionOrigin::Paste).unwrap();
-        assert_eq!(s.ds_user_id, 71234567890);
+        assert_eq!(s.ds_user_id, PK);
     }
 
     #[test]
@@ -322,7 +324,7 @@ mod tests {
         ] {
             let s = Session::from_sessionid(input, UA, SessionOrigin::Paste)
                 .unwrap_or_else(|e| panic!("\"{input}\" should be accepted, but failed: {e}"));
-            assert_eq!(s.ds_user_id, 71234567890);
+            assert_eq!(s.ds_user_id, PK);
             assert_eq!(s.sessionid.expose(), "71234567890%3AAbCd%3A20");
         }
     }
@@ -414,7 +416,7 @@ mod tests {
         let s = Session::from_sessionid(whole_row, UA, SessionOrigin::Paste).unwrap();
 
         assert_eq!(s.sessionid.expose(), "71234567890%3AAbCd%3A20");
-        assert_eq!(s.ds_user_id, 71234567890);
+        assert_eq!(s.ds_user_id, PK);
         assert!(!s.cookie_header().contains("csrftoken=abc123"));
     }
 

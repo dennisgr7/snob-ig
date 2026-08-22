@@ -171,10 +171,12 @@ impl Basis {
 mod tests {
     use super::*;
 
-    fn users(pks: &[Pk]) -> Vec<User> {
+    /// Plain numbers in, ids out: what these tests are about is which account
+    /// is in which list, not how one is spelled.
+    fn users(pks: &[u64]) -> Vec<User> {
         pks.iter()
             .map(|&pk| User {
-                pk,
+                pk: Pk::new(pk),
                 username: format!("u{pk}"),
                 full_name: None,
                 is_private: None,
@@ -184,8 +186,8 @@ mod tests {
             .collect()
     }
 
-    fn pks(us: &[User]) -> Vec<Pk> {
-        us.iter().map(|u| u.pk).collect()
+    fn pks(us: &[User]) -> Vec<u64> {
+        us.iter().map(|u| u.pk.get()).collect()
     }
 
     /// **A run that finishes holding an older capture reports nothing.**

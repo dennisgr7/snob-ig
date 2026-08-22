@@ -697,9 +697,9 @@ mod tests {
             .unwrap_or_else(|| panic!("no run recorded for {account_pk}"))
     }
 
-    fn user(pk: Pk, name: &str) -> User {
+    fn user(pk: u64, name: &str) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: name.into(),
             full_name: None,
             is_private: None,
@@ -733,17 +733,20 @@ mod tests {
     #[test]
     fn an_account_that_was_never_watched_has_no_mark() {
         let db = Store::in_memory().unwrap();
-        assert_eq!(mark(db.conn(), 7, ListKind::Followers).unwrap(), None);
+        assert_eq!(
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn a_mark_is_written_and_read_back() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(id),
                 compared_at: 1_700,
@@ -757,22 +760,25 @@ mod tests {
     #[test]
     fn the_two_lists_are_marked_apart() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
-        assert_eq!(mark(db.conn(), 7, ListKind::Following).unwrap(), None);
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
+        assert_eq!(
+            mark(db.conn(), Pk::new(7), ListKind::Following).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn marking_again_moves_the_mark_rather_than_failing() {
         let mut db = Store::in_memory().unwrap();
-        let first = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        let second = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let first = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        let second = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, first, 1_700).unwrap();
-        set_mark(db.conn(), 7, ListKind::Followers, second, 1_800).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, first, 1_700).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, second, 1_800).unwrap();
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
@@ -804,7 +810,7 @@ mod tests {
     fn the_run_retention_keeps_is_the_run_status_shows() {
         let db = Store::in_memory().unwrap();
         users::upsert(db.conn(), &user(7, "me")).unwrap();
-        accounts::upsert(db.conn(), 7, true).unwrap();
+        accounts::upsert(db.conn(), Pk::new(7), true).unwrap();
         let now = 2_000_000_000;
         let long_ago = now - KEEP_RUNS_FOR_SECS - 1;
 
@@ -814,7 +820,7 @@ mod tests {
             record_run(
                 db.conn(),
                 &Run {
-                    account_pk: 7,
+                    account_pk: Pk::new(7),
                     started_at: long_ago,
                     finished_at: Some(long_ago),
                     requests: 1,
@@ -883,11 +889,11 @@ mod tests {
         const THE_TEST_RUN: &str = "https://n8n.local/webhook-test/snob";
 
         let mut db = Store::in_memory().unwrap();
-        let capture = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let capture = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         commit_report(
             &mut db,
-            7,
+            Pk::new(7),
             &[(ListKind::Followers, capture)],
             1_700,
             None,
@@ -926,13 +932,13 @@ mod tests {
     #[test]
     fn a_quiet_run_moves_the_moment_without_moving_the_capture() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_800).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_800).unwrap();
 
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(id),
                 compared_at: 1_800,
@@ -954,14 +960,14 @@ mod tests {
     #[test]
     fn a_receipt_whose_capture_was_pruned_can_be_marked_again() {
         let mut db = Store::in_memory().unwrap();
-        let first = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        set_mark(db.conn(), 7, ListKind::Followers, first, 1_700).unwrap();
+        let first = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, first, 1_700).unwrap();
 
         db.conn()
             .execute("DELETE FROM snapshots WHERE id = ?1", params![first])
             .unwrap();
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers)
+            mark(db.conn(), Pk::new(7), ListKind::Followers)
                 .unwrap()
                 .unwrap()
                 .snapshot_id,
@@ -969,11 +975,11 @@ mod tests {
             "the fixture depends on the receipt outliving its capture"
         );
 
-        let second = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        set_mark(db.conn(), 7, ListKind::Followers, second, 1_800).unwrap();
+        let second = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, second, 1_800).unwrap();
 
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: Some(second),
                 compared_at: 1_800,
@@ -993,15 +999,15 @@ mod tests {
     #[test]
     fn pruning_the_marked_capture_leaves_the_receipt_behind() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        set_mark(db.conn(), 7, ListKind::Followers, id, 1_700).unwrap();
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, id, 1_700).unwrap();
 
         db.conn()
             .execute("DELETE FROM snapshots WHERE id = ?1", params![id])
             .unwrap();
 
         assert_eq!(
-            mark(db.conn(), 7, ListKind::Followers).unwrap(),
+            mark(db.conn(), Pk::new(7), ListKind::Followers).unwrap(),
             Some(Mark {
                 snapshot_id: None,
                 compared_at: 1_700,
@@ -1013,14 +1019,14 @@ mod tests {
     #[test]
     fn a_rename_inside_the_window_is_reported_with_both_names() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "before")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "before")]);
 
         // The walk that sees the new name is what files the history row.
         users::upsert(db.conn(), &user(1, "after")).unwrap();
 
         let found = renames_since(db.conn(), id, 0, head_now(db.conn())).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].pk, 1);
+        assert_eq!(found[0].pk, Pk::new(1));
         assert_eq!(found[0].from, "before");
         assert_eq!(found[0].to, "after");
     }
@@ -1033,7 +1039,7 @@ mod tests {
     #[test]
     fn a_rename_already_reported_is_not_reported_again() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "before")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "before")]);
         users::upsert(db.conn(), &user(1, "after")).unwrap();
 
         assert_eq!(
@@ -1066,7 +1072,7 @@ mod tests {
     #[test]
     fn a_rename_filed_after_the_head_was_read_waits_for_the_next_window() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "before"), user(2, "other")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "before"), user(2, "other")]);
 
         // What this run will report on, and the head it read before comparing.
         users::upsert(db.conn(), &user(1, "after")).unwrap();
@@ -1077,13 +1083,13 @@ mod tests {
 
         let found = renames_since(db.conn(), id, 0, head).unwrap();
         assert_eq!(found.len(), 1, "only what was inside the window: {found:?}");
-        assert_eq!(found[0].pk, 1);
+        assert_eq!(found[0].pk, Pk::new(1));
 
         // And the next run, starting where this one stopped, picks up the one
         // that arrived late rather than losing it.
         let next = renames_since(db.conn(), id, head, head_now(db.conn())).unwrap();
         assert_eq!(next.len(), 1);
-        assert_eq!(next[0].pk, 2);
+        assert_eq!(next[0].pk, Pk::new(2));
     }
 
     /// The newest run of each account outlives the retention window.
@@ -1101,14 +1107,14 @@ mod tests {
     #[test]
     fn the_last_run_of_an_account_is_never_pruned() {
         let mut db = Store::in_memory().unwrap();
-        let _ = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let _ = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let long_ago = 1_000;
         for started_at in [long_ago, long_ago + 1] {
             record_run(
                 db.conn(),
                 &Run {
-                    account_pk: 7,
+                    account_pk: Pk::new(7),
                     started_at,
                     finished_at: Some(started_at),
                     requests: 0,
@@ -1156,8 +1162,8 @@ mod tests {
     #[test]
     fn an_old_capture_nothing_needs_is_removed_with_its_members() {
         let mut db = Store::in_memory().unwrap();
-        let old = account_with_capture(&mut db, 7, &[user(1, "one")]);
-        let newer = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let old = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        let newer = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
         age(&db, old, KEEP_FOR_SECS + 1);
 
         assert_eq!(prune(db.conn(), crate::store::now()).unwrap().captures, 1);
@@ -1181,11 +1187,11 @@ mod tests {
     #[test]
     fn the_capture_a_mark_points_at_is_kept_however_old_it_is() {
         let mut db = Store::in_memory().unwrap();
-        let marked = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let marked = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
         // A newer one, so the marked capture is not kept merely for being last.
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        set_mark(db.conn(), 7, ListKind::Followers, marked, 1_000).unwrap();
+        set_mark(db.conn(), Pk::new(7), ListKind::Followers, marked, 1_000).unwrap();
         age(&db, marked, KEEP_FOR_SECS * 10);
 
         prune(db.conn(), crate::store::now()).unwrap();
@@ -1200,10 +1206,10 @@ mod tests {
     #[test]
     fn the_newest_capture_of_each_list_is_always_kept() {
         let mut db = Store::in_memory().unwrap();
-        let followers = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let followers = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        users::ensure(db.conn(), 7).unwrap();
-        let opened = snapshots::begin(db.conn(), 7, ListKind::Following, None).unwrap();
+        users::ensure(db.conn(), Pk::new(7)).unwrap();
+        let opened = snapshots::begin(db.conn(), Pk::new(7), ListKind::Following, None).unwrap();
         snapshots::save_page(&mut db, opened.id, &[user(2, "two")], None).unwrap();
         snapshots::close(
             db.conn(),
@@ -1234,9 +1240,9 @@ mod tests {
     #[test]
     fn an_unfinished_walk_is_left_alone() {
         let mut db = Store::in_memory().unwrap();
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
-        let partial = snapshots::begin(db.conn(), 7, ListKind::Followers, None)
+        let partial = snapshots::begin(db.conn(), Pk::new(7), ListKind::Followers, None)
             .unwrap()
             .id;
         snapshots::save_page(&mut db, partial, &[user(3, "three")], Some("cursor")).unwrap();
@@ -1259,7 +1265,7 @@ mod tests {
     #[test]
     fn a_report_still_waiting_is_never_pruned() {
         let mut db = Store::in_memory().unwrap();
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let now = crate::store::now();
         // A year, written out rather than taken from the constant it is meant
@@ -1270,9 +1276,11 @@ mod tests {
         // Owed, and young enough to still be news — the other half of the rule
         // is the test below.
         let owed =
-            crate::store::deliveries::enqueue(db.conn(), "owed", 7, "{}", now - 60, None).unwrap();
+            crate::store::deliveries::enqueue(db.conn(), "owed", Pk::new(7), "{}", now - 60, None)
+                .unwrap();
         let done =
-            crate::store::deliveries::enqueue(db.conn(), "done", 7, "{}", long_ago, None).unwrap();
+            crate::store::deliveries::enqueue(db.conn(), "done", Pk::new(7), "{}", long_ago, None)
+                .unwrap();
         crate::store::deliveries::delivered(db.conn(), done, 200, long_ago).unwrap();
 
         prune(db.conn(), now).unwrap();
@@ -1302,12 +1310,13 @@ mod tests {
     #[test]
     fn a_report_too_old_to_be_news_stops_being_owed() {
         let mut db = Store::in_memory().unwrap();
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let now = crate::store::now();
         let stale = now - crate::store::deliveries::MAX_AGE_SECS - 1;
         let id =
-            crate::store::deliveries::enqueue(db.conn(), "stale", 7, "{}", stale, None).unwrap();
+            crate::store::deliveries::enqueue(db.conn(), "stale", Pk::new(7), "{}", stale, None)
+                .unwrap();
         assert_eq!(crate::store::deliveries::pending(db.conn()).unwrap(), 1);
 
         prune(db.conn(), now).unwrap();
@@ -1332,14 +1341,14 @@ mod tests {
     #[test]
     fn the_run_log_does_not_grow_without_end() {
         let mut db = Store::in_memory().unwrap();
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         let now = crate::store::now();
         for age in [KEEP_RUNS_FOR_SECS + 1, 60] {
             record_run(
                 db.conn(),
                 &Run {
-                    account_pk: 7,
+                    account_pk: Pk::new(7),
                     started_at: now - age,
                     finished_at: Some(now - age),
                     requests: 1,
@@ -1358,7 +1367,7 @@ mod tests {
             .unwrap();
         assert_eq!(left, 1, "the old one goes and the recent one stays");
         assert_eq!(
-            one_of(&last_runs(db.conn()).unwrap(), 7).started_at,
+            one_of(&last_runs(db.conn()).unwrap(), Pk::new(7)).started_at,
             now - 60
         );
     }
@@ -1371,11 +1380,11 @@ mod tests {
     #[test]
     fn the_last_run_is_the_last_run_of_that_account() {
         let mut db = Store::in_memory().unwrap();
-        account_with_capture(&mut db, 7, &[user(1, "one")]);
-        account_with_capture(&mut db, 8, &[user(2, "two")]);
+        account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
+        account_with_capture(&mut db, Pk::new(8), &[user(2, "two")]);
 
         let now = crate::store::now();
-        for (pk, changes) in [(7u64, 5u32), (8, 0)] {
+        for (pk, changes) in [(Pk::new(7), 5u32), (Pk::new(8), 0)] {
             record_run(
                 db.conn(),
                 &Run {
@@ -1390,8 +1399,14 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(one_of(&last_runs(db.conn()).unwrap(), 7).changes, 5);
-        assert_eq!(one_of(&last_runs(db.conn()).unwrap(), 8).changes, 0);
+        assert_eq!(
+            one_of(&last_runs(db.conn()).unwrap(), Pk::new(7)).changes,
+            5
+        );
+        assert_eq!(
+            one_of(&last_runs(db.conn()).unwrap(), Pk::new(8)).changes,
+            0
+        );
     }
 
     /// `username_history` holds everybody this tool has ever seen. A diff about
@@ -1399,7 +1414,7 @@ mod tests {
     #[test]
     fn somebody_outside_the_capture_is_not_reported() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "one")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "one")]);
 
         users::upsert(db.conn(), &user(2, "stranger")).unwrap();
         users::upsert(db.conn(), &user(2, "stranger_renamed")).unwrap();
@@ -1417,7 +1432,7 @@ mod tests {
     #[test]
     fn two_renames_in_one_window_are_one_move_from_the_first_name() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "first")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "first")]);
 
         users::upsert(db.conn(), &user(1, "second")).unwrap();
         users::upsert(db.conn(), &user(1, "third")).unwrap();
@@ -1434,7 +1449,7 @@ mod tests {
     #[test]
     fn a_name_that_came_back_to_where_it_started_is_not_a_rename() {
         let mut db = Store::in_memory().unwrap();
-        let id = account_with_capture(&mut db, 7, &[user(1, "original")]);
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "original")]);
 
         users::upsert(db.conn(), &user(1, "briefly")).unwrap();
         users::upsert(db.conn(), &user(1, "original")).unwrap();

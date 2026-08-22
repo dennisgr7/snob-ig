@@ -14,6 +14,7 @@
 //! answer is passed in rather than asked for. That is what
 //! `engine::ask_consent_with` exists for.
 
+use snob_core::Pk;
 use snob_core::session::{Session, SessionOrigin};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
@@ -74,7 +75,7 @@ async fn ask_as(
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -214,7 +215,7 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
     // A list of theirs that was walked at some point, which is what `--cache`
     // is for reading back.
     let ghost = User {
-        pk: 7,
+        pk: Pk::new(7),
         username: "ghost".into(),
         full_name: None,
         is_private: None,
@@ -222,13 +223,13 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
         pfp_url: None,
     };
     users::upsert(db.conn(), &ghost).unwrap();
-    accounts::upsert(db.conn(), 7, false).unwrap();
-    let opened = snapshots::begin(db.conn(), 7, ListKind::Followers, Some(1)).unwrap();
+    accounts::upsert(db.conn(), Pk::new(7), false).unwrap();
+    let opened = snapshots::begin(db.conn(), Pk::new(7), ListKind::Followers, Some(1)).unwrap();
     snapshots::save_page(
         &mut db,
         opened.id,
         &[User {
-            pk: 8,
+            pk: Pk::new(8),
             username: "someone".into(),
             full_name: None,
             is_private: None,
@@ -248,7 +249,7 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -297,7 +298,7 @@ async fn an_answer_about_one_account_does_not_cover_another() {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );

@@ -905,6 +905,7 @@ pub fn jitter_sentence(jitter: std::time::Duration) -> Option<String> {
 mod tests {
     use super::*;
     use crate::engine::ListOutcome;
+    use snob_core::Pk;
 
     /// Every string this module draws goes through the name filter, and the
     /// paragraph breaks it lays out survive it.
@@ -935,7 +936,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, name)| User {
-                pk: i as u64 + 1,
+                pk: Pk::new(i as u64 + 1),
                 username: (*name).into(),
                 full_name: None,
                 is_private: None,
@@ -1063,7 +1064,7 @@ mod tests {
             requests: 1,
             started_at: 0,
             taken_at: 0,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by,
             resumable: false,

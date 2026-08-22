@@ -9,6 +9,7 @@
 //! client is built only because an `App` needs one; if any of this ever reached
 //! for it, the mock server it points at has nothing mounted and would say so.
 
+use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
 use snob_core::session::{Session, SessionOrigin};
 use snob_ig::client::IgClient;
@@ -23,11 +24,11 @@ use snob_cli::engine::watch;
 mod common;
 use common::{SID, UA};
 
-const ME: u64 = 42;
+const ME: Pk = Pk::new(42);
 
 fn user(pk: u64, name: &str) -> User {
     User {
-        pk,
+        pk: Pk::new(pk),
         username: name.into(),
         full_name: None,
         is_private: None,

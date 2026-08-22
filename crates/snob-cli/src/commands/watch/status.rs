@@ -713,6 +713,7 @@ pub(super) fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
     use snob_core::watch::RecordedOutcome;
 
     fn config(text: &str) -> WatchConfig {
@@ -899,7 +900,7 @@ target = \"someone\"
         snob_store::store::users::upsert(
             db.conn(),
             &snob_core::model::User {
-                pk: 7,
+                pk: Pk::new(7),
                 username: "friend".into(),
                 full_name: None,
                 is_private: None,
@@ -908,12 +909,12 @@ target = \"someone\"
             },
         )
         .unwrap();
-        snob_store::store::accounts::upsert(db.conn(), 7, false).unwrap();
+        snob_store::store::accounts::upsert(db.conn(), Pk::new(7), false).unwrap();
 
         let edited = config("schema = 1\nevery = \"6h\"\n\n[[account]]\ntarget = \"@friend\"\n");
         assert_eq!(
             watched_pks(&db, Some(&edited)).unwrap(),
-            Some(vec![7]),
+            Some(vec![Pk::new(7)]),
             "the file names @friend and the store knows friend; they are one account"
         );
     }
@@ -930,7 +931,7 @@ target = \"someone\"
     /// opposite of one.
     fn ran(outcome: ExitCode) -> watch_store::Run {
         watch_store::Run {
-            account_pk: 42,
+            account_pk: Pk::new(42),
             started_at: NOW - 60,
             finished_at: Some(NOW - 60),
             requests: 1,

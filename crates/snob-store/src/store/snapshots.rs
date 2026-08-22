@@ -610,9 +610,9 @@ mod tests {
     use super::*;
     use crate::store::{accounts, users};
 
-    fn user(pk: Pk) -> User {
+    fn user(pk: u64) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: format!("user{pk}"),
             full_name: None,
             is_private: None,
@@ -648,7 +648,9 @@ mod tests {
     #[test]
     fn asking_whether_a_walk_can_be_continued_answers_for_the_next_process() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], Some("next")).unwrap();
 
         // Claimed by this process, which is what `begin` and `save_page` leave
@@ -664,12 +666,12 @@ mod tests {
         );
 
         assert!(
-            !is_resumable(db.conn(), 1, ListKind::Followers).unwrap(),
+            !is_resumable(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
             "the next process will find this claim fresh and refuse it, so the advice \
              must not promise a continuation"
         );
         assert_eq!(
-            resumable(db.conn(), 1, ListKind::Followers)
+            resumable(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .map(|s| s.id),
             Some(id),
@@ -715,7 +717,7 @@ mod tests {
     fn base() -> Store {
         let db = Store::in_memory().unwrap();
         users::upsert(db.conn(), &user(1)).unwrap();
-        accounts::upsert(db.conn(), 1, true).unwrap();
+        accounts::upsert(db.conn(), Pk::new(1), true).unwrap();
         db
     }
 
@@ -743,14 +745,14 @@ mod tests {
     #[test]
     fn a_walk_another_process_is_working_on_is_left_alone() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
         claimed_by_somebody_else(&db, id, now());
 
         assert!(
-            resumable(db.conn(), 1, ListKind::Followers)
+            resumable(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_none(),
             "somebody else is walking this one"
@@ -762,13 +764,13 @@ mod tests {
     #[test]
     fn a_walk_abandoned_long_enough_is_adopted() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
         claimed_by_somebody_else(&db, id, now() - CLAIM_TTL_SECS - 1);
 
-        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+        let adopted = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .expect("whoever held it is gone");
         assert_eq!(adopted.id, id);
@@ -780,7 +782,7 @@ mod tests {
     #[test]
     fn resuming_takes_the_claim_in_the_same_breath() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
@@ -793,7 +795,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            resumable(db.conn(), 1, ListKind::Followers)
+            resumable(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_some()
         );
@@ -820,14 +822,14 @@ mod tests {
     #[test]
     fn asking_whether_a_walk_is_resumable_does_not_claim_it() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
         close(db.conn(), id, StopReason::Canceled).unwrap();
 
         assert!(
-            is_resumable(db.conn(), 1, ListKind::Followers).unwrap(),
+            is_resumable(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
             "the walk stopped with a cursor, inside the window"
         );
 
@@ -854,7 +856,7 @@ mod tests {
     #[test]
     fn a_claim_goes_stale_while_the_partial_is_still_worth_resuming() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
@@ -871,7 +873,7 @@ mod tests {
             .unwrap();
         claimed_by_somebody_else(&db, id, started + 30);
 
-        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+        let adopted = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .expect("the claim is stale and the partial is young");
         assert_eq!(adopted.id, id);
@@ -887,7 +889,7 @@ mod tests {
     #[test]
     fn a_page_for_a_walk_somebody_else_took_over_is_refused() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
@@ -919,7 +921,7 @@ mod tests {
     #[test]
     fn closing_a_walk_somebody_else_took_over_is_refused() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
@@ -965,14 +967,14 @@ mod tests {
         let mut db = base();
 
         // The partial worth resuming: it has a cursor.
-        let wanted = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let wanted = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, wanted, &[user(10)], Some("cursor")).unwrap();
 
         // And a newer row this process opened and walked away from without
         // closing, so it is claimed, incomplete and has no cursor at all.
-        let abandoned = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let abandoned = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
 
@@ -989,7 +991,7 @@ mod tests {
             .unwrap();
         assert!(abandoned > wanted, "the dead one has to be the newer row");
 
-        let adopted = resumable(db.conn(), 1, ListKind::Followers)
+        let adopted = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .expect("there is a partial with a cursor to continue");
         assert_eq!(
@@ -1013,7 +1015,7 @@ mod tests {
     fn a_capture_that_stopped_short_is_never_found_by_id() {
         let mut db = base();
 
-        let cut_short = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let cut_short = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, cut_short, &[user(10)], Some("cursor")).unwrap();
@@ -1024,14 +1026,14 @@ mod tests {
         );
 
         // The other half of the view: begun, never closed, so no `taken_at`.
-        let still_open = begin(db.conn(), 1, ListKind::Following, Some(10))
+        let still_open = begin(db.conn(), Pk::new(1), ListKind::Following, Some(10))
             .unwrap()
             .id;
         assert!(find_usable(db.conn(), still_open).unwrap().is_none());
 
         // And one it does answer for, so this cannot pass by refusing
         // everything.
-        let whole = begin(db.conn(), 1, ListKind::Following, Some(1))
+        let whole = begin(db.conn(), Pk::new(1), ListKind::Following, Some(1))
             .unwrap()
             .id;
         save_page(&mut db, whole, &[user(11)], None).unwrap();
@@ -1048,7 +1050,7 @@ mod tests {
     #[test]
     fn closing_a_finished_capture_again_cannot_unfinish_it() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, id, &[user(10)], None).unwrap();
@@ -1069,20 +1071,20 @@ mod tests {
     fn clearing_partials_spares_the_one_somebody_is_writing_to() {
         let mut db = base();
 
-        let live = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let live = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, live, &[user(10)], Some("cursor")).unwrap();
         claimed_by_somebody_else(&db, live, now());
 
-        let abandoned = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let abandoned = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         save_page(&mut db, abandoned, &[user(11)], Some("cursor")).unwrap();
         claimed_by_somebody_else(&db, abandoned, now() - CLAIM_TTL_SECS - 1);
 
         assert_eq!(
-            delete_partials(db.conn(), 1, ListKind::Followers).unwrap(),
+            delete_partials(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
             1
         );
 
@@ -1100,11 +1102,11 @@ mod tests {
     #[test]
     fn a_fresh_snapshot_is_not_complete() {
         let db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(10))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
             .unwrap()
             .id;
         assert!(
-            latest_complete(db.conn(), 1, ListKind::Followers)
+            latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_none()
         );
@@ -1114,7 +1116,7 @@ mod tests {
     #[test]
     fn saving_pages_accumulates_members_in_order() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, Some(4))
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(4))
             .unwrap()
             .id;
 
@@ -1124,7 +1126,7 @@ mod tests {
         let pks: Vec<_> = members(db.conn(), id)
             .unwrap()
             .into_iter()
-            .map(|u| u.pk)
+            .map(|u| u.pk.get())
             .collect();
         assert_eq!(pks, vec![10, 11, 12, 13]);
     }
@@ -1132,7 +1134,9 @@ mod tests {
     #[test]
     fn repeats_across_pages_are_not_counted_twice() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
 
         let first = save_page(&mut db, id, &[user(10), user(11)], Some("c")).unwrap();
         // Instagram repeats accounts across pages when the list shifts.
@@ -1150,7 +1154,9 @@ mod tests {
     #[test]
     fn repeats_do_not_disturb_the_order_of_what_follows() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
 
         save_page(&mut db, id, &[user(10), user(11)], Some("c1")).unwrap();
         // The first two come round again, with one genuinely new behind them.
@@ -1160,7 +1166,7 @@ mod tests {
         let pks: Vec<_> = members(db.conn(), id)
             .unwrap()
             .into_iter()
-            .map(|u| u.pk)
+            .map(|u| u.pk.get())
             .collect();
         assert_eq!(pks, vec![10, 11, 12, 13]);
     }
@@ -1168,10 +1174,12 @@ mod tests {
     #[test]
     fn saving_a_page_advances_the_cursor() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], Some("next")).unwrap();
 
-        let pending = resumable(db.conn(), 1, ListKind::Followers)
+        let pending = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .unwrap();
         assert_eq!(pending.id, id);
@@ -1193,12 +1201,14 @@ mod tests {
         let mut db = base();
         users::upsert(db.conn(), &user(10)).unwrap();
 
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         let mut renamed = user(10);
         renamed.username = "brand_new_name".into();
 
         let saved = save_page(&mut db, id, &[renamed], None).unwrap();
-        assert_eq!(saved.renamed, vec![(10, "user10".to_string())]);
+        assert_eq!(saved.renamed, vec![(Pk::new(10), "user10".to_string())]);
     }
 
     /// The most important rule of the store: a half-finished snapshot can never
@@ -1216,23 +1226,27 @@ mod tests {
             StopReason::SessionInvalid,
             StopReason::PageLimit,
         ] {
-            let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+            let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+                .unwrap()
+                .id;
             save_page(&mut db, id, &[user(10)], None).unwrap();
             close(db.conn(), id, reason).unwrap();
 
             assert!(
-                latest_complete(db.conn(), 1, ListKind::Followers)
+                latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
                     .unwrap()
                     .is_none(),
                 "a snapshot cut short by {reason:?} should not be usable"
             );
         }
 
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], None).unwrap();
         close(db.conn(), id, StopReason::Completed).unwrap();
         assert!(
-            latest_complete(db.conn(), 1, ListKind::Followers)
+            latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_some()
         );
@@ -1253,7 +1267,9 @@ mod tests {
 
         let mut ids = Vec::new();
         for _ in 0..2 {
-            let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+            let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+                .unwrap()
+                .id;
             save_page(&mut db, id, &[user(10)], None).unwrap();
             close(db.conn(), id, StopReason::Completed).unwrap();
             ids.push(id);
@@ -1273,7 +1289,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            latest_complete(db.conn(), 1, ListKind::Followers)
+            latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1287,7 +1303,9 @@ mod tests {
     fn every_stop_reason_is_accepted_by_the_schema() {
         let mut db = base();
         for reason in StopReason::ALL {
-            let id = begin(db.conn(), 1, ListKind::Following, None).unwrap().id;
+            let id = begin(db.conn(), Pk::new(1), ListKind::Following, None)
+                .unwrap()
+                .id;
             save_page(&mut db, id, &[user(10)], None).unwrap();
             close(db.conn(), id, reason)
                 .unwrap_or_else(|e| panic!("the schema rejected {reason:?}: {e}"));
@@ -1297,16 +1315,18 @@ mod tests {
     #[test]
     fn closing_cleanly_clears_the_pending_cursor() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], Some("leftover")).unwrap();
         close(db.conn(), id, StopReason::Completed).unwrap();
 
-        let snapshot = latest_complete(db.conn(), 1, ListKind::Followers)
+        let snapshot = latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.next_cursor, None);
         assert!(
-            resumable(db.conn(), 1, ListKind::Followers)
+            resumable(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_none()
         );
@@ -1315,11 +1335,13 @@ mod tests {
     #[test]
     fn an_interrupted_one_keeps_its_cursor_to_resume() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], Some("from_here")).unwrap();
         close(db.conn(), id, StopReason::Canceled).unwrap();
 
-        let pending = resumable(db.conn(), 1, ListKind::Followers)
+        let pending = resumable(db.conn(), Pk::new(1), ListKind::Followers)
             .unwrap()
             .unwrap();
         assert_eq!(pending.next_cursor.as_deref(), Some("from_here"));
@@ -1328,7 +1350,9 @@ mod tests {
     #[test]
     fn something_too_old_is_not_resumed() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10)], Some("stale")).unwrap();
 
         let long_ago = now() - RESUME_WINDOW_SECS - 1;
@@ -1340,7 +1364,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            resumable(db.conn(), 1, ListKind::Followers)
+            resumable(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_none()
         );
@@ -1349,12 +1373,14 @@ mod tests {
     #[test]
     fn the_two_lists_do_not_mix() {
         let mut db = base();
-        let followers = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let followers = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, followers, &[user(10)], None).unwrap();
         close(db.conn(), followers, StopReason::Completed).unwrap();
 
         assert!(
-            latest_complete(db.conn(), 1, ListKind::Following)
+            latest_complete(db.conn(), Pk::new(1), ListKind::Following)
                 .unwrap()
                 .is_none()
         );
@@ -1363,7 +1389,9 @@ mod tests {
     #[test]
     fn deleting_a_snapshot_deletes_its_members() {
         let mut db = base();
-        let id = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, id, &[user(10), user(11)], None).unwrap();
 
         db.conn()
@@ -1382,19 +1410,23 @@ mod tests {
     #[test]
     fn deleting_partials_spares_the_complete_ones() {
         let mut db = base();
-        let good = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let good = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, good, &[user(10)], None).unwrap();
         close(db.conn(), good, StopReason::Completed).unwrap();
 
-        let bad = begin(db.conn(), 1, ListKind::Followers, None).unwrap().id;
+        let bad = begin(db.conn(), Pk::new(1), ListKind::Followers, None)
+            .unwrap()
+            .id;
         save_page(&mut db, bad, &[user(11)], Some("c")).unwrap();
 
         assert_eq!(
-            delete_partials(db.conn(), 1, ListKind::Followers).unwrap(),
+            delete_partials(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
             1
         );
         assert!(
-            latest_complete(db.conn(), 1, ListKind::Followers)
+            latest_complete(db.conn(), Pk::new(1), ListKind::Followers)
                 .unwrap()
                 .is_some()
         );
