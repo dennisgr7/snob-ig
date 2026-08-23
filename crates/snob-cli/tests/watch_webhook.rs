@@ -325,6 +325,12 @@ async fn an_unreachable_address_is_a_temporary_failure() {
     // Dropping a `MockServer` and reusing its address would be the obvious way
     // to write this and is not reliable — the port can be taken again between
     // the drop and the request.
+    //
+    // On Windows this test takes about two seconds, and so does the preflight
+    // one below: Winsock retries the SYN after the RST before it reports
+    // WSAECONNREFUSED. That is per connection, not per port, so no other
+    // closed port is any faster — and the one spelling that would be is the
+    // freed `MockServer` address this comment says not to use. Accepted.
     let client = WebhookClient::new(Webhook {
         url: Url::parse("http://127.0.0.1:1/hook").unwrap(),
         headers: vec![],
