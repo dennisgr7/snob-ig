@@ -300,11 +300,6 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Refuses a database written by a pre-English build.
-///
-/// The schema version is 1 in both, so the migration runner would consider it
-/// up to date and every query would then fail with a cryptic SQL error. The
-/// missing view is the cheapest tell.
 /// Refuses a database written by a **newer** build, before the migration runner
 /// says so in its own words.
 ///
@@ -326,6 +321,11 @@ fn reject_newer_schema(conn: &Connection, path: &Path) -> Result<(), StoreError>
     Ok(())
 }
 
+/// Refuses a database written by a pre-English build.
+///
+/// The schema version is 1 in both, so the migration runner would consider it
+/// up to date and every query would then fail with a cryptic SQL error. The
+/// missing view is the cheapest tell.
 fn reject_outdated_schema(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {

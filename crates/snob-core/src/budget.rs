@@ -90,7 +90,6 @@ pub fn challenge_cooldown() -> Duration {
     CHALLENGE_COOLDOWN
 }
 
-/// Grants everything and records nothing.
 /// Grants everything and counts nothing. **Tests only**: using it against
 /// Instagram skips rate control entirely.
 #[doc(hidden)]

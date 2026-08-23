@@ -277,30 +277,6 @@ pub fn is_safe_to_remove(dir: &Path) -> bool {
     }
 }
 
-/// Creates the directory and restricts it to its owner.
-///
-/// **Both halves of that sentence are enforced now.** On Unix it chmods 0700,
-/// which it always did. On Windows it used to do nothing at all and rely on the
-/// ACL inherited from `%LOCALAPPDATA%` — and the comment here said so, which is
-/// the whole defect: on a machine whose profile ACL is not the default, nothing
-/// inherited limits anything, and the database is the entire follower history
-/// in the clear. `session.json` is DPAPI-sealed and was never the exposure;
-/// the database and the browser profile were.
-///
-/// So on Windows this writes a DACL of its own, with
-/// `PROTECTED_DACL_SECURITY_INFORMATION`, which is the flag that stops
-/// inheritance rather than merely adding to it. One access-allowed ACE, for the
-/// user this process is running as, and nothing else — the faithful reading of
-/// 0700. Administrators and `SYSTEM` are deliberately not listed: on Unix root
-/// is not in a 0700 mode either, and on Windows both hold the privileges that
-/// let them take ownership regardless, so naming them would widen the written
-/// rule without narrowing what anybody can actually reach.
-///
-/// **A failure is an error, not a warning**, for the same reason the Unix side
-/// has always been one: a directory this could not restrict is a directory
-/// holding the follower history where the check said it would not be, and a
-/// caller that is told "fine" cannot act on it. It gets its own variant so the
-/// sentence names what really went wrong instead of blaming the creation.
 /// Where a file that should not outlive the session goes.
 ///
 /// `$XDG_RUNTIME_DIR` when there is one, and [`std::env::temp_dir`] otherwise.
@@ -358,6 +334,30 @@ pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
     }
 }
 
+/// Creates the directory and restricts it to its owner.
+///
+/// **Both halves of that sentence are enforced now.** On Unix it chmods 0700,
+/// which it always did. On Windows it used to do nothing at all and rely on the
+/// ACL inherited from `%LOCALAPPDATA%` — and the comment here said so, which is
+/// the whole defect: on a machine whose profile ACL is not the default, nothing
+/// inherited limits anything, and the database is the entire follower history
+/// in the clear. `session.json` is DPAPI-sealed and was never the exposure;
+/// the database and the browser profile were.
+///
+/// So on Windows this writes a DACL of its own, with
+/// `PROTECTED_DACL_SECURITY_INFORMATION`, which is the flag that stops
+/// inheritance rather than merely adding to it. One access-allowed ACE, for the
+/// user this process is running as, and nothing else — the faithful reading of
+/// 0700. Administrators and `SYSTEM` are deliberately not listed: on Unix root
+/// is not in a 0700 mode either, and on Windows both hold the privileges that
+/// let them take ownership regardless, so naming them would widen the written
+/// rule without narrowing what anybody can actually reach.
+///
+/// **A failure is an error, not a warning**, for the same reason the Unix side
+/// has always been one: a directory this could not restrict is a directory
+/// holding the follower history where the check said it would not be, and a
+/// caller that is told "fine" cannot act on it. It gets its own variant so the
+/// sentence names what really went wrong instead of blaming the creation.
 pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
     std::fs::create_dir_all(dir).map_err(|source| PathError::Create {
         path: dir.to_path_buf(),

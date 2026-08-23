@@ -491,13 +491,6 @@ pub fn latest_complete(
     Ok(snapshot)
 }
 
-/// One usable snapshot by id.
-///
-/// From the view, like [`latest_complete`], so a caller holding the id of a
-/// walk that stopped short gets `None` rather than a capture with accounts
-/// missing from it. That is the difference between a monitor saying nothing and
-/// a monitor announcing two hundred departures that never happened, and it is
-/// held here rather than by whoever remembers to check `complete`.
 /// Whether anything has ever been captured of this list, finished or not.
 ///
 /// A deliberately weaker question than [`latest_complete`], and the difference
@@ -522,6 +515,13 @@ pub fn any_capture(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<
     Ok(found.is_some())
 }
 
+/// One usable snapshot by id.
+///
+/// From the view, like [`latest_complete`], so a caller holding the id of a
+/// walk that stopped short gets `None` rather than a capture with accounts
+/// missing from it. That is the difference between a monitor saying nothing and
+/// a monitor announcing two hundred departures that never happened, and it is
+/// held here rather than by whoever remembers to check `complete`.
 pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, StoreError> {
     let snapshot = conn
         .query_row(

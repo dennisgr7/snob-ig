@@ -170,9 +170,6 @@ pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     Ok(ExitCode::Ok)
 }
 
-/// Both lists have to be complete. The set commands only need the crossed-
-/// against list whole; here every one of the five counts leans on both lists,
-/// so a single missing account would bend the summary from partial to wrong.
 /// How this summary names the account it is about.
 ///
 /// Filtered on both paths, for the reason `target::label` gives about the one
@@ -195,6 +192,9 @@ fn summary_target(typed: Option<&str>, viewer: &crate::app::Viewer) -> String {
     }
 }
 
+/// Both lists have to be complete. The set commands only need the crossed-
+/// against list whole; here every one of the five counts leans on both lists,
+/// so a single missing account would bend the summary from partial to wrong.
 fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     if outcome.is_complete() {
         return Ok(());

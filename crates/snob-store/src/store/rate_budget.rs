@@ -120,7 +120,6 @@ const WRITE_EMISSION_MS: i64 = 900_000;
 const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 
 /// Slack before deciding the system clock has gone backwards.
-/// Slack before deciding the system clock has gone backwards.
 const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
