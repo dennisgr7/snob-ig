@@ -14,8 +14,8 @@ longer does the job it was there to do.
 
 `snob`, a terminal tool that tells you who does not follow you back on
 Instagram, and tracks changes to your followers and following over time. It also
-follows and unfollows one account at a time, and shows and downloads the stories
-an account has up. Single binary, no runtime. Windows and Linux on x86_64 and
+follows and unfollows one account at a time, shows an account's page the way
+Instagram does, and shows and downloads the stories an account has up. Single binary, no runtime. Windows and Linux on x86_64 and
 ARM64, macOS on Apple Silicon.
 
 It is a convenience tool for a person's own account, signed in as themselves.
@@ -262,7 +262,7 @@ of asking those three something:
                             │
                        commands::*
               orchestration and presentation only
-    lists · sets · scan · pfp · watch · login · logout · purge · whoami
+    lists · sets · scan · profile · pfp · stories · watch · login · logout · purge · whoami
                             │
               output::* · report::* · exit::*
 ```
@@ -702,6 +702,17 @@ Two judgment calls worth understanding before touching them:
   look like they would work, and why neither does, are written out at
   `store::watch::set_mark`, with a test for each.
 
+- **Highlights are not `stories`, and will be a command of their own.** A
+  story is what is up for a day; a highlight is what an account chose to keep,
+  for years, and a profile carries several of them with a title each. Folding
+  them into `snob stories` would need a flag to say which of the two is meant
+  and a second index to say which highlight, on a command whose `-d 2` means
+  "the second thing in the one list". The shape that reads is `snob highlights
+  someone` for the numbered tray, `snob highlights someone 2` for the items of
+  the second, and `-d`, `--all`, `-o`, `-i` on that exactly as `stories` has
+  them. `snob profile` lists the tray; downloading is the command that does
+  not exist yet. The client half is in and verified: `IgClient::highlights_tray`
+  and `IgClient::highlight`, which is `reels_media` asked with `highlight:<id>`.
 - **The story browser draws with `console` and reads keys with `crossterm`, and
   is not built on a terminal-UI framework.** Measured in August 2026 by building
   this tree twice: the browser as it stands is **+18,432 B and 0 new crates on
@@ -823,6 +834,58 @@ is what meeting Instagram taught, including the parts that are still open:
   - The list payload carries `pk`, `username` and `full_name` and **no
     friendship status**, which is why `friendships/show_many/` exists at all.
     See the settled note about it, and the batch size recorded there.
+- **The profile page was captured on 23 August 2026, across eleven accounts**,
+  driven by hand: public and private, followed and not, with and without
+  posts, with none to eighteen highlights, with nobody to thirty-three people
+  in common, and the viewer's own. 91 navigations, 758 API calls, 6 HTML
+  documents; the transcript carried a live session and was deleted once the
+  findings below were written down. What it settled:
+  - **The web client no longer calls `web_profile_info`.** The header comes
+    from `PolarisProfilePageContentQuery` on `/api/graphql`, a POST. The REST
+    endpoint still answers — verified with a counted request the same day —
+    and carries everything `snob profile` prints: `edge_followed_by`,
+    `edge_follow`, `edge_owner_to_timeline_media.count`, `biography`,
+    `external_url`, `follows_viewer`, `has_requested_viewer`,
+    `highlight_reel_count`, `category_name` (an empty string when there is
+    none), and `edge_mutual_followed_by` with the count and the **three**
+    names the page puts in its "Followed by" line. Nothing in it says whether
+    a story is up; that is GraphQL-only (`latest_reel_media`), so `profile`
+    spends the `reels_media` request to know.
+  - **`GET /api/v1/highlights/{pk}/highlights_tray/` answers on `www`** with
+    the whole tray in one page — eighteen highlights arrived in one, and
+    `has_next_page` was false on every account — carrying id, title,
+    `media_count`, `created_at`, `updated_timestamp` and a 150px cover. The
+    web client reaches the same data through
+    `PolarisProfileStoryHighlightsTrayContentQuery`, a POST, which this crate
+    does not take.
+  - **`reels_media` takes a prefixed id.** `highlight:<id>` returns the
+    highlight as a reel that `ReelItem` parses unchanged, with `expiring_at`
+    absent on every item; the browser itself uses the same endpoint with
+    `archiveDay:<id>` for the viewer's story archive.
+  - **`GET /api/v1/friendships/{pk}/mutual_followers/?page_size=12&max_id=N`**
+    is the "mutual" tab of the followers dialog: the accounts the viewer
+    follows that follow the account, twelve a page, the offset as the cursor,
+    the same user shape as a followers page and no cursor on the last page.
+    Thirty-three mutuals were three pages. A larger `page_size` has not been
+    sent. This is what `profile` names the whole list with, at
+    `count / 12` requests and nothing stored, where `engine::people::in_common`
+    needs the account's followers walked.
+  - **A private account the viewer does not follow** still answers the
+    profile with counters, bio and the mutual line, and answers the tray with
+    nothing. `profile` does not ask for the tray or the reel there, and says
+    they are not visible rather than that there are none.
+  - **The browser marks a highlight as seen through the very mutation it uses
+    for a story**, with `reelId: "highlight:<id>"` — 42 times in this session.
+    `no_seen.rs` already names it, and the prefix changes nothing: reading a
+    highlight through this crate registers nothing.
+  - **Two endpoints worth a command, not yet taken.**
+    `GET /api/v1/friendships/pending/` is the follow requests waiting for the
+    viewer's answer — 73 of them, one page, the followers shape — and
+    `GET /api/v1/archive/reel/day_shells/` is the viewer's own story archive
+    by day, each day a reel `reels_media` serves as `archiveDay:<id>`. Both
+    are GETs about the viewer's own account.
+  - The followers dialog asks `count=12` with `search_surface=follow_list_page`;
+    this tool's `count=50` is a settled decision above and was not revisited.
 - **Some accounts cannot be resolved at all, and it is Instagram's fault.**
   `web_profile_info` answers **400** for certain business accounts with
   `Asset asset://laser.provider/ig_business_category_subvertical has been
