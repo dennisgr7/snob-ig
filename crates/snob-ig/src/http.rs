@@ -149,7 +149,7 @@ pub fn builder(
     #[cfg(all(windows, target_arch = "aarch64"))]
     {
         let _ = extra;
-        return Ok(built);
+        Ok(built)
     }
 
     // Mozilla's list in full, then whatever the user named. `tls_certs_only`
@@ -380,7 +380,7 @@ mod tests {
     #[cfg(all(windows, target_arch = "aarch64"))]
     #[test]
     fn the_schannel_build_does_not_pretend_it_can_narrow() {
-        assert!(!CAN_NARROW);
+        const { assert!(!CAN_NARROW) };
     }
 
     /// A run cannot change what it trusts halfway through.
