@@ -204,9 +204,9 @@ image pins the compiler `rust-toolchain.toml` pins, so bump the two together.
 **The musl target is the container's own architecture** — `x86_64` on an Intel
 host, the same string the remote job uses, and `aarch64-unknown-linux-musl` on
 an ARM64 host, where the arm64 image's `musl-gcc` cannot compile for x86_64
-and a test binary of the other architecture could only run emulated. That
-second case is the only place the shipped ARM64 Linux binary's suite runs at
-all: the remote matrix tests x86_64 and builds aarch64. Measured on a
+and a test binary of the other architecture could only run emulated. The
+remote job picks its target the same way, so an x86_64 runner and an ARM64
+one each test the binary they ship. Measured on a
 Snapdragon X (8 cores): 167 s cold, 41 s warm, and the container peaks at
 5.4 GB with four build jobs — 9.4 GB with eight, for 30 s less. `run.sh` sets
 `CARGO_BUILD_JOBS` from the VM's memory, one job per 2 GB and never more than
@@ -229,9 +229,10 @@ redacted log still carries real names; the profile is Playwright's own
 temporary directory and goes with the browser. Delete `out/` once what it
 showed is written here: that is what was done with both August captures.
 
-CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
-targets. Three things there are deliberate, and all three are the same idea:
-what is tested has to be what ships. The Linux job installs a keyring daemon,
+CI runs fmt, clippy and the suite on Linux — x86_64 and ARM64, each against
+its own musl target — Windows and macOS, then builds five targets. Three
+things there are deliberate, and all three are the same idea: what is tested
+has to be what ships. The Linux jobs install a keyring daemon,
 because without one the secret store falls back to a file and the backend under
 test is not the one users get. **Every platform runs the `testing` feature as
 its own step, and clippy lints with `--all-features`**: `--workspace` alone
