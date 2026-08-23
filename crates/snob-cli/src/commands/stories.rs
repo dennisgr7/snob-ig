@@ -136,7 +136,7 @@ pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> R
 
     if let Some(selection) = args.action.selection() {
         return download_selected(
-            app.client(),
+            app.client_shared(),
             &stories,
             selection,
             args.action.output.as_deref(),
@@ -151,7 +151,7 @@ pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> R
 /// does not have -- before the first request, so `-d 3,9` against a tray of
 /// five downloads nothing rather than three stories and an error.
 async fn download_selected(
-    client: &IgClient,
+    client: std::sync::Arc<IgClient>,
     stories: &Stories,
     selection: crate::cli::DownloadSelection,
     destination: Option<&Path>,
@@ -169,9 +169,9 @@ async fn download_selected(
     // failure is the run's failure. Several go the way `--all` always went:
     // `-o` names a directory and the loop keeps going past one that fails.
     if let [number] = numbers[..] {
-        return download_one(client, stories, number, destination).await;
+        return download_one(&client, stories, number, destination).await;
     }
-    download_many(client, stories, &numbers, destination).await
+    download_many(client, stories, numbers, destination).await
 }
 
 /// The sentence for a number the tray does not have, shared by the single
@@ -549,42 +549,95 @@ fn already_saved(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// answers `Canceled` at once, so carrying on would count them all as
 /// failures and exit 1 for what the user did on purpose.
 async fn download_many(
-    client: &IgClient,
+    client: std::sync::Arc<IgClient>,
     stories: &Stories,
-    numbers: &[usize],
+    numbers: Vec<usize>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
     let dir = destination.unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
 
-    let mut failed = Vec::new();
-    for &number in numbers {
-        match save_story(client, stories, number, dir).await {
-            Ok(Saved::Now(path)) => ui::info(&format!("Saved {}", path.display())),
+    // Several in flight rather than one after another. The CDN is a different
+    // host with its own limits and is deliberately not paced (the reasoning
+    // is on `IgClient::download_capped`), the client to it carries nothing
+    // that names the account, and the connection is HTTP/2 -- so three
+    // stories share one TCP+TLS connection instead of each waiting its own
+    // round trip. Three is what a browser does when it opens a tray, and
+    // past it a home link is the limit, not the latency.
+    let stories = std::sync::Arc::new(stories.clone());
+    let dir = std::sync::Arc::new(dir.to_path_buf());
+    let slots = std::sync::Arc::new(Semaphore::new(STORY_DOWNLOADS_IN_FLIGHT));
+    let mut tasks = JoinSet::new();
+    for &number in &numbers {
+        let (client, stories, dir, slots) = (
+            std::sync::Arc::clone(&client),
+            std::sync::Arc::clone(&stories),
+            std::sync::Arc::clone(&dir),
+            std::sync::Arc::clone(&slots),
+        );
+        tasks.spawn(async move {
+            // A closed semaphore is impossible here -- nothing closes it --
+            // so the only way this fails is the runtime shutting down, and
+            // then there is nobody to report to.
+            let _slot = slots.acquire_owned().await.ok()?;
+            Some((number, save_story(&client, &stories, number, &dir).await))
+        });
+    }
+
+    let total = numbers.len();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        let Ok(Some((number, saved))) = joined else {
+            // A task that panicked or was aborted: the runtime is going
+            // down, or Ctrl+C already won below. Nothing to add.
+            continue;
+        };
+        match saved {
+            // Numbered, because they finish in whichever order the network
+            // decides and the listing's numbers are what the user reads.
+            Ok(Saved::Now(path)) => ui::info(&format!("Saved {number}: {}", path.display())),
             Ok(Saved::Already(path)) => {
-                ui::info(&format!("Already saved {}", path.display()));
+                ui::info(&format!("Already saved {number}: {}", path.display()));
             }
             Err(e) if was_canceled(&e) => {
+                // The token is shared, so every download still running has
+                // already answered `Canceled` or is about to; aborting only
+                // stops their reports from arriving after "stopped".
+                tasks.abort_all();
                 return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
             }
-            Err(e) => failed.push(format!("{number}: {e}")),
+            Err(e) => failed.push((number, e.to_string())),
         }
     }
 
     if failed.is_empty() {
         return Ok(ExitCode::Ok);
     }
+    failed.sort_by_key(|(number, _)| *number);
+    let lines: Vec<String> = failed
+        .iter()
+        .map(|(number, why)| format!("{number}: {why}"))
+        .collect();
     Err(ExitError::new(
         ExitCode::Error,
         format!(
             "{} of {} stories could not be downloaded:\n{}",
             failed.len(),
-            numbers.len(),
-            failed.join("\n")
+            total,
+            lines.join("\n")
         ),
     )
     .into())
 }
+
+/// How many stories download at once under `-d all` or a set.
+///
+/// See the comment in [`download_many`]. Not configurable: a flag would be a
+/// way to go faster, and this program's knobs only ever turn the other way.
+const STORY_DOWNLOADS_IN_FLIGHT: usize = 3;
 
 /// Whether a failed download was the user stopping it.
 fn was_canceled(e: &anyhow::Error) -> bool {

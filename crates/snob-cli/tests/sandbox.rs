@@ -1259,6 +1259,79 @@ async fn all_stories_land_in_the_directory_that_was_named() {
     );
 }
 
+/// Stories download several at a time, and the report still reads in the
+/// listing's order: one that the CDN refuses is named by its number among the
+/// ones that were saved, not by whichever finished first.
+#[tokio::test]
+async fn a_failed_story_is_reported_by_number_among_the_saved_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let base = instagram.uri();
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/feed/reels_media/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"reels_media":[{{"items":[
+                {{"pk":"1","media_type":1,"taken_at":1000,"expiring_at":99999999999,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/one.jpg","width":1080,"height":1920}}]}}}},
+                {{"pk":"2","media_type":1,"taken_at":2000,"expiring_at":99999999999,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/gone.jpg","width":1080,"height":1920}}]}}}},
+                {{"pk":"3","media_type":1,"taken_at":3000,"expiring_at":99999999999,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/three.jpg","width":1080,"height":1920}}]}}}}
+            ]}}]}}"#
+        )))
+        .mount(&instagram)
+        .await;
+    for name in ["/one.jpg", "/three.jpg"] {
+        Mock::given(method("GET"))
+            .and(url_path(name))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xe0 a picture".to_vec()),
+            )
+            .mount(&instagram)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(url_path("/gone.jpg"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&instagram)
+        .await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "-d", "all"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(here.join("me-1.jpg").is_file(), "{said}");
+    assert!(here.join("me-3.jpg").is_file(), "{said}");
+    assert!(!here.join("me-2.jpg").exists());
+    assert!(
+        !here.join("me-2.part").exists(),
+        "a refused download left its partial behind: {said}"
+    );
+    assert!(
+        said.contains("1 of 3 stories could not be downloaded"),
+        "{said}"
+    );
+    // Down a pipe the failure is the JSON shape, so the newline is escaped.
+    assert!(
+        said.contains("\\n2: ") || said.contains("\n2: "),
+        "the failure is named by number: {said}"
+    );
+    assert!(
+        said.contains("Saved 1: ") && said.contains("Saved 3: "),
+        "{said}"
+    );
+}
+
 /// The same sandbox login, with a CSRF token, which is what
 /// `snob login --browser` produces and what a write needs.
 fn log_in_writing(root: &Path, instagram: &MockServer) {

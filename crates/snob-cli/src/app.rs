@@ -155,7 +155,9 @@ pub enum ConsentInAdvance {
 }
 
 pub struct App {
-    client: IgClient,
+    /// Shared, for the one place that fans work out across tasks: the story
+    /// downloads. Everywhere else reads it through [`App::client`] as before.
+    client: Arc<IgClient>,
     db: Store,
     progress: Progress,
     consent_in_advance: ConsentInAdvance,
@@ -246,7 +248,7 @@ impl App {
         })?;
 
         Ok(Some(Self {
-            client: IgClient::new(session, pacer)?,
+            client: Arc::new(IgClient::new(session, pacer)?),
             db,
             progress,
             cancel,
@@ -272,7 +274,7 @@ impl App {
     pub fn for_test(client: IgClient, db: Store, viewer: Viewer) -> Self {
         let cancel = client.pacer().cancel_token().clone();
         Self {
-            client,
+            client: Arc::new(client),
             db,
             progress: Progress::new(false),
             cancel,
@@ -285,6 +287,16 @@ impl App {
 
     pub fn client(&self) -> &IgClient {
         &self.client
+    }
+
+    /// The client, to be held by a task.
+    ///
+    /// `JoinSet` wants `'static`, and `IgClient` is deliberately not `Clone`
+    /// -- it owns the pacer and the cancel token, and two of it would be two
+    /// budgets. One `Arc` is what lets several story downloads share the one
+    /// client and its one CDN connection pool; nothing else needs this.
+    pub fn client_shared(&self) -> Arc<IgClient> {
+        Arc::clone(&self.client)
     }
 
     /// The three pieces a walk needs at once: it reads through the client and
