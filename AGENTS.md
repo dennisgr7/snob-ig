@@ -1151,7 +1151,7 @@ against.
 | Binary, aarch64-pc-windows-msvc | 5,885,952 B |
 | Binary, x86_64-pc-windows-msvc | larger by roughly a third |
 | Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
-| `rust_xlsxwriter` + `zopfli` | ~498 KiB, 6.6%, for one of five output formats — behind the `xlsx` feature, on by default. Measured on x86_64 Windows, August 2026: **656,384 B, 9.3%**, and six crates, between the default build and `--no-default-features`, which is what the feature lets a source build leave out |
+| The `xlsx` feature (`rust_xlsxwriter` + `zip` + `zopfli`) | ~498 KiB, 6.6%, for one of five output formats — behind the `xlsx` feature, on by default. Measured on x86_64 Windows, August 2026: **656,384 B, 9.3%**, and six crates, between the default build and `--no-default-features`, which is what the feature lets a source build leave out. The row used to credit the whole figure to the writer alone; `cargo tree -i zopfli` says otherwise — zopfli arrives through `zip`'s `deflate` umbrella, which `rust_xlsxwriter` asks for on its own, so the number is the feature's, not one crate's |
 | Static CRT on Windows | +126,976 B per binary |
 | `tracing-subscriber`'s `env-filter`, replaced by `Targets` | **−327,680 B, 4.4%**, −3 crates (`matchers`, `regex-automata`, `regex-syntax`), measured on x86_64 Windows release either side of the change |
 | Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
@@ -1166,8 +1166,9 @@ down now. The last is not a build cost at all and dwarfs all of them, which is
 why `login` removes the profile when it is done with it.
 
 The three Unix targets have never been measured — nothing here cross-links
-them. Note that musl carries the Secret Service stack, some thirty crates a
-Windows build does not, so it is not comparable.
+them. Note that musl carries the Secret Service stack — 50 crates a Windows
+build does not have, counted with `cargo tree --target x86_64-unknown-linux-musl`
+in August 2026 — so it is not comparable.
 
 **The three terminal-interface rows are measured on `x86_64-pc-windows-msvc`**,
 not on ARM64 like the rest: they are deltas taken by building the same tree
@@ -1239,6 +1240,42 @@ left in a report nobody can find, and in the order they are worth doing.
   of them a 200. Until somebody has been refused, there is nothing here to
   implement, which is why it is parsed into nothing and kept as the string that
   was sent.
+
+- **Sending things to the user's own phone was investigated in August 2026 and
+  is not being built.** The question was whether `snob` could push a profile
+  link, or a file `pfp`/`stories` downloaded, from the PC to the phone. The
+  answer, documented so nobody re-derives it: **Quick Share on Windows has no
+  programmable surface at all** — no API, no CLI, no URI scheme, no published
+  protocol, and the open-source reimplementations are GPL-3.0, which a MIT
+  binary cannot embed. **AirDrop has a public API** (`NSSharingService`, usable
+  from an unsigned console binary) but covers one of five platforms. Nothing
+  gives a zero-touch push anyway: Android 10+ forbids launching activities from
+  the background, so every channel ends in a notification the user taps.
+
+  Two facts survive the investigation and are worth keeping. First, the deep
+  link to send is `https://www.instagram.com/<username>/`, never
+  `instagram://…`: Meta documents the https form as the universal link that
+  opens the app when installed and degrades to the web when not, and both
+  stores' association files confirm it; the `instagram://` schemes lost their
+  documentation in 2020 and survive only as community knowledge. Second, if
+  this is ever built, the cheap and uniform mechanism is a **QR code in the
+  terminal** holding that https link — the `qrcode` crate with default
+  features off has zero transitive dependencies — plus, for files, an
+  ephemeral HTTP server on the LAN whose URL goes in the QR (the pattern
+  `qrcp` proves). Force dark modules on a light ground with ANSI rather than
+  trusting the terminal theme, and keep the four-module quiet zone: inverted
+  QR codes are outside the spec and phone cameras do not owe them a read.
+
+- **If the `keyring-core` family stops being maintained, the exit is
+  per-platform, and Linux is the hard one.** The four crates on the credential
+  path are one maintainer's, post the 2026 split the root `Cargo.toml`
+  documents. The Windows half is `CredWriteW`/`CredReadW`/`CredDeleteW` —
+  about 150 lines against `windows-sys`, and this tree already calls Win32
+  directly in `pipe.rs` and `paths.rs`. The macOS half is comparable against
+  `Security.framework`. The Linux half is the Secret Service D-Bus protocol
+  with a Diffie-Hellman session, and is the reason the store crates exist;
+  it is not something to hand-write. This is a plan, not work: nothing is
+  wrong with the crates today.
 
 ## Known walls
 

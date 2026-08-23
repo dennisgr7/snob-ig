@@ -225,7 +225,7 @@ which `snob login --browser` picks up on its own. If you logged in by pasting,
 `snob login --paste --csrftoken <token>` is how to add it.
 
 Every list takes `--format json|ndjson|csv|xlsx|md` and `-o file`, filters like
-`--only private` or `--no-verified`, and `--limit`. Run `snob --help` for the
+`--only private` or `--hide verified`, and `--limit`. Run `snob --help` for the
 rest.
 
 A username can be written with or without a leading `@`. If you write it on
