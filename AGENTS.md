@@ -1175,6 +1175,8 @@ against.
 | Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
 | `dialoguer`, replaced by `ui::menu` on the browser's own pieces | **−12,288 B**, −2 crates (`dialoguer`, `shell-words`), measured on aarch64-pc-windows-msvc release either side of the change. The crate's one use was a two-to-three entry menu; the browser already read keys and drew a highlighted list |
 | `ratatui` + `crossterm` for the same browser | +106,496 B, 1.32%, +27 crates — rejected |
+| `clap` without its `color` feature | **−18,432 B**, 0.37%, −8 crates (`anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`, `colorchoice`, `utf8parse`, `is_terminal_polyfill`, `once_cell_polyfill`), measured on aarch64-pc-windows-msvc in August 2026, compiles with no code change — **kept**, because `snob --help` in color is a position and not an accident |
+| `zstd` out of `Accept-Encoding` | **−77,312 B**, 1.55%, −3 crates and −24.78 s of C compilation per cold build (`zstd-sys` is the one decoder that is not Rust), measured the same way — **kept**, because the header is Chrome's character for character and the project's whole wire posture is that it does not differ from a browser's where a server could see it |
 | `image` with only `jpeg`+`png`, the floor under any terminal image | +312,320 B, 3.9%, +17 crates — rejected |
 | Chromium profile after `snob login --browser` | 87.2 MB, 886 files |
 
@@ -1295,6 +1297,30 @@ left in a report nobody can find, and in the order they are worth doing.
   with a Diffie-Hellman session, and is the reason the store crates exist;
   it is not something to hand-write. This is a plan, not work: nothing is
   wrong with the crates today.
+
+- **Four dependency trades were measured in August 2026 and not taken, and
+  the numbers are in the table above so nobody re-measures them.** `clap`
+  without `color` and `zstd` out of the encoders are both real savings and
+  both rejected for a reason that is a position, not a cost: the help in
+  color, and an `Accept-Encoding` that is Chrome's character for character.
+  `rust_xlsxwriter` stays too: it is the fourth most expensive compilation
+  unit in the tree at 39 s, and an OOXML writer of our own would be about 450
+  lines with their own suite -- which is taking on ownership of a format,
+  not putting maintenance down. If the format ever goes, it goes whole
+  (`csv` opens in Excel); it does not get a hand-rolled writer.
+  And three that would not even be savings, with the sentence that closes
+  each: **the system's SQLite** -- every table here is `STRICT`, which needs
+  SQLite 3.37 (November 2021), which neither `winsqlite3.dll` nor a given
+  macOS promises, and musl links nothing from the system anyway, and two
+  builds of one tag against two engines are not reproducible. **Native TLS
+  on every platform** -- on musl that is a vendored OpenSSL, which is the
+  C crypto this project does not link, on macOS it is SecureTransport, which
+  Apple deprecated, and it loses `--strict-roots` on every target but the
+  one that cannot offer it. **`directories` by hand** -- four functions, each
+  a platform convention (`SHGetKnownFolderPath`, not `%APPDATA%`; XDG with
+  its fallbacks; `Application Support`), for the path a program that keeps
+  the session and the database derives everything from: a wrong answer does
+  not fail, it makes a second data directory and loses the history.
 
 ## Known walls
 
