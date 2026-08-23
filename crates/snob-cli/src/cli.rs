@@ -179,7 +179,16 @@ Exit codes:
   4   Instagram wants the account verified -- open the address it prints
   5   Instagram is throttling, or the account is in cooldown -- wait
   130 stopped by you: Ctrl+C, or a confirmation not given -- including with
-      no terminal to ask at, where -y confirms in advance";
+      no terminal to ask at, where -y confirms in advance
+
+Environment:
+  NO_COLOR          no styling, whatever the terminal supports
+  CLICOLOR_FORCE    styling even where stdout is not a terminal
+  FORCE_HYPERLINK   OSC 8 hyperlinks even where they were not detected
+  SNOB_LOG          what --verbose shows, as target=level pairs
+  SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
+                    the two secrets a command line would otherwise carry;
+                    see \"snob login --help\" and \"snob watch --help\"";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -1008,6 +1017,33 @@ mod tests {
         assert_eq!(args.filter.hide, vec![Attr::Verified]);
         assert_eq!(args.output.format, Some(Format::Json));
         assert!(args.walk.cache && args.walk.yes);
+    }
+
+    /// The environment variables the program answers to are announced in one
+    /// place, under the examples, where exit codes already live.
+    ///
+    /// Four of them used to be documented nowhere at all: three belong to the
+    /// crates behind the styling (`console`, `supports-hyperlinks`) and one to
+    /// `main::init_tracing`, so no flag's help ever mentioned them. This pins
+    /// the list. `SNOB_IGNORE_COOLDOWN` is deliberately absent -- its own
+    /// doc-comment in `rate_budget` says why it is not advertised -- and the
+    /// assertion holds that down too.
+    #[test]
+    fn the_environment_variables_are_announced_together() {
+        for name in [
+            "NO_COLOR",
+            "CLICOLOR_FORCE",
+            "FORCE_HYPERLINK",
+            "SNOB_LOG",
+            "SNOB_CSRFTOKEN",
+            "SNOB_SIGNING_KEY",
+        ] {
+            assert!(EXAMPLES.contains(name), "{name} is read but not announced");
+        }
+        assert!(
+            !EXAMPLES.contains("SNOB_IGNORE_COOLDOWN"),
+            "the escape hatch is deliberately not advertised"
+        );
     }
 
     /// Hidden from the help, still accepted: the first release documented it.
