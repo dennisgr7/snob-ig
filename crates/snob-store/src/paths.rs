@@ -404,12 +404,38 @@ pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
         let found = std::fs::symlink_metadata(dir).map_err(create)?;
         if found.is_dir() {
             std::fs::remove_dir_all(dir).map_err(create)?;
+        } else if is_link_to_a_directory(&found) {
+            // Windows keeps two kinds of link, and a link to a directory is
+            // removed with `RemoveDirectory`: `DeleteFile` answers
+            // `ERROR_ACCESS_DENIED` on it, which is how the planted-link test
+            // failed on every machine where the link could be made at all --
+            // Developer Mode, or the Administrator a CI runner is. Either way
+            // this takes the link and leaves what it pointed at alone.
+            std::fs::remove_dir(dir).map_err(create)?;
         } else {
             std::fs::remove_file(dir).map_err(create)?;
         }
         std::fs::create_dir(dir).map_err(create)?;
     }
     restrict_to_this_account(dir)
+}
+
+/// Whether a directory entry is a link whose target is a directory.
+///
+/// Only Windows tells the two kinds of link apart, and only there does it
+/// matter: a directory link is a directory to the call that removes it. On
+/// Unix every link is a file and `remove_file` takes it.
+fn is_link_to_a_directory(found: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        found.file_type().is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = found;
+        false
+    }
 }
 
 /// The half of [`create_private_dir`] that makes the directory private.

@@ -98,6 +98,10 @@ place is a regime rather than permission.
 - **`bash tools/ci/run.sh`** runs the Linux CI job — musl, a real keyring behind
   a session bus — in a container on the development machine, in under a minute
   once warm.
+- On Windows, a planted **directory link** under the stories scratch name is
+  now replaced rather than refused: removing one takes `RemoveDirectory`, and
+  `DeleteFile` answered "access denied" wherever the link could be made at all
+  — Developer Mode, or the Administrator a CI runner is.
 - Smaller: `@ alice` in an `--exclude-list` now matches; `watch diff --json`
   carries `schema` like its siblings; `snob stories -o out.xlsx` is refused
   rather than written as text under that name; a push-back on the login's
