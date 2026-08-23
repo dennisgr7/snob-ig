@@ -208,7 +208,10 @@ and a test binary of the other architecture could only run emulated. That
 second case is the only place the shipped ARM64 Linux binary's suite runs at
 all: the remote matrix tests x86_64 and builds aarch64. Measured on a
 Snapdragon X (8 cores): 167 s cold, 41 s warm, and the container peaks at
-5.4 GB with the default `CARGO_BUILD_JOBS=4` — 9.4 GB at 8 jobs, for 30 s less.
+5.4 GB with four build jobs — 9.4 GB with eight, for 30 s less. `run.sh` sets
+`CARGO_BUILD_JOBS` from the VM's memory, one job per 2 GB and never more than
+its CPUs, so the 8 GB default VM gets four and a 16 GB one gets all eight;
+`CARGO_BUILD_JOBS` in the environment still wins.
 The Windows and macOS jobs are not there because a container cannot run either;
 the host is the Windows job.
 
