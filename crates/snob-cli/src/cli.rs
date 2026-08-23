@@ -920,16 +920,6 @@ pub struct FollowArgs {
     pub consent: ConsentArgs,
 }
 
-/// Not reachable from the CLI yet; see the note in [`Command`].
-#[derive(Subcommand, Debug)]
-pub enum ImportCommand {
-    /// Import Instagram's "Download your information" archive
-    Dyi {
-        /// Path to the downloaded archive
-        path: PathBuf,
-    },
-}
-
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attr {
     Verified,

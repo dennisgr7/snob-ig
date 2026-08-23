@@ -26,7 +26,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::cli::{Format, ImportCommand};
+use clap::Subcommand;
+
+use crate::cli::Format;
 use crate::exit::ExitCode;
 use crate::output::{self, Rendered};
 use crate::ui;
@@ -40,6 +42,20 @@ use crate::ui;
 /// packs about a thousand to one, so a per-file cap leaves a one-megabyte
 /// archive able to ask for gigabytes.
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Not reachable from the CLI yet; see the note on [`crate::cli::Command`].
+///
+/// Defined here rather than in `cli.rs` on purpose: until it is wired up,
+/// `cli.rs` describes only what exists, and the enum lives next to the one
+/// function that takes it.
+#[derive(Subcommand, Debug)]
+pub enum ImportCommand {
+    /// Import Instagram's "Download your information" archive
+    Dyi {
+        /// Path to the downloaded archive
+        path: std::path::PathBuf,
+    },
+}
 
 pub fn run(command: ImportCommand) -> Result<ExitCode> {
     let ImportCommand::Dyi { path } = command;
