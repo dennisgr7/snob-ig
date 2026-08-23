@@ -426,15 +426,114 @@ async fn download_one(
         .and_then(|i| stories.items.get(i))
         .ok_or_else(|| no_such_story(stories, number))?;
 
-    let bytes = bytes_of(client, story).await?;
-    let extension = extension_of(&bytes);
-    let path = match destination {
-        Some(p) => p.to_path_buf(),
-        None => default_name(Path::new("."), &stories.username, number, extension)?,
-    };
-    write(&bytes, &path, destination.is_some())?;
-    ui::info(&format!("Saved {}", path.display()));
+    match destination {
+        // The user named it, so replacing what is there is their call -- and
+        // so is downloading it again. Held whole: a named destination may be
+        // anywhere, and this keeps the one-file contract exactly as it was.
+        Some(path) => {
+            let bytes = bytes_of(client, story).await?;
+            output::write_bytes(&bytes, Some(path))?;
+            ui::info(&format!("Saved {}", path.display()));
+        }
+        None => match save_story(client, stories, number, Path::new(".")).await? {
+            Saved::Now(path) => ui::info(&format!("Saved {}", path.display())),
+            Saved::Already(path) => ui::info(&format!("Already saved {}", path.display())),
+        },
+    }
     Ok(ExitCode::Ok)
+}
+
+/// What [`save_story`] found: the file it wrote, or the one already there.
+enum Saved {
+    Now(PathBuf),
+    Already(PathBuf),
+}
+
+/// Saves one story under the name the listing implies, to disk as it arrives.
+///
+/// **Nothing is fetched for a story already on disk.** The name depends on
+/// the extension and the extension is read from the bytes, so this used to
+/// download the whole story and only then discover, inside `default_name`,
+/// that the name was taken -- on a second `-d all` that was every story in
+/// the tray, fetched and thrown away. The four extensions `extension_of` can
+/// answer are tried first; a hit is "already saved" and costs nothing.
+///
+/// That look is an optimization in front of the atomic check, not a
+/// replacement for it: the write still goes through `output::create_new`,
+/// which refuses a name that appeared between the look and the open. The
+/// doc on `output::write_new` says why the creation has to be the check.
+///
+/// **The file is written to `<stem>.part` and renamed at the end.** The
+/// bytes stream to disk through `IgClient::download_to` -- the download used
+/// to sit in memory whole, then get copied once more for the write -- and a
+/// stream that stops halfway must not leave a truncated file under the real
+/// name, where the look above would take it for a finished one. A `.part` is
+/// removed on any failure here; one left by a killed process is removed the
+/// next time the same story is asked for.
+async fn save_story(
+    client: &IgClient,
+    stories: &Stories,
+    number: usize,
+    dir: &Path,
+) -> Result<Saved> {
+    let stem = format!("{}-{number}", printable(&stories.username));
+    if let Some(existing) = already_saved(dir, &stem) {
+        return Ok(Saved::Already(existing));
+    }
+
+    let story = &stories.items[number - 1];
+    let url = story
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("story {number} has no downloadable version"))?;
+
+    let part = dir.join(format!("{stem}.part"));
+    let _ = std::fs::remove_file(&part);
+    let mut file = output::create_new(&part)?;
+    let downloaded = match client.download_to(url, MAX_STORY_BYTES, &mut file).await {
+        Ok(downloaded) => downloaded,
+        Err(e) => {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            return Err(e.into());
+        }
+    };
+    file.sync_all()
+        .with_context(|| format!("could not finish writing {}", part.display()))?;
+    drop(file);
+
+    // `default_name` answers a bare name and checks the directory only for a
+    // collision; joined here, or `-o somewhere` made the directory and the
+    // file landed in the working directory.
+    let name = match default_name(
+        dir,
+        &stories.username,
+        number,
+        extension_of(&downloaded.head),
+    ) {
+        Ok(name) => name,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    let path = dir.join(name);
+    if let Err(e) = std::fs::rename(&part, &path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(
+            anyhow::Error::new(e).context(format!("could not move into place {}", path.display()))
+        );
+    }
+    Ok(Saved::Now(path))
+}
+
+/// The file a story with this stem was saved to earlier, if any extension
+/// `extension_of` can produce is already there.
+fn already_saved(dir: &Path, stem: &str) -> Option<PathBuf> {
+    ["mp4", "webp", "png", "jpg"]
+        .into_iter()
+        .map(|ext| dir.join(format!("{stem}.{ext}")))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Downloads all of them into a directory.
@@ -460,24 +559,11 @@ async fn download_many(
 
     let mut failed = Vec::new();
     for &number in numbers {
-        let story = &stories.items[number - 1];
-        let saved = async {
-            let bytes = bytes_of(client, story).await?;
-            // `default_name` answers a bare name and checks the directory
-            // only for a collision; joined here, or `-o somewhere` made the
-            // directory and the file landed in the working directory.
-            let path = dir.join(default_name(
-                dir,
-                &stories.username,
-                number,
-                extension_of(&bytes),
-            )?);
-            write(&bytes, &path, false)?;
-            Ok::<_, anyhow::Error>(path)
-        }
-        .await;
-        match saved {
-            Ok(path) => ui::info(&format!("Saved {}", path.display())),
+        match save_story(client, stories, number, dir).await {
+            Ok(Saved::Now(path)) => ui::info(&format!("Saved {}", path.display())),
+            Ok(Saved::Already(path)) => {
+                ui::info(&format!("Already saved {}", path.display()));
+            }
             Err(e) if was_canceled(&e) => {
                 return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
             }
@@ -539,21 +625,6 @@ pub(crate) fn default_name(
     extension: &str,
 ) -> Result<PathBuf> {
     output::default_path(dir, &format!("{}-{number}", printable(username)), extension)
-}
-
-/// Writes it, refusing to replace a file nobody named.
-///
-/// The same rule `pfp` follows: a path the user typed is theirs to overwrite,
-/// and a name this program invented is not — that name came off a server, and
-/// silently replacing a file because of what an account called its story is the
-/// kind of thing nobody finds out about until it matters.
-fn write(bytes: &[u8], path: &Path, named_by_user: bool) -> Result<()> {
-    let rendered = Rendered::Bytes(bytes.to_vec());
-    if named_by_user {
-        output::write_rendered(&rendered, Some(path))
-    } else {
-        output::write_new(&rendered, path)
-    }
 }
 
 #[cfg(test)]

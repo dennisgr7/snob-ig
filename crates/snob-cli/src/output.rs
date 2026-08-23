@@ -234,6 +234,33 @@ pub fn write(
     write_rendered(&render(users, format, presentation)?, destination)
 }
 
+/// [`write_rendered`] for bytes that are not a rendering.
+///
+/// A story is a file that arrived; wrapping it in `Rendered::Bytes` meant
+/// copying the whole thing once more -- up to the story ceiling -- to hand a
+/// borrowed slice to a writer that only ever reads one. `Rendered` stays for
+/// what is rendered.
+pub fn write_bytes(bytes: &[u8], destination: Option<&Path>) -> Result<()> {
+    match destination {
+        Some(path) => {
+            std::fs::write(path, bytes)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            ui::info(&format!("Written to {}", path.display()));
+            Ok(())
+        }
+        None => write_stdout(bytes),
+    }
+}
+
+/// [`write_new`] for bytes that are not a rendering; see [`write_bytes`].
+pub fn write_bytes_new(bytes: &[u8], path: &Path) -> Result<()> {
+    create_new(path)?
+        .write_all(bytes)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    ui::info(&format!("Written to {}", path.display()));
+    Ok(())
+}
+
 /// Writes to a name **this program chose**, refusing to touch anything that is
 /// already there.
 ///
@@ -281,34 +308,29 @@ pub fn create_new(path: &Path) -> Result<std::fs::File> {
 /// Writes an already-rendered result to the destination, with the same
 /// file-vs-stdout behavior every command shares.
 pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result<()> {
-    match destination {
-        Some(path) => {
-            std::fs::write(path, rendered.as_bytes())
-                .with_context(|| format!("could not write {}", path.display()))?;
-            // The path goes as plain text, not as a file:// link, which some
-            // terminals highlight but cannot open.
-            ui::info(&format!("Written to {}", path.display()));
-        }
-        None => {
-            let stdout = std::io::stdout();
-            let mut locked = stdout.lock();
-            // Not `.ok()` on either call. Standard output is line-buffered, so
-            // at this point the tail of the result is still in the buffer and
-            // the flush is where a full disk reports itself. Discarded, `snob
-            // pfp someone > face.jpg` on a full filesystem printed nothing,
-            // exited 0, and left a truncated JPEG behind.
-            //
-            // A closed reader is the one exception, and it is not a failure:
-            // `snob followers | head -20` is a reader that has finished, and on
-            // Windows there is no SIGPIPE to end the process the way it does on
-            // Unix. Reporting "could not write the result" and exiting non-zero
-            // there would make a normal shell idiom look like an error.
-            for step in [locked.write_all(rendered.as_bytes()), locked.flush()] {
-                match step {
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                    other => other.context("could not write the result")?,
-                }
-            }
+    write_bytes(rendered.as_bytes(), destination)
+}
+
+/// The result, on standard output, for a reader that may have left.
+///
+/// Not `.ok()` on either call. Standard output is line-buffered, so at this
+/// point the tail of the result is still in the buffer and the flush is where
+/// a full disk reports itself. Discarded, `snob pfp someone > face.jpg` on a
+/// full filesystem printed nothing, exited 0, and left a truncated JPEG
+/// behind.
+///
+/// A closed reader is the one exception, and it is not a failure: `snob
+/// followers | head -20` is a reader that has finished, and on Windows there
+/// is no SIGPIPE to end the process the way it does on Unix. Reporting "could
+/// not write the result" and exiting non-zero there would make a normal shell
+/// idiom look like an error.
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    for step in [locked.write_all(bytes), locked.flush()] {
+        match step {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => other.context("could not write the result")?,
         }
     }
     Ok(())

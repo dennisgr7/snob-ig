@@ -15,7 +15,7 @@ use url::Url;
 use crate::error::IgError;
 
 use super::IgClient;
-use super::transport::{MAX_HOPS, read_capped_bytes, same_origin};
+use super::transport::{MAX_HOPS, read_capped_bytes, same_origin, stream_capped};
 
 /// Ceiling on a downloaded asset. A profile picture tops out at 1080x1080 and
 /// lands far below this; the cap exists so that a redirect to something else
@@ -117,6 +117,62 @@ impl IgClient {
     /// [`IgClient::check_downloadable`] included: the URL still has to point
     /// at the CDN, and every redirect hop after it is held to the same rule.
     pub async fn download_capped(&self, url: &str, cap: usize) -> Result<Vec<u8>, IgError> {
+        let response = self.fetch_asset(url).await?;
+        // Raced against the token like the API read, for the same reason: a
+        // CDN that answers with headers and then stalls holds this process for
+        // as long as it likes.
+        tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            bytes = read_capped_bytes(response, cap as u64) => bytes,
+        }
+    }
+
+    /// [`IgClient::download_capped`], written to `sink` as it arrives rather
+    /// than held in memory first.
+    ///
+    /// For a story video. `download_capped` returns the whole body as a `Vec`,
+    /// and a command that then wrote it to disk had the file in memory once
+    /// for the download and -- until it stopped copying -- once more for the
+    /// write: eighty megabytes of resident memory for a forty-megabyte clip,
+    /// whose only destination was a file. This hands each chunk to the sink
+    /// and keeps nothing, so the peak is one chunk whatever the size.
+    ///
+    /// What comes back is [`Downloaded`]: the byte count and the first few
+    /// bytes, because the file's extension is decided from its magic number
+    /// and a caller that streamed everything to disk no longer has them.
+    ///
+    /// Everything else is the same as `download_capped` -- the CDN-only
+    /// redirect rule, the unpaced client, the browser's `Accept-Encoding`,
+    /// the ceiling, the race against Ctrl+C -- because it is the same fetch
+    /// with a different place to put the bytes. On any error the sink holds a
+    /// prefix of the file; whoever owns the file removes it.
+    pub async fn download_to(
+        &self,
+        url: &str,
+        cap: usize,
+        sink: &mut (impl std::io::Write + Send),
+    ) -> Result<Downloaded, IgError> {
+        let response = self.fetch_asset(url).await?;
+        let mut head = Head::default();
+        let mut tee = Tee {
+            head: &mut head,
+            sink,
+        };
+        let len = tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
+            n = stream_capped(response, cap as u64, &mut tee) => n,
+        }?;
+        Ok(Downloaded {
+            len,
+            head: head.bytes,
+        })
+    }
+
+    /// The GET behind both downloads: checked, unpaced, and refused on a
+    /// status the CDN's own terms explain.
+    async fn fetch_asset(&self, url: &str) -> Result<reqwest::Response, IgError> {
         let url = Url::parse(url)?;
         self.check_downloadable(&url)?;
         tracing::debug!(%url, "GET asset");
@@ -151,15 +207,49 @@ impl IgClient {
                 body: "the picture could not be downloaded".into(),
             });
         }
+        Ok(response)
+    }
+}
 
-        // Raced against the token like the API read, for the same reason: a
-        // CDN that answers with headers and then stalls holds this process for
-        // as long as it likes.
-        tokio::select! {
-            biased;
-            () = self.pacer.cancel_token().canceled() => Err(IgError::Canceled),
-            bytes = read_capped_bytes(response, cap as u64) => bytes,
+/// What a streamed download leaves the caller with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Downloaded {
+    /// Bytes written to the sink.
+    pub len: u64,
+    /// The first bytes of the file, up to [`HEAD_BYTES`]: enough for the magic
+    /// number that decides the extension, retained because the rest went
+    /// straight to disk.
+    pub head: Vec<u8>,
+}
+
+/// How many leading bytes [`Downloaded::head`] keeps. Twelve is what the
+/// WebP check needs (`RIFF....WEBP`); sixteen leaves room.
+pub const HEAD_BYTES: usize = 16;
+
+#[derive(Default)]
+struct Head {
+    bytes: Vec<u8>,
+}
+
+/// Copies the first [`HEAD_BYTES`] aside and forwards everything to the sink.
+struct Tee<'a, W: std::io::Write> {
+    head: &'a mut Head,
+    sink: &'a mut W,
+}
+
+impl<W: std::io::Write> std::io::Write for Tee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = HEAD_BYTES.saturating_sub(self.head.bytes.len());
+        if room > 0 {
+            self.head
+                .bytes
+                .extend_from_slice(&buf[..buf.len().min(room)]);
         }
+        self.sink.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
     }
 }
 
@@ -221,6 +311,43 @@ mod tests {
         assert!(matches!(error, IgError::Unexpected { status: 403, .. }));
     }
 
+    /// The streamed download leaves the caller the two things it still needs
+    /// after the bytes have gone to disk: how many there were, and the magic
+    /// number -- the whole file, when the file is shorter than the head.
+    #[tokio::test]
+    async fn a_streamed_download_keeps_its_head_and_its_length() {
+        let server = MockServer::start().await;
+        let body: Vec<u8> = (0..40u8).collect();
+        Mock::given(method("GET"))
+            .and(path("/clip.mp4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/clip.mp4", server.uri());
+        let client = client(&server).await;
+        let mut sink = Vec::new();
+        let got = client.download_to(&url, 64, &mut sink).await.unwrap();
+
+        assert_eq!(sink, body, "every byte reached the sink, in order");
+        assert_eq!(got.len, 40);
+        assert_eq!(got.head, body[..HEAD_BYTES].to_vec());
+
+        // Shorter than the head: the head is the whole thing.
+        Mock::given(method("GET"))
+            .and(path("/tiny"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+        let mut sink = Vec::new();
+        let got = client
+            .download_to(&format!("{}/tiny", server.uri()), 64, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(got.head, vec![1, 2, 3]);
+        assert_eq!(got.len, 3);
+    }
+
     /// Something that is not a picture must not be read until memory runs out.
     #[tokio::test]
     async fn a_download_past_the_ceiling_is_refused() {
@@ -235,6 +362,19 @@ mod tests {
 
         let error = client.download_capped(&url, 8).await.unwrap_err();
         assert!(matches!(error, IgError::TooLarge { limit: 8 }));
+
+        // The streaming twin meets the same ceiling in the same loop, and the
+        // sink holds what arrived before it -- a prefix, never the whole
+        // body -- which is what lets a caller writing to disk remove the
+        // file rather than keep a truncated one.
+        let mut sink = Vec::new();
+        let error = client.download_to(&url, 8, &mut sink).await.unwrap_err();
+        assert!(matches!(error, IgError::TooLarge { limit: 8 }));
+        assert!(
+            sink.len() < 64,
+            "the whole body reached the sink: {}",
+            sink.len()
+        );
 
         // The same body under a ceiling that fits arrives whole.
         assert_eq!(client.download_capped(&url, 64).await.unwrap().len(), 64);

@@ -86,7 +86,7 @@ pub(super) fn build_client(
 pub(super) async fn read_capped(response: reqwest::Response, cap: u64) -> Result<String, IgError> {
     // Lossy rather than strict: a body that is not valid UTF-8 is not JSON
     // either, and saying "could not parse" is more use than "invalid encoding".
-    Ok(String::from_utf8_lossy(&read_capped_bytes(response, cap).await?).into_owned())
+    Ok(utf8_or_lossy(read_capped_bytes(response, cap).await?))
 }
 
 /// The ceiling itself: refuse a declared length over it, and read in chunks so
@@ -102,9 +102,40 @@ pub(super) async fn read_capped(response: reqwest::Response, cap: u64) -> Result
 /// `http::read_capped` stays where it is. Its doc names why it truncates rather
 /// than refusing, which is a different rule for a different reader.
 pub(super) async fn read_capped_bytes(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     cap: u64,
 ) -> Result<Vec<u8>, IgError> {
+    // Sized from the declaration when there is one, which in practice means
+    // the CDN: tower-http drops `Content-Length` when it decompresses, and
+    // every API answer is compressed, so an API body grows by doubling and a
+    // picture arrives into a buffer of the right size. Capped by the ceiling
+    // so a lying header cannot reserve more than this would ever accept.
+    let mut bytes: Vec<u8> = Vec::with_capacity(
+        response
+            .content_length()
+            .map_or(0, |declared| declared.min(cap) as usize),
+    );
+    stream_capped(response, cap, &mut bytes).await?;
+    Ok(bytes)
+}
+
+/// The body, chunk by chunk, into whatever the caller hands over -- a `Vec`
+/// for the API and a file for a story -- refusing past `cap`.
+///
+/// **The one copy of the chunked read.** The in-memory reader above is this
+/// over a `Vec`, and the story download is this over a file on disk, so the
+/// ceiling is counted in one loop whichever way the bytes are going. The
+/// declared-length check in front of it only ever fires on an uncompressed
+/// answer (see `read_capped_bytes` for why that means the CDN); the running
+/// count is the barrier every answer meets.
+///
+/// Returns how many bytes were written. On `TooLarge` the sink holds what
+/// arrived before the ceiling; a caller writing to disk removes the file.
+pub(super) async fn stream_capped(
+    mut response: reqwest::Response,
+    cap: u64,
+    sink: &mut (impl std::io::Write + Send),
+) -> Result<u64, IgError> {
     let too_large = || IgError::TooLarge {
         limit: cap as usize,
     };
@@ -115,14 +146,27 @@ pub(super) async fn read_capped_bytes(
         return Err(too_large());
     }
 
-    let mut bytes: Vec<u8> = Vec::new();
+    let mut written: u64 = 0;
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len() as u64 + chunk.len() as u64 > cap {
+        if written + chunk.len() as u64 > cap {
             return Err(too_large());
         }
-        bytes.extend_from_slice(&chunk);
+        sink.write_all(&chunk)
+            .map_err(|e| IgError::Decode(format!("could not write the download: {e}")))?;
+        written += chunk.len() as u64;
     }
-    Ok(bytes)
+    Ok(written)
+}
+
+/// A body as text, copied only when it has to be.
+///
+/// `String::from_utf8_lossy(..).into_owned()` copies the whole body even when
+/// it is valid UTF-8 -- which every answer here is -- because the borrowed
+/// `Cow` has to be owned. `from_utf8` moves the buffer instead, and the lossy
+/// path is kept for the byte sequence that is not text, with the same
+/// replacement characters it always produced.
+fn utf8_or_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// The load headers, if Instagram volunteered any, as one string to log.

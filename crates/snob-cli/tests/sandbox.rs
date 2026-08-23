@@ -1117,19 +1117,83 @@ async fn a_story_is_downloaded_under_the_name_the_listing_implies() {
         b"\xff\xd8\xff\xe0 a picture"
     );
 
-    // A second download of the same story is refused rather than replacing
-    // the file: the name was invented here, not typed.
+    // A second download of the same story neither replaces the file -- the
+    // name was invented here, not typed -- nor fetches it: the look at the
+    // directory comes before the request, so the CDN sees nothing.
+    let fetched_before = instagram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/big.jpg")
+        .count();
     let again = snob_from(
         &here,
         tmp.path(),
         &instagram,
         &["stories", "me", "--download", "1"],
     );
-    assert!(!again.status.success(), "{}", stdout(&again));
     assert!(
-        stderr(&again).contains("already exists"),
+        again.status.success(),
+        "{}{}",
+        stdout(&again),
+        stderr(&again)
+    );
+    assert!(
+        stderr(&again).contains("Already saved"),
         "{}",
         stderr(&again)
+    );
+    let fetched_after = instagram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/big.jpg")
+        .count();
+    assert_eq!(
+        fetched_before, fetched_after,
+        "the story was fetched again for a file already on disk"
+    );
+    assert_eq!(
+        std::fs::read(here.join("me-1.jpg")).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture",
+        "the file on disk was left alone"
+    );
+}
+
+/// A download that stopped halfway leaves a `.part`, never a truncated file
+/// under the real name -- which the look-before-fetch above would otherwise
+/// take for a finished one. The next ask for the same story replaces it.
+#[tokio::test]
+async fn a_leftover_part_file_is_replaced_and_never_taken_for_the_story() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+    std::fs::write(here.join("me-1.part"), b"half of").unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "--download", "1"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !here.join("me-1.part").exists(),
+        "the leftover was not cleaned up"
+    );
+    assert_eq!(
+        std::fs::read(here.join("me-1.jpg")).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+    assert!(
+        stderr(&out).contains("Saved ") && !stderr(&out).contains("Already"),
+        "{}",
+        stderr(&out)
     );
 }
 
@@ -1158,23 +1222,40 @@ async fn all_stories_land_in_the_directory_that_was_named() {
         "a story leaked into the working directory"
     );
 
-    // Run again into the same directory: both names are taken, both are
-    // reported, and the second is still attempted after the first failed.
+    // Run again into the same directory: both are already there, both are
+    // said to be, nothing is fetched, and the run is a success -- a second
+    // `-d all` is the ordinary way of asking "anything new?", and it used to
+    // download the whole tray again only to refuse every name.
+    let fetched_before = instagram.received_requests().await.unwrap().len();
     let again = snob_from(
         &here,
         tmp.path(),
         &instagram,
         &["stories", "me", "--all", "-o", "saved"],
     );
-    assert!(!again.status.success());
+    assert!(again.status.success(), "{}", stderr(&again));
     let said = stderr(&again);
+    assert_eq!(
+        said.matches("Already saved").count(),
+        2,
+        "both stories should be reported as already saved: {said}"
+    );
+    let fetched_after = instagram.received_requests().await.unwrap().len();
+    // The tray listing itself is one request; the two media files are none.
     assert!(
-        said.contains("2 of 2 stories could not be downloaded"),
-        "{said}"
+        fetched_after - fetched_before <= 2,
+        "media was fetched again for files already on disk: {} requests",
+        fetched_after - fetched_before
     );
     assert!(
-        said.contains("me-2.mp4"),
-        "the loop stopped at the first failure: {said}"
+        !instagram
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .skip(fetched_before)
+            .any(|r| r.url.path() == "/big.jpg" || r.url.path() == "/clip.mp4"),
+        "a media URL was requested on the second run"
     );
 }
 
