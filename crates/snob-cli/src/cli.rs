@@ -664,7 +664,10 @@ pub struct StoriesArgs {
     pub output: Option<PathBuf>,
 
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
-    #[arg(long, value_enum)]
+    // Only the listing has a format. A download writes a file and the browser
+    // draws a screen, so `--format json -d 3` used to be accepted and then
+    // ignored, which reads as a format that did not work.
+    #[arg(long, value_enum, conflicts_with_all = ["download", "all", "interactive"])]
     pub format: Option<StoryFormat>,
 }
 
@@ -858,6 +861,24 @@ mod tests {
     fn cache_and_refresh_are_mutually_exclusive() {
         let result = Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]);
         assert!(result.is_err());
+    }
+
+    /// A story listing's format has nothing to say about a download or the
+    /// browser, and was accepted and ignored next to both.
+    #[test]
+    fn a_story_format_only_goes_with_the_listing() {
+        for extra in [["-d", "1"], ["--all", ""], ["-i", ""]] {
+            let mut line = vec!["snob", "stories", "someone", "--format", "json", extra[0]];
+            if !extra[1].is_empty() {
+                line.push(extra[1]);
+            }
+            assert!(
+                Cli::try_parse_from(&line).is_err(),
+                "--format was accepted alongside {}",
+                extra[0]
+            );
+        }
+        assert!(Cli::try_parse_from(["snob", "stories", "someone", "--format", "json"]).is_ok());
     }
     /// `--tls-extra-root` only means something alongside `--strict-roots`.
     ///
