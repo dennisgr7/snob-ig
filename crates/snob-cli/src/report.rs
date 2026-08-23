@@ -443,6 +443,27 @@ pub fn ask_to_continue(shown: &str) -> String {
     format!("Continue with {shown}?")
 }
 
+/// Being unable to ask and being told no are two different events, and this is
+/// the first one, shaped the same way everywhere a question finds no terminal:
+/// what was not done, why nothing could be asked, and how to answer in
+/// advance. Exit 130, which is what the README's table and `--help` both
+/// promise for a confirmation that was not given.
+///
+/// The advice rides in the message rather than on a hint, and that is
+/// load-bearing: [`rendered`] returns early for this exit code, so a hint set
+/// on an interrupted error is advice nobody is ever shown — which is exactly
+/// what happened to `follow`'s for as long as it carried one. Three commands
+/// wrote this sentence themselves, each a little differently, before it lived
+/// here; the scheduled monitor keeps its own variant, because "a scheduled run
+/// has nobody to ask" is a different fact from "there is no terminal".
+pub fn refuse_unattended(refused: String, in_advance: String) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!("{refused}, and there is no terminal to ask at. {in_advance}"),
+    )
+    .into()
+}
+
 /// Nobody is there to be asked, so nothing is enumerated.
 ///
 /// Which way to answer in advance is the **caller's** fact rather than this
@@ -462,14 +483,10 @@ pub fn refuse_unconsented(shown: &str, in_advance: ConsentInAdvance) -> anyhow::
              while you are here."
         ),
     };
-    ExitError::new(
-        ExitCode::Interrupted,
-        format!(
-            "reading {shown}'s lists needs confirmation, and there is no terminal to \
-             ask at. {in_advance}"
-        ),
+    refuse_unattended(
+        format!("reading {shown}'s lists needs confirmation"),
+        in_advance,
     )
-    .into()
 }
 
 /// They were asked, and they said no.

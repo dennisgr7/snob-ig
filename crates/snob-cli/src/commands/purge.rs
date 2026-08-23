@@ -253,22 +253,14 @@ pub fn run_with(
     // whether anybody is there, asked differently, is how one of them starts
     // answering for a person who is sitting right in front of it.
     if !args.yes && !someone_is_there {
-        // `Interrupted`, which is what the README's table and `--help` both
-        // promise for "a confirmation that was not given — including with no
-        // terminal to ask at". This returned the generic failure, so a script
-        // branching on 130 to re-run with `--yes` never fired and one branching
-        // on 1 warned about a half-finished delete that had not started.
-        //
-        // The advice goes in the message rather than the hint: `print_error`
-        // returns early for this code, so a hint would be dropped. That early
-        // return is also why the duplicate `ui::info` is gone — the sentence is
-        // printed once, by the printer.
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            "nothing was deleted: there is no terminal to confirm at.\n\
-             To delete it unattended, run \"snob purge --yes\".",
-        )
-        .into());
+        // The shared refusal, which is where the exit code and the "advice in
+        // the message, never on a hint" rule now live — this used to build the
+        // sentence by hand, and so did `follow` and the consent gate, each a
+        // little differently.
+        return Err(crate::report::refuse_unattended(
+            "nothing was deleted: it needs confirmation".to_string(),
+            "To delete it unattended, run \"snob purge --yes\".".to_string(),
+        ));
     }
 
     if !args.yes && !ui::confirm("\nDelete all of it?", false)? {

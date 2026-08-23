@@ -96,15 +96,13 @@ pub async fn run(
     // request" rather than "follow" for a private account, and it is not asked
     // at all when the relationship already holds. All three need the profile.
     if !args.yes && !ui::can_be_asked() {
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!(
-                "nothing was {}ed: there is nobody to confirm it",
-                verb.present()
-            ),
-        )
-        .with_hint("pass -y to confirm in advance")
-        .into());
+        // The advice used to ride on a hint, and a hint on exit 130 is advice
+        // nobody is shown — `report::rendered` returns early for that code.
+        // The shared refusal puts it in the message, where it arrives.
+        return Err(crate::report::refuse_unattended(
+            format!("nothing was {}ed: it needs confirmation", verb.present()),
+            "Pass -y to confirm in advance.".to_string(),
+        ));
     }
 
     let profile = app
