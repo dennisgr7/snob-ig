@@ -94,14 +94,31 @@ impl PipeTransport {
 /// case can be tested without a browser: it was the one part of this transport
 /// that a WebSocket library used to do for us.
 ///
-/// Anything left over stays in `buffer` for the next read.
-fn take_messages(buffer: &mut Vec<u8>) -> Vec<Message> {
+/// Anything left over stays in `buffer` for the next read, and `scanned`
+/// remembers how much of it has already been searched.
+///
+/// The cursor is what keeps this linear. Without it, every read re-searched
+/// the buffer from byte zero while a message arrived in pieces, which is
+/// O(len²/chunk): at the 8 MiB ceiling that is on the order of four billion
+/// bytes scanned to deliver one message -- and `Storage.getCookies` against a
+/// real profile is exactly the kind of answer that arrives in pieces. The
+/// caller owns the cursor for the same reason it owns the buffer: this stays
+/// a pure function a test can drive.
+fn take_messages(buffer: &mut Vec<u8>, scanned: &mut usize) -> Vec<Message> {
     let mut out = Vec::new();
-    while let Some(end) = buffer.iter().position(|byte| *byte == 0) {
+    while let Some(end) = buffer[*scanned..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|found| found + *scanned)
+    {
         let mut message: Vec<u8> = buffer.drain(..=end).collect();
         message.pop();
         out.push(message);
+        // The drain shifted everything left, so the next search starts over
+        // -- at the front of a buffer that no longer holds what was searched.
+        *scanned = 0;
     }
+    *scanned = buffer.len();
     out
 }
 
@@ -120,7 +137,10 @@ where
     let mut reader = reader;
     std::thread::spawn(move || {
         let mut buffer: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 8192];
+        let mut scanned = 0usize;
+        // 64 KiB rather than 8: a cookie answer runs to hundreds of
+        // kilobytes, and the chunk size is how many syscalls that costs.
+        let mut chunk = [0u8; 65536];
         loop {
             let read = match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => return,
@@ -131,7 +151,7 @@ where
                 tracing::warn!("the browser sent a protocol message past the ceiling");
                 return;
             }
-            for message in take_messages(&mut buffer) {
+            for message in take_messages(&mut buffer, &mut scanned) {
                 if incoming.blocking_send(message).is_err() {
                     return;
                 }
@@ -819,23 +839,27 @@ mod tests {
     #[test]
     fn messages_are_reassembled_across_reads() {
         let mut buffer = Vec::new();
+        let mut scanned = 0;
 
         buffer.extend_from_slice(br#"{"id":1}"#);
         assert!(
-            take_messages(&mut buffer).is_empty(),
+            take_messages(&mut buffer, &mut scanned).is_empty(),
             "no terminator has arrived yet"
         );
+        assert_eq!(scanned, buffer.len(), "what was searched is remembered");
 
         buffer.push(0);
-        let first = take_messages(&mut buffer);
+        let first = take_messages(&mut buffer, &mut scanned);
         assert_eq!(first, vec![br#"{"id":1}"#.to_vec()]);
         assert!(buffer.is_empty());
+        assert_eq!(scanned, 0);
 
         // Two whole messages and the beginning of a third, in one read.
         buffer.extend_from_slice(b"{\"id\":2}\0{\"id\":3}\0{\"id\"");
-        let rest = take_messages(&mut buffer);
+        let rest = take_messages(&mut buffer, &mut scanned);
         assert_eq!(rest, vec![br#"{"id":2}"#.to_vec(), br#"{"id":3}"#.to_vec()]);
         assert_eq!(buffer, b"{\"id\"");
+        assert_eq!(scanned, buffer.len());
     }
 
     /// An empty message is a message. Dropping it would desynchronize the
@@ -843,6 +867,9 @@ mod tests {
     #[test]
     fn an_empty_message_is_still_one() {
         let mut buffer = b"\0a\0".to_vec();
-        assert_eq!(take_messages(&mut buffer), vec![Vec::new(), b"a".to_vec()]);
+        assert_eq!(
+            take_messages(&mut buffer, &mut 0),
+            vec![Vec::new(), b"a".to_vec()]
+        );
     }
 }
