@@ -159,6 +159,7 @@ const EXAMPLES: &str = "\
 Examples:
   snob login                          store your session, once
   snob unfollowers                    who does not follow you back
+  snob profile someone                their page: counts, bio, who you both know
   snob scan someone                   the full picture of another account
   snob pfp someone -o picture.jpg     their profile picture, at full size
   snob stories someone                what they have up right now
@@ -201,6 +202,16 @@ pub enum Command {
                       is left alone: uninstall it with whatever installed it."
     )]
     Purge(PurgeArgs),
+
+    /// An account as its page shows it: counts, bio, who you both know, highlights
+    #[command(
+        after_help = "What you would see opening the profile, for three or four requests: the \
+                      counters, the bio, whether you follow each other, the accounts you follow \
+                      that follow them, the highlights and whether anything is up right now. It \
+                      walks no list and stores nothing. \"snob scan\" is the crossing, and \
+                      costs both lists."
+    )]
+    Profile(ProfileArgs),
 
     /// Summary of the whole account: followers, following, and how they cross
     Scan(ScanArgs),
@@ -709,6 +720,20 @@ pub struct WatchOnceArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct ProfileArgs {
+    /// Account to show. Defaults to your own.
+    pub target: Option<String>,
+
+    /// Output format. Defaults to a table on a terminal and JSON in a pipe.
+    #[arg(long, value_enum)]
+    pub format: Option<ProfileFormat>,
+
+    /// Write the result to a file instead of standard output
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct PfpArgs {
     /// Account whose profile picture to download
     pub target: String,
@@ -798,6 +823,16 @@ pub enum StoryFormat {
     Table,
     Json,
     Ndjson,
+}
+
+/// The formats a profile has: a card to read, an object to parse, a
+/// document to keep. The row formats are for a list of accounts, and a
+/// profile is not one — the same reasoning as [`StoryFormat`].
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileFormat {
+    Table,
+    Json,
+    Md,
 }
 
 impl From<StoryFormat> for Format {

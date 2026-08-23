@@ -146,6 +146,36 @@ and `snob friends` (you follow each other). `snob followers` and
 `snob following` print a list on its own.
 
 ```bash
+snob profile someone
+```
+
+```
+@someone  Some One  (private)
+  a line of bio
+
+Followers:    244
+Following:    319
+Posts:        0
+
+You follow them, they follow you
+Followed by @ana, @luis, @eva and 30 others:
+  @ana @luis @eva @pat ...
+
+Highlights:   2
+   1  trip   5 items, updated Jul 13 at 10:53
+   2  home   6 items, updated Feb 9 at 10:08
+Stories up:   none
+profile of @someone - 6 requests
+```
+
+What you would see opening the profile, and nothing walked: the counters, the
+bio, whether you follow each other, the accounts you follow that follow them,
+the highlights and whether anything is up right now. Three or four requests
+for most accounts, one more per twelve people you have in common. Without a
+name it is your own page. `--format json` for a script, `--format md` for a
+note.
+
+```bash
 snob scan
 ```
 

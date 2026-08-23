@@ -68,7 +68,7 @@ fn link(user: &User) -> String {
 /// of `x](http://evil.test)` produced a second, working link to somewhere else,
 /// sitting in the row as though this file had put it there. The destination is
 /// a separate problem with a separate answer: `User::profile_url` encodes.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace('[', "\\[")

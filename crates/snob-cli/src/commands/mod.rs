@@ -6,6 +6,7 @@ pub mod lists;
 pub mod login;
 pub mod logout;
 pub mod pfp;
+pub mod profile;
 pub mod purge;
 pub mod scan;
 pub mod sets;

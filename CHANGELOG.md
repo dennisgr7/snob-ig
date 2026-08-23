@@ -24,6 +24,14 @@ place is a regime rather than permission.
   out from a 403 that would read as an expired session.
   `snob login --paste --csrftoken <token>` is the way to add one on a machine
   with no browser to launch.
+- **`snob profile`** is an account the way its page shows it, for three or
+  four requests: the counters and the post count, the bio, whether you follow
+  each other, the "followed by a, b and 30 others" line with the whole list
+  under it, the highlights with their sizes and dates, and whether anything is
+  up right now. It walks no list and stores nothing; `snob scan` is still the
+  crossing. A private account you do not follow is not asked for the reels it
+  would not serve, and the summary says they are not visible rather than that
+  there are none. `--format json` and `--format md` as well as the table.
 - **The list commands' options are three groups rather than one struct**, and
   a flag a command would ignore is now refused by the parser: `snob scan
   --limit` used to be accepted with a warning, `--cache` with `--max-pages` or
