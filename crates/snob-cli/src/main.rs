@@ -77,13 +77,13 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             effective_format(args.format.map(Format::from), args.output.as_deref()),
             Format::Json
         ),
-        Command::Whoami(args) => args.json,
+        Command::Whoami(args) => args.output.json,
         Command::Watch(args) => match &args.command {
-            None => args.run.json,
-            Some(WatchCommand::Once(once)) => once.json,
-            Some(WatchCommand::Check(check)) => check.json,
-            Some(WatchCommand::Status(status)) => status.json,
-            Some(WatchCommand::Diff(diff)) => diff.json,
+            None => args.run.output.json,
+            Some(WatchCommand::Once(once)) => once.output.json,
+            Some(WatchCommand::Check(check)) => check.output.json,
+            Some(WatchCommand::Status(status)) => status.output.json,
+            Some(WatchCommand::Diff(diff)) => diff.output.json,
             Some(WatchCommand::Setup(_)) => false,
         },
         Command::Login(_)

@@ -75,10 +75,27 @@ re-litigation in a normal change.
     command, and a command without `-i` prints and exits however it was run.
     There is no REPL and no global interactive mode; a second command language
     would need a second parser for every flag above.
-  The list commands' options are composed from three `flatten` groups —
-  `FilterArgs`, `OutputArgs`, `WalkArgs` — so a command takes the groups it
-  acts on and a flag it would ignore is refused by clap rather than warned
-  about. `scan` is the list options without `--limit`.
+  Two spellings are settled with the conventions. `--offline` is the one word
+  for "spend no network" — the list commands and `whoami` both take it, and
+  `--cache`, the name the lists used first, stays as a hidden alias the way
+  `mutuals` and `--no-verified` do. And the short-flag space is deliberately
+  almost empty: `-y -o -d -i` are the whole list, `-v` (verbose or version?)
+  and `-f` (format or force?) are ambiguous in exactly the way that costs a
+  typo later, and a new short flag has to argue for itself here first.
+  The two wizards are the written exception to the first and third rule.
+  `login` with no method flag and `watch setup` ask several questions and
+  draw arrow-key menus without `-i`, because a wizard is a command whose one
+  job *is* the questions; both refuse to start where no menu can be shown,
+  and both leave a non-interactive route beside them (`login --paste` reads
+  standard input; `watch.toml` is written by hand from the template). A third
+  wizard has to fit that same shape.
+  The one-question convention and the two detected interactivities are held
+  by `flatten` groups in `cli.rs` rather than by review: `ConsentArgs` is
+  `-y`, defined once, `ProgressArgs` is `--no-progress`, `StatusOutputArgs`
+  is `--json`, and the list commands compose `FilterArgs`, `OutputArgs` and
+  `WalkArgs` the same way — so a command takes the groups it acts on and a
+  flag it would ignore is refused by clap rather than warned about. `scan` is
+  the list options without `--limit`.
 
 And the domain rules, which exist because breaking them puts a real account at
 risk:
@@ -978,7 +995,7 @@ is what meeting Instagram taught, including the parts that are still open:
     defects came from this before the ids went in.
   - **`Provenance::describes_now()` is what decides whether a run may conclude
     anything.** A list served during a cooldown, after a failed poll, or under
-    `--cache` was not verified by this run, so it is neither compared nor
+    `--offline` was not verified by this run, so it is neither compared nor
     marked — and not marking it is the half that matters, because a mark moved
     over an unreported change loses it permanently.
   - **A run with nothing to report costs one request, not two.**

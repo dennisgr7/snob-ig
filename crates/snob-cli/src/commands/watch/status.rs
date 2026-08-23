@@ -96,7 +96,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         snob_core::clock::now(),
     );
 
-    if args.json {
+    if args.output.json {
         let document = super::wire::status_json(
             config.is_some(),
             &config::path(paths),

@@ -240,9 +240,9 @@ impl Progress {
     /// A label that flashes costs nothing. A **line** that says it does is
     /// different: with no bar to draw on this printed `walking @someone
     /// followers` to standard error, and the two runs that have no bar are
-    /// `--no-progress`, where the user asked for silence, and `--cache`, which
+    /// `--no-progress`, where the user asked for silence, and `--offline`, which
     /// walks nothing at all and answers from the database. Both were told about
-    /// a walk that never happened, and `snob scan --cache` said it four times.
+    /// a walk that never happened, and `snob scan --offline` said it four times.
     /// So without a bar there is nothing to name.
     pub fn begin(&self, subject: &str) {
         self.animate();

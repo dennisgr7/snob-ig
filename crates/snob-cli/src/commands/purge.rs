@@ -252,7 +252,7 @@ pub fn run_with(
     // The same predicate `confirm` gates on, deliberately: two questions about
     // whether anybody is there, asked differently, is how one of them starts
     // answering for a person who is sitting right in front of it.
-    if !args.yes && !someone_is_there {
+    if !args.consent.yes && !someone_is_there {
         // The shared refusal, which is where the exit code and the "advice in
         // the message, never on a hint" rule now live — this used to build the
         // sentence by hand, and so did `follow` and the consent gate, each a
@@ -263,7 +263,7 @@ pub fn run_with(
         ));
     }
 
-    if !args.yes && !ui::confirm("\nDelete all of it?", false)? {
+    if !args.consent.yes && !ui::confirm("\nDelete all of it?", false)? {
         crate::ui::say!("Nothing was deleted.");
         return Ok(ExitCode::Ok);
     }

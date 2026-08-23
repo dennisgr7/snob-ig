@@ -209,9 +209,9 @@ fn summary_line(
     ));
 
     // When it is stored, say so and say from when. This read only the counts,
-    // so `snob unfollowers --cache` a month later printed a line that could not
+    // so `snob unfollowers --offline` a month later printed a line that could not
     // be told apart from a crossing walked five minutes ago — while `snob
-    // followers --cache` says "list stored on 07/07 at 14:12" for the very same
+    // followers --offline` says "list stored on 07/07 at 14:12" for the very same
     // capture. `Provenance`'s own doc names an answer that does not say where it
     // came from as half of the defect it was written for.
     //
@@ -295,9 +295,9 @@ mod tests {
 
     /// A crossing served from storage says so, and says from when.
     ///
-    /// The line read only the counts, so `snob unfollowers --cache` a month
+    /// The line read only the counts, so `snob unfollowers --offline` a month
     /// later was indistinguishable from a crossing walked five minutes ago —
-    /// while `snob followers --cache` says "list stored on 07/07 at 14:12" for
+    /// while `snob followers --offline` says "list stored on 07/07 at 14:12" for
     /// the very same capture. The counts are right and `check_same_moment`
     /// blocks the dangerous case, so this is completeness rather than a
     /// correction; but an answer that does not say where it came from is half

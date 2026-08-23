@@ -38,7 +38,7 @@ pub(super) async fn check(
 ) -> Result<ExitCode> {
     let report = preflight(&args, &secrets, paths).await?;
 
-    if args.json {
+    if args.output.json {
         crate::ui::say!("{}", serde_json::to_string_pretty(&check_json(&report))?);
     } else {
         for line in describe_check(&report) {

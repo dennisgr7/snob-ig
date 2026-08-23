@@ -28,7 +28,7 @@ pub(super) fn diff(
 
     let report = crate::engine::watch::from_store(&app, args.target.as_deref())?;
 
-    if args.json {
+    if args.output.json {
         // With `schema`, like every other message: this was the one JSON this
         // command family emits with no version on it, while the README says
         // each one carries it.

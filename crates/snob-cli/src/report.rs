@@ -330,11 +330,11 @@ pub fn refuse_incomplete(
 ///
 /// - A **cooldown** is waited out, so "run it again later" is true and the
 ///   throttling code is right.
-/// - **`--cache`** is the user's own doing, and dropping it is the fix.
+/// - **`--offline`** is the user's own doing, and dropping it is the fix.
 /// - A **failed poll** is neither. Nobody asked for storage — the request to
 ///   check went out and did not come back — so advising them to drop a flag
 ///   they never typed sends them looking for something that is not there. This
-///   arm used to fall in with `--cache` because the only question asked was
+///   arm used to fall in with `--offline` because the only question asked was
 ///   whether either side was a cooldown.
 pub fn refuse_different_moments(
     a: Provenance,
@@ -355,7 +355,7 @@ pub fn refuse_different_moments(
     } else if either(Provenance::CacheFlag) {
         (
             ExitCode::Error,
-            "Run it again without --cache, so both lists are checked against the account.",
+            "Run it again without --offline, so both lists are checked against the account.",
         )
     } else {
         (
@@ -575,7 +575,7 @@ pub fn refuse_private(username: &str, requested: bool) -> anyhow::Error {
 /// run.
 ///
 /// Two things people expect quietly stop happening — the truncation wall cannot
-/// be detected without a declared size, and `--cache` has nothing to weigh
+/// be detected without a declared size, and `--offline` has nothing to weigh
 /// freshness against — so both are said out loud rather than left to be
 /// discovered.
 pub fn counters_unknowable(username: &str) -> String {
@@ -603,7 +603,7 @@ pub fn refuse_nothing_looked_at(name: &str) -> anyhow::Error {
 
 /// A name the monitor was pointed at and has never walked.
 ///
-/// Deliberately not [`refuse_nothing_stored`], which talks about `--cache` — a
+/// Deliberately not [`refuse_nothing_stored`], which talks about `--offline` — a
 /// flag the commands that reach this do not have. What the user has to do here
 /// is walk the account once, and the sentence says so.
 pub fn refuse_never_walked(name: &str) -> anyhow::Error {
@@ -796,7 +796,7 @@ pub fn pager_warning(warning: Warning) -> String {
     }
 }
 
-/// Nothing stored to answer with, and `--cache` said not to look.
+/// Nothing stored to answer with, and `--offline` said not to look.
 ///
 /// Two situations reach this: the account has never been seen at all, and the
 /// account is known but this list of it has never been walked. They get the
@@ -811,9 +811,9 @@ pub fn pager_warning(warning: Warning) -> String {
 pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
     ExitError::new(
         ExitCode::Error,
-        format!("no {kind} list is stored, and --cache says not to look for one"),
+        format!("no {kind} list is stored, and --offline says not to look for one"),
     )
-    .with_hint(format!("run \"snob {kind}\" once, or drop --cache"))
+    .with_hint(format!("run \"snob {kind}\" once, or drop --offline"))
     .into()
 }
 
@@ -1251,7 +1251,7 @@ mod tests {
             Epoch::new(1),
         );
         let hint = hint_of(&asked_for).unwrap();
-        assert!(hint.contains("--cache"), "{hint}");
+        assert!(hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(ExitCode::from_chain(&asked_for), Some(ExitCode::Error));
 
@@ -1266,7 +1266,7 @@ mod tests {
             Epoch::new(1),
         );
         let hint = hint_of(&nobody_could_check).unwrap();
-        assert!(!hint.contains("--cache"), "{hint}");
+        assert!(!hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(
             ExitCode::from_chain(&nobody_could_check),

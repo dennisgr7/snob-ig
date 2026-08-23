@@ -27,7 +27,7 @@ pub struct Target {
     ///
     /// It used to be a `String` holding `pk.to_string()` in that case, with a
     /// comment saying it was only a label. It was not: `engine::decide` writes
-    /// it straight into `users.username`, so `--cache` clobbered a correct
+    /// it straight into `users.username`, so `--offline` clobbered a correct
     /// stored name with the number, filed a rename that never happened, and
     /// then told the user their own account had no stored list — because
     /// `find_pk_by_username` no longer matched the real one.
@@ -137,7 +137,7 @@ pub async fn resolve(app: &mut App, args: &ListQuery) -> Result<Target> {
     // size and skips the check entirely when there is nothing to compare with,
     // so the truncation wall — the one that catches Instagram serving 39 of
     // 21631 followers — cannot be detected on this account. And the counters
-    // are what `--cache` weighs freshness against, so every run re-walks.
+    // are what `--offline` weighs freshness against, so every run re-walks.
     //
     // Said here rather than in the client because this is where a *walk* is
     // being set up; `pfp` reaches the same fallback and loses nothing by it.

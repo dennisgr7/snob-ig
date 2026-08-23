@@ -141,7 +141,7 @@ async fn with_cache_the_network_is_not_touched() {
     let before = requests(&server).await;
 
     let mut args = args();
-    args.walk.cache = true;
+    args.walk.offline = true;
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(found.len(), 30);
@@ -150,7 +150,7 @@ async fn with_cache_the_network_is_not_touched() {
     assert_eq!(
         requests(&server).await,
         before,
-        "--cache must not ask for anything"
+        "--offline must not ask for anything"
     );
 }
 
@@ -172,7 +172,7 @@ async fn a_cached_crossing_asks_about_the_account_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.walk.yes = true;
+    args.walk.consent.yes = true;
 
     // Populate both lists, in runs of their own.
     execute(&server, tmp.path(), &args).await.unwrap();
@@ -216,7 +216,7 @@ async fn a_walk_invalidates_the_counters_it_was_started_with() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.walk.yes = true;
+    args.walk.consent.yes = true;
 
     let mut app = app(&server, open_db(tmp.path()));
     // Nothing stored, so this one walks.
@@ -261,7 +261,7 @@ async fn a_cached_pair_carries_no_evidence_and_cannot_be_crossed() {
     execute(&server, tmp.path(), &args()).await.unwrap();
 
     let mut args = args();
-    args.walk.cache = true;
+    args.walk.offline = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(
@@ -379,7 +379,7 @@ async fn with_nothing_stored_cache_fails_instead_of_lying() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
-    args.walk.cache = true;
+    args.walk.offline = true;
 
     assert!(execute(&server, tmp.path(), &args).await.is_err());
 }
@@ -420,7 +420,7 @@ async fn cache_with_a_named_target_stays_off_the_network() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@Ghost".into());
-    cached.walk.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute(&empty, tmp.path(), &cached).await.unwrap();
 
     assert_eq!(found.len(), 2);
@@ -434,12 +434,12 @@ async fn cache_with_an_unknown_target_fails_without_the_network() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.walk.cache = true;
+    args.walk.offline = true;
     args.target = Some("@nobody".into());
     let error = execute(&server, tmp.path(), &args).await.unwrap_err();
 
     assert!(
-        error.to_string().contains("--cache says not to look"),
+        error.to_string().contains("--offline says not to look"),
         "{error}"
     );
     assert_eq!(
@@ -601,7 +601,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     let tmp = tempfile::tempdir().unwrap();
     execute(&server, tmp.path(), &args()).await.unwrap();
     let mut following_args = args();
-    following_args.walk.cache = false;
+    following_args.walk.offline = false;
     {
         let mut app = app(&server, open_db(tmp.path()));
         engine::list(&mut app, &following_args, ListKind::Following)
@@ -629,7 +629,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     }
 
     let mut cached = args();
-    cached.walk.cache = true;
+    cached.walk.offline = true;
     let (_, followers) = execute(&server, tmp.path(), &cached).await.unwrap();
     let following = {
         let mut app = app(&server, open_db(tmp.path()));

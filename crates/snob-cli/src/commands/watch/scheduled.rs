@@ -74,7 +74,7 @@ pub(super) async fn scheduled(
     // Installed once for the process, which is what lets this open an `App` per
     // run without leaving a signal listener behind on each one.
     let cancel = crate::interrupt::install();
-    let wording = Printing::unattended(args.json).wording();
+    let wording = Printing::unattended(args.output.json).wording();
 
     let mut last_run = seed_for(paths, &schedule, snob_core::clock::now())?;
 

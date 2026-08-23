@@ -218,7 +218,7 @@ pub struct TickList {
 pub enum Skipped {
     /// Nothing in this run established that the list still describes the
     /// account. That is the three storage paths where no request was spent
-    /// finding out: a cooldown, a failed poll, and `--cache`.
+    /// finding out: a cooldown, a failed poll, and `--offline`.
     NobodyLooked(Provenance),
     /// The walk did not finish, so accounts are missing from it — and every one
     /// of them would be reported as somebody who left.
@@ -994,7 +994,7 @@ fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Op
 /// Which account this is about, from storage alone.
 ///
 /// Deliberately not `target::from_store`: that one refuses with
-/// `report::refuse_nothing_stored`, a sentence about `--cache`, which is a flag
+/// `report::refuse_nothing_stored`, a sentence about `--offline`, which is a flag
 /// this command does not have. `report::refuse_never_walked` is the one that
 /// belongs here, and it carries the difference between the two.
 fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {

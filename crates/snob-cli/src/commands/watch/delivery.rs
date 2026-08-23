@@ -896,7 +896,7 @@ mod tests {
         owe(&app, &delivery, 1, snob_core::clock::now());
 
         let args = WatchRunArgs {
-            no_progress: true,
+            progress: crate::cli::ProgressArgs { no_progress: true },
             ..WatchRunArgs::default()
         };
         run_one(&args, &mut app, &[], Some(&delivery))

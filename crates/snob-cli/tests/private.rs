@@ -175,7 +175,7 @@ async fn with_cache_the_stored_snapshot_is_still_served() {
     )
     .await;
     let mut cached = args();
-    cached.walk.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute_with(&private, db(), &cached).await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(outcome.requests, 0);

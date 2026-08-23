@@ -35,7 +35,8 @@ pub(super) async fn open_and_run(
     secrets: &SecretStore,
     paths: &AppPaths,
 ) -> Result<()> {
-    let Session::Open(mut app) = common::open_with_progress(!args.no_progress, secrets, paths)?
+    let Session::Open(mut app) =
+        common::open_with_progress(!args.progress.no_progress, secrets, paths)?
     else {
         // Said by `common::open`, and there is nothing this run can do about it
         // — but the loop keeps going, because a session restored later should
@@ -72,7 +73,13 @@ pub(super) async fn run_one(
     watched: &[Watched],
     delivery: Option<&Delivery>,
 ) -> Result<()> {
-    let outcome = run_accounts(app, watched, delivery, Printing::unattended(args.json)).await;
+    let outcome = run_accounts(
+        app,
+        watched,
+        delivery,
+        Printing::unattended(args.output.json),
+    )
+    .await;
     match outcome.failed {
         Some(e) => Err(e),
         None => Ok(()),
@@ -546,7 +553,7 @@ mod tests {
         let secrets = snob_store::secrets::SecretStore::new(paths.clone(), true)
             .with_service(&format!("snob-ig-test-settle-{}", std::process::id()));
         let args = WatchRunArgs {
-            no_progress: true,
+            progress: crate::cli::ProgressArgs { no_progress: true },
             ..WatchRunArgs::default()
         };
 

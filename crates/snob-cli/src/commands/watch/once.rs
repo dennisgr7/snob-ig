@@ -53,7 +53,7 @@ pub(super) async fn once(
 
     // Already settled, at the top: this run is the one that most needs it,
     // and it is not the only door that closes before `run_accounts`.
-    let mut app = common::app(&secrets, paths, !args.no_progress)?;
+    let mut app = common::app(&secrets, paths, !args.progress.no_progress)?;
     // The monitor takes an answer in advance from `watch.toml`, never from a
     // flag, so the refusal when nobody is at a terminal has to say so.
     app.consent_comes_from_the_config();
@@ -64,7 +64,7 @@ pub(super) async fn once(
         &mut app,
         &watched,
         delivery.as_ref(),
-        Printing::watched(args.json),
+        Printing::watched(args.output.json),
     )
     .await;
 
@@ -121,8 +121,8 @@ mod tests {
                 heartbeat: false,
             },
             target: None,
-            json: false,
-            no_progress: true,
+            output: crate::cli::StatusOutputArgs { json: false },
+            progress: crate::cli::ProgressArgs { no_progress: true },
         };
 
         let refused = once(args, secrets, &paths).await;

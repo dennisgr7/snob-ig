@@ -95,7 +95,7 @@ pub async fn run(
     // names the account the way Instagram spells it, it says "send a follow
     // request" rather than "follow" for a private account, and it is not asked
     // at all when the relationship already holds. All three need the profile.
-    if !args.yes && !ui::can_be_asked() {
+    if !args.consent.yes && !ui::can_be_asked() {
         // The advice used to ride on a hint, and a hint on exit 130 is advice
         // nobody is shown — `report::rendered` returns early for that code.
         // The shared refusal puts it in the message, where it arrives.
@@ -143,7 +143,7 @@ pub async fn run(
     // that were reported as one everywhere else in this tool until it was
     // fixed. The guard above is what stops that being reachable here, so this
     // branch only ever runs with somebody at the keyboard.
-    if !args.yes && !ui::confirm(&question, false)? {
+    if !args.consent.yes && !ui::confirm(&question, false)? {
         return Ok(ExitCode::Interrupted);
     }
 

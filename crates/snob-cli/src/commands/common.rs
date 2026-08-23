@@ -34,7 +34,7 @@ pub enum Session {
 /// Opens the app for a list command, or refuses because there is no session.
 pub fn open(walk: &WalkArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Box<App>> {
     // No bar when the answer comes out of storage: there is nothing to watch.
-    app(secrets, paths, !walk.no_progress && !walk.cache)
+    app(secrets, paths, !walk.progress.no_progress && !walk.offline)
 }
 
 /// Opens the app, or refuses because there is no session.
@@ -79,9 +79,9 @@ pub fn open_with_progress(
 fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
     engine::ListQuery {
         target: target.clone(),
-        yes: walk.yes,
+        yes: walk.consent.yes,
         refresh: walk.refresh,
-        cache: walk.cache,
+        cache: walk.offline,
         max_age: walk.max_age,
         no_resume: walk.no_resume,
         max_pages: walk.max_pages,

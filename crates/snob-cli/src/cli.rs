@@ -270,6 +270,11 @@ pub enum Command {
     Unfollow(FollowArgs),
 
     /// Track an account over time and report what changed
+    #[command(
+        after_help = "With no subcommand it stays up and runs on a schedule; the subcommands                       are the things a person does by hand. \"--json\" here emits one JSON                       object per run, one per line -- what the list commands would call                       ndjson, spelled --json because each object is the state of one run.
+
+                      An account named like a subcommand -- \"status\", \"once\", \"diff\",                       \"check\", \"setup\" -- is read as the subcommand; write it \"@status\"                       to watch the account."
+    )]
     Watch(WatchArgs),
     // `import dyi` is written and tested but not wired up here on purpose: the
     // reader works, and what is unfinished is the question of what an import
@@ -329,9 +334,8 @@ pub struct WhoamiArgs {
     #[arg(long)]
     pub offline: bool,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -343,9 +347,8 @@ pub struct LogoutArgs {
 
 #[derive(Args, Debug)]
 pub struct PurgeArgs {
-    /// Delete without asking. Needed when there is no terminal to ask at.
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    #[command(flatten)]
+    pub consent: ConsentArgs,
 
     /// List what would be deleted and delete nothing
     #[arg(long, conflicts_with = "yes")]
@@ -443,40 +446,81 @@ pub struct OutputArgs {
     pub path: Option<PathBuf>,
 }
 
+/// The one question a command asks, answered in advance.
+///
+/// One definition for the one convention: each command asks at most one thing
+/// — consent to enumerate somebody else's lists, confirmation of a write,
+/// confirmation of a purge — and `-y` is always the answer to that one thing.
+/// It used to be spelled out three times, each with its own sentence, and
+/// nothing tied them together. What the question *is* stays with the command
+/// that asks it, in its `after_help` and in the question itself.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct ConsentArgs {
+    /// Answer yes in advance to the one question this command asks.
+    /// Needed when there is no terminal to ask at.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+/// Whether the progress bar draws. One definition, like [`ConsentArgs`]:
+/// the bar already hides itself when standard error is not a terminal, so
+/// this flag is only for the terminal that has one and does not want it.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct ProgressArgs {
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
+}
+
+/// The status-object switch, for commands that report the state of things.
+///
+/// `--json` is for a status object; `--format` is for a document. One
+/// definition holds the first half of that convention the way the narrowed
+/// format enums hold the second.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct StatusOutputArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// How a walk is made: whether to make one at all, how far, and whether
 /// anybody has to be asked first.
 ///
-/// `--cache` answers out of storage and spends nothing, so the two flags that
-/// shape a walk conflict with it rather than being accepted and ignored.
+/// `--offline` answers out of storage and spends nothing, so the two flags
+/// that shape a walk conflict with it rather than being accepted and ignored.
 #[derive(Args, Debug, Clone)]
 pub struct WalkArgs {
     /// Walk the list again even if there is a recent snapshot
-    #[arg(long, conflicts_with = "cache")]
+    #[arg(long, conflicts_with = "offline")]
     pub refresh: bool,
 
-    /// Use the last stored snapshot without touching the network
-    #[arg(long, conflicts_with = "refresh")]
-    pub cache: bool,
+    /// Answer from the last stored snapshot without touching the network
+    // `--cache` was the name until August 2026; kept as a hidden alias so a
+    // script written against it still runs, the same way `mutuals` and
+    // `--no-verified` are kept. `--offline` is the spelling that generalizes:
+    // `whoami` already used it, and the two used to be two names for the one
+    // intention a script has — spend no network.
+    #[arg(long, alias = "cache", conflicts_with = "refresh")]
+    pub offline: bool,
 
     /// Maximum age of a reusable snapshot (30m, 6h, 2d)
     #[arg(long, value_name = "DURATION", default_value = "6h", value_parser = duration)]
     pub max_age: std::time::Duration,
 
     /// Start from scratch instead of continuing an interrupted walk
-    #[arg(long, conflicts_with = "cache")]
+    #[arg(long, conflicts_with = "offline")]
     pub no_resume: bool,
 
     /// Stop the walk after N pages, saving requests
-    #[arg(long, value_name = "N", conflicts_with = "cache")]
+    #[arg(long, value_name = "N", conflicts_with = "offline")]
     pub max_pages: Option<u32>,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
 
-    /// Do not ask before enumerating someone else's account
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    #[command(flatten)]
+    pub consent: ConsentArgs,
 }
 
 /// What no flags mean. Written by hand because a derived `Default` would put
@@ -486,12 +530,12 @@ impl Default for WalkArgs {
     fn default() -> Self {
         Self {
             refresh: false,
-            cache: false,
+            offline: false,
             max_age: std::time::Duration::from_secs(6 * 3600),
             no_resume: false,
             max_pages: None,
-            no_progress: false,
-            yes: false,
+            progress: ProgressArgs::default(),
+            consent: ConsentArgs::default(),
         }
     }
 }
@@ -557,13 +601,14 @@ pub struct WatchRunArgs {
     #[command(flatten)]
     pub delivery: WebhookArgs,
 
-    /// Emit one JSON object per run, on standard output
-    #[arg(long)]
-    pub json: bool,
+    // A doc comment here would not reach the help -- clap renders the
+    // flattened group's own docs -- so the "one object per run, one per line"
+    // sentence lives in the Watch command's after_help, where it shows.
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
 }
 
 /// Where a report goes, shared by the scheduled run and `once`.
@@ -672,9 +717,8 @@ pub enum WatchCommand {
 
 #[derive(Args, Debug, Default)]
 pub struct WatchCheckArgs {
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
     /// Do not post anything to the webhook
     #[arg(long)]
@@ -690,9 +734,8 @@ pub struct WatchSetupArgs {
 
 #[derive(Args, Debug)]
 pub struct WatchStatusArgs {
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -700,9 +743,8 @@ pub struct WatchDiffArgs {
     /// Account to report on. Defaults to your own.
     pub target: Option<String>,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -719,13 +761,11 @@ pub struct WatchOnceArgs {
     // which is the only thing an unattended run accepts.
     pub target: Option<String>,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
 }
 
 #[derive(Args, Debug)]
@@ -786,9 +826,8 @@ pub struct FollowArgs {
     /// The one account to follow or unfollow
     pub target: String,
 
-    /// Do not ask for confirmation. Needed when there is no terminal to ask at.
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    #[command(flatten)]
+    pub consent: ConsentArgs,
 }
 
 /// Not reachable from the CLI yet; see the note in [`Command`].
@@ -978,23 +1017,44 @@ mod tests {
     }
 
     #[test]
-    fn cache_and_refresh_are_mutually_exclusive() {
-        let result = Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]);
+    fn offline_and_refresh_are_mutually_exclusive() {
+        let result = Cli::try_parse_from(["snob", "followers", "--offline", "--refresh"]);
         assert!(result.is_err());
     }
 
-    /// `--cache` makes no walk, so a flag that shapes one is refused rather
+    /// `--cache` was the spelling until August 2026; a script written against
+    /// it still runs, and the conflicts follow the alias to the same argument.
+    #[test]
+    fn the_old_cache_spelling_still_parses_and_is_not_advertised() {
+        let cli = Cli::try_parse_from(["snob", "followers", "--cache"]).unwrap();
+        let Command::Followers(args) = cli.command else {
+            panic!("followers");
+        };
+        assert!(args.walk.offline);
+        assert!(Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]).is_err());
+
+        let help = Cli::command()
+            .find_subcommand("followers")
+            .expect("followers is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--cache"), "{help}");
+        assert!(help.contains("--offline"), "{help}");
+    }
+
+    /// `--offline` makes no walk, so a flag that shapes one is refused rather
     /// than accepted and ignored.
     #[test]
-    fn a_flag_that_shapes_a_walk_is_refused_with_cache() {
+    fn a_flag_that_shapes_a_walk_is_refused_with_offline() {
         for flag in [["--max-pages", "2"], ["--no-resume", ""]] {
-            let mut line = vec!["snob", "followers", "--cache", flag[0]];
+            let mut line = vec!["snob", "followers", "--offline", flag[0]];
             if !flag[1].is_empty() {
                 line.push(flag[1]);
             }
             assert!(
                 Cli::try_parse_from(&line).is_err(),
-                "{} was accepted alongside --cache",
+                "{} was accepted alongside --offline",
                 flag[0]
             );
         }
@@ -1007,7 +1067,15 @@ mod tests {
     fn scan_takes_the_list_options_but_not_the_cap() {
         assert!(Cli::try_parse_from(["snob", "scan", "--limit", "5"]).is_err());
         let cli = Cli::try_parse_from([
-            "snob", "scan", "someone", "--hide", "verified", "--format", "json", "--cache", "-y",
+            "snob",
+            "scan",
+            "someone",
+            "--hide",
+            "verified",
+            "--format",
+            "json",
+            "--offline",
+            "-y",
         ])
         .unwrap();
         let Command::Scan(args) = cli.command else {
@@ -1016,7 +1084,7 @@ mod tests {
         assert_eq!(args.target.as_deref(), Some("someone"));
         assert_eq!(args.filter.hide, vec![Attr::Verified]);
         assert_eq!(args.output.format, Some(Format::Json));
-        assert!(args.walk.cache && args.walk.yes);
+        assert!(args.walk.offline && args.walk.consent.yes);
     }
 
     /// The environment variables the program answers to are announced in one

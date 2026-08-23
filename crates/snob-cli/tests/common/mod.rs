@@ -12,7 +12,7 @@
 //! itself in the binaries that happen to use all of it.
 #![allow(dead_code)]
 
-use snob_cli::cli::{FilterArgs, ListArgs, OutputArgs, WalkArgs};
+use snob_cli::cli::{ConsentArgs, FilterArgs, ListArgs, OutputArgs, ProgressArgs, WalkArgs};
 
 /// A plausible desktop Chrome User-Agent. The session is tied to one, and
 /// Instagram checks that the two agree.
@@ -34,8 +34,8 @@ pub fn args() -> ListArgs {
         output: OutputArgs::default(),
         limit: None,
         walk: WalkArgs {
-            no_progress: true,
-            yes: true,
+            progress: ProgressArgs { no_progress: true },
+            consent: ConsentArgs { yes: true },
             ..WalkArgs::default()
         },
     }

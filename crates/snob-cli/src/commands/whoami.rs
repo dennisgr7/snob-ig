@@ -19,7 +19,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
         // wants to tell apart were one code, and one of them handed the parser
         // nothing to read. Every field the object always carries is here;
         // everything that describes a session that does not exist is null.
-        if args.json {
+        if args.output.json {
             crate::ui::say!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -132,7 +132,7 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
         }
     }
 
-    if args.json {
+    if args.output.json {
         // Every value here is a stable token, never a human-facing string —
         // with exactly one exception, `error.message`, which is documentation
         // for a person and which nothing may branch on. Rewording anything else

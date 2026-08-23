@@ -406,7 +406,7 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@ghost".into());
-    cached.walk.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute_with(&empty, reopen(tmp.path()), budget.clone(), &cached)
         .await
         .unwrap();

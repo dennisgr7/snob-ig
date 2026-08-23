@@ -9,7 +9,7 @@
 //! belongs to the operating system rather than to this process, and these tests
 //! delete.
 
-use snob_cli::cli::PurgeArgs;
+use snob_cli::cli::{ConsentArgs, PurgeArgs};
 use snob_cli::commands::purge;
 use snob_cli::exit::ExitCode;
 use snob_core::session::{Session, SessionOrigin};
@@ -80,7 +80,7 @@ fn populate(paths: &AppPaths, store: &SecretStore) {
 /// The only way to run the deletion path without a terminal.
 fn purge_now() -> PurgeArgs {
     PurgeArgs {
-        yes: true,
+        consent: ConsentArgs { yes: true },
         dry_run: false,
     }
 }
@@ -126,7 +126,7 @@ fn a_dry_run_deletes_nothing() {
     populate(&paths, &store);
 
     let args = PurgeArgs {
-        yes: false,
+        consent: ConsentArgs { yes: false },
         dry_run: true,
     };
     purge::run(args, store, &paths).unwrap();
@@ -231,7 +231,7 @@ fn an_unattended_run_without_yes_is_refused_rather_than_assumed_no() {
     populate(&paths, &store);
 
     let args = PurgeArgs {
-        yes: false,
+        consent: ConsentArgs { yes: false },
         dry_run: false,
     };
     let error = purge::run_with(args, store, &paths, false)
