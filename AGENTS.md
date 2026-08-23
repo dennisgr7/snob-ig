@@ -52,6 +52,33 @@ re-litigation in a normal change.
   conventional-commit prefixes.
 - Prefer the compiled, dependency-free option. Native binary, instant start,
   broad platform support — that is the point of the project, not an accident.
+- **The command line keeps three conventions**, settled in August 2026 after
+  reading every flag against every other:
+  - **One question per command, and `-y` answers it in advance.** Consent to
+    enumerate somebody else's lists, confirmation of a write, confirmation of
+    a purge — each command asks at most one thing, and `-y` is always the
+    answer to that one thing. A command that wanted a second question would
+    need a second flag, which is the signal it is two commands.
+  - **`--json` is for a status object; `--format` is for a document.**
+    `whoami` and every `watch` subcommand emit one object about the state of
+    things and take `--json`. Everything that prints a thing a person reads —
+    a list, a summary, a profile, a story listing — takes `--format`, with an
+    enum narrowed to the forms it actually has (`StoryFormat`,
+    `ProfileFormat`), so `--format xlsx` on five stories is refused rather
+    than accepted and ignored. A new command takes one or the other, never a
+    third spelling.
+  - **Two kinds of interactivity are detected and one is asked for.** Whether
+    the output is decorated (a table, color, hyperlinks, hints) is read from
+    standard output being a terminal; whether a question can be asked is read
+    from standard input and standard error being one. Taking the terminal
+    over — the story browser — is never inferred from either: it is `-i`, per
+    command, and a command without `-i` prints and exits however it was run.
+    There is no REPL and no global interactive mode; a second command language
+    would need a second parser for every flag above.
+  The list commands' options are composed from three `flatten` groups —
+  `FilterArgs`, `OutputArgs`, `WalkArgs` — so a command takes the groups it
+  acts on and a flag it would ignore is refused by clap rather than warned
+  about. `scan` is the list options without `--limit`.
 
 And the domain rules, which exist because breaking them puts a real account at
 risk:
