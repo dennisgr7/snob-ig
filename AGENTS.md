@@ -201,6 +201,14 @@ compiles from cold; after that the two named volumes keep the registry and the
 target directory, and a run is under a minute. `tools/ci/ci.sh` is the four
 commands the remote job runs and has to be kept in step with `ci.yml`; the
 image pins the compiler `rust-toolchain.toml` pins, so bump the two together.
+**The musl target is the container's own architecture** — `x86_64` on an Intel
+host, the same string the remote job uses, and `aarch64-unknown-linux-musl` on
+an ARM64 host, where the arm64 image's `musl-gcc` cannot compile for x86_64
+and a test binary of the other architecture could only run emulated. That
+second case is the only place the shipped ARM64 Linux binary's suite runs at
+all: the remote matrix tests x86_64 and builds aarch64. Measured on a
+Snapdragon X (8 cores): 167 s cold, 41 s warm, and the container peaks at
+5.4 GB with the default `CARGO_BUILD_JOBS=4` — 9.4 GB at 8 jobs, for 30 s less.
 The Windows and macOS jobs are not there because a container cannot run either;
 the host is the Windows job.
 

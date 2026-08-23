@@ -97,7 +97,9 @@ place is a regime rather than permission.
   a walk is paid for, naming the formats it has.
 - **`bash tools/ci/run.sh`** runs the Linux CI job — musl, a real keyring behind
   a session bus — in a container on the development machine, in under a minute
-  once warm.
+  once warm. The musl target is the machine's own: `aarch64-unknown-linux-musl`
+  on an ARM64 host, where asking for x86_64 failed in every C build script and
+  where that shipped target's suite had never run at all.
 - On Windows, a planted **directory link** under the stories scratch name is
   now replaced rather than refused: removing one takes `RemoveDirectory`, and
   `DeleteFile` answered "access denied" wherever the link could be made at all

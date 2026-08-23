@@ -14,7 +14,10 @@ FROM rust:1.97.1-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools gnome-keyring dbus-x11 libdbus-1-3 file \
     && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-linux-musl \
+# The musl target of whichever architecture this image is built for: x86_64
+# on an Intel host, aarch64 on an ARM64 one. ci.sh picks the same string the
+# same way, and `musl-tools` only ever installs the host's own musl-gcc.
+RUN rustup target add "$(uname -m)-unknown-linux-musl" \
     && rustup component add rustfmt clippy
 
 ENV CARGO_TERM_COLOR=always \
