@@ -995,6 +995,23 @@ is what meeting Instagram taught, including the parts that are still open:
     because the hard part of cron is that the two day fields combine with OR
     when both are restricted and AND when either is `*`, and getting it wrong
     fires on the wrong days silently.
+    **The search walks instants and steps over whole days the calendar does
+    not name.** Each candidate minute costs a conversion into the zone, and
+    walking every minute of the four-year horizon was what `0 0 31 2 *` cost:
+    2.1 million conversions, 1.58 s in release, inside `snob check`, for the
+    answer "never" — and `watch` paid it again on every wake, through
+    `room_at`. `next::minutes_on_named_days` jumps from a day the calendar
+    does not name to the next one by asking the zone where that day begins
+    (where the previous one ends, going back), **not by adding twenty-four
+    hours**: the day a zone springs forward through is twenty-three hours
+    long, and the arithmetic landed an hour into the next named day, past a
+    moment it then never saw. A day the calendar does name is still walked
+    minute by minute, so nothing about how a minute is judged changed. What
+    holds it is a sweep against a copy of the minute-by-minute search, across
+    both transition fixtures, with and without a last run. The one accepted
+    deviation is in a zone whose fall-back crosses midnight: the second
+    showing of "yesterday 23:xx" sits inside today, and a forward jump steps
+    over it.
     Missed runs are **folded into one and never replayed**: firing twelve to
     catch up is the burst the pacing exists to prevent, and they would all
     report the same present state anyway. How many were missed is counted

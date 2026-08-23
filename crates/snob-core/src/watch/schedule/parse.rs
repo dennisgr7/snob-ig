@@ -16,12 +16,19 @@ pub(super) struct FieldSet(pub(super) u64);
 
 impl FieldSet {
     /// Everything in `range`, which is what `*` means.
+    ///
+    /// A mask rather than a loop. `Calendar::allows` asks `is_all` twice per
+    /// minute it looks at, and the search looks at a lot of minutes; the loop
+    /// rebuilt the set from scratch on every one of them.
     pub(super) fn all(range: std::ops::RangeInclusive<u32>) -> Self {
-        let mut bits = 0u64;
-        for value in range {
-            bits |= 1 << value;
+        if range.is_empty() {
+            return Self(0);
         }
-        Self(bits)
+        let (start, end) = (*range.start(), *range.end());
+        debug_assert!(end < 64, "a field value is a bit in a u64");
+        let through_end = u64::MAX >> (63 - end);
+        let below_start = (1u64 << start) - 1;
+        Self(through_end & !below_start)
     }
 
     pub(super) fn contains(self, value: u32) -> bool {
@@ -240,6 +247,22 @@ mod tests {
             next_after(&mon_thu, None, at(hours(10)), &Utc),
             Some(at(3 * hours(24) + hours(9)))
         );
+    }
+
+    /// The mask is the same set the loop it replaced built, for every range a
+    /// field has, and for the empty one.
+    #[test]
+    fn a_whole_field_is_every_value_in_its_range() {
+        for range in [1..=31, 0..=6, 0..=59, 0..=23, 1..=12, 0..=63] {
+            let mut bits = 0u64;
+            for value in range.clone() {
+                bits |= 1 << value;
+            }
+            assert_eq!(FieldSet::all(range.clone()), FieldSet(bits), "{range:?}");
+            assert!(FieldSet::all(range.clone()).is_all(range));
+        }
+        let empty = std::ops::RangeInclusive::new(5, 4);
+        assert_eq!(FieldSet::all(empty), FieldSet(0), "an empty range is empty");
     }
 
     /// Seven and zero are both Sunday. Folded, so `* * * * 7` and `* * * * 0`

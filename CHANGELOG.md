@@ -100,6 +100,11 @@ place is a regime rather than permission.
   once warm. The musl target is the machine's own: `aarch64-unknown-linux-musl`
   on an ARM64 host, where asking for x86_64 failed in every C build script and
   where that shipped target's suite had never run at all.
+- **`snob check` answers at once about a calendar that never fires.** The
+  search walked four years of minutes before saying so — a second and a half
+  of CPU for `0 0 31 2 *` — and `snob watch` walked them again on every wake.
+  It steps over whole days the calendar does not name now; what a named day
+  means is unchanged, and a sweep against the old walk says so.
 - On Windows, a planted **directory link** under the stories scratch name is
   now replaced rather than refused: removing one takes `RemoveDirectory`, and
   `DeleteFile` answered "access denied" wherever the link could be made at all

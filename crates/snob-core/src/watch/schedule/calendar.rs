@@ -81,9 +81,17 @@ impl Calendar {
     /// When one of them is `*`, only the other one decides. Every
     /// implementation that gets this wrong gets it wrong quietly.
     pub(super) fn allows<Tz: TimeZone>(&self, at: &DateTime<Tz>) -> bool {
-        if !self.times.allows(at.hour(), at.minute()) {
-            return false;
-        }
+        self.times.allows(at.hour(), at.minute()) && self.allows_day(at)
+    }
+
+    /// Whether this moment falls on a day the calendar names, whatever the
+    /// time of day.
+    ///
+    /// The half of [`allows`](Self::allows) the search asks on its own: a day
+    /// this answers `false` for has no minute `allows` could accept, so the
+    /// search steps over it whole rather than asking about each of its
+    /// minutes.
+    pub(super) fn allows_day<Tz: TimeZone>(&self, at: &DateTime<Tz>) -> bool {
         if !self.months.contains(at.month()) {
             return false;
         }
@@ -238,11 +246,16 @@ mod tests {
     fn two_restricted_day_fields_combine_with_or() {
         let calendar = parse_cron("0 9 13 * 5").unwrap();
         let day = |at: Epoch| calendar.allows(&Utc.timestamp_opt(at.get(), 0).unwrap());
+        let date = |at: Epoch| calendar.allows_day(&Utc.timestamp_opt(at.get(), 0).unwrap());
 
         // Friday 2026-08-21 at 09:00 -- a Friday that is not the 13th.
         assert!(day(at(4 * hours(24) + hours(9))));
         // Monday 2026-08-17 at 09:00 -- neither.
         assert!(!day(at(hours(9))));
+
+        // The day half on its own says the same about the days, at any time.
+        assert!(date(at(4 * hours(24) + hours(15))));
+        assert!(!date(at(hours(15))));
     }
 
     /// And when one of them is `*`, only the other decides. Read as OR, `*`
@@ -251,8 +264,14 @@ mod tests {
     fn one_unrestricted_day_field_leaves_the_other_in_charge() {
         let calendar = parse_cron("0 9 * * 1").unwrap();
         let day = |at: Epoch| calendar.allows(&Utc.timestamp_opt(at.get(), 0).unwrap());
+        let date = |at: Epoch| calendar.allows_day(&Utc.timestamp_opt(at.get(), 0).unwrap());
 
         assert!(day(at(hours(9))), "Monday");
         assert!(!day(at(hours(24) + hours(9))), "Tuesday");
+        assert!(date(at(hours(15))), "Monday, whatever the hour");
+        assert!(
+            !date(at(hours(24) + hours(15))),
+            "Tuesday, whatever the hour"
+        );
     }
 }
