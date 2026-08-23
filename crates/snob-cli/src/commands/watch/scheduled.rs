@@ -188,8 +188,9 @@ pub(super) async fn scheduled(
         // Slept in bounded stretches and re-checked against the wall clock each
         // time round, rather than in one long sleep. A laptop that suspends for
         // eight hours makes a single long timer wrong by eight hours, and
-        // asking "is it time yet?" costs nothing.
-        let nap = (wake_at - now).clamp(1, 60) as u64;
+        // asking "is it time yet?" costs nothing -- asking it every minute
+        // for six hours costs a little, which is what `nap_for` is about.
+        let nap = nap_for(wake_at - now);
         if cancel
             .sleep_or_cancel(std::time::Duration::from_secs(nap))
             .await
@@ -245,13 +246,56 @@ fn missed_warning(missed: u32) -> String {
     }
 }
 
+/// How long to sleep before looking at the clock again, given how far the
+/// next run is.
+///
+/// Short near the moment and longer far from it. The loop used to nap at most
+/// a minute whatever the distance, so a monitor on `--every 6h` woke three
+/// hundred and sixty times between two pieces of work -- each wake-up cheap
+/// in CPU and each one a timer the operating system could not coalesce, on a
+/// laptop where that is the thing that costs battery. Five minutes when the
+/// run is more than ten away brings that to about seventy; the last ten
+/// minutes are walked in one-minute steps so the run still lands within a
+/// minute of its moment.
+///
+/// What detects a suspend is unchanged by this: it is the jump in the wall
+/// clock between two turns, read against [`CLOCK_JUMP_SECS`], not how often
+/// the clock is read. A laptop shut for eight hours is noticed on the first
+/// turn after it wakes, whichever nap it was in. And a nap can never run past
+/// the moment: it is bounded by the distance, so the wake-up for a run ten
+/// minutes out is never later than the run.
+fn nap_for(remaining: i64) -> u64 {
+    const FAR: i64 = 10 * 60;
+    let ceiling = if remaining > FAR {
+        NAP_FAR_SECS
+    } else {
+        NAP_NEAR_SECS
+    };
+    remaining.clamp(1, ceiling) as u64
+}
+
+/// The two nap ceilings [`nap_for`] chooses between. Both stay under the
+/// fifteen-minute floor between runs, so neither can nap through one.
+const NAP_NEAR_SECS: i64 = 60;
+const NAP_FAR_SECS: i64 = 5 * 60;
+
 /// How far the clock may move between two turns of the loop and still be
 /// ticking.
 ///
-/// A nap is at most sixty seconds, so anything past two minutes is a
-/// correction, a suspend, or a resume — none of which the moment being waited
-/// for was computed against.
-const CLOCK_JUMP_SECS: i64 = 120;
+/// Twice the longest nap: a turn that took longer than that did not sleep
+/// and wake, it was corrected, suspended, or resumed -- none of which the
+/// moment being waited for was computed against. Tied to [`NAP_FAR_SECS`]
+/// rather than written as a number, because the number was the nap's and
+/// the two have to move together: a five-minute nap against a two-minute
+/// jump would have called every ordinary turn a suspend.
+const CLOCK_JUMP_SECS: i64 = 2 * NAP_FAR_SECS;
+
+// The two orderings the loop leans on, held where they cannot be argued
+// with: the jump threshold sits clear above the longest nap (or every
+// ordinary turn reads as a suspend), and no nap may cross the floor between
+// runs (or the loop could sleep through one).
+const _: () = assert!(CLOCK_JUMP_SECS > NAP_FAR_SECS);
+const _: () = assert!(NAP_FAR_SECS < snob_core::watch::schedule::MIN_GAP_SECS);
 
 /// When the monitor last started a run, for any account.
 ///
@@ -327,6 +371,19 @@ fn seed_for(paths: &AppPaths, schedule: &Schedule, now: Epoch) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Near the moment the loop steps by the minute; far from it, by five.
+    /// Neither step can carry the loop past the moment itself.
+    #[test]
+    fn the_nap_is_short_near_the_moment_and_long_far_from_it() {
+        assert_eq!(nap_for(0), 1, "never a zero-second sleep");
+        assert_eq!(nap_for(-5), 1, "a moment already past is looked at now");
+        assert_eq!(nap_for(30), 30, "bounded by the distance when close");
+        assert_eq!(nap_for(90), 60, "a minute at most inside the last ten");
+        assert_eq!(nap_for(10 * 60), 60, "the last ten minutes are near");
+        assert_eq!(nap_for(10 * 60 + 1), 5 * 60, "past them, five minutes");
+        assert_eq!(nap_for(6 * 3600), 5 * 60);
+    }
 
     /// An interval measures from the first start, not from this one.
     ///

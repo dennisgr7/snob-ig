@@ -39,6 +39,10 @@ clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used for one derive: the envelope `cdp::reply_to` reads the message id off
+# without building the whole document.
+serde.workspace = true
 dialoguer.workspace = true
 console.workspace = true
 # Keys for the story browser, and nothing else in this program. It draws with

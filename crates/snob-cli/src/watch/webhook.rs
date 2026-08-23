@@ -252,7 +252,14 @@ impl WebhookClient {
 
 /// What the far end said, in one line.
 fn describe(status: reqwest::StatusCode, body: &str) -> String {
-    let excerpt: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Two hundred characters are kept, so sixty-four words is more than the
+    // excerpt can ever show; the body is the receiver's, up to four kilobytes,
+    // and this is the path a receiver that is down sends every retry through.
+    let excerpt: String = body
+        .split_whitespace()
+        .take(64)
+        .collect::<Vec<_>>()
+        .join(" ");
     if excerpt.is_empty() {
         return status.to_string();
     }

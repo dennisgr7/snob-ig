@@ -2567,6 +2567,7 @@ dependencies = [
  "libc",
  "opener",
  "rust_xlsxwriter",
+ "serde",
  "serde_json",
  "snob-core",
  "snob-ig",

@@ -174,6 +174,10 @@ fn utf8_or_lossy(bytes: Vec<u8>) -> String {
 /// Absent from a CDN answer and from anything that is not the API, so `None` is
 /// ordinary rather than notable.
 pub(super) fn load_of(response: &reqwest::Response) -> Option<String> {
+    // Read on every answer whether or not anything will log it, on purpose:
+    // the value travels on `Answer` and the test that holds the recording
+    // promise reads it from there, with no subscriber installed. Gating it on
+    // the log level would make the field lie exactly where it is checked.
     let headers = response.headers();
     let named = |name: &str| {
         headers

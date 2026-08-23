@@ -49,8 +49,21 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// two-factor codes arrive by SMS and people go looking for their phone.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Gap between cookie checks.
+/// Gap between cookie checks, while the login is young.
+///
+/// Each check asks the browser for its whole cookie jar and reads it back
+/// over the pipe, so the interval is how much of that a login costs. Two
+/// seconds for the first half minute, so a person who was already signed in
+/// is not kept waiting; after that [`POLL_INTERVAL_SETTLED`], because nobody
+/// completes a two-factor prompt in under five seconds and the three hundred
+/// polls a ten-minute wait used to make were work nobody read.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Gap between cookie checks once the login has been going a while.
+const POLL_INTERVAL_SETTLED: Duration = Duration::from_secs(5);
+
+/// How long the quick interval lasts before the settled one takes over.
+const POLL_QUICKLY_FOR: Duration = Duration::from_secs(30);
 
 /// Gap between looks at the pipe while waiting for the browser to come up.
 ///
@@ -419,8 +432,21 @@ impl Cdp {
 /// A message that is not JSON at all is not a reply either — the transport
 /// hands over bytes and says nothing about what is in them.
 fn reply_to(id: u64, message: &[u8]) -> Option<Value> {
-    let value: Value = serde_json::from_slice(message).ok()?;
-    (value.get("id").and_then(Value::as_u64) == Some(id)).then_some(value)
+    // The `id` is read off the raw bytes before anything is built. A browser
+    // narrates -- target events, console output, the cookie jar every two
+    // seconds while somebody logs in -- and building a `Value` for each of
+    // those only to read one integer and drop the tree was the bulk of this
+    // function's work. `serde_json::Deserializer` with a struct that names
+    // only `id` skips everything else at the tokenizer.
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        id: Option<u64>,
+    }
+    let envelope: Envelope = serde_json::from_slice(message).ok()?;
+    if envelope.id != Some(id) {
+        return None;
+    }
+    serde_json::from_slice(message).ok()
 }
 
 /// Picks the Instagram cookies out of everything the browser holds.
@@ -460,7 +486,8 @@ fn collect(cookies: &[Value]) -> Option<BrowserCookies> {
 
 /// Waits for the login to happen, checking every couple of seconds.
 pub async fn wait_for_login(cdp: &mut Cdp, cancel: &CancelToken) -> Result<BrowserCookies> {
-    let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let deadline = started + LOGIN_TIMEOUT;
 
     loop {
         if cancel.is_canceled() {
@@ -475,15 +502,44 @@ pub async fn wait_for_login(cdp: &mut Cdp, cancel: &CancelToken) -> Result<Brows
                 LOGIN_TIMEOUT.as_secs() / 60
             );
         }
-        if cancel.sleep_or_cancel(POLL_INTERVAL).await {
+        if cancel
+            .sleep_or_cancel(poll_interval(started.elapsed()))
+            .await
+        {
             bail!("canceled");
         }
+    }
+}
+
+/// Which of the two intervals applies, given how long the login has run.
+fn poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < POLL_QUICKLY_FOR {
+        POLL_INTERVAL
+    } else {
+        POLL_INTERVAL_SETTLED
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first half minute polls quickly; after that, at a pace a person
+    /// finding their phone will not notice.
+    #[test]
+    fn the_poll_slows_down_once_the_login_has_been_going_a_while() {
+        assert_eq!(poll_interval(Duration::ZERO), POLL_INTERVAL);
+        assert_eq!(poll_interval(Duration::from_secs(29)), POLL_INTERVAL);
+        assert_eq!(
+            poll_interval(Duration::from_secs(30)),
+            POLL_INTERVAL_SETTLED
+        );
+        assert_eq!(
+            poll_interval(Duration::from_secs(500)),
+            POLL_INTERVAL_SETTLED
+        );
+        assert!(POLL_INTERVAL < POLL_INTERVAL_SETTLED);
+    }
 
     /// A second `snob login --browser` hands its command line to the instance
     /// already holding the profile and exits within a second. Waiting the full
