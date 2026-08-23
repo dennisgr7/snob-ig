@@ -498,7 +498,7 @@ output: `snob scan someone | jq` reaches the consent question and can answer it.
 The two exceptions are the prompts that **draw** rather than only ask, and both
 need standard **error** to be a terminal as well — not standard output, which no
 prompt here touches. `ui::can_show_a_menu` gates the menu, because that is where
-`dialoguer` draws. `ui::can_mask` gates the masked secret prompt, which reads
+`ui::menu` draws. `ui::can_mask` gates the masked secret prompt, which reads
 its keys through `console::Term::stderr()`: that call answers `Key::Unknown`
 immediately and forever when the stream is not a TTY, so gated on standard input
 alone `snob login --paste 2> log` spun a core and never read what was pasted.
@@ -1173,6 +1173,7 @@ against.
 | Static CRT on Windows | +126,976 B per binary |
 | `tracing-subscriber`'s `env-filter`, replaced by `Targets` | **−327,680 B, 4.4%**, −3 crates (`matchers`, `regex-automata`, `regex-syntax`), measured on x86_64 Windows release either side of the change |
 | Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
+| `dialoguer`, replaced by `ui::menu` on the browser's own pieces | **−12,288 B**, −2 crates (`dialoguer`, `shell-words`), measured on aarch64-pc-windows-msvc release either side of the change. The crate's one use was a two-to-three entry menu; the browser already read keys and drew a highlighted list |
 | `ratatui` + `crossterm` for the same browser | +106,496 B, 1.32%, +27 crates — rejected |
 | `image` with only `jpeg`+`png`, the floor under any terminal image | +312,320 B, 3.9%, +17 crates — rejected |
 | Chromium profile after `snob login --browser` | 87.2 MB, 886 files |

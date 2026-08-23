@@ -43,7 +43,6 @@ serde_json.workspace = true
 # Used for one derive: the envelope `cdp::reply_to` reads the message id off
 # without building the whole document.
 serde.workspace = true
-dialoguer.workspace = true
 console.workspace = true
 # Keys for the story browser, and nothing else in this program. It draws with
 # `console` and reads with this: the split is deliberate and the reasoning is on

@@ -268,7 +268,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// Gives the cursor back if the process dies with a menu on screen.
 ///
 /// The release profile is `panic = "abort"`, so nothing runs on the way out —
-/// and `dialoguer` hides the cursor while a prompt is up. A panic during the
+/// and `ui::menu` hides the cursor and takes the terminal raw while a menu
+/// is up, as the story browser does. A panic during the
 /// login menu therefore left the user with an invisible cursor for the rest of
 /// their shell session, which reads as the terminal being broken rather than
 /// as this program having failed.

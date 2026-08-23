@@ -455,7 +455,7 @@ fn room_for(schedule: &schedule::Schedule) -> std::time::Duration {
 // The three below are the whole of what `ask_schedule` decides, split out from
 // the prompting so a test can reach them.
 //
-// Nothing could. The validation lives on this side of `dialoguer`, and the one
+// Nothing could. The validation lives on this side of the menu, and the one
 // test that claimed to cover it — `an_interval_below_the_floor_is_refused_at_setup`
 // — asserted `Schedule::every(300).is_err()`, which is a fact about the schedule
 // module and says nothing about whether `setup` asks it. Deleting the
@@ -713,7 +713,7 @@ fn ask_accounts(webhook: Option<&str>) -> Result<Vec<(String, Option<Epoch>)>> {
 /// "Watches your account and 1 other" as two unrelated lines.
 ///
 /// Split from the prompting so it can be read. Everything around it is behind
-/// `dialoguer`, which answers nothing without a terminal.
+/// `ui::menu`, which answers nothing without a terminal.
 ///
 /// The residue, written down rather than left to be found: an attended
 /// `snob watch once <stranger> --webhook …` still asks a question that says
@@ -998,7 +998,7 @@ evry = \"6h\"
     ///
     /// This used to be one line asserting `Schedule::every(300).is_err()`, which
     /// is a fact about the schedule module and says nothing about whether
-    /// `setup` asks it. The validation was unreachable behind `dialoguer`, so
+    /// `setup` asks it. The validation was unreachable behind the menu, so
     /// deleting it left the suite green while `every = "5m"` went into a file
     /// the scheduler then refuses at every run — and `config::parse` cannot
     /// catch that, because it checks the TOML and the schema number, not what

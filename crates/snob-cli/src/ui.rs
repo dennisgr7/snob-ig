@@ -142,9 +142,9 @@ pub fn can_be_asked() -> bool {
 /// Stricter than [`can_be_asked`], and about a different pair of streams than
 /// the stdin-and-stdout one this replaced. A menu is not a line of text: it
 /// needs keys, which arrive on standard input, and it redraws itself with
-/// cursor movement on **standard error**, which is where `dialoguer` puts every
-/// prompt — `Select::interact_opt` builds a `Term::stderr()`. Standard output
-/// is the one stream a menu never touches.
+/// cursor movement on **standard error**, which is where `ui::menu` draws —
+/// it writes through a `Term::stderr()`, as the story browser does. Standard
+/// output is the one stream a menu never touches.
 ///
 /// Asking about the wrong two got it wrong in both directions: `snob login |
 /// tee log` refused to show a menu it could have drawn perfectly well, and
@@ -258,28 +258,25 @@ pub fn choose_login_method() -> Result<Option<LoginMethod>> {
 
 /// Picks one of several options with the arrow keys. `None` means Esc.
 pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
-    use dialoguer::theme::ColorfulTheme;
-
-    dialoguer::Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .items(labels)
-        .default(0)
-        .interact_opt()
-        .context("could not show the menu")
+    menu::choose(prompt, labels)
 }
 
-/// Undoes what a prompt did to the terminal, for an exit that runs no
-/// destructors.
+/// Undoes what a menu or the browser did to the terminal, for an exit that
+/// runs no destructors.
 ///
-/// `dialoguer` hides the cursor while a menu is up and shows it again on the
-/// way out. The release profile is `panic = "abort"` and the forced-quit path
-/// calls `exit(130)`, so neither of those runs its way out — and an invisible
-/// cursor is not scoped to this program. It stays that way for the rest of the
-/// shell session, long after the user has forgotten what they pressed.
+/// Both hide the cursor while they are up and put the terminal in raw mode to
+/// read keys, and both restore the two on the way out through guards. The
+/// release profile is `panic = "abort"` and the forced-quit path calls
+/// `exit(130)`, so neither guard runs on those ways out — and neither an
+/// invisible cursor nor a raw terminal is scoped to this program. They stay
+/// that way for the rest of the shell session, long after the user has
+/// forgotten what they pressed.
 ///
-/// Idempotent and safe with no terminal: `console` writes the sequence to
-/// stderr and does nothing if that is not a terminal.
+/// Idempotent and safe with no terminal: `console` writes the cursor sequence
+/// to stderr and does nothing if that is not a terminal, and leaving raw mode
+/// a terminal was never in is a no-op.
 pub fn restore_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
     let _ = console::Term::stderr().show_cursor();
 }
 
@@ -500,6 +497,7 @@ mod tests {
 /// Drawing and key-reading for the interactive story list. See its own header
 /// for what it costs against the terminal-UI framework it is not.
 pub mod browser;
+pub mod menu;
 
 /// The interactive story list.
 pub mod stories;
