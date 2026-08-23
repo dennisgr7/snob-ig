@@ -14,7 +14,7 @@ use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
 use crate::app::App;
-use crate::cli::{Attr, Format, ListArgs};
+use crate::cli::{Attr, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs};
 use crate::engine::{self, ListOutcome};
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
@@ -32,9 +32,9 @@ pub enum Session {
 }
 
 /// Opens the app for a list command, or refuses because there is no session.
-pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Box<App>> {
+pub fn open(walk: &WalkArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Box<App>> {
     // No bar when the answer comes out of storage: there is nothing to watch.
-    app(secrets, paths, !args.no_progress && !args.cache)
+    app(secrets, paths, !walk.no_progress && !walk.cache)
 }
 
 /// Opens the app, or refuses because there is no session.
@@ -74,18 +74,29 @@ pub fn open_with_progress(
 /// The part of the command line the engine is asked with.
 ///
 /// Here and not in `engine`, so the engine knows nothing about clap: this is
-/// the one place the parser's struct is read for what the engine needs.
+/// the one place the parser's structs are read for what the engine needs.
+/// Two commands carry a walk, and both become the same query.
+fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
+    engine::ListQuery {
+        target: target.clone(),
+        yes: walk.yes,
+        refresh: walk.refresh,
+        cache: walk.cache,
+        max_age: walk.max_age,
+        no_resume: walk.no_resume,
+        max_pages: walk.max_pages,
+    }
+}
+
 impl From<&ListArgs> for engine::ListQuery {
     fn from(args: &ListArgs) -> Self {
-        Self {
-            target: args.target.clone(),
-            yes: args.yes,
-            refresh: args.refresh,
-            cache: args.cache,
-            max_age: args.max_age,
-            no_resume: args.no_resume,
-            max_pages: args.max_pages,
-        }
+        query(&args.target, &args.walk)
+    }
+}
+
+impl From<&ScanArgs> for engine::ListQuery {
+    fn from(args: &ScanArgs) -> Self {
+        query(&args.target, &args.walk)
     }
 }
 
@@ -171,8 +182,8 @@ impl Destination {
 }
 
 /// Settles the destination and refuses up front what would only fail later.
-pub fn destination(args: &ListArgs) -> Result<Destination> {
-    let path = args.output.clone();
+pub fn destination(args: &OutputArgs) -> Result<Destination> {
+    let path = args.path.clone();
     let format = output::effective_format(args.format, path.as_deref());
     output::check_destination(format, path.as_deref())?;
 
@@ -184,7 +195,7 @@ pub fn destination(args: &ListArgs) -> Result<Destination> {
 }
 
 /// Builds the filter from the arguments.
-pub fn filter_from(args: &ListArgs) -> Result<Filter> {
+pub fn filter_from(args: &FilterArgs) -> Result<Filter> {
     let mut hide: Vec<Attribute> = args.hide.iter().copied().map(attribute).collect();
     if args.no_verified && !hide.contains(&Attribute::Verified) {
         hide.push(Attribute::Verified);
@@ -235,7 +246,7 @@ fn attribute(a: Attr) -> Attribute {
 /// blank line. The caller ends it when the run is over.
 pub async fn walk_named(
     app: &mut App,
-    args: &ListArgs,
+    args: impl Into<engine::ListQuery>,
     kind: ListKind,
     subject: &str,
     check: impl FnOnce(&ListOutcome) -> Result<()>,
@@ -259,24 +270,8 @@ pub async fn walk_named(
 mod tests {
     use super::*;
 
-    fn args() -> ListArgs {
-        ListArgs {
-            target: None,
-            hide: vec![],
-            only: vec![],
-            no_verified: false,
-            exclude_list: None,
-            format: None,
-            output: None,
-            limit: None,
-            refresh: false,
-            cache: false,
-            max_age: std::time::Duration::from_secs(6 * 3600),
-            no_resume: false,
-            max_pages: None,
-            no_progress: true,
-            yes: true,
-        }
+    fn args() -> FilterArgs {
+        FilterArgs::default()
     }
 
     #[test]
@@ -323,14 +318,18 @@ mod tests {
     /// be settled before the first request rather than after the walk.
     #[test]
     fn the_destination_is_settled_from_the_arguments() {
-        let mut a = args();
-        a.output = Some(PathBuf::from("result.csv"));
-        assert_eq!(destination(&a).unwrap().format(), Format::Csv);
+        let to_file = OutputArgs {
+            format: None,
+            path: Some(PathBuf::from("result.csv")),
+        };
+        assert_eq!(destination(&to_file).unwrap().format(), Format::Csv);
 
         // A spreadsheet on standard output is refused here, before anything is
         // spent finding out.
-        let mut binary = args();
-        binary.format = Some(Format::Xlsx);
+        let binary = OutputArgs {
+            format: Some(Format::Xlsx),
+            path: None,
+        };
         assert!(destination(&binary).is_err());
     }
 }

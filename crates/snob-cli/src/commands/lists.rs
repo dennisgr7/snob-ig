@@ -22,10 +22,10 @@ pub async fn run(
     paths: &AppPaths,
     kind: ListKind,
 ) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
 
-    let mut app = common::open(&args, &secrets, paths)?;
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // Named before the engine runs, so the bar says what it is about during
     // consent, resolution and the counter poll rather than only once pages

@@ -35,10 +35,9 @@ use common::{SID, UA, args_for};
 /// `yes` is the one field that has to differ from the shared fixture — the tests
 /// there would hang on the prompt, and these exist to reach it.
 fn args(target: &str) -> ListArgs {
-    ListArgs {
-        yes: false,
-        ..args_for(target)
-    }
+    let mut args = args_for(target);
+    args.walk.yes = false;
+    args
 }
 
 /// No mock is mounted on purpose. Every test here asserts the answer arrives
@@ -184,7 +183,7 @@ async fn your_own_name_never_needs_confirming_even_with_nobody_there() {
 #[tokio::test]
 async fn a_yes_given_in_advance_needs_no_terminal() {
     let mut args = args("@ghost");
-    args.yes = true;
+    args.walk.yes = true;
 
     let (result, spent) = ask(&args, false).await;
     result.expect("-y is consent");
@@ -256,10 +255,8 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
 
     // No `-y`, no terminal — `cargo test` is not one — and somebody else's
     // account. Every ingredient of the refusal, and it must not come.
-    let args = ListArgs {
-        cache: true,
-        ..args("@ghost")
-    };
+    let mut args = args("@ghost");
+    args.walk.cache = true;
     let (users, outcome) = engine::list(&mut app, &args, ListKind::Followers)
         .await
         .expect("a local answer needs nobody's permission and nobody's terminal");

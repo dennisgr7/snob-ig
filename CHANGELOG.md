@@ -24,6 +24,12 @@ place is a regime rather than permission.
   out from a 403 that would read as an expired session.
   `snob login --paste --csrftoken <token>` is the way to add one on a machine
   with no browser to launch.
+- **The list commands' options are three groups rather than one struct**, and
+  a flag a command would ignore is now refused by the parser: `snob scan
+  --limit` used to be accepted with a warning, `--cache` with `--max-pages` or
+  `--no-resume` walked nothing and said nothing, and `snob stories --format json
+  -d 2` printed no JSON. `--no-verified` still works and is out of the help:
+  `--hide verified` is the general form.
 - **`snob stories`** lists what an account has up: what each story is, when it
   went up and how long it has left. `--download 2` saves one by the number the
   listing printed, `--all` saves all of them, and `--interactive` is a list you

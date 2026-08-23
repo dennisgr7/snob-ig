@@ -1,8 +1,9 @@
 //! `snob scan`: the whole-account summary.
 //!
 //! Walks both lists and prints the five counts. Unlike the set commands it
-//! returns no account list, so `--limit` has nothing to trim, the machine
-//! formats emit a counts object, and the row formats come out one row wide.
+//! returns no account list, so it takes no `--limit` — `cli::ScanArgs` is the
+//! list options without it — the machine formats emit a counts object, and the
+//! row formats come out one row wide.
 //!
 //! On somebody else's account it opens with the people you both know, which is
 //! the line you actually read first — and it costs nothing, because the answer
@@ -17,7 +18,7 @@ use snob_core::{Epoch, Pk};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
-use crate::cli::{Format, ListArgs};
+use crate::cli::{Format, ScanArgs};
 use crate::commands::common::{self, Destination};
 use crate::engine::{self, ListOutcome, ResultSource, people};
 use crate::exit::ExitCode;
@@ -80,15 +81,11 @@ struct Summary<'a> {
     following: &'a ListOutcome,
 }
 
-pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
+pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
 
-    if args.limit.is_some() {
-        ui::warn("--limit has no effect on scan: it prints counts, not accounts");
-    }
-
-    let mut app = common::open(&args, &secrets, paths)?;
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // The label of the account being summarized, worked out up front so the
     // hints can name it.
@@ -132,7 +129,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // covers only the two lists that were walked — so without the bound the
     // opening line could name accounts unfollowed months ago while reading
     // exactly like one worked out this minute.
-    let max_age = i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX);
+    let max_age = i64::try_from(args.walk.max_age.as_secs()).unwrap_or(i64::MAX);
     let now = snob_core::clock::now();
     let stale = found.as_ref().is_some_and(|f| !f.is_current(max_age, now));
     let followed_by = found.filter(|_| !stale);

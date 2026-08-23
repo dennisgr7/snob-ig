@@ -203,7 +203,7 @@ pub enum Command {
     Purge(PurgeArgs),
 
     /// Summary of the whole account: followers, following, and how they cross
-    Scan(ListArgs),
+    Scan(ScanArgs),
 
     /// Accounts you follow that do not follow you back
     Unfollowers(ListArgs),
@@ -332,11 +332,59 @@ pub struct PurgeArgs {
     pub dry_run: bool,
 }
 
+/// The options every command that prints a list of accounts takes.
+///
+/// Composed from three groups rather than written as one struct, and the
+/// reason is `scan`: it walks the same two lists with the same filter and
+/// writes to the same destinations, but it prints counts, so `--limit` had
+/// nothing to trim and was accepted with a warning. One flat struct meant
+/// every command took every flag whether it meant anything or not, and the
+/// warning was the cheapest way to say so. A command now takes the groups it
+/// acts on — [`ScanArgs`] is this without the cap — and a flag it would ignore
+/// is one clap refuses.
+///
+/// The order of the fields is the order of the help, so a reader meets the
+/// target, then what to show, then where, then how the walk is made.
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
     pub target: Option<String>,
 
+    #[command(flatten)]
+    pub filter: FilterArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+
+    /// Trim the output to the first N accounts. Saves no requests: --max-pages
+    /// is what does that.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    #[command(flatten)]
+    pub walk: WalkArgs,
+}
+
+/// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five
+/// counts has no rows to cut.
+#[derive(Args, Debug)]
+pub struct ScanArgs {
+    /// Account to summarize. Defaults to your own.
+    pub target: Option<String>,
+
+    #[command(flatten)]
+    pub filter: FilterArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+
+    #[command(flatten)]
+    pub walk: WalkArgs,
+}
+
+/// Which accounts a list keeps.
+#[derive(Args, Debug, Clone, Default)]
+pub struct FilterArgs {
     /// Hide accounts with any of these attributes
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub hide: Vec<Attr>,
@@ -351,26 +399,37 @@ pub struct ListArgs {
     pub only: Vec<Attr>,
 
     /// Shorthand for --hide verified
-    #[arg(long)]
+    // Hidden rather than removed: it is the spelling the first release
+    // documented, so a script written against it still runs. It is kept out of
+    // the help because `--hide` is the general form and a second way to say
+    // one thing is the beginning of one per attribute.
+    #[arg(long, hide = true)]
     pub no_verified: bool,
 
     /// File of usernames to exclude from the result, one per line
     #[arg(long, value_name = "FILE")]
     pub exclude_list: Option<PathBuf>,
+}
 
+/// Where a list goes and in what shape.
+#[derive(Args, Debug, Clone, Default)]
+pub struct OutputArgs {
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
     #[arg(long, value_enum)]
     pub format: Option<Format>,
 
     /// Write the result to a file instead of standard output
-    #[arg(short = 'o', long, value_name = "FILE")]
-    pub output: Option<PathBuf>,
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    pub path: Option<PathBuf>,
+}
 
-    /// Trim the output to the first N accounts. Saves no requests: --max-pages
-    /// is what does that.
-    #[arg(long, value_name = "N")]
-    pub limit: Option<usize>,
-
+/// How a walk is made: whether to make one at all, how far, and whether
+/// anybody has to be asked first.
+///
+/// `--cache` answers out of storage and spends nothing, so the two flags that
+/// shape a walk conflict with it rather than being accepted and ignored.
+#[derive(Args, Debug, Clone)]
+pub struct WalkArgs {
     /// Walk the list again even if there is a recent snapshot
     #[arg(long, conflicts_with = "cache")]
     pub refresh: bool,
@@ -384,11 +443,11 @@ pub struct ListArgs {
     pub max_age: std::time::Duration,
 
     /// Start from scratch instead of continuing an interrupted walk
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cache")]
     pub no_resume: bool,
 
     /// Stop the walk after N pages, saving requests
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", conflicts_with = "cache")]
     pub max_pages: Option<u32>,
 
     /// Do not draw the progress bar
@@ -398,6 +457,23 @@ pub struct ListArgs {
     /// Do not ask before enumerating someone else's account
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+/// What no flags mean. Written by hand because a derived `Default` would put
+/// `--max-age` at zero seconds, and a test building arguments with
+/// `..Default::default()` would then find every snapshot stale.
+impl Default for WalkArgs {
+    fn default() -> Self {
+        Self {
+            refresh: false,
+            cache: false,
+            max_age: std::time::Duration::from_secs(6 * 3600),
+            no_resume: false,
+            max_pages: None,
+            no_progress: false,
+            yes: false,
+        }
+    }
 }
 
 /// Parses durations written like `30m`, `6h`, `2d`, `2w`.
@@ -861,6 +937,61 @@ mod tests {
     fn cache_and_refresh_are_mutually_exclusive() {
         let result = Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]);
         assert!(result.is_err());
+    }
+
+    /// `--cache` makes no walk, so a flag that shapes one is refused rather
+    /// than accepted and ignored.
+    #[test]
+    fn a_flag_that_shapes_a_walk_is_refused_with_cache() {
+        for flag in [["--max-pages", "2"], ["--no-resume", ""]] {
+            let mut line = vec!["snob", "followers", "--cache", flag[0]];
+            if !flag[1].is_empty() {
+                line.push(flag[1]);
+            }
+            assert!(
+                Cli::try_parse_from(&line).is_err(),
+                "{} was accepted alongside --cache",
+                flag[0]
+            );
+        }
+    }
+
+    /// `scan` prints counts, so it has no rows for `--limit` to cut and does
+    /// not take it. It used to, with a warning, because it shared the list
+    /// commands' struct.
+    #[test]
+    fn scan_takes_the_list_options_but_not_the_cap() {
+        assert!(Cli::try_parse_from(["snob", "scan", "--limit", "5"]).is_err());
+        let cli = Cli::try_parse_from([
+            "snob", "scan", "someone", "--hide", "verified", "--format", "json", "--cache", "-y",
+        ])
+        .unwrap();
+        let Command::Scan(args) = cli.command else {
+            panic!("scan");
+        };
+        assert_eq!(args.target.as_deref(), Some("someone"));
+        assert_eq!(args.filter.hide, vec![Attr::Verified]);
+        assert_eq!(args.output.format, Some(Format::Json));
+        assert!(args.walk.cache && args.walk.yes);
+    }
+
+    /// Hidden from the help, still accepted: the first release documented it.
+    #[test]
+    fn no_verified_still_parses_and_is_not_advertised() {
+        let cli = Cli::try_parse_from(["snob", "unfollowers", "--no-verified"]).unwrap();
+        let Command::Unfollowers(args) = cli.command else {
+            panic!("unfollowers");
+        };
+        assert!(args.filter.no_verified);
+
+        let help = Cli::command()
+            .find_subcommand("unfollowers")
+            .expect("unfollowers is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--no-verified"), "{help}");
+        assert!(help.contains("--hide"), "{help}");
     }
 
     /// A story listing's format has nothing to say about a download or the

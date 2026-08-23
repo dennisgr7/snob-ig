@@ -251,7 +251,7 @@ async fn refresh_is_refused_while_the_cooldown_lasts() {
     start_cooldown(&budget);
 
     let mut args = args();
-    args.refresh = true;
+    args.walk.refresh = true;
     let error = execute_with(&server, reopen(tmp.path()), budget.clone(), &args)
         .await
         .unwrap_err();
@@ -406,7 +406,7 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@ghost".into());
-    cached.cache = true;
+    cached.walk.cache = true;
     let (found, outcome) = execute_with(&empty, reopen(tmp.path()), budget.clone(), &cached)
         .await
         .unwrap();

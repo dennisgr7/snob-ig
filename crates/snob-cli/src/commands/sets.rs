@@ -82,10 +82,10 @@ pub async fn run(
     paths: &AppPaths,
     op: SetOp,
 ) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
 
-    let mut app = common::open(&args, &secrets, paths)?;
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // The list being crossed against comes first. If it turns out incomplete
     // there is no result to give, so it is worth finding out before spending

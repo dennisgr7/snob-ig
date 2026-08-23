@@ -12,7 +12,7 @@
 //! itself in the binaries that happen to use all of it.
 #![allow(dead_code)]
 
-use snob_cli::cli::ListArgs;
+use snob_cli::cli::{FilterArgs, ListArgs, OutputArgs, WalkArgs};
 
 /// A plausible desktop Chrome User-Agent. The session is tied to one, and
 /// Instagram checks that the two agree.
@@ -30,20 +30,14 @@ pub const SID: &str = "42%3AAbCdEfGh%3A20";
 pub fn args() -> ListArgs {
     ListArgs {
         target: None,
-        hide: vec![],
-        only: vec![],
-        no_verified: false,
-        exclude_list: None,
-        format: None,
-        output: None,
+        filter: FilterArgs::default(),
+        output: OutputArgs::default(),
         limit: None,
-        refresh: false,
-        cache: false,
-        max_age: std::time::Duration::from_secs(6 * 3600),
-        no_resume: false,
-        max_pages: None,
-        no_progress: true,
-        yes: true,
+        walk: WalkArgs {
+            no_progress: true,
+            yes: true,
+            ..WalkArgs::default()
+        },
     }
 }
 

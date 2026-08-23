@@ -141,7 +141,7 @@ async fn with_cache_the_network_is_not_touched() {
     let before = requests(&server).await;
 
     let mut args = args();
-    args.cache = true;
+    args.walk.cache = true;
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(found.len(), 30);
@@ -172,7 +172,7 @@ async fn a_cached_crossing_asks_about_the_account_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.yes = true;
+    args.walk.yes = true;
 
     // Populate both lists, in runs of their own.
     execute(&server, tmp.path(), &args).await.unwrap();
@@ -216,7 +216,7 @@ async fn a_walk_invalidates_the_counters_it_was_started_with() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.yes = true;
+    args.walk.yes = true;
 
     let mut app = app(&server, open_db(tmp.path()));
     // Nothing stored, so this one walks.
@@ -261,7 +261,7 @@ async fn a_cached_pair_carries_no_evidence_and_cannot_be_crossed() {
     execute(&server, tmp.path(), &args()).await.unwrap();
 
     let mut args = args();
-    args.cache = true;
+    args.walk.cache = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(
@@ -293,7 +293,7 @@ async fn refresh_walks_again_even_with_no_changes() {
     execute(&server, tmp.path(), &args()).await.unwrap();
 
     let mut args = args();
-    args.refresh = true;
+    args.walk.refresh = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(outcome.source(), ResultSource::Fetched);
@@ -326,7 +326,7 @@ async fn refresh_walks_again_when_the_counter_poll_fails() {
     mount_list(&server, 30).await;
 
     let mut refreshing = args();
-    refreshing.refresh = true;
+    refreshing.walk.refresh = true;
     let (found, outcome) = execute(&server, tmp.path(), &refreshing).await.unwrap();
 
     assert_eq!(
@@ -379,7 +379,7 @@ async fn with_nothing_stored_cache_fails_instead_of_lying() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
-    args.cache = true;
+    args.walk.cache = true;
 
     assert!(execute(&server, tmp.path(), &args).await.is_err());
 }
@@ -420,7 +420,7 @@ async fn cache_with_a_named_target_stays_off_the_network() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@Ghost".into());
-    cached.cache = true;
+    cached.walk.cache = true;
     let (found, outcome) = execute(&empty, tmp.path(), &cached).await.unwrap();
 
     assert_eq!(found.len(), 2);
@@ -434,7 +434,7 @@ async fn cache_with_an_unknown_target_fails_without_the_network() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.cache = true;
+    args.walk.cache = true;
     args.target = Some("@nobody".into());
     let error = execute(&server, tmp.path(), &args).await.unwrap_err();
 
@@ -468,7 +468,7 @@ async fn the_page_cap_leaves_the_list_marked_incomplete() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.max_pages = Some(1);
+    args.walk.max_pages = Some(1);
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert!(!outcome.is_complete());
@@ -513,7 +513,7 @@ async fn an_interrupted_walk_is_left_unclaimed_for_the_next_run() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.max_pages = Some(1);
+    args.walk.max_pages = Some(1);
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert!(
@@ -601,7 +601,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     let tmp = tempfile::tempdir().unwrap();
     execute(&server, tmp.path(), &args()).await.unwrap();
     let mut following_args = args();
-    following_args.cache = false;
+    following_args.walk.cache = false;
     {
         let mut app = app(&server, open_db(tmp.path()));
         engine::list(&mut app, &following_args, ListKind::Following)
@@ -629,7 +629,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     }
 
     let mut cached = args();
-    cached.cache = true;
+    cached.walk.cache = true;
     let (_, followers) = execute(&server, tmp.path(), &cached).await.unwrap();
     let following = {
         let mut app = app(&server, open_db(tmp.path()));
@@ -687,7 +687,7 @@ async fn an_interrupted_walk_continues_from_the_cursor_it_stored() {
 
     // A walk stopped after one page, with a cursor saved.
     let mut capped = args();
-    capped.max_pages = Some(1);
+    capped.walk.max_pages = Some(1);
     execute(&server, tmp.path(), &capped).await.unwrap();
 
     let partial: i64 = open_db(tmp.path())
@@ -759,12 +759,12 @@ async fn no_resume_walks_the_list_again_from_the_first_page() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut capped = args();
-    capped.max_pages = Some(1);
+    capped.walk.max_pages = Some(1);
     execute(&server, tmp.path(), &capped).await.unwrap();
     let after_the_first = requests(&server).await;
 
     let mut fresh = args();
-    fresh.no_resume = true;
+    fresh.walk.no_resume = true;
     execute(&server, tmp.path(), &fresh).await.unwrap();
 
     let resumes: i64 = open_db(tmp.path())

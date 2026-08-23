@@ -59,11 +59,14 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
     let json = match &cli.command {
         Command::Followers(args)
         | Command::Following(args)
-        | Command::Scan(args)
         | Command::Unfollowers(args)
         | Command::Fans(args)
         | Command::Friends(args) => matches!(
-            effective_format(args.format, args.output.as_deref()),
+            effective_format(args.output.format, args.output.path.as_deref()),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Scan(args) => matches!(
+            effective_format(args.output.format, args.output.path.as_deref()),
             Format::Json | Format::Ndjson
         ),
         Command::Stories(args) => matches!(
