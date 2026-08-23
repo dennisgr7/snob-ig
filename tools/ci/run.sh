@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the Linux CI job locally. From the repository root:
 #
-#     bash ci/local/run.sh
+#     bash tools/ci/run.sh
 #
 # The first run builds the image and compiles everything from cold, which
 # takes a few minutes; the two named volumes keep the registry and the
@@ -19,7 +19,7 @@ cd "$(dirname "$0")/../.."
 root="$(pwd -W 2>/dev/null || pwd)"
 export MSYS_NO_PATHCONV=1
 
-docker build -q -t snob-ci ci/local >/dev/null
+docker build -q -t snob-ci tools/ci >/dev/null
 exec docker run --rm \
     -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
     -v "$root:/src" \

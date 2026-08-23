@@ -95,7 +95,7 @@ place is a regime rather than permission.
   --no-default-features` is 656 KB and six crates lighter. The released binary
   is unchanged, and a build without the feature refuses `--format xlsx` before
   a walk is paid for, naming the formats it has.
-- **`bash ci/local/run.sh`** runs the Linux CI job — musl, a real keyring behind
+- **`bash tools/ci/run.sh`** runs the Linux CI job — musl, a real keyring behind
   a session bus — in a container on the development machine, in under a minute
   once warm.
 - Smaller: `@ alice` in an `--exclude-list` now matches; `watch diff --json`
