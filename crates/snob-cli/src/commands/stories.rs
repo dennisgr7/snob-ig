@@ -171,7 +171,8 @@ async fn download_selected(
     if let [number] = numbers[..] {
         return download_one(&client, stories, number, destination).await;
     }
-    download_many(client, stories, numbers, destination).await
+    let stem = printable(&stories.username);
+    download_many(client, stem, stories.items.clone(), numbers, destination).await
 }
 
 /// The sentence for a number the tray does not have, shared by the single
@@ -218,7 +219,7 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Stories> {
 /// the biggest. `image_versions2` is read even for a video, because a video
 /// item carries its poster frame there and an item with no `video_versions` is
 /// then still downloadable as the picture Instagram has of it.
-fn story_from(item: &ReelItem) -> Story {
+pub(crate) fn story_from(item: &ReelItem) -> Story {
     let kind = Kind::of(item.media_type);
     let video = largest(&item.video_versions).map(|v| v.url.clone());
     let image = item
@@ -435,7 +436,15 @@ async fn download_one(
             output::write_bytes(&bytes, Some(path))?;
             ui::info(&format!("Saved {}", path.display()));
         }
-        None => match save_story(client, stories, number, Path::new(".")).await? {
+        None => match save_story(
+            client,
+            &stories.username,
+            &stories.items,
+            number,
+            Path::new("."),
+        )
+        .await?
+        {
             Saved::Now(path) => ui::info(&format!("Saved {}", path.display())),
             Saved::Already(path) => ui::info(&format!("Already saved {}", path.display())),
         },
@@ -444,7 +453,7 @@ async fn download_one(
 }
 
 /// What [`save_story`] found: the file it wrote, or the one already there.
-enum Saved {
+pub(crate) enum Saved {
     Now(PathBuf),
     Already(PathBuf),
 }
@@ -470,18 +479,22 @@ enum Saved {
 /// name, where the look above would take it for a finished one. A `.part` is
 /// removed on any failure here; one left by a killed process is removed the
 /// next time the same story is asked for.
-async fn save_story(
+/// `stem_base` is what comes before the number in the file name: the username
+/// for a story, the username and the highlight's number for a highlight item.
+/// Filtered here, because it carries a name that came off the server.
+pub(crate) async fn save_story(
     client: &IgClient,
-    stories: &Stories,
+    stem_base: &str,
+    items: &[Story],
     number: usize,
     dir: &Path,
 ) -> Result<Saved> {
-    let stem = format!("{}-{number}", printable(&stories.username));
+    let stem = format!("{}-{number}", printable(stem_base));
     if let Some(existing) = already_saved(dir, &stem) {
         return Ok(Saved::Already(existing));
     }
 
-    let story = &stories.items[number - 1];
+    let story = &items[number - 1];
     let url = story
         .url
         .as_deref()
@@ -505,12 +518,7 @@ async fn save_story(
     // `default_name` answers a bare name and checks the directory only for a
     // collision; joined here, or `-o somewhere` made the directory and the
     // file landed in the working directory.
-    let name = match default_name(
-        dir,
-        &stories.username,
-        number,
-        extension_of(&downloaded.head),
-    ) {
+    let name = match default_name(dir, stem_base, number, extension_of(&downloaded.head)) {
         Ok(name) => name,
         Err(e) => {
             let _ = std::fs::remove_file(&part);
@@ -548,9 +556,10 @@ fn already_saved(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// A Ctrl+C is the one failure that is not collected. Every fetch after it
 /// answers `Canceled` at once, so carrying on would count them all as
 /// failures and exit 1 for what the user did on purpose.
-async fn download_many(
+pub(crate) async fn download_many(
     client: std::sync::Arc<IgClient>,
-    stories: &Stories,
+    stem_base: String,
+    items: Vec<Story>,
     numbers: Vec<usize>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -567,14 +576,16 @@ async fn download_many(
     // stories share one TCP+TLS connection instead of each waiting its own
     // round trip. Three is what a browser does when it opens a tray, and
     // past it a home link is the limit, not the latency.
-    let stories = std::sync::Arc::new(stories.clone());
+    let stem_base = std::sync::Arc::new(stem_base);
+    let items = std::sync::Arc::new(items);
     let dir = std::sync::Arc::new(dir.to_path_buf());
     let slots = std::sync::Arc::new(Semaphore::new(STORY_DOWNLOADS_IN_FLIGHT));
     let mut tasks = JoinSet::new();
     for &number in &numbers {
-        let (client, stories, dir, slots) = (
+        let (client, stem_base, items, dir, slots) = (
             std::sync::Arc::clone(&client),
-            std::sync::Arc::clone(&stories),
+            std::sync::Arc::clone(&stem_base),
+            std::sync::Arc::clone(&items),
             std::sync::Arc::clone(&dir),
             std::sync::Arc::clone(&slots),
         );
@@ -583,7 +594,10 @@ async fn download_many(
             // so the only way this fails is the runtime shutting down, and
             // then there is nobody to report to.
             let _slot = slots.acquire_owned().await.ok()?;
-            Some((number, save_story(&client, &stories, number, &dir).await))
+            Some((
+                number,
+                save_story(&client, &stem_base, &items, number, &dir).await,
+            ))
         });
     }
 
@@ -640,7 +654,7 @@ async fn download_many(
 const STORY_DOWNLOADS_IN_FLIGHT: usize = 3;
 
 /// Whether a failed download was the user stopping it.
-fn was_canceled(e: &anyhow::Error) -> bool {
+pub(crate) fn was_canceled(e: &anyhow::Error) -> bool {
     e.chain()
         .any(|cause| matches!(cause.downcast_ref::<IgError>(), Some(IgError::Canceled)))
 }

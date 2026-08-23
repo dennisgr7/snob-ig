@@ -5,7 +5,8 @@ Instagram from the terminal.
 It walks your followers and your following, crosses them, and answers the
 questions the app will not: who does not follow you back, who you never followed
 back, and who you and somebody else both know. It can also pull a profile
-picture at full size, and show or save the stories an account has up.
+picture at full size, and show or save the stories an account has up and the
+highlights its profile keeps.
 
 All of it is work you can already do by hand in the app, for as long as you have
 the patience: scroll two lists, compare them, long-press a picture. snob is the
@@ -208,7 +209,20 @@ has left. `--download 2` saves the second one, `--download 1,3` or
 you move through with the arrow keys — Enter opens the story in whatever you
 already open pictures and videos with, `D` keeps a copy.
 
-**Saving a story does not mark it as seen.** Instagram registers a view with a
+```bash
+snob highlights someone
+```
+
+The highlights under their bio, numbered, with each one's title, size and last
+addition. `snob highlights someone 2` lists what the second one holds, and on
+that listing `--download` and `-i` mean exactly what they mean on `stories`;
+without the number, `--download 2` saves everything in the second highlight and
+`--download all` the whole profile. Files land as `someone-2-3.jpg` — the
+highlight's number, then the item's. In `-i` the tray works like folders: Enter
+walks in, Left or Backspace walks back out, `D` keeps one item or a whole
+highlight, depending on where you press it.
+
+**Saving a story or a highlight does not mark it as seen.** Instagram registers a view with a
 separate request, and that request is a write — so it falls under the two-write
 rule below, and there is no code here that could send it. A test reads the whole
 source on every build to keep it that way. It follows from snob being a

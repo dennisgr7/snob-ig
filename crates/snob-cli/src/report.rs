@@ -270,6 +270,23 @@ pub fn stored_on(taken_at: Epoch) -> String {
     format_epoch(taken_at, "earlier")
 }
 
+/// "Aug 3, 2024", for a moment that may be years old.
+///
+/// [`stored_on`] carries no year because everything it dates — a capture, a
+/// story, a cooldown — is at most days away and the hour is the informative
+/// part. A highlight is the opposite: kept for years on purpose, so "Aug 3"
+/// alone would read as this year and be wrong most of the time, and the
+/// hour of a moment years back says nothing worth a column.
+pub fn dated(at: Epoch) -> String {
+    chrono::DateTime::from_timestamp(at.get(), 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%b %-d, %Y")
+                .to_string()
+        })
+        .unwrap_or_else(|| "sometime".to_string())
+}
+
 /// "04/08 at 16:30", from a cooldown end.
 ///
 /// The conversion to seconds is [`EpochMs::to_epoch`] and is not written here.

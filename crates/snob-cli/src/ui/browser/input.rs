@@ -118,6 +118,11 @@ pub enum Action {
     First,
     Last,
     Open,
+    /// One level up, in a browser that has levels. The story list has none
+    /// and ignores it; the highlights browser goes from the items back to
+    /// the tray. Not `Quit`: leaving a folder and leaving the program are
+    /// different intentions, and Esc keeps meaning the second everywhere.
+    Back,
     Download,
     Redraw,
     Quit,
@@ -175,6 +180,12 @@ pub fn action_of(key: KeyEvent) -> Action {
         KeyCode::Home | KeyCode::Char('g') if plain => Action::First,
         KeyCode::End | KeyCode::Char('G') if plain => Action::Last,
         KeyCode::Enter => Action::Open,
+        // Right alongside Enter and Left alongside Backspace: in a browser
+        // with levels the arrows walk into and out of a folder, the way every
+        // two-pane file view binds them. In the flat story list Right opens,
+        // which is what Enter does, and Left does nothing.
+        KeyCode::Right if plain => Action::Open,
+        KeyCode::Left | KeyCode::Backspace if plain => Action::Back,
         KeyCode::Char('d') | KeyCode::Char('D') if plain => Action::Download,
         KeyCode::Esc | KeyCode::Char('q') if plain => Action::Quit,
         _ => Action::None,
@@ -199,16 +210,40 @@ mod tests {
     }
 
     /// The defect this module exists for. Under `console`, `ESC[1;2D` left `2D`
-    /// in the queue and the `D` reached the browser as a download.
+    /// in the queue and the `D` reached the browser as a download. Shift+Left
+    /// is plain-with-shift so it lands on `Back`, which is harmless; Ctrl+Left
+    /// is somebody's terminal binding and stays untouched.
     #[test]
     fn a_shifted_arrow_is_not_a_download() {
         assert_eq!(
             action_of(key(KeyCode::Left, KeyModifiers::SHIFT)),
-            Action::None
+            Action::Back
         );
         assert_eq!(
             action_of(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Action::None
+        );
+    }
+
+    /// The keys a browser with levels adds: out of a folder, and into one.
+    #[test]
+    fn left_goes_back_and_right_opens() {
+        assert_eq!(
+            action_of(key(KeyCode::Left, KeyModifiers::NONE)),
+            Action::Back
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Action::Back
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Right, KeyModifiers::NONE)),
+            Action::Open
+        );
+        // Esc stays "leave the program", not "leave the folder".
+        assert_eq!(
+            action_of(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Quit
         );
     }
 

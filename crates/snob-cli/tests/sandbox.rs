@@ -869,6 +869,244 @@ async fn with_downloadable_stories(server: &MockServer) {
         .await;
 }
 
+/// A tray of two highlights whose media the fake Instagram itself serves,
+/// with the items matched on `reel_ids` -- so an ask under the wrong id, or
+/// under a bare one, finds no mock and fails loudly.
+async fn with_downloadable_highlights(server: &MockServer) {
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(url_path(format!(
+            "/api/v1/highlights/{PK}/highlights_tray/"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tray":[
+                {"id":"highlight:100","title":"trip","media_count":2,
+                 "created_at":1600000000,"updated_timestamp":1700000000},
+                {"id":"highlight:200","title":"food","media_count":1}
+            ],"status":"ok"}"#,
+        ))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/feed/reels_media/"))
+        .and(query_param("reel_ids", "highlight:100"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"reels_media":[{{"items":[
+                {{"pk":"1","media_type":1,"taken_at":1600000000,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/big.jpg","width":1080,"height":1920}}]}}}},
+                {{"pk":"2","media_type":2,"taken_at":1600001000,
+                 "video_versions":[
+                    {{"url":"{base}/clip.mp4","width":720,"height":1280}}]}}
+            ]}}]}}"#
+        )))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/feed/reels_media/"))
+        .and(query_param("reel_ids", "highlight:200"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"reels_media":[{{"items":[
+                {{"pk":"3","media_type":1,"taken_at":1600002000,
+                 "image_versions2":{{"candidates":[
+                    {{"url":"{base}/big.jpg","width":1080,"height":1920}}]}}}}
+            ]}}]}}"#
+        )))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/big.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xe0 a picture".to_vec()),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/clip.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"\x00\x00\x00\x18ftypisom a clip".to_vec()),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The tray listing numbers the highlights, and those numbers are what the
+/// second positional and a tray-level `-d` take.
+#[tokio::test]
+async fn the_tray_is_listed_with_the_numbers_the_command_takes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["highlights", "me", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("it is JSON");
+    let tray = listed["highlights"].as_array().expect("an array");
+    assert_eq!(tray.len(), 2);
+    assert_eq!(tray[0]["number"], 1);
+    assert_eq!(tray[0]["title"], "trip");
+    assert_eq!(tray[0]["items"], 2);
+    assert_eq!(
+        tray[0]["id"], "highlight:100",
+        "the id keeps the tray's own spelling, the one the items are fetched with"
+    );
+    // The tray costs the profile and the tray, and opens no highlight: the
+    // items of a listing nobody asked into are requests nobody asked for.
+    let opened = posted(&instagram)
+        .await
+        .iter()
+        .filter(|r| r.url.path().contains("reels_media"))
+        .count();
+    assert_eq!(opened, 0, "listing the tray opened a highlight");
+}
+
+/// `snob highlights me 1` numbers the items, and `-d` inside takes those
+/// numbers: the file lands under `me-<highlight>-<item>`, so the two indexes
+/// a person read are the two in the name.
+#[tokio::test]
+async fn a_highlight_item_is_saved_under_both_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["highlights", "me", "1", "--download", "2"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("me-1-2.mp4")).expect("item 2 of highlight 1, written here"),
+        b"\x00\x00\x00\x18ftypisom a clip"
+    );
+
+    // Asked again, the file on disk answers: nothing is fetched and nothing
+    // is replaced -- the story rule, holding across the second index.
+    let again = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["highlights", "me", "1", "--download", "2"],
+    );
+    assert!(
+        again.status.success(),
+        "{}{}",
+        stdout(&again),
+        stderr(&again)
+    );
+    assert!(
+        stderr(&again).contains("Already saved"),
+        "{}",
+        stderr(&again)
+    );
+}
+
+/// Without an item number, `-d` takes a whole highlight by its tray number
+/// and saves everything in it.
+#[tokio::test]
+async fn a_whole_highlight_is_saved_by_its_tray_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["highlights", "me", "--download", "1"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("me-1-1.jpg")).expect("the photo"),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+    assert_eq!(
+        std::fs::read(here.join("me-1-2.mp4")).expect("the video"),
+        b"\x00\x00\x00\x18ftypisom a clip"
+    );
+    assert!(
+        !here.join("me-2-1.jpg").exists(),
+        "highlight 2 was not asked for and must not be fetched"
+    );
+}
+
+/// A tray number nobody has is refused by name, before anything is opened --
+/// at both places a number is taken.
+#[tokio::test]
+async fn a_highlight_number_nobody_has_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    for args in [
+        &["highlights", "me", "9"][..],
+        &["highlights", "me", "--download", "9"][..],
+    ] {
+        let out = snob(tmp.path(), Some(&instagram), args);
+        assert!(!out.status.success(), "{args:?} should have been refused");
+        assert!(
+            stderr(&out).contains("there is no highlight 9"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    let opened = posted(&instagram)
+        .await
+        .iter()
+        .filter(|r| r.url.path().contains("reels_media"))
+        .count();
+    assert_eq!(opened, 0, "a refused number still opened a highlight");
+}
+
+/// **Nothing that would register a view goes out**, walking the whole
+/// feature: the tray, one highlight's items, and a download.
+#[tokio::test]
+async fn reading_highlights_sends_nothing_that_marks_them_seen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = tmp.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    snob(tmp.path(), Some(&instagram), &["highlights", "me"]);
+    snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["highlights", "me", "2", "-d", "all"],
+    );
+
+    for request in posted(&instagram).await {
+        assert!(
+            !request.url.path().contains("seen"),
+            "a request went to {} while only reading highlights",
+            request.url.path()
+        );
+        assert_eq!(
+            request.method,
+            wiremock::http::Method::GET,
+            "reading highlights sent a {} to {}",
+            request.method,
+            request.url.path()
+        );
+    }
+}
+
 /// The binary, run from a directory of the test's choosing -- which is where a
 /// story lands when `-o` says nothing.
 fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> Output {

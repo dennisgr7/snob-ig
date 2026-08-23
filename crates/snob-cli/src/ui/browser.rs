@@ -20,5 +20,6 @@
 //! modified key -- be tested without a terminal at all.
 
 pub mod input;
+pub mod scratch;
 pub mod screen;
 pub mod viewport;

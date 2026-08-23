@@ -500,4 +500,5 @@ pub mod browser;
 pub mod menu;
 
 /// The interactive story list.
+pub mod highlights;
 pub mod stories;

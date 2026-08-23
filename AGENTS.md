@@ -15,7 +15,8 @@ longer does the job it was there to do.
 `snob`, a terminal tool that tells you who does not follow you back on
 Instagram, and tracks changes to your followers and following over time. It also
 follows and unfollows one account at a time, shows an account's page the way
-Instagram does, and shows and downloads the stories an account has up. Single binary, no runtime. Windows and Linux on x86_64 and
+Instagram does, and shows and downloads the stories an account has up and the
+highlights its profile keeps. Single binary, no runtime. Windows and Linux on x86_64 and
 ARM64, macOS on Apple Silicon.
 
 It is a convenience tool for a person's own account, signed in as themselves.
@@ -750,17 +751,24 @@ Two judgment calls worth understanding before touching them:
   look like they would work, and why neither does, are written out at
   `store::watch::set_mark`, with a test for each.
 
-- **Highlights are not `stories`, and will be a command of their own.** A
+- **Highlights are not `stories`, and are a command of their own.** A
   story is what is up for a day; a highlight is what an account chose to keep,
   for years, and a profile carries several of them with a title each. Folding
   them into `snob stories` would need a flag to say which of the two is meant
   and a second index to say which highlight, on a command whose `-d 2` means
-  "the second thing in the one list". The shape that reads is `snob highlights
-  someone` for the numbered tray, `snob highlights someone 2` for the items of
-  the second, and `-d`, `--all`, `-o`, `-i` on that exactly as `stories` has
-  them. `snob profile` lists the tray; downloading is the command that does
-  not exist yet. The client half is in and verified: `IgClient::highlights_tray`
-  and `IgClient::highlight`, which is `reels_media` asked with `highlight:<id>`.
+  "the second thing in the one list". So `snob highlights someone` numbers the
+  tray, `snob highlights someone 2` numbers the items of the second, and `-d`,
+  `--all`, `-o`, `-i` act on the items exactly as `stories` has them — while
+  without the number `-d` takes whole highlights, because a number means the
+  listing that is actually on screen. Files are named `user-2-3.jpg`, tray
+  number then item number, through the very `save_story` path stories go
+  through; `commands::highlights` orchestrates, and `ui::highlights` is the
+  two-level browser on the same `ui::browser` pieces, with `Action::Back`
+  (Left, Backspace) as the one key the flat story list does not use. The
+  client half is `IgClient::highlights_tray` and `IgClient::highlight`, which
+  is `reels_media` asked with `highlight:<id>`; a private account the viewer
+  does not follow is answered from the profile without asking the tray, the
+  same two sentences `profile` keeps apart.
 - **The story browser draws with `console` and reads keys with `crossterm`, and
   is not built on a terminal-UI framework.** Measured in August 2026 by building
   this tree twice: the browser as it stands is **+18,432 B and 0 new crates on

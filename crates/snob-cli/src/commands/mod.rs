@@ -1,5 +1,6 @@
 pub mod common;
 pub mod follow;
+pub mod highlights;
 #[cfg(feature = "xlsx")]
 pub mod import;
 pub mod lists;

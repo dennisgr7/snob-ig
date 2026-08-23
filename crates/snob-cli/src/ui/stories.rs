@@ -39,10 +39,11 @@ use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 
-use crate::commands::stories::{Stories, bytes_of, default_name, extension_of};
+use crate::commands::stories::{Stories, Story, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
 use crate::output;
 use crate::ui::browser::input::{Action, Next, Session, TICK, next, page};
+use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::browser::screen::Screen;
 use crate::ui::browser::viewport::Viewport;
 
@@ -132,17 +133,36 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
             Action::First => selected = 0,
             Action::Last => selected = stories.items.len() - 1,
             Action::Open => {
-                note = match open(client, stories, selected, &scratch, &mut opened).await {
+                note = match open(
+                    client,
+                    &stories.username,
+                    &stories.items,
+                    selected,
+                    &scratch,
+                    &mut opened,
+                )
+                .await
+                {
                     Ok(path) => format!("Opened {}", path.display()),
                     Err(e) => format!("Could not open it: {e}"),
                 };
             }
             Action::Download => {
-                note = match keep(client, stories, selected, &mut opened).await {
+                note = match keep(
+                    client,
+                    &stories.username,
+                    &stories.items,
+                    selected,
+                    &mut opened,
+                )
+                .await
+                {
                     Ok(path) => format!("Saved {}", path.display()),
                     Err(e) => format!("Could not save it: {e}"),
                 };
             }
+            // A flat list has no level to go up to.
+            Action::Back => {}
             Action::Redraw => screen.invalidate(),
             Action::Quit => break ExitCode::Ok,
             // Raw mode is what makes this reachable. Outside it, Ctrl+C either
@@ -255,9 +275,14 @@ fn frame(
 /// project this was studied against does, and it puts a signed link to somebody
 /// else's story in a browser history — and it opens a browser to look at a
 /// picture, which is not what the user asked for.
-async fn open(
+/// `stem_base` is what comes before the number in the file's name — the
+/// username for a story, the username and the highlight's number for a
+/// highlight item — so the two browsers write the very names their commands
+/// write.
+pub(crate) async fn open(
     client: &IgClient,
-    stories: &Stories,
+    stem_base: &str,
+    items: &[Story],
     index: usize,
     scratch: &Scratch,
     cache: &mut [Option<PathBuf>],
@@ -271,19 +296,14 @@ async fn open(
         }
     }
 
-    let bytes = bytes_of(client, &stories.items[index]).await?;
+    let bytes = bytes_of(client, &items[index]).await?;
     // Through the same gate as `keep` and `snob stories --download`, and for
     // the same reason: the name came off the server. `printable` strips what
     // a terminal must not draw and leaves everything a path reads -- a `..`,
     // a drive letter, a UNC share -- and `Path::join` hands an absolute name
     // the whole path. This was the one write of a story that did not ask
     // `default_path`, and with `fs::write` it would also have followed a link.
-    let name = default_name(
-        scratch.dir(),
-        &stories.username,
-        index + 1,
-        extension_of(&bytes),
-    )?;
+    let name = default_name(scratch.dir(), stem_base, index + 1, extension_of(&bytes))?;
     let path = scratch.dir().join(name);
     output::create_new(&path)?
         .write_all(&bytes)
@@ -295,9 +315,10 @@ async fn open(
 
 /// Saves the story where the user is working, rather than in the scratch
 /// directory that gets deleted.
-async fn keep(
+pub(crate) async fn keep(
     client: &IgClient,
-    stories: &Stories,
+    stem_base: &str,
+    items: &[Story],
     index: usize,
     cache: &mut [Option<PathBuf>],
 ) -> Result<PathBuf> {
@@ -305,15 +326,10 @@ async fn keep(
     // on the same story is one request, not two.
     let bytes = match cache[index].as_ref().filter(|p| p.is_file()) {
         Some(path) => std::fs::read(path)?,
-        None => bytes_of(client, &stories.items[index]).await?,
+        None => bytes_of(client, &items[index]).await?,
     };
 
-    let path = default_name(
-        Path::new("."),
-        &stories.username,
-        index + 1,
-        extension_of(&bytes),
-    )?;
+    let path = default_name(Path::new("."), stem_base, index + 1, extension_of(&bytes))?;
     // Created, not written over: the name is one this program invented, and
     // `snob stories --download` refuses to replace a file under such a name.
     // This key did not, which was two answers to one question.
@@ -321,64 +337,4 @@ async fn keep(
         .write_all(&bytes)
         .with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
-}
-
-/// How long a scratch directory has to be untouched before a later run treats
-/// it as abandoned.
-///
-/// A browsing session is minutes. Six hours is far past anything that could
-/// still be live, and being generous costs nothing: the only thing waiting
-/// buys is that a run started this morning and left open over lunch does not
-/// have its files pulled out from under it by a run started after it.
-const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
-
-/// The scratch directory, removed when the browsing session ends.
-///
-/// A type rather than two calls, so that leaving through an error removes it
-/// too.
-///
-/// **What it can and cannot promise, measured on Windows 11 in August 2026
-/// rather than assumed.** This used to say that an image viewer holds the file
-/// open so Windows will not delete it, and that turned out to be false for the
-/// viewers people actually have: Photos with the picture on screen and Media
-/// Player with the video playing hold no handle at all — Restart Manager
-/// reports nobody, and the delete succeeds with the window still up. So on the
-/// ordinary path the file really is gone when the session ends, on all three
-/// platforms. On Unix it was never in doubt: `unlink` succeeds regardless and
-/// a viewer that already has it open keeps working.
-///
-/// The case that cannot be fixed is a viewer that opens the file without
-/// `FILE_SHARE_DELETE`. Nothing deletes underneath that, not `DeleteFileW` and
-/// not the POSIX-semantics disposition — only waiting. That is what
-/// [`sweep`] is for, and it is the only mechanism here that does not depend on
-/// something having gone right.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(dir: PathBuf) -> Result<Self> {
-        // Fresh, not adopted: the name carries the process id, which anybody
-        // on the machine can guess ahead of time. The function says what a
-        // planted entry under that name used to be able to do.
-        snob_store::paths::create_fresh_private_dir(&dir)
-            .with_context(|| format!("could not create {}", dir.display()))?;
-        Ok(Self(dir))
-    }
-
-    fn dir(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // Silent by design: a file a greedy viewer is still holding is not an
-        // error the user can do anything about, and a warning printed every
-        // time somebody looked at a story would train them to ignore warnings.
-        // The sweep at the start of the next run is what actually answers it.
-        //
-        // **This does not run on a panic.** The release profile is
-        // `panic = "abort"`, so no destructor does. That is another reason the
-        // sweep exists rather than being a belt-and-braces extra.
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }

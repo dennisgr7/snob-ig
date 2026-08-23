@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`snob highlights`**: the highlights an account keeps on its profile, as a
+  command of its own beside `stories`. `snob highlights someone` numbers the
+  tray with each one's title, size and dates; `snob highlights someone 2`
+  lists what the second holds; `--download`, `-o`, `--format` and `-i` act on
+  that listing exactly as they do on `stories`, and without the number
+  `--download` saves whole highlights — `-d 2` the second, `-d all` the whole
+  profile. Files land as `someone-2-3.jpg`, the tray's number then the
+  item's, streamed and deduplicated the way stories are. `-i` browses the
+  tray like folders: Enter or Right walks in, Left or Backspace walks back
+  out, D saves an item or a whole highlight depending on where it is pressed.
+  Like a story, none of it marks anything as seen, and the test that reads
+  the source to prove that already covered the highlight spelling. A private
+  account you do not follow is told apart from an account with no highlights,
+  and the tray is not even asked for.
+
 - `--sign-with` now trims surrounding whitespace before checking its
   32-character floor, the same way `snob watch setup` always did. A key that
   was only long enough by counting invisible padding is refused at both doors

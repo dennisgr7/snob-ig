@@ -73,6 +73,10 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             effective_format(args.list.format.map(Format::from), None),
             Format::Json | Format::Ndjson
         ),
+        Command::Highlights(args) => matches!(
+            effective_format(args.list.format.map(Format::from), None),
+            Format::Json | Format::Ndjson
+        ),
         Command::Profile(args) => matches!(
             effective_format(args.format.map(Format::from), args.output.as_deref()),
             Format::Json
@@ -255,6 +259,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Friends(args) => commands::sets::run(args, store, &paths, SetOp::Friends).await,
         Command::Pfp(args) => commands::pfp::run(args, store, &paths).await,
         Command::Stories(args) => commands::stories::run(args, store, &paths).await,
+        Command::Highlights(args) => commands::highlights::run(args, store, &paths).await,
         Command::Follow(args) => {
             commands::follow::run(args, commands::follow::Verb::Follow, store, &paths).await
         }

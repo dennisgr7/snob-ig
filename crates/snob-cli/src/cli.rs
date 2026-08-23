@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
                   Walks your followers and your following, crosses them, and answers who \
                   does not follow you back, who you never followed back, and who you and \
                   somebody else both know. It also shows and downloads the stories an \
-                  account has up.\n\n\
+                  account has up and the highlights it keeps.\n\n\
                   It changes exactly two things and asks first about both: \"follow\" and \
                   \"unfollow\", one account at a time. It never blocks, never removes a \
                   follower, and never tells anybody you looked at their story.",
@@ -174,6 +174,8 @@ Examples:
   snob pfp someone -o picture.jpg     their profile picture, at full size
   snob stories someone                what they have up right now
   snob stories someone -i             move through it with the arrow keys
+  snob highlights someone             the highlights its profile keeps, numbered
+  snob highlights someone 2 -d all    save everything in the second one
   snob unfollow someone               the one thing snob changes, after asking
   snob unfollowers --format csv -o unfollowers.csv
 
@@ -262,6 +264,17 @@ pub enum Command {
                       snob has no way of doing that and a test keeps it that way."
     )]
     Stories(StoriesArgs),
+
+    /// Show the highlights an account keeps on its profile, and download them
+    #[command(
+        after_help = "\"snob highlights someone\" numbers the tray; \"snob highlights someone 2\" \
+                      lists what the second one holds, and takes -d, -o and -i exactly as \
+                      \"stories\" does. Without the number, -d takes whole highlights: \
+                      \"-d 2\" saves everything in the second, \"-d all\" the whole profile. \
+                      Listing and downloading a highlight does not tell the account you \
+                      looked. snob has no way of doing that and a test keeps it that way."
+    )]
+    Highlights(HighlightsArgs),
 
     /// Follow an account
     #[command(
@@ -830,7 +843,7 @@ fn download_selection(text: &str) -> Result<DownloadSelection, String> {
             None => (part, part),
         };
         let complaint =
-            || format!("\"{part}\" is not a story number, a range like 2-4, or \"all\"");
+            || format!("\"{part}\" is not a number from the listing, a range like 2-4, or \"all\"");
         let from: usize = from.parse().map_err(|_| complaint())?;
         let to: usize = to.parse().map_err(|_| complaint())?;
         if from == 0 {
@@ -842,7 +855,7 @@ fn download_selection(text: &str) -> Result<DownloadSelection, String> {
         for n in from..=to {
             if numbers.len() >= MOST {
                 return Err(format!(
-                    "that is more than {MOST} stories; \"all\" is the way to ask for a whole tray"
+                    "that is more than {MOST}; \"all\" is the way to ask for everything listed"
                 ));
             }
             if !numbers.contains(&n) {
@@ -862,8 +875,7 @@ fn download_selection(text: &str) -> Result<DownloadSelection, String> {
 /// copying four flags and their conflicts.
 #[derive(Args, Debug)]
 pub struct MediaActionArgs {
-    /// Download stories: a number from the listing, a set (1,3 or 2-4), or
-    /// "all"
+    /// Download from the listing: a number, a set (1,3 or 2-4), or "all"
     #[arg(
         short = 'd',
         long,
@@ -878,7 +890,7 @@ pub struct MediaActionArgs {
     #[arg(long, hide = true, conflicts_with_all = ["download", "interactive"])]
     pub all: bool,
 
-    /// Move through the stories with the arrow keys
+    /// Move through the listing with the arrow keys
     #[arg(short = 'i', long)]
     pub interactive: bool,
 
@@ -913,6 +925,25 @@ pub struct MediaListArgs {
 pub struct StoriesArgs {
     /// Account whose stories to show. Defaults to your own.
     pub target: Option<String>,
+
+    #[command(flatten)]
+    pub action: MediaActionArgs,
+
+    #[command(flatten)]
+    pub list: MediaListArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct HighlightsArgs {
+    /// Account whose highlights to show. Defaults to your own — but the first
+    /// bare word is always read as an account, so picking a highlight of your
+    /// own takes your username in front of the number.
+    pub target: Option<String>,
+
+    /// A highlight's number from the tray listing: what -d and -i then act on
+    /// is what that highlight holds
+    #[arg(value_name = "HIGHLIGHT", value_parser = clap::value_parser!(u64).range(1..))]
+    pub highlight: Option<u64>,
 
     #[command(flatten)]
     pub action: MediaActionArgs,
@@ -1300,6 +1331,48 @@ mod tests {
             .to_string();
         assert!(!help.contains("--all"), "{help}");
         assert!(help.contains("--download"), "{help}");
+    }
+
+    /// The `highlights` positionals: an account, then a number naming one
+    /// entry of its tray. The number and the selection flags compose the way
+    /// AGENTS.md settled -- `-d`, `-o`, `-i` on the items exactly as
+    /// `stories` has them, and without the number `-d` takes whole entries.
+    #[test]
+    fn highlights_takes_an_account_and_then_a_number() {
+        let cli = Cli::try_parse_from(["snob", "highlights", "someone"]).expect("tray listing");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.target.as_deref(), Some("someone"));
+        assert_eq!(args.highlight, None);
+
+        let cli =
+            Cli::try_parse_from(["snob", "highlights", "someone", "2", "-d", "3"]).expect("item");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.highlight, Some(2));
+        assert_eq!(
+            args.action.selection(),
+            Some(DownloadSelection::These(vec![3]))
+        );
+
+        // No account at all is the viewer's own tray.
+        let cli = Cli::try_parse_from(["snob", "highlights"]).expect("own tray");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.target, None);
+
+        // The listing starts at 1, and the parser is where zero stops.
+        assert!(Cli::try_parse_from(["snob", "highlights", "someone", "0"]).is_err());
+
+        // The same conflicts as stories: one action per run.
+        assert!(Cli::try_parse_from(["snob", "highlights", "x", "2", "-d", "1", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "highlights", "x", "--format", "json", "-d", "1"])
+                .is_err()
+        );
     }
 
     /// `--tls-extra-root` only means something alongside `--strict-roots`.
