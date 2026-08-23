@@ -161,6 +161,25 @@ pub fn can_show_a_menu() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Whether a media browser may open *instead of* the printed listing.
+///
+/// Stricter than [`can_show_a_menu`] by exactly one stream, and the third
+/// stream is the point. A browser needs what a menu needs — keys from
+/// standard input, drawing on standard error — but opening one also means
+/// **not printing the listing**, and the listing's stream is standard output.
+/// With stdout redirected, `snob stories someone > list.txt` is somebody
+/// collecting the listing while watching the terminal: both other streams are
+/// attended, a menu could be drawn, and drawing one would fill the file with
+/// nothing while a browser waited on keys. The listing wins wherever it was
+/// asked for; the browser replaces it only where it would have scrolled by.
+///
+/// This is the predicate behind defaulting to the browser at all — the
+/// explicit flags (`-i`, `--no-interactive`, and every action flag) are
+/// decided before it is consulted, in `MediaActionArgs::browses`.
+pub fn a_human_would_watch_the_listing_scroll_by() -> bool {
+    can_show_a_menu() && std::io::stdout().is_terminal()
+}
+
 /// Asks a question and reads one line back.
 ///
 /// The prompt goes to standard error because it is not the result. On stdout it

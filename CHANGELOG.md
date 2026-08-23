@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The browsers are now the default on a terminal.** `snob stories` and
+  `snob highlights` open their arrow-key browser when standard input, output
+  and error are all a terminal and nothing else was asked for; a pipe, a
+  redirect, `--format`, `--download` or `-o` all print or save exactly as
+  before. `--no-interactive` is the new explicit spelling for the printed
+  listing on a terminal, and `-i` still forces the browser where detection
+  would not have opened one.
+
 - **`snob highlights`**: the highlights an account keeps on its profile, as a
   command of its own beside `stories`. `snob highlights someone` numbers the
   tray with each one's title, size and dates; `snob highlights someone 2`

@@ -127,9 +127,17 @@ pub async fn run(args: HighlightsArgs, secrets: SecretStore, paths: &AppPaths) -
         return Ok(ExitCode::Ok);
     }
 
+    // Decided once for both levels: the browser is the default for a person
+    // at a terminal, and every explicit flag beats detection.
+    // `MediaActionArgs::browses` is the whole rule.
+    let browses = args.action.browses(
+        args.list.format.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
+
     match args.highlight {
-        None => at_the_tray(&app, &tray, &args, paths).await,
-        Some(number) => inside_one(&app, &tray, number as usize, &args, paths).await,
+        None => at_the_tray(&app, &tray, &args, browses, paths).await,
+        Some(number) => inside_one(&app, &tray, number as usize, &args, browses, paths).await,
     }
 }
 
@@ -139,9 +147,10 @@ async fn at_the_tray(
     app: &crate::app::App,
     tray: &Tray,
     args: &HighlightsArgs,
+    browses: bool,
     paths: &AppPaths,
 ) -> Result<ExitCode> {
-    if args.action.interactive {
+    if browses {
         return crate::ui::highlights::browse(app.client(), tray, None, paths).await;
     }
 
@@ -158,6 +167,7 @@ async fn inside_one(
     tray: &Tray,
     number: usize,
     args: &HighlightsArgs,
+    browses: bool,
     paths: &AppPaths,
 ) -> Result<ExitCode> {
     // Checked against the tray before any further request, so `snob
@@ -167,7 +177,7 @@ async fn inside_one(
         return Err(no_such_highlight(tray, number));
     }
 
-    if args.action.interactive {
+    if browses {
         return crate::ui::highlights::browse(app.client(), tray, Some(number - 1), paths).await;
     }
 

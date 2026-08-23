@@ -78,7 +78,7 @@ pub async fn browse(
     if !term.is_term() {
         return Err(
             ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("without one, use the listings and --download")
+                .with_hint("--no-interactive prints the listing; --download saves without one")
                 .into(),
         );
     }
@@ -93,7 +93,7 @@ pub async fn browse(
             ExitCode::Error,
             format!("the terminal would not go into raw mode: {e}"),
         )
-        .with_hint("without one, use the listings and --download")
+        .with_hint("--no-interactive prints the listing; --download saves without one")
     })?;
 
     let mut folders: Vec<Folder> = tray

@@ -172,9 +172,8 @@ Examples:
   snob profile someone                their page: counts, bio, who you both know
   snob scan someone                   the full picture of another account
   snob pfp someone -o picture.jpg     their profile picture, at full size
-  snob stories someone                what they have up right now
-  snob stories someone -i             move through it with the arrow keys
-  snob highlights someone             the highlights its profile keeps, numbered
+  snob stories someone                browse what they have up; a listing in a pipe
+  snob highlights someone             browse the highlights its profile keeps
   snob highlights someone 2 -d all    save everything in the second one
   snob unfollow someone               the one thing snob changes, after asking
   snob unfollowers --format csv -o unfollowers.csv
@@ -890,9 +889,19 @@ pub struct MediaActionArgs {
     #[arg(long, hide = true, conflicts_with_all = ["download", "interactive"])]
     pub all: bool,
 
-    /// Move through the listing with the arrow keys
+    /// Move through the listing with the arrow keys. The default on a
+    /// terminal; this forces it, and fails where no terminal can be taken
     #[arg(short = 'i', long)]
     pub interactive: bool,
+
+    /// Print the listing and exit, even on a terminal
+    // Long-only, like every flag since the short space was closed. It
+    // conflicts with `-i` alone: beside `-d`, `-o` or `--format` it is
+    // redundant rather than ignored -- each of those already prints -- and a
+    // script that says `--no-interactive` defensively should not break the
+    // day a download is added to it.
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
 
     /// Where a download goes. A directory when several are saved, a file when
     /// one is.
@@ -907,6 +916,32 @@ impl MediaActionArgs {
             return Some(DownloadSelection::All);
         }
         self.download.clone()
+    }
+
+    /// Whether this run takes the terminal over.
+    ///
+    /// The order is the contract. What was *said* wins over what is detected:
+    /// `-i` first, then anything that already asks for the printed or
+    /// downloaded form — `--no-interactive`, a selection, a destination, a
+    /// format. Only a run that asked for nothing at all falls to detection,
+    /// and `attending` is [`crate::ui::a_human_would_watch_the_listing_scroll_by`]:
+    /// all three streams a terminal, because the browser reads keys, draws on
+    /// standard error and *withholds* the listing from standard output.
+    ///
+    /// A pure function of its inputs so the whole matrix is testable without
+    /// a terminal; the caller supplies the one detected bit.
+    pub fn browses(&self, format_given: bool, attending: bool) -> bool {
+        if self.interactive {
+            return true;
+        }
+        if self.no_interactive
+            || self.selection().is_some()
+            || self.output.is_some()
+            || format_given
+        {
+            return false;
+        }
+        attending
     }
 }
 
@@ -1331,6 +1366,56 @@ mod tests {
             .to_string();
         assert!(!help.contains("--all"), "{help}");
         assert!(help.contains("--download"), "{help}");
+    }
+
+    /// The whole matrix of "does this run take the terminal over".
+    ///
+    /// What was said beats what was detected, in every combination: `-i`
+    /// wins outright, every static flag refuses, and only a run that asked
+    /// for nothing at all listens to the detection bit.
+    #[test]
+    fn the_browser_is_the_default_only_when_nothing_else_was_asked_for() {
+        let action = |line: &[&str]| {
+            let Command::Stories(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("stories");
+            };
+            (args.action, args.list.format.is_some())
+        };
+
+        // Nothing asked for: the detection bit decides.
+        let (bare, fmt) = action(&["snob", "stories", "x"]);
+        assert!(bare.browses(fmt, true));
+        assert!(!bare.browses(fmt, false), "a pipe never gets a browser");
+
+        // Forced on: a terminal that cannot browse is an error, not a print,
+        // so the answer stays true whatever was detected.
+        let (forced, fmt) = action(&["snob", "stories", "x", "-i"]);
+        assert!(forced.browses(fmt, false));
+
+        // Every explicit route to the static forms wins over an attending
+        // terminal.
+        for line in [
+            &["snob", "stories", "x", "--no-interactive"][..],
+            &["snob", "stories", "x", "-d", "2"][..],
+            &["snob", "stories", "x", "--all"][..],
+            &["snob", "stories", "x", "--format", "json"][..],
+            &["snob", "stories", "x", "-o", "somewhere"][..],
+        ] {
+            let (static_asked, fmt) = action(line);
+            assert!(
+                !static_asked.browses(fmt, true),
+                "{line:?} must not open the browser"
+            );
+        }
+
+        // The two spellings contradict each other and clap says so; beside
+        // the flags that already print, --no-interactive is redundant and
+        // allowed, so a defensive script survives growing a download.
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "--no-interactive", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "stories", "x", "--no-interactive", "-d", "1"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "highlights", "x", "2", "--no-interactive"]).is_ok());
     }
 
     /// The `highlights` positionals: an account, then a number naming one

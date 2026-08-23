@@ -130,7 +130,12 @@ pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> R
         return Ok(ExitCode::Ok);
     }
 
-    if args.action.interactive {
+    // The browser is the default for a person at a terminal; every explicit
+    // flag beats detection. `MediaActionArgs::browses` is the whole rule.
+    if args.action.browses(
+        args.list.format.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    ) {
         return crate::ui::stories::browse(app.client(), &stories, paths).await;
     }
 

@@ -203,24 +203,25 @@ Their profile picture at 1080x1080, which is not the size the web page serves.
 snob stories someone
 ```
 
-What they have up right now, numbered, with what each one is and how long it
-has left. `--download 2` saves the second one, `--download 1,3` or
-`--download 2-4` a set, `--download all` the whole tray, and `-i` opens a list
-you move through with the arrow keys — Enter opens the story in whatever you
-already open pictures and videos with, `D` keeps a copy.
+On a terminal this opens a list you move through with the arrow keys — Enter
+opens the story in whatever you already open pictures and videos with, `D`
+keeps a copy, `q` leaves. In a pipe or a redirect it prints the numbered
+listing instead, and `--no-interactive` prints it on a terminal too.
+`--download 2` saves the second one, `--download 1,3` or `--download 2-4` a
+set, `--download all` the whole tray.
 
 ```bash
 snob highlights someone
 ```
 
-The highlights under their bio, numbered, with each one's title, size and last
-addition. `snob highlights someone 2` lists what the second one holds, and on
-that listing `--download` and `-i` mean exactly what they mean on `stories`;
-without the number, `--download 2` saves everything in the second highlight and
+On a terminal the tray opens like folders: Enter walks in, Left or Backspace
+walks back out, `D` keeps one item or a whole highlight, depending on where
+you press it. In a pipe it prints the numbered tray, and `--no-interactive`
+prints it on a terminal too. `snob highlights someone 2` is the second one;
+on its listing `--download` means what it means on `stories`, and without the
+number `--download 2` saves everything in the second highlight,
 `--download all` the whole profile. Files land as `someone-2-3.jpg` — the
-highlight's number, then the item's. In `-i` the tray works like folders: Enter
-walks in, Left or Backspace walks back out, `D` keeps one item or a whole
-highlight, depending on where you press it.
+highlight's number, then the item's.
 
 **Saving a story or a highlight does not mark it as seen.** Instagram registers a view with a
 separate request, and that request is a write — so it falls under the two-write

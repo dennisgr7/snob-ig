@@ -68,14 +68,28 @@ re-litigation in a normal change.
     `ProfileFormat`), so `--format xlsx` on five stories is refused rather
     than accepted and ignored. A new command takes one or the other, never a
     third spelling.
-  - **Two kinds of interactivity are detected and one is asked for.** Whether
-    the output is decorated (a table, color, hyperlinks, hints) is read from
-    standard output being a terminal; whether a question can be asked is read
-    from standard input and standard error being one. Taking the terminal
-    over — the story browser — is never inferred from either: it is `-i`, per
-    command, and a command without `-i` prints and exits however it was run.
-    There is no REPL and no global interactive mode; a second command language
-    would need a second parser for every flag above.
+  - **Three kinds of interactivity are detected, and the third carries both
+    overrides written out.** Whether the output is decorated (a table, color,
+    hyperlinks, hints) is read from standard output being a terminal; whether
+    a question can be asked is read from standard input and standard error
+    being one. Taking the terminal over — the media browsers — is the default
+    exactly when **all three** streams are a human's terminal and the run
+    asked for nothing else: every action and format flag (`-d`, `-o`,
+    `--format`) already names the printed or downloaded form,
+    `--no-interactive` (long-only) is the explicit static spelling beside
+    them, and `-i` forces the browser and fails where none can be drawn
+    rather than falling back. Said beats detected, in that order, and the
+    order lives in one place — `MediaActionArgs::browses`, a pure function
+    with the whole matrix as a test. The three streams live in
+    `ui::a_human_would_watch_the_listing_scroll_by`, whose doc says why
+    standard output is one of them: opening a browser *withholds* the
+    listing, so `snob stories x > file` keeps writing the file. This reverses
+    the earlier rule — take-over was never inferred, `-i` per command —
+    which the owner lifted in August 2026 after using the browsers: they are
+    what a person at a terminal wants first, and the pipe, redirect and
+    script cases the old rule protected are exactly the ones detection
+    refuses. There is still no REPL and no global interactive mode; a second
+    command language would need a second parser for every flag above.
   Two spellings are settled with the conventions. `--offline` is the one word
   for "spend no network" — the list commands and `whoami` both take it, and
   `--cache`, the name the lists used first, stays as a hidden alias the way
