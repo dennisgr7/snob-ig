@@ -189,6 +189,10 @@ walk it produced would be a real account read with no waits between pages.
 `cargo install --path crates/snob-cli` puts a release `snob` on the PATH, but it
 has to be repeated after every change; for iterating, `cargo run` is the one.
 
+**Everything that is not the binary and not a test lives under `tools/`**:
+the local CI job and the browser recorder, each in a directory of its own
+with its instructions at the top of its entry script.
+
 **The Linux job runs on this machine too**, in a container: `bash
 tools/ci/run.sh`. It is the job that differs most from a developer's host —
 musl, a real Secret Service keyring behind a session bus, a static link — and
@@ -199,6 +203,20 @@ commands the remote job runs and has to be kept in step with `ci.yml`; the
 image pins the compiler `rust-toolchain.toml` pins, so bump the two together.
 The Windows and macOS jobs are not there because a container cannot run either;
 the host is the Windows job.
+
+**The browser recorder is `node tools/capture/record.js`**, and it is how the
+captures this document cites were made. It launches the machine's Chrome
+with a throwaway profile, the person logs in and browses by hand, and every
+API call, document and navigation goes to `tools/capture/out/events.jsonl`
+with the cookie values, the csrf token, the LSD and DTSG tokens and the
+session id redacted before they are written. `node tools/capture/summarize.js`
+reads it back — the endpoints a page hits, the GraphQL operations by friendly
+name and `doc_id`, the key tree of any one reply (`shape <needle>`), and the
+profile header of every account visited side by side (`profiles`). Needs
+`playwright` on the machine, global is fine. `out/` is gitignored because the
+redacted log still carries real names; the profile is Playwright's own
+temporary directory and goes with the browser. Delete `out/` once what it
+showed is written here: that is what was done with both August captures.
 
 CI runs fmt, clippy and the suite on Linux, Windows and macOS, then builds five
 targets. Three things there are deliberate, and all three are the same idea:
