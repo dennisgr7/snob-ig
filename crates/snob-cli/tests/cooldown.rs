@@ -27,7 +27,7 @@ use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 use snob_cli::exit::ExitCode;
 
 mod common;
-use common::{SID, UA, args};
+use common::{SID, UA, args, requests};
 
 /// A budget over a database that exists.
 ///
@@ -92,10 +92,6 @@ async fn execute_with(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 /// Reports no cooldown for a fixed number of calls, then an active one: the
 /// shape of a cooldown another process sets while a run is underway.
 struct LateCooldown {

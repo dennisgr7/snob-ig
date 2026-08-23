@@ -5,47 +5,21 @@
 
 use snob_core::Pk;
 use snob_core::model::ListKind;
-use snob_core::session::{Session, SessionOrigin};
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
-use snob_store::store::Store;
-use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
 use snob_cli::engine::cooldown::check_same_moment;
 use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 
 mod common;
-use common::{SID, UA, args};
+use common::{app, args, open_db, requests};
 
 /// An app pointed at the mock server, over a database that outlives it.
 ///
 /// A fresh one per invocation on purpose: that is what a second run of the
 /// command really is, and it is the only way the stored snapshot gets to prove
 /// it survives the process.
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::unlimited())
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: Pk::new(42),
-            username: Some("me".into()),
-        },
-    )
-}
-
-fn open_db(root: &std::path::Path) -> Store {
-    Store::open_at(&root.join("test.db")).unwrap()
-}
-
 /// A profile with whatever follower count is asked for.
 async fn mount_profile(server: &MockServer, followers: u64) {
     Mock::given(method("GET"))
@@ -98,10 +72,6 @@ async fn execute(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 #[tokio::test]
 async fn the_first_run_walks_the_list_and_later_ones_reuse() {
     let server = MockServer::start().await;

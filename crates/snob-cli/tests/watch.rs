@@ -11,18 +11,14 @@
 
 use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::session::{Session, SessionOrigin};
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
 use snob_store::store::{Store, accounts, snapshots, users};
-use url::Url;
 use wiremock::MockServer;
 
-use snob_cli::app::{App, Viewer};
+use snob_cli::app::App;
 use snob_cli::engine::watch;
 
 mod common;
-use common::{SID, UA};
+use common::app;
 
 const ME: Pk = Pk::new(42);
 
@@ -43,21 +39,6 @@ fn users(names: &[(u64, &str)]) -> Vec<User> {
 
 /// An app over this database. The server has nothing mounted, so any request
 /// would fail loudly rather than quietly succeeding.
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::unlimited())
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: ME,
-            username: Some("me".into()),
-        },
-    )
-}
-
 /// Stores a finished walk of `kind` holding `members`, the way a real one does.
 fn walked(db: &mut Store, kind: ListKind, members: &[User]) -> i64 {
     users::ensure(db.conn(), ME).unwrap();

@@ -5,43 +5,21 @@
 //! went to the wrong one would show up as a count on a server that was not
 //! meant to get it.
 
-use std::sync::Arc;
-
 use snob_core::Pk;
-use snob_core::budget::UnlimitedRateBudget;
 use snob_core::secret::Secret;
-use snob_core::session::{Session, SessionOrigin};
 use snob_core::watch::sign;
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
 use snob_store::store::{Store, deliveries};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use snob_cli::app::{App, Viewer};
 use snob_cli::watch::webhook::{Attempt, Webhook, WebhookClient};
 
 mod common;
-use common::{SID, UA};
+use common::app;
 
 fn open_db(root: &std::path::Path) -> Store {
     Store::open_at(&root.join("test.db")).unwrap()
-}
-
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::new(Arc::new(UnlimitedRateBudget)))
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: Pk::new(42),
-            username: Some("me".into()),
-        },
-    )
 }
 
 fn client_for(

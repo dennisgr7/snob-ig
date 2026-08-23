@@ -25,30 +25,7 @@ use snob_cli::engine::Provenance;
 use snob_cli::engine::watch::{self, Skipped, TickReport, Watched};
 
 mod common;
-use common::{SID, UA};
-
-fn open_db(root: &std::path::Path) -> Store {
-    Store::open_at(&root.join("test.db")).unwrap()
-}
-
-fn app_with(server: &MockServer, db: Store, budget: Arc<dyn RateBudget>) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::new(budget))
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: Pk::new(42),
-            username: Some("me".into()),
-        },
-    )
-}
-
-fn app(server: &MockServer, db: Store) -> App {
-    app_with(server, db, Arc::new(UnlimitedRateBudget))
-}
+use common::{SID, UA, app, app_with, open_db, requests};
 
 /// A profile answering with these two counters.
 async fn mount_profile(server: &MockServer, followers: u64, following: u64) {
@@ -76,10 +53,6 @@ async fn mount_list(server: &MockServer, kind: &str, pks: &[u64]) {
         )
         .mount(server)
         .await;
-}
-
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
 }
 
 /// A whole run: look, then record having reported it.

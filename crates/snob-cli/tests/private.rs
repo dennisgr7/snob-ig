@@ -18,7 +18,7 @@ use snob_cli::cli::ListArgs;
 use snob_cli::engine::{self, ListOutcome};
 
 mod common;
-use common::{SID, UA};
+use common::{SID, UA, requests};
 
 /// The account every test here asks about.
 fn args() -> ListArgs {
@@ -76,10 +76,6 @@ async fn execute(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 #[tokio::test]
 async fn a_private_account_you_do_not_follow_fails_before_any_walk() {
     let server = MockServer::start().await;

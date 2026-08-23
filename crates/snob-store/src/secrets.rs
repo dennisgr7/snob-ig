@@ -805,43 +805,23 @@ fn parse_session(json: &str) -> Result<Session, SecretsError> {
 /// Writes with restricted permissions and atomically: first to a temporary in
 /// the same directory, then rename.
 fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<(), SecretsError> {
-    use std::io::Write;
-
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let temporary = dir.join(format!(
         ".{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
 
-    let mut options = std::fs::OpenOptions::new();
-    // `create_new`, not `create`: the temporary's name is predictable, and with
-    // `create` an existing one would be opened and written **with whatever
-    // permissions it already had**, which is the one thing the mode below is
-    // here to prevent. It would follow a symlink, too. Anything left over from
-    // a failed run is cleared first rather than reused.
-    options.write(true).create_new(true);
-    // Permissions are set at creation, not afterwards: a later chmod leaves a
-    // window in which the file is readable by others.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let _ = std::fs::remove_file(&temporary);
-    let mut f = options
-        .open(&temporary)
-        .map_err(|source| SecretsError::Write {
+    // The recipe -- create-new, mode at creation, sync before return -- is
+    // `paths::write_new_private`, shared with the monitor's configuration
+    // file. What is this function's own is the temporary name and the rename
+    // over the real one, so a reader of the session file never sees half of
+    // it.
+    crate::paths::write_new_private(&temporary, contents).map_err(|source| {
+        SecretsError::Write {
             path: temporary.display().to_string(),
             source,
-        })?;
-    f.write_all(contents)
-        .and_then(|()| f.sync_all())
-        .map_err(|source| SecretsError::Write {
-            path: temporary.display().to_string(),
-            source,
-        })?;
-    drop(f);
+        }
+    })?;
 
     std::fs::rename(&temporary, path).map_err(|source| SecretsError::Write {
         path: path.display().to_string(),

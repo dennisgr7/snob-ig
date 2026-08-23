@@ -334,6 +334,48 @@ pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
     }
 }
 
+/// Creates a file only its owner can read, at exactly this name, and syncs
+/// its contents to disk before returning.
+///
+/// The recipe existed twice -- the session fallback in `secrets` and the
+/// monitor's `watch.toml` in `config` -- and the second copy was
+/// `create(true).truncate(true)` for a while, which differs in two ways that
+/// matter: an existing file at a predictable name is opened **with whatever
+/// permissions it already had**, since the mode only applies at creation, and
+/// the open follows a symlink. That defect was found in one copy and fixed
+/// there; the next hardening lands here once instead.
+///
+/// The pieces, each load-bearing:
+/// - anything left over from a failed run is removed first, which is what
+///   makes `create_new` usable at a fixed name;
+/// - `create_new`, not `create`: never open something that already exists,
+///   never follow a link;
+/// - on Unix the mode is set **at creation** -- a later chmod leaves a window
+///   in which the file is readable by others;
+/// - `sync_all` before returning: a file that is renamed into place with its
+///   contents still in the page cache is not the protection against a
+///   half-written file that writing to a temporary is for.
+///
+/// The caller owns what the name means -- `secrets` hands a temporary in and
+/// renames it over the real name; `config` writes the real name directly --
+/// and owns mapping the error into its own vocabulary.
+pub fn write_new_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let _ = std::fs::remove_file(path);
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 /// Creates the directory and restricts it to its owner.
 ///
 /// **Both halves of that sentence are enforced now.** On Unix it chmods 0700,
