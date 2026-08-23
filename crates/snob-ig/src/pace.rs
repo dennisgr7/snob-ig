@@ -282,22 +282,6 @@ impl Pacer {
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
-    /// Charges the budget for one request, off the async worker.
-    ///
-    /// `reserve` opens an immediate transaction against a database this process
-    /// does not have to itself — the v2 service is meant to share it — so under
-    /// contention it sits on the five-second busy timeout. That is a long time
-    /// to hold a runtime worker, and this runs before every single request.
-    async fn reserve(&self) -> Result<Duration, crate::error::IgError> {
-        self.charge(false).await
-    }
-
-    /// The same, for a follow or an unfollow. See
-    /// [`snob_core::budget::RateBudget::reserve_write`].
-    async fn reserve_write(&self) -> Result<Duration, crate::error::IgError> {
-        self.charge(true).await
-    }
-
     /// Reads the cooldown off the async worker, for the reason [`Self::reserve`]
     /// gives about the one below it.
     ///
@@ -395,11 +379,14 @@ impl Pacer {
             return Err(crate::error::IgError::InCooldown { until_ms });
         }
 
-        let owed = if write {
-            self.reserve_write().await?
-        } else {
-            self.reserve().await?
-        };
+        // `charge` opens an immediate transaction against a database this
+        // process does not have to itself — the v2 service is meant to share
+        // it — so under contention it sits on the five-second busy timeout,
+        // off the async worker, before every single request. The public pair
+        // `clear_to_send`/`clear_to_send_write` stays two methods on purpose
+        // (the write budget is a different promise); these were two private
+        // wrappers under that door, unpacking a boolean the caller had.
+        let owed = self.charge(write).await?;
         // Counted at the reservation rather than at the answer: the budget has
         // been charged by now whatever the server goes on to say.
         self.spent.fetch_add(1, Ordering::Relaxed);

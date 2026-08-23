@@ -77,21 +77,33 @@ pub(super) fn check_json(report: &crate::engine::check::CheckReport) -> serde_js
 /// Hand-built rather than derived from the report, because this is a contract
 /// with whatever is reading it and the struct behind it is not: renaming a
 /// field in `ListReport` must not silently rename a key here.
+/// The `account` object, shared by `--json` and the webhook body.
+///
+/// The eight lines were verbatim in both documents, which is the one way the
+/// two could come to describe the same account differently. The true value,
+/// unfiltered: `printable` is for terminals; a machine format has to carry
+/// the name that identifies the account, and `serde_json` escapes what it
+/// emits.
+fn report_account_json(report: &WatchReport) -> serde_json::Value {
+    serde_json::json!({
+        "pk": report.account_pk,
+        "username": report.username,
+        "is_self": report.is_self,
+    })
+}
+
+/// The `lists` object, shared for the same reason as [`report_account_json`].
+fn report_lists_json(report: &WatchReport) -> serde_json::Value {
+    serde_json::json!({
+        "followers": list_json(report.followers.as_ref()),
+        "following": list_json(report.following.as_ref()),
+    })
+}
+
 pub(super) fn as_json(report: &WatchReport) -> serde_json::Value {
     serde_json::json!({
-        "account": {
-            "pk": report.account_pk,
-            // The true value, unfiltered. `printable` is for terminals; a
-            // machine format has to carry the name that identifies the account,
-            // and `serde_json` escapes what it emits. This is what the rest of
-            // the tool's JSON already does.
-            "username": report.username,
-            "is_self": report.is_self,
-        },
-        "lists": {
-            "followers": list_json(report.followers.as_ref()),
-            "following": list_json(report.following.as_ref()),
-        },
+        "account": report_account_json(report),
+        "lists": report_lists_json(report),
         "changes": {
             "followers": diff_json(report.followers.as_ref()),
             "following": diff_json(report.following.as_ref()),
@@ -354,15 +366,8 @@ pub(super) fn payload(tick: &TickReport, run_id: &str, event: &str) -> serde_jso
             "lists": run_lists_json(tick),
             "tool": { "name": "snob", "version": env!("CARGO_PKG_VERSION") },
         },
-        "account": {
-            "pk": report.account_pk,
-            "username": report.username,
-            "is_self": report.is_self,
-        },
-        "lists": {
-            "followers": list_json(report.followers.as_ref()),
-            "following": list_json(report.following.as_ref()),
-        },
+        "account": report_account_json(report),
+        "lists": report_lists_json(report),
         "counts": {
             "followers_gained": changes.followers.gained.len(),
             "followers_lost":   changes.followers.lost.len(),

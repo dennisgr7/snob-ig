@@ -620,16 +620,12 @@ fn ask_webhook() -> Result<WebhookAnswers> {
         true,
     )? {
         let value = ui::prompt_secret("A shared secret (at least 32 characters, random)")?;
-        if value.trim().chars().count() < 32 {
-            // The same floor `--sign-with` applies, for the same reason, and
-            // said in the same place a person is standing. A short secret is
-            // guessable offline by anybody holding one signed report.
-            bail!(concat!(
-                "a signing secret has to be at least 32 characters. Generate one -- ",
-                "\"openssl rand -hex 32\" -- rather than choosing one"
-            ));
-        }
-        Some(Secret::new(value.to_string()))
+        // The same validator `--sign-with` runs, literally: one floor, one
+        // trim, one sentence, so a key the flag accepts is a key the wizard
+        // accepts and the other way round. The wizard used to keep its own
+        // count, and the two had drifted over whether whitespace counts.
+        let value = crate::cli::signing_secret(&value).map_err(|why| anyhow::anyhow!(why))?;
+        Some(Secret::new(value))
     } else {
         None
     };

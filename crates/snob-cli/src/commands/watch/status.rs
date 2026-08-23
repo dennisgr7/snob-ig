@@ -166,10 +166,10 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
             .map(|of| (of.run.account_pk, of.who.clone()))
             .collect();
         for mark in &marks {
-            if !labels.contains_key(&mark.account_pk) {
+            if let std::collections::btree_map::Entry::Vacant(slot) = labels.entry(mark.account_pk)
+            {
                 let name = snob_store::store::users::name(db.conn(), mark.account_pk)?;
-                let label = crate::app::label(mark.account_pk, name.as_deref());
-                labels.insert(mark.account_pk, label);
+                slot.insert(crate::app::label(mark.account_pk, name.as_deref()));
             }
             let who = &labels[&mark.account_pk];
             crate::ui::say!(
@@ -365,12 +365,12 @@ fn expected_gap(config: &WatchConfig, now: Epoch) -> Option<i64> {
     const MOST_STEPS: usize = 200;
 
     let schedule = schedule_from(&Default::default(), Some(config)).ok()?;
-    let first = schedule::next_moment(&schedule, Some(now), now, &chrono::Local)?;
+    let first = schedule::next_after(&schedule, Some(now), now, &chrono::Local)?;
 
     let mut at = first;
     let mut widest = 0;
     for _ in 0..MOST_STEPS {
-        let Some(next) = schedule::next_moment(&schedule, Some(at), at, &chrono::Local) else {
+        let Some(next) = schedule::next_after(&schedule, Some(at), at, &chrono::Local) else {
             break;
         };
         widest = widest.max(next - at);

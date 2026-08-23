@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `--sign-with` now trims surrounding whitespace before checking its
+  32-character floor, the same way `snob watch setup` always did. A key that
+  was only long enough by counting invisible padding is refused at both doors
+  now; a key that never carried whitespace at its edges is unchanged.
+
 **snob follows, unfollows, and shows you stories.** The first release that
 changes anything on Instagram at all, and the rule it replaces is worth reading
 before the features: `snob` used to write nothing, deliberately, because a read

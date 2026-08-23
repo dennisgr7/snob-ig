@@ -36,10 +36,10 @@ use chrono::TimeZone;
 use crate::Epoch;
 
 use calendar::{Calendar, Times};
-use next::{next_after, next_local_midnight};
+use next::next_local_midnight;
 use parse::{FieldSet, parse_cron};
 
-pub use next::{due, next_moment, wake_at, with_jitter};
+pub use next::{due, next_after, wake_at, with_jitter};
 pub use parse::{Weekday, parse_time};
 
 /// The shortest gap between two runs.

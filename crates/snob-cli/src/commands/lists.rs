@@ -64,11 +64,7 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
                 " - list stored on {}",
                 report::stored_on(outcome.taken_at)
             ));
-            if outcome.requests > 0 {
-                line.push_str(&format!(" - {}", report::requests(outcome.requests)));
-            } else {
-                line.push_str(" - without touching the network");
-            }
+            line.push_str(&report::spent(outcome.requests));
         }
         ResultSource::Fetched => {
             line.push_str(&format!(" - {}", report::requests(outcome.requests)));

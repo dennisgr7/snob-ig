@@ -215,23 +215,16 @@ fn summary_line(
     // capture. `Provenance`'s own doc names an answer that does not say where it
     // came from as half of the defect it was written for.
     //
-    // The older of the two dates, because a crossing is only as recent as its
-    // staler half. `check_same_moment` is what stops the two being far apart at
-    // all, so this is completeness rather than a correction.
     if base_outcome.source() == ResultSource::Cached
         || against_outcome.source() == ResultSource::Cached
     {
         line.push_str(&format!(
             " - lists stored on {}",
-            report::stored_on(base_outcome.taken_at.min(against_outcome.taken_at))
+            report::stored_on_the_older_of(base_outcome.taken_at, against_outcome.taken_at)
         ));
     }
 
-    if total_requests > 0 {
-        line.push_str(&format!(" - {}", report::requests(total_requests)));
-    } else {
-        line.push_str(" - without touching the network");
-    }
+    line.push_str(&report::spent(total_requests));
     line
 }
 

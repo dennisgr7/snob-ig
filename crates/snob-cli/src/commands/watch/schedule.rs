@@ -334,7 +334,7 @@ mod tests {
         // days are the grid.
         let ran_at = snob_core::Epoch::new(MONDAY_0000 + 9 * 3600);
         assert_eq!(
-            schedule::next_moment(
+            schedule::next_after(
                 &schedule,
                 Some(ran_at),
                 ran_at + std::time::Duration::from_secs(60),

@@ -61,20 +61,12 @@ pub async fn run(args: WhoamiArgs, store: SecretStore, paths: &AppPaths) -> Resu
     let mut code = ExitCode::Ok;
 
     if !args.offline {
-        // Assembled by `app::pacer` rather than here, so this one is wired like
-        // every other: with the process's cancellation token, and with somebody
-        // to tell when the budget imposes a wait. It had neither, so `snob
-        // whoami` on a rationed bucket sat silent for as long as the debt
-        // lasted and Ctrl+C did not reach it.
-        let pacer = crate::app::pacer(
-            paths,
-            std::sync::Arc::new(|waited: std::time::Duration| {
-                ui::info(&format!(
-                    "The request budget is rationing; waiting {}.",
-                    snob_core::duration::format(waited)
-                ));
-            }),
-        )?;
+        // Assembled by `app::pacer_saying_a_line` rather than here, so this
+        // one is wired like every other: with the process's cancellation
+        // token, and with somebody to tell when the budget imposes a wait. It
+        // had neither, so `snob whoami` on a rationed bucket sat silent for
+        // as long as the debt lasted and Ctrl+C did not reach it.
+        let pacer = crate::app::pacer_saying_a_line(paths)?;
 
         // A cooldown means nothing is spent, and checking a session is a
         // request like any other. `--offline` is the way to ask anyway, and it

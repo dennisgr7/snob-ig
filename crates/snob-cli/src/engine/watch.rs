@@ -72,6 +72,23 @@ pub struct WatchReport {
 }
 
 impl WatchReport {
+    /// Whether the tick found anything, without cloning the diffs.
+    ///
+    /// [`WatchReport::changes`] clones both lists' diffs and every rename to
+    /// answer, and two of its five callers only wanted this bool or the
+    /// count -- on the monitor's path, where no deliberate wait amortizes a
+    /// copy of every arrival and departure.
+    pub fn has_changes(&self) -> bool {
+        self.change_count() > 0
+    }
+
+    /// How many individual changes, counted the way `Changes::len` counts --
+    /// both lists plus the renames -- without building a `Changes`.
+    pub fn change_count(&self) -> usize {
+        let of = |kind| self.report(kind).map_or(0, |r| r.diff.len());
+        of(ListKind::Followers) + of(ListKind::Following) + self.renamed.len()
+    }
+
     /// The changes, in the shape the payload and the printer both want.
     pub fn changes(&self) -> Changes {
         Changes {
@@ -308,7 +325,7 @@ pub fn commit(
             finished_at: Some(snob_core::clock::now()),
             requests: tick.requests,
             outcome: Some(tick.outcome().into()),
-            changes: tick.report.changes().len() as u32,
+            changes: tick.report.change_count() as u32,
         },
     );
     if let Err(e) = record {

@@ -231,7 +231,7 @@ pub fn schedule_of(schedule: &Schedule, now: Epoch) -> Checked {
     let mut next = Vec::new();
     let mut at = now;
     for _ in 0..MOMENTS_SHOWN {
-        match schedule::next_moment(schedule, Some(at), at, &chrono::Local) {
+        match schedule::next_after(schedule, Some(at), at, &chrono::Local) {
             Some(moment) if moment > at => {
                 next.push(moment);
                 at = moment;

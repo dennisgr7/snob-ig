@@ -380,8 +380,6 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
     // minutes ago from one of last month. `lists::print_summary` says it for a
     // single list; this is the same sentence for a crossing.
     //
-    // The older of the two dates, because a scan is only as recent as its
-    // staler half.
     if summary.followers.source() == ResultSource::Cached
         || summary.following.source() == ResultSource::Cached
     {
@@ -389,7 +387,7 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         rows.push(format!(
             "{:<14}{}",
             "Stored on:",
-            report::stored_on(summary.followers.taken_at.min(summary.following.taken_at))
+            report::stored_on_the_older_of(summary.followers.taken_at, summary.following.taken_at)
         ));
     }
 

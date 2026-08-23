@@ -131,33 +131,22 @@ fn last_instant_of_previous_local_day<Tz: TimeZone>(
     zone.from_local_datetime(&yesterday).latest()
 }
 
-/// The next moment this schedule is due, for somebody who wants to see it
-/// rather than sleep until it.
-///
-/// The same function the loop uses, deliberately: a preflight that worked the
-/// moments out its own way would be checking a schedule nobody runs. `None`
-/// means the calendar can never match, which is the one answer worth a red line
-/// before anything is scheduled at all.
-pub fn next_moment<Tz: TimeZone>(
-    schedule: &Schedule,
-    last_run: Option<Epoch>,
-    now: Epoch,
-    zone: &Tz,
-) -> Option<Epoch> {
-    next_after(schedule, last_run, now, zone)
-}
-
 /// The next moment this schedule is due after `now`.
 ///
 /// `None` only when the calendar can never match. Both arguments and the answer
 /// are moments; the zone is what turns them into wall-clock time, and it is
 /// passed in so a test can pick one rather than inherit the machine's.
 ///
+/// Public directly: `next_moment` used to re-export this under a second name,
+/// differing only in visibility, so the preflight and the loop looked like
+/// they might be asking two functions. They ask this one -- deliberately, or
+/// a preflight would be checking a schedule nobody runs.
+///
 /// The minute arithmetic below works in bare seconds, and deliberately: a
 /// minute index is not a moment, and neither is the offset of one from another.
 /// The moments come in and go out as [`Epoch`], which is where a transposition
 /// would cost something.
-pub(super) fn next_after<Tz: TimeZone>(
+pub fn next_after<Tz: TimeZone>(
     schedule: &Schedule,
     last_run: Option<Epoch>,
     now: Epoch,
@@ -223,11 +212,8 @@ pub(super) fn next_after<Tz: TimeZone>(
     // statement about the moments, not about the instants the process happened
     // to write a row at.
     //
-    // The addition saturates, in [`Epoch`]'s own `Add`, because an absurd
-    // `--every` can arrive from a hand-edited `watch.toml`: the sum overflowed,
-    // which panicked a debug build and in release wrapped to a negative floor,
-    // turning an interval of billions of years into one that ran every fifteen
-    // minutes.
+    // The addition saturates here too, for the reason the no-grid branch
+    // above spells out.
     let served = last_run.map(|last| moment_served(calendar, last, zone));
     let floor = match (served, last_run) {
         // Never earlier than the row the last run wrote, whatever the snap

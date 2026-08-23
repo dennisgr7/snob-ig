@@ -370,7 +370,7 @@ async fn tick_one(
 
     if printing.json {
         crate::ui::say!("{}", json_line(&tick_json(&tick)));
-    } else if printing.watching || !tick.report.changes().is_empty() {
+    } else if printing.watching || tick.report.has_changes() {
         for line in describe(&tick.report, tick.lists.iter().any(|l| l.skipped.is_some())) {
             crate::ui::say!("{line}");
         }

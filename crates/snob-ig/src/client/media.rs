@@ -82,19 +82,6 @@ impl IgClient {
 
     /// The same, with the caller naming the ceiling.
     ///
-    /// A story video does not fit under [`MAX_ASSET_BYTES`], which was sized
-    /// for a 1080x1080 picture. Rather than raising that constant — and with it
-    /// the ceiling on every profile picture, for a reason that has nothing to
-    /// do with profile pictures — the caller that needs a different one says
-    /// so, and says why where it says it.
-    ///
-    /// Everything else is identical, [`IgClient::check_downloadable`]
-    /// included: the URL still has to point at the CDN, and every redirect hop
-    /// after it is held to the same rule.
-    pub async fn download_capped_public(&self, url: &str, cap: usize) -> Result<Vec<u8>, IgError> {
-        self.download_capped(url, cap).await
-    }
-
     /// Refuses a picture URL that does not go where a picture goes.
     ///
     /// The address of the first hop comes straight out of Instagram's answer,
@@ -118,7 +105,18 @@ impl IgClient {
 
     /// The body of [`IgClient::download`], with the ceiling as an argument so a
     /// test can reach it without moving eight megabytes around.
-    pub(super) async fn download_capped(&self, url: &str, cap: usize) -> Result<Vec<u8>, IgError> {
+    ///
+    /// Public because a story video does not fit under [`MAX_ASSET_BYTES`],
+    /// which was sized for a 1080x1080 picture: rather than raising that
+    /// constant -- and with it the ceiling on every profile picture, for a
+    /// reason that has nothing to do with profile pictures -- the caller that
+    /// needs a different cap says so, and says why where it says it. It used
+    /// to be re-exported through a wrapper whose whole doc explained that it
+    /// was identical to this; the wrapper said nothing the visibility cannot.
+    /// Everything else is the same for every caller,
+    /// [`IgClient::check_downloadable`] included: the URL still has to point
+    /// at the CDN, and every redirect hop after it is held to the same rule.
+    pub async fn download_capped(&self, url: &str, cap: usize) -> Result<Vec<u8>, IgError> {
         let url = Url::parse(url)?;
         self.check_downloadable(&url)?;
         tracing::debug!(%url, "GET asset");

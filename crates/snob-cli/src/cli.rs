@@ -127,8 +127,18 @@ pub struct Cli {
 /// Thirty-two characters is the shortest that is not a guessing target. It is
 /// counted in characters rather than bytes because the person typing it is
 /// counting characters.
-fn signing_secret(value: &str) -> Result<String, String> {
+///
+/// **The one floor, wherever a key arrives.** `--sign-with` applies it as a
+/// value parser and `watch setup` applies it to what was typed at the prompt;
+/// the wizard had its own copy of the count, and the two had already
+/// diverged -- the wizard trimmed before counting, the flag did not, so a
+/// 30-character key padded with spaces passed one door and was refused at the
+/// other. Trimming is now part of the rule: the prompt's non-terminal path
+/// reads a whole line, newline included, and a key that differs from itself
+/// by invisible whitespace is a support case.
+pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
     const FLOOR: usize = 32;
+    let value = value.trim();
     let length = value.chars().count();
     if length < FLOOR {
         return Err(format!(

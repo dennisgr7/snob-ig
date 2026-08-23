@@ -512,7 +512,7 @@ pub(crate) async fn bytes_of(client: &IgClient, story: &Story) -> Result<Vec<u8>
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("Instagram described this story but offered no media for it"))?;
-    Ok(client.download_capped_public(url, MAX_STORY_BYTES).await?)
+    Ok(client.download_capped(url, MAX_STORY_BYTES).await?)
 }
 
 /// What arrived, read from the bytes rather than from the URL.

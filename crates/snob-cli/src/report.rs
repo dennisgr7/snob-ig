@@ -240,6 +240,31 @@ fn filtered(text: &str, join: &str) -> String {
         .join(join)
 }
 
+/// The requests half of a summary line: what was spent, or the promise that
+/// nothing was.
+///
+/// Two commands wrote the `if` themselves — the single lists and the
+/// crossings — and "without touching the network" is exactly the kind of
+/// sentence this module exists to keep from drifting into two ways of
+/// describing one situation.
+pub fn spent(n: u32) -> String {
+    if n > 0 {
+        format!(" - {}", requests(n))
+    } else {
+        " - without touching the network".to_string()
+    }
+}
+
+/// The date a crossing's summary names: the older of the two captures,
+/// because a crossing is only as recent as its staler half.
+///
+/// `check_same_moment` is what stops the two being far apart at all, so this
+/// is completeness rather than a correction. The rule was written out twice,
+/// comment and all, in `sets` and `scan`.
+pub fn stored_on_the_older_of(a: snob_core::Epoch, b: snob_core::Epoch) -> String {
+    stored_on(a.min(b))
+}
+
 /// "Aug 3 at 14:12", in the local zone like every other moment the tool prints.
 pub fn stored_on(taken_at: Epoch) -> String {
     format_epoch(taken_at, "earlier")

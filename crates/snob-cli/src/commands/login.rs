@@ -105,17 +105,7 @@ fn who(session: &Session) -> String {
 /// changed nothing — a message that was simply false, and only the second press
 /// got out.
 fn pacer(paths: &AppPaths) -> Result<Pacer> {
-    crate::app::pacer(
-        paths,
-        // One line rather than a bar: this is a single request, so there is
-        // nothing for a bar to count.
-        std::sync::Arc::new(|waited: std::time::Duration| {
-            ui::info(&format!(
-                "The request budget is rationing; waiting {}.",
-                snob_core::duration::format(waited)
-            ));
-        }),
-    )
+    crate::app::pacer_saying_a_line(paths)
 }
 
 /// Works out the method: whatever the flags say, or whatever the user picks

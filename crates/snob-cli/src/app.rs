@@ -114,6 +114,26 @@ pub fn pacer(
         .announcing(announce))
 }
 
+/// [`pacer`] with the announcement the single-request commands want: one line
+/// on standard error, because there is nothing for a bar to count.
+///
+/// `login` and `whoami` are the two commands AGENTS.md lists as building their
+/// client directly, and they are also the two that want exactly this
+/// presentation -- which each of them wired by hand, identically, doc-comment
+/// included. The bar-or-line distinction `pacer`'s doc defends is untouched:
+/// this is one of the two presentations, named.
+pub fn pacer_saying_a_line(paths: &AppPaths) -> Result<Pacer> {
+    pacer(
+        paths,
+        Arc::new(|waited: std::time::Duration| {
+            crate::ui::info(&format!(
+                "The request budget is rationing; waiting {}.",
+                snob_core::duration::format(waited)
+            ));
+        }),
+    )
+}
+
 /// How a run could have been given consent before it started.
 ///
 /// The refusal printed when nobody is at a terminal names the way *this*
