@@ -792,33 +792,123 @@ pub struct PfpArgs {
     pub output: Option<PathBuf>,
 }
 
+/// What `-d/--download` selects, decided at the parser so a typo is exit 2
+/// and nothing was fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadSelection {
+    /// Every story in the tray.
+    All,
+    /// The numbered ones, in the order they were asked for: `3`, `1,3`, `2-4`.
+    These(Vec<usize>),
+}
+
+/// Parses `all`, one number, or a comma-separated run of numbers and ranges.
+///
+/// The listing is one-based, so zero is refused by name rather than
+/// underflowing later. The count is capped well past any real tray, so
+/// `-d 1-999999999` is a parse error instead of an allocation.
+fn download_selection(text: &str) -> Result<DownloadSelection, String> {
+    const MOST: usize = 200;
+    if text.eq_ignore_ascii_case("all") {
+        return Ok(DownloadSelection::All);
+    }
+    let mut numbers: Vec<usize> = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        let (from, to) = match part.split_once('-') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => (part, part),
+        };
+        let complaint =
+            || format!("\"{part}\" is not a story number, a range like 2-4, or \"all\"");
+        let from: usize = from.parse().map_err(|_| complaint())?;
+        let to: usize = to.parse().map_err(|_| complaint())?;
+        if from == 0 {
+            return Err("the listing starts at 1".to_string());
+        }
+        if from > to {
+            return Err(format!("\"{part}\" runs backwards"));
+        }
+        for n in from..=to {
+            if numbers.len() >= MOST {
+                return Err(format!(
+                    "that is more than {MOST} stories; \"all\" is the way to ask for a whole tray"
+                ));
+            }
+            if !numbers.contains(&n) {
+                numbers.push(n);
+            }
+        }
+    }
+    Ok(DownloadSelection::These(numbers))
+}
+
+/// What a media command does with its tray: download some of it, or take the
+/// terminal over and browse it.
+///
+/// One definition, written for `stories` and for the `highlights` command
+/// AGENTS.md already shapes ("`-d`, `--all`, `-o`, `-i` on that exactly as
+/// `stories` has them") — so the second command takes this group instead of
+/// copying four flags and their conflicts.
 #[derive(Args, Debug)]
-pub struct StoriesArgs {
-    /// Account whose stories to show. Defaults to your own.
-    pub target: Option<String>,
+pub struct MediaActionArgs {
+    /// Download stories: a number from the listing, a set (1,3 or 2-4), or
+    /// "all"
+    #[arg(
+        short = 'd',
+        long,
+        value_name = "N|all",
+        value_parser = download_selection,
+        conflicts_with = "interactive"
+    )]
+    pub download: Option<DownloadSelection>,
 
-    /// Download the story with this number, as printed by the listing
-    #[arg(short = 'd', long, value_name = "N", conflicts_with_all = ["all", "interactive"])]
-    pub download: Option<usize>,
-
-    /// Download every story
-    #[arg(long, conflicts_with = "interactive")]
+    /// What "-d all" was spelled before -d took it; hidden, kept so a script
+    /// written against the first release still runs
+    #[arg(long, hide = true, conflicts_with_all = ["download", "interactive"])]
     pub all: bool,
 
     /// Move through the stories with the arrow keys
     #[arg(short = 'i', long)]
     pub interactive: bool,
 
-    /// Where a download goes. A directory with --all, a file otherwise.
+    /// Where a download goes. A directory when several are saved, a file when
+    /// one is.
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+}
 
+impl MediaActionArgs {
+    /// `--all` folded into the selection, so a command reads one field.
+    pub fn selection(&self) -> Option<DownloadSelection> {
+        if self.all {
+            return Some(DownloadSelection::All);
+        }
+        self.download.clone()
+    }
+}
+
+/// The listing's format, apart from the actions so the conflicts can say it:
+/// a download writes a file and the browser draws a screen, so `--format json
+/// -d 3` used to be accepted and then ignored, which reads as a format that
+/// did not work.
+#[derive(Args, Debug)]
+pub struct MediaListArgs {
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
-    // Only the listing has a format. A download writes a file and the browser
-    // draws a screen, so `--format json -d 3` used to be accepted and then
-    // ignored, which reads as a format that did not work.
     #[arg(long, value_enum, conflicts_with_all = ["download", "all", "interactive"])]
     pub format: Option<StoryFormat>,
+}
+
+#[derive(Args, Debug)]
+pub struct StoriesArgs {
+    /// Account whose stories to show. Defaults to your own.
+    pub target: Option<String>,
+
+    #[command(flatten)]
+    pub action: MediaActionArgs,
+
+    #[command(flatten)]
+    pub list: MediaListArgs,
 }
 
 #[derive(Args, Debug)]
@@ -1150,6 +1240,68 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["snob", "stories", "someone", "--format", "json"]).is_ok());
     }
+
+    /// `-d` takes the listing's numbers in every shape the help promises, and
+    /// refuses the shapes that would only fail later, at the parser -- exit 2,
+    /// nothing fetched.
+    #[test]
+    fn a_download_selection_parses_numbers_ranges_and_all() {
+        use DownloadSelection::{All, These};
+
+        let selected = |line: &[&str]| {
+            let cli = Cli::try_parse_from(line).unwrap();
+            let Command::Stories(args) = cli.command else {
+                panic!("stories");
+            };
+            args.action.selection()
+        };
+
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "3"]),
+            Some(These(vec![3]))
+        );
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "1,3"]),
+            Some(These(vec![1, 3]))
+        );
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "2-4"]),
+            Some(These(vec![2, 3, 4]))
+        );
+        // A duplicate is asked for once: 2-4 already brought 3.
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "2-4,3,1"]),
+            Some(These(vec![2, 3, 4, 1]))
+        );
+        assert_eq!(selected(&["snob", "stories", "x", "-d", "all"]), Some(All));
+        // The first release's spelling still works, hidden, and folds into
+        // the same selection.
+        assert_eq!(selected(&["snob", "stories", "x", "--all"]), Some(All));
+        assert_eq!(selected(&["snob", "stories", "x"]), None);
+
+        for bad in ["0", "3-1", "one", "1,,2", "1-999999999"] {
+            assert!(
+                Cli::try_parse_from(["snob", "stories", "x", "-d", bad]).is_err(),
+                "{bad} should have been refused at the parser"
+            );
+        }
+        // The two spellings of "everything" cannot be combined with each
+        // other or with the browser.
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "-d", "all", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "-d", "1", "-i"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "--all", "-i"]).is_err());
+
+        // Hidden means hidden: the help teaches -d, not --all.
+        let help = Cli::command()
+            .find_subcommand("stories")
+            .expect("stories is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--all"), "{help}");
+        assert!(help.contains("--download"), "{help}");
+    }
+
     /// `--tls-extra-root` only means something alongside `--strict-roots`.
     ///
     /// On the platform store there is nothing to add to: whatever an

@@ -130,19 +130,61 @@ pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> R
         return Ok(ExitCode::Ok);
     }
 
-    if args.interactive {
+    if args.action.interactive {
         return crate::ui::stories::browse(app.client(), &stories, paths).await;
     }
 
-    if let Some(n) = args.download {
-        return download_one(app.client(), &stories, n, args.output.as_deref()).await;
+    if let Some(selection) = args.action.selection() {
+        return download_selected(
+            app.client(),
+            &stories,
+            selection,
+            args.action.output.as_deref(),
+        )
+        .await;
     }
 
-    if args.all {
-        return download_all(app.client(), &stories, args.output.as_deref()).await;
-    }
+    list(&stories, args.list.format, args.action.output.as_deref())
+}
 
-    list(&stories, args.format, args.output.as_deref())
+/// Turns the parsed selection into story numbers and refuses any the tray
+/// does not have -- before the first request, so `-d 3,9` against a tray of
+/// five downloads nothing rather than three stories and an error.
+async fn download_selected(
+    client: &IgClient,
+    stories: &Stories,
+    selection: crate::cli::DownloadSelection,
+    destination: Option<&Path>,
+) -> Result<ExitCode> {
+    let numbers: Vec<usize> = match selection {
+        crate::cli::DownloadSelection::All => (1..=stories.items.len()).collect(),
+        crate::cli::DownloadSelection::These(numbers) => numbers,
+    };
+    for &number in &numbers {
+        if number > stories.items.len() {
+            return Err(no_such_story(stories, number));
+        }
+    }
+    // One story keeps the single-download contract: `-o` names a file, and a
+    // failure is the run's failure. Several go the way `--all` always went:
+    // `-o` names a directory and the loop keeps going past one that fails.
+    if let [number] = numbers[..] {
+        return download_one(client, stories, number, destination).await;
+    }
+    download_many(client, stories, &numbers, destination).await
+}
+
+/// The sentence for a number the tray does not have, shared by the single
+/// and the many paths so they cannot drift.
+fn no_such_story(stories: &Stories, number: usize) -> anyhow::Error {
+    anyhow!(
+        "there is no story {number}: @{} has {}",
+        printable(&stories.username),
+        match stories.items.len() {
+            1 => "one".to_string(),
+            n => format!("{n} stories"),
+        }
+    )
 }
 
 /// The network half, kept apart from the session and the filesystem so a test
@@ -382,16 +424,7 @@ async fn download_one(
     let story = number
         .checked_sub(1)
         .and_then(|i| stories.items.get(i))
-        .ok_or_else(|| {
-            anyhow!(
-                "there is no story {number}: @{} has {}",
-                printable(&stories.username),
-                match stories.items.len() {
-                    1 => "one".to_string(),
-                    n => format!("{n} stories"),
-                }
-            )
-        })?;
+        .ok_or_else(|| no_such_story(stories, number))?;
 
     let bytes = bytes_of(client, story).await?;
     let extension = extension_of(&bytes);
@@ -416,17 +449,18 @@ async fn download_one(
 /// A Ctrl+C is the one failure that is not collected. Every fetch after it
 /// answers `Canceled` at once, so carrying on would count them all as
 /// failures and exit 1 for what the user did on purpose.
-async fn download_all(
+async fn download_many(
     client: &IgClient,
     stories: &Stories,
+    numbers: &[usize],
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let dir = destination.unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
 
     let mut failed = Vec::new();
-    for (index, story) in stories.items.iter().enumerate() {
-        let number = index + 1;
+    for &number in numbers {
+        let story = &stories.items[number - 1];
         let saved = async {
             let bytes = bytes_of(client, story).await?;
             // `default_name` answers a bare name and checks the directory
@@ -459,7 +493,7 @@ async fn download_all(
         format!(
             "{} of {} stories could not be downloaded:\n{}",
             failed.len(),
-            stories.items.len(),
+            numbers.len(),
             failed.join("\n")
         ),
     )

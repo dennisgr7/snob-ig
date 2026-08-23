@@ -772,6 +772,11 @@ async fn listing_stories_sends_nothing_that_marks_them_seen() {
 
 /// A number nobody has is refused by name rather than by panic, and an
 /// out-of-range one does not wrap round to the last story.
+///
+/// Zero is refused earlier than nine, and differently: the value parser
+/// answers it, so it is exit 2 with nothing fetched, while nine parses and is
+/// refused against the tray. Both were "there is no story" until `-d` learned
+/// sets and ranges, which moved the zero check to where a typo costs nothing.
 #[tokio::test]
 async fn a_story_number_nobody_has_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -779,22 +784,54 @@ async fn a_story_number_nobody_has_is_refused() {
     with_stories(&instagram).await;
     log_in(tmp.path(), &instagram);
 
-    for number in ["0", "9"] {
-        let out = snob(
-            tmp.path(),
-            Some(&instagram),
-            &["stories", "me", "--download", number],
-        );
-        assert!(
-            !out.status.success(),
-            "story {number} should not have been downloaded"
-        );
-        assert!(
-            stderr(&out).contains("there is no story"),
-            "{}",
-            stderr(&out)
-        );
-    }
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["stories", "me", "--download", "0"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "zero is a parse error, answered before anything was spent"
+    );
+    assert!(
+        stderr(&out).contains("the listing starts at 1"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["stories", "me", "--download", "9"],
+    );
+    assert!(
+        !out.status.success(),
+        "story 9 should not have been downloaded"
+    );
+    assert!(
+        stderr(&out).contains("there is no story"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A set with one bad number downloads nothing: the refusal comes before
+    // the first request, not after two good stories are already on disk.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["stories", "me", "--download", "1,9"],
+    );
+    assert!(!out.status.success(), "1,9 should refuse as a whole");
+    assert!(
+        stderr(&out).contains("there is no story 9"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("Saved") && !stdout(&out).contains("Saved"),
+        "nothing may be saved when part of the set is refused"
+    );
 }
 
 /// A reel whose media the fake Instagram itself serves, so a download has

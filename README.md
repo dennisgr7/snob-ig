@@ -203,9 +203,10 @@ snob stories someone
 ```
 
 What they have up right now, numbered, with what each one is and how long it
-has left. `--download 2` saves the second one, `--all` saves all of them, and
-`-i` opens a list you move through with the arrow keys — Enter opens the story
-in whatever you already open pictures and videos with, `D` keeps a copy.
+has left. `--download 2` saves the second one, `--download 1,3` or
+`--download 2-4` a set, `--download all` the whole tray, and `-i` opens a list
+you move through with the arrow keys — Enter opens the story in whatever you
+already open pictures and videos with, `D` keeps a copy.
 
 **Saving a story does not mark it as seen.** Instagram registers a view with a
 separate request, and that request is a write — so it falls under the two-write

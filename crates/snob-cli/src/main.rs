@@ -70,7 +70,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Format::Json | Format::Ndjson
         ),
         Command::Stories(args) => matches!(
-            effective_format(args.format.map(Format::from), None),
+            effective_format(args.list.format.map(Format::from), None),
             Format::Json | Format::Ndjson
         ),
         Command::Profile(args) => matches!(
