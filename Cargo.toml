@@ -18,7 +18,7 @@ anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 # The TLS backend is **not** listed here. It is chosen per platform, in
 # crates/snob-ig/Cargo.toml, and the reason is written out there.
 # No `cookies`: nothing here keeps a cookie jar — the session travels as an
@@ -109,11 +109,26 @@ indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
 rust_xlsxwriter = "0.97"
-# Only to read Instagram's export. `deflate` is what a zip holding JSON uses;
+# Only to read Instagram's export. Deflate is what a zip holding JSON uses;
 # rust_xlsxwriter already pulls this crate in, so the features are kept narrow
 # rather than adding a second copy of the compression code.
-zip = { version = "8", default-features = false, features = ["deflate"] }
-tracing = "0.1"
+#
+# The decoder feature by name, not the `deflate` umbrella: in zip 8 the umbrella
+# also turns on `deflate-zopfli`, a *compressor*, and the one use here is
+# `ZipArchive` reading an export. Today this changes nothing in the tree --
+# rust_xlsxwriter asks for the umbrella and features are additive -- but the
+# line states what this dependency is for, and the day the xlsx writer is
+# measured out (see AGENTS.md) zopfli leaves with it instead of staying behind
+# unasked-for.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# No `attributes`, which is a default feature. It exists for
+# `#[tracing::instrument]`, which nothing in this tree writes -- every event
+# here is an explicit `tracing::debug!`/`warn!` call -- and it is what keeps
+# `tracing-attributes` and its `syn` edge in the build. The external consumers
+# (`h2`, `hyper-util`) ask only for `std`, so dropping it here drops the
+# proc-macro from the tree. Same shape as `env-filter` below: build time and
+# one less crate for `cargo deny` to clear, not binary size.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # No `env-filter`. It exists to parse `RUST_LOG`'s full grammar -- span names,
 # field matchers, `[span{field=value}]` -- and to do that it compiles
 # `matchers`, `regex-automata` and `regex-syntax`: a complete regular-expression
