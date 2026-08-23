@@ -181,6 +181,16 @@ pub(super) struct Answer {
     pub(super) load: Option<String>,
 }
 
+impl Answer {
+    /// Whether the status is a 2xx. Half the question: a 200 can still
+    /// declare failure in the body, and that half is `decode`'s. Spelled once
+    /// because `(200..300).contains(...)` was written at three sites, and a
+    /// range typo at one of them is invisible in review.
+    pub(super) fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
 impl IgClient {
     /// One request to Instagram's API, with the headers a browser would send.
     ///
@@ -287,8 +297,7 @@ impl IgClient {
                         retry_after,
                         load,
                     };
-                    self.note_push_back(&answer);
-                    return Err(self.classify_and_record(answer.status, ""));
+                    return Err(self.refuse(&answer));
                 }
                 Err(e) => return Err(e),
             };

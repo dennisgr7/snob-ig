@@ -179,10 +179,52 @@ pub fn begin(
 /// oldest `started_at` still inside the resume window, `?4` the newest
 /// `claimed_at` that counts as abandoned, `?5` the process whose own claim does
 /// not disqualify a row.
-const RESUMABLE: &str = "account_pk = ?1 AND kind = ?2 AND complete = 0
+const RESUMABLE: &str = concat!(
+    "account_pk = ?1 AND kind = ?2 AND complete = 0
      AND next_cursor IS NOT NULL AND started_at >= ?3
-     AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ?4
-          OR claimed_by = ?5)";
+     AND ",
+    claim_available!("?4", "?5")
+);
+
+/// The four terms that decide whether a claim protects a row, spelled once.
+///
+/// [`RESUMABLE`] asks them to find a walk worth continuing; [`delete_partials`]
+/// asks them to know what it must leave alone -- and the two used to be
+/// hand-typed copies with the parameters in different orders, which is the
+/// exact defect the doc-comment above argues `RESUMABLE` exists to prevent.
+/// AGENTS.md records where the copy drifted before the claim column existed:
+/// one process's `delete_partials` deleted a walk the other was writing to.
+///
+/// A macro rather than a second const because the two statements number their
+/// parameters differently -- `?4`/`?5` inside `RESUMABLE`, `?4`/`?3` in the
+/// DELETE -- and renumbering a live statement's bindings to share a string is
+/// a worse trade than passing the indexes in. `$stale` is the newest
+/// `claimed_at` that still protects a row; `$process` is the one whose own
+/// claim does not count against it.
+macro_rules! claim_available {
+    ($stale:literal, $process:literal) => {
+        concat!(
+            "(claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ",
+            $stale,
+            " OR claimed_by = ",
+            $process,
+            ")"
+        )
+    };
+}
+use claim_available;
+
+/// The two moments the resumability predicate binds, worked out together.
+///
+/// The subtraction was spelled five times across the three statements, and a
+/// copy that subtracted the wrong constant would move a boundary the
+/// compile-time assertion on [`CLAIM_TTL_SECS`] exists to hold apart.
+fn resume_bounds(now: snob_core::Epoch) -> (i64, i64) {
+    (
+        (now - Duration::from_secs(RESUME_WINDOW_SECS as u64)).get(),
+        (now - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
+    )
+}
 
 /// Looks for an interrupted walk this process may continue, and takes it.
 ///
@@ -230,8 +272,8 @@ pub fn resumable(
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
-                (now - Duration::from_secs(RESUME_WINDOW_SECS as u64)).get(),
-                (now - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
+                resume_bounds(now).0,
+                resume_bounds(now).1,
                 // This process's own claim does not disqualify a row here: the
                 // caller is about to take it, and resuming its own work after a
                 // restart is what the window is for. `is_resumable` binds `None`
@@ -269,8 +311,8 @@ pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
-                (now - Duration::from_secs(RESUME_WINDOW_SECS as u64)).get(),
-                (now - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
+                resume_bounds(now).0,
+                resume_bounds(now).1,
                 // Nobody's claim is excused here, including this process's own:
                 // `claimed_by = NULL` is NULL, so the last term of the shared
                 // predicate goes inert. The run that continues the walk is never
@@ -536,10 +578,15 @@ pub fn find_usable(conn: &Connection, id: i64) -> Result<Option<Snapshot>, Store
 /// The users in a snapshot, in the order Instagram served them.
 pub fn members(conn: &Connection, id: i64) -> Result<Vec<User>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT u.pk, u.username, u.full_name, u.is_private, u.is_verified, u.pfp_url
-         FROM snapshot_members m JOIN users u ON u.pk = m.user_pk
-         WHERE m.snapshot_id = ?1
-         ORDER BY m.ordinal",
+        // `USER_COLUMNS` with the alias applied, so the list `row_to_user`
+        // reads by position exists once. The alias rewrite is mechanical;
+        // the order is the part that must not fork.
+        &format!(
+            "SELECT u.{} FROM snapshot_members m JOIN users u ON u.pk = m.user_pk
+             WHERE m.snapshot_id = ?1
+             ORDER BY m.ordinal",
+            super::users::USER_COLUMNS.replace(", ", ", u.")
+        ),
     )?;
     let rows = stmt.query_map(params![id], super::users::row_to_user)?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -561,16 +608,24 @@ pub fn delete_partials(
     //
     // A claim that has gone stale is not protection: whoever held it is gone,
     // and the row is exactly the abandoned partial this is here to clear.
+    //
+    // The claim terms are `claim_available!`, the same four `RESUMABLE`
+    // binds -- shared by construction since the copy here drifted once (see
+    // the doc on the macro). What this deliberately does not share is the
+    // resume window: a cursor-less or expired partial is not resumable, and
+    // it is exactly what this exists to clear.
     let deleted = conn.execute(
-        "DELETE FROM snapshots
+        concat!(
+            "DELETE FROM snapshots
          WHERE account_pk = ?1 AND kind = ?2 AND complete = 0
-           AND (claimed_by IS NULL OR claimed_by = ?3
-                OR claimed_at IS NULL OR claimed_at < ?4)",
+           AND ",
+            claim_available!("?4", "?3")
+        ),
         params![
             pk_to_sql(account_pk),
             kind.as_str(),
             this_process(),
-            (now() - Duration::from_secs(CLAIM_TTL_SECS as u64)).get(),
+            resume_bounds(now()).1,
         ],
     )?;
     Ok(deleted)

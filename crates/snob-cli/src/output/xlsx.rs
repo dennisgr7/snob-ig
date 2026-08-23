@@ -21,15 +21,7 @@ use snob_core::Epoch;
 use snob_core::Pk;
 use snob_core::model::{User, printable};
 
-/// The column names. The same six frozen keys the csv uses.
-const HEADER: [&str; 6] = [
-    "pk",
-    "username",
-    "full_name",
-    "is_private",
-    "is_verified",
-    "pfp_url",
-];
+use crate::output::USER_COLUMNS as HEADER;
 
 /// Excel refuses a string longer than this.
 const MAX_TEXT: usize = 32_767;

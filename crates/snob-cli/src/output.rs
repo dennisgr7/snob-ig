@@ -16,6 +16,22 @@ use snob_core::model::{User, printable};
 use crate::cli::Format;
 use crate::ui;
 
+/// The six JSON keys of `User`, in the order the struct declares them: the
+/// column set every row format shares.
+///
+/// `csv` and `xlsx` each had a frozen copy, identical, with a comment on the
+/// second pointing at the first instead of a constant tying them. Here, above
+/// the `xlsx` feature gate, so the build without the feature still has the
+/// one definition. A test below holds the list to the struct's actual keys.
+pub(crate) const USER_COLUMNS: [&str; 6] = [
+    "pk",
+    "username",
+    "full_name",
+    "is_private",
+    "is_verified",
+    "pfp_url",
+];
+
 pub(crate) mod csv;
 pub(crate) mod md;
 pub(crate) mod table;
@@ -608,5 +624,36 @@ mod tests {
         let payload = vec![0x50, 0x4b, 0x03, 0x04, 0x00, 0xff];
         write_rendered(&Rendered::Bytes(payload.clone()), Some(&path)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+}
+
+#[cfg(test)]
+mod user_columns_tests {
+    /// The columns are a projection of `User`'s serialized shape, so the
+    /// authority is the struct itself: serialize one with every field set and
+    /// compare the key sets. The *order* cannot be read back -- serde_json
+    /// sorts an object's keys -- so order stays a reviewed fact; what this
+    /// holds is that a field added to `User` fails here first, which is the
+    /// reminder to decide its column everywhere at once.
+    #[test]
+    fn the_shared_columns_are_the_struct_keys() {
+        let user = snob_core::model::User {
+            pk: snob_core::Pk::new(1),
+            username: "a".to_string(),
+            full_name: Some("b".to_string()),
+            is_private: Some(true),
+            is_verified: Some(false),
+            pfp_url: Some("https://example.test/p.jpg".to_string()),
+        };
+        let value = serde_json::to_value(&user).expect("a user serializes");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("a user is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut columns = super::USER_COLUMNS.to_vec();
+        columns.sort_unstable();
+        assert_eq!(keys, columns, "serde_json answers the keys sorted");
     }
 }

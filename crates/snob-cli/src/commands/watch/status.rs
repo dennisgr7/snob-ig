@@ -130,11 +130,11 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     if last_runs.is_empty() {
         crate::ui::say!("It has not run yet.");
     } else {
-        for run in &last_runs {
-            let pk = run.account_pk;
-            let name = snob_store::store::users::name(db.conn(), pk)?;
-            let who = crate::app::label(pk, name.as_deref());
-
+        // Over `runs_of`, not `last_runs`: the label was resolved once, up
+        // there where the store is open, and this used to resolve it again --
+        // one query per run -- which is one more chance for the lines here to
+        // name an account differently from the notes below them.
+        for RunOf { run, who, .. } in &runs_of {
             let mut line = format!("{who} last ran on {}", report::stored_on(run.started_at));
             if let Some(outcome) = &run.outcome
                 && *outcome != RunOutcome::Ok
@@ -146,7 +146,7 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
                 line.push_str(&format!(
                     " and found {} change{}",
                     run.changes,
-                    if run.changes == 1 { "" } else { "s" }
+                    plural(run.changes as usize)
                 ));
             }
             crate::ui::say!("{line}.");
@@ -157,9 +157,21 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
     if marks.is_empty() {
         crate::ui::say!("The monitor has not reported on anything yet.");
     } else {
+        // Two marks per account is the ordinary case -- one per list -- so
+        // resolving the label per mark asked the same question twice. The
+        // runs already resolved most of them; only an account with marks and
+        // no recorded run is asked about here, once.
+        let mut labels: std::collections::BTreeMap<snob_core::Pk, String> = runs_of
+            .iter()
+            .map(|of| (of.run.account_pk, of.who.clone()))
+            .collect();
         for mark in &marks {
-            let name = snob_store::store::users::name(db.conn(), mark.account_pk)?;
-            let who = crate::app::label(mark.account_pk, name.as_deref());
+            if !labels.contains_key(&mark.account_pk) {
+                let name = snob_store::store::users::name(db.conn(), mark.account_pk)?;
+                let label = crate::app::label(mark.account_pk, name.as_deref());
+                labels.insert(mark.account_pk, label);
+            }
+            let who = &labels[&mark.account_pk];
             crate::ui::say!(
                 "{who}: {} last reported on {}",
                 mark.kind,

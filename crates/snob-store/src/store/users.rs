@@ -111,11 +111,19 @@ pub fn name(conn: &Connection, pk: Pk) -> Result<Option<String>, StoreError> {
         .filter(|name| !name.is_empty()))
 }
 
+/// The columns [`row_to_user`] reads, in the order it reads them.
+///
+/// The same rule as `SNAPSHOT_COLUMNS`, for the same mapper-by-position
+/// reason -- and here a slip is quieter than an `InvalidColumnIndex`:
+/// `is_private` and `is_verified` are both `Option<bool>`, so a transposed
+/// pair compiles, runs, and swaps two attributes on every account. The join
+/// in `snapshots::members` prefixes these with the table alias.
+pub(crate) const USER_COLUMNS: &str = "pk, username, full_name, is_private, is_verified, pfp_url";
+
 pub fn find(conn: &Connection, pk: Pk) -> Result<Option<User>, StoreError> {
     let u = conn
         .query_row(
-            "SELECT pk, username, full_name, is_private, is_verified, pfp_url
-             FROM users WHERE pk = ?1",
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE pk = ?1"),
             params![pk_to_sql(pk)],
             row_to_user,
         )

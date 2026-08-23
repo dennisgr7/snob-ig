@@ -263,14 +263,8 @@ impl IgClient {
         // A 200 can still be an error: Instagram returns `{"status":"fail"}`
         // with a 200 in some cases, and a GraphQL refusal is *always* a 200
         // with the reason in an `errors` array.
-        if !(200..300).contains(&answer.status) || declares_failure(body) {
-            // Here rather than in each caller. It used to be in `get` only,
-            // which meant the write path -- the one that earns the twelve-hour
-            // cooldown, and the one where a push-back is most worth seeing --
-            // was the single class of request never measured, while
-            // `AGENTS.md` promised every one of them was.
-            self.note_push_back(answer);
-            return Err(self.classify_and_record(answer.status, body));
+        if !answer.is_success() || declares_failure(body) {
+            return Err(self.refuse(answer));
         }
 
         serde_json::from_str(body).map_err(|e| {
@@ -309,6 +303,22 @@ impl IgClient {
     /// below 0x20 — the HTTP parser refuses one before we ever see it — so
     /// there is nothing here that a terminal would act on, which is the same
     /// argument the `Referer` above rests on.
+    /// The one way a push-back leaves the client: noted, then classified.
+    ///
+    /// One function rather than a pair of calls at each site, and the history
+    /// says why. The pair used to be written out by hand -- in `decode`, in
+    /// `page`, and in the transport's unreadable-body arm -- in an order
+    /// nothing enforced, and before that the noting lived in `get` only,
+    /// which left the write path (the one that earns the twelve-hour
+    /// cooldown, and the one where a push-back is most worth seeing) as the
+    /// single class of request never measured, while AGENTS.md promised every
+    /// one of them was. Now "every push-back is measured" is checkable by
+    /// reading one function.
+    pub(in crate::client) fn refuse(&self, answer: &Answer) -> IgError {
+        self.note_push_back(answer);
+        self.classify_and_record(answer.status, &answer.body)
+    }
+
     pub(in crate::client) fn note_push_back(&self, answer: &Answer) {
         tracing::debug!(
             status = answer.status,

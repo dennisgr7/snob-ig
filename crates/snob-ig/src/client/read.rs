@@ -274,9 +274,9 @@ impl IgClient {
     /// the page per write.
     pub async fn page(&self, path: &str) -> Result<String, IgError> {
         let answer = self.get_body(path, &[], "", Surface::Document).await?;
-        if !(200..300).contains(&answer.status) {
-            self.note_push_back(&answer);
-            return Err(self.classify_and_record(answer.status, &answer.body));
+        // No `declares_failure` here, deliberately: this is HTML, not JSON.
+        if !answer.is_success() {
+            return Err(self.refuse(&answer));
         }
         Ok(answer.body)
     }
