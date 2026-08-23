@@ -159,11 +159,111 @@ pub struct WebProfileInfo {
     pub followers: Option<CountEdge>,
     #[serde(default, rename = "edge_follow")]
     pub following: Option<CountEdge>,
+    /// Whether this account follows the logged-in viewer. The one fact a
+    /// crossing spends a whole walk to learn, answered for a single account by
+    /// the request every command already makes.
+    #[serde(default)]
+    pub follows_viewer: Option<bool>,
+    /// Whether this account has asked to follow the viewer and is waiting.
+    #[serde(default)]
+    pub has_requested_viewer: Option<bool>,
+    #[serde(default)]
+    pub biography: Option<String>,
+    #[serde(default)]
+    pub external_url: Option<String>,
+    /// How many posts are on the grid. Zero is a real answer here, unlike the
+    /// two counters above, because nothing compares a walk against it.
+    #[serde(default, rename = "edge_owner_to_timeline_media")]
+    pub posts: Option<CountEdge>,
+    /// The accounts the viewer follows that follow this one: the count and the
+    /// first three names, which is exactly the "Followed by a, b and 31 others"
+    /// line the web page opens with. The full list is a page walk of its own,
+    /// `IgClient::mutual_followers_page`.
+    #[serde(default, rename = "edge_mutual_followed_by")]
+    pub mutual: Option<MutualEdge>,
+    /// How many highlights sit under the bio. The tray itself is
+    /// `IgClient::highlights_tray`.
+    #[serde(default)]
+    pub highlight_reel_count: Option<u64>,
+    #[serde(default)]
+    pub is_business_account: Option<bool>,
+    #[serde(default)]
+    pub category_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct CountEdge {
     pub count: u64,
+}
+
+/// `edge_mutual_followed_by`: a count and a preview of names.
+///
+/// Verified against the live endpoint in August 2026: three names arrive
+/// however large the count is, which matches what the page shows. The shape
+/// is GraphQL's — an edge list of nodes — on what is otherwise a REST answer,
+/// because `web_profile_info` is the old GraphQL profile query served at a
+/// REST address.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MutualEdge {
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub edges: Vec<UsernameEdge>,
+}
+
+impl MutualEdge {
+    /// The names in the preview, in the order the page would show them.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.edges.iter().map(|e| e.node.username.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsernameEdge {
+    pub node: UsernameNode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsernameNode {
+    pub username: String,
+}
+
+/// Response of `/api/v1/highlights/{pk}/highlights_tray/`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HighlightsTray {
+    #[serde(default)]
+    pub tray: Vec<Highlight>,
+}
+
+/// One highlight under an account's bio: the tray entry, not its items.
+///
+/// The items are a reel like any other and come from `reels_media` asked with
+/// this `id` — the `highlight:` prefix included, which is how that endpoint
+/// tells a highlight from an account. Verified live in August 2026: the reply
+/// parses as [`Reel`] unchanged, with `expiring_at` absent on every item,
+/// which is why that field is optional.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Highlight {
+    /// `highlight:18053469532505617`. Kept as the string it is, prefix and
+    /// all, because that is the spelling the items are fetched with.
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub media_count: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<Epoch>,
+    /// When something was last added to it.
+    #[serde(default)]
+    pub updated_timestamp: Option<Epoch>,
+    #[serde(default)]
+    pub cover_media: Option<CoverMedia>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CoverMedia {
+    #[serde(default)]
+    pub cropped_image_version: Option<PictureVersion>,
 }
 
 impl WebProfileInfo {
@@ -213,6 +313,18 @@ impl WebProfileInfo {
             profile_pic_url_hd: None,
             followers: None,
             following: None,
+            // And none of what the profile page shows. Search is an identity
+            // lookup; a caller wanting the rest has the profile route or
+            // nothing, and says so.
+            follows_viewer: user.friendship_status.as_ref().map(|f| f.followed_by),
+            has_requested_viewer: None,
+            biography: None,
+            external_url: None,
+            posts: None,
+            mutual: None,
+            highlight_reel_count: None,
+            is_business_account: None,
+            category_name: None,
         }
     }
 }

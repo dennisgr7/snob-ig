@@ -276,6 +276,15 @@ mod tests {
             profile_pic_url_hd: None,
             followers: None,
             following: None,
+            follows_viewer: None,
+            has_requested_viewer: None,
+            biography: None,
+            external_url: None,
+            posts: None,
+            mutual: None,
+            highlight_reel_count: None,
+            is_business_account: None,
+            category_name: None,
             // The route that answered. Search is the fallback for the accounts
             // `web_profile_info` cannot serialize; these fixtures are the
             // ordinary case.

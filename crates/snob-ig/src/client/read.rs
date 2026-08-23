@@ -10,8 +10,8 @@ use snob_core::Pk;
 
 use crate::error::IgError;
 use crate::model::{
-    FriendshipsPage, Identity, Reel, ReelsMedia, SearchUser, TopSearch, UserInfo, UserInfoEnvelope,
-    WebProfileInfo, WebProfileInfoEnvelope,
+    FriendshipsPage, Highlight, HighlightsTray, Identity, Reel, ReelsMedia, SearchUser, TopSearch,
+    UserInfo, UserInfoEnvelope, WebProfileInfo, WebProfileInfoEnvelope,
 };
 
 use super::IgClient;
@@ -30,6 +30,16 @@ impl Direction {
             Self::Followers => "followers",
             Self::Following => "following",
         }
+    }
+}
+
+/// The path of an account's own page, which is where a browser makes most of
+/// the calls about that account from. Empty when the name is not known.
+fn profile_page(username: &str) -> String {
+    if username.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", snob_core::model::in_a_path(username))
     }
 }
 
@@ -269,6 +279,106 @@ impl IgClient {
             return Err(self.classify_and_record(answer.status, &answer.body));
         }
         Ok(answer.body)
+    }
+
+    /// The accounts the viewer follows that follow this one, a page at a time.
+    ///
+    /// What the profile page opens with — "Followed by a, b and 31 others" —
+    /// and what its "mutual" tab lists in full. The page carries the count and
+    /// three names on its own (`WebProfileInfo::mutual`); this is the rest,
+    /// and it is the cheap way to the answer `engine::people::in_common` works
+    /// out from storage: that one needs the account's whole followers list
+    /// walked, this needs `count / 12` requests and nothing stored.
+    ///
+    /// **Twelve per page because that is what the web client asks for**, seen
+    /// in a capture of August 2026, and a larger page has not been tried.
+    /// `followers` accepts fifty and this may too, but a number nobody has sent
+    /// is not one to ship — the cost of being wrong is the request being
+    /// refused on an endpoint that has never refused anything.
+    ///
+    /// The cursor is the offset, spelled as a string, and the reply is the
+    /// same shape as a followers page.
+    pub async fn mutual_followers_page(
+        &self,
+        pk: Pk,
+        username: &str,
+        cursor: Option<&str>,
+    ) -> Result<FriendshipsPage, IgError> {
+        const PAGE_SIZE: &str = "12";
+        let mut query: Vec<(&str, &str)> = vec![("page_size", PAGE_SIZE)];
+        if let Some(c) = cursor {
+            query.push(("max_id", c));
+        }
+        self.get(
+            &format!("/api/v1/friendships/{pk}/mutual_followers/"),
+            &query,
+            // In a browser this is the "mutual" tab of the followers dialog,
+            // which has an address of its own.
+            &if username.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{}/followers/mutualOnly",
+                    snob_core::model::in_a_path(username)
+                )
+            },
+        )
+        .await
+    }
+
+    /// The highlights under an account's bio. One request.
+    ///
+    /// The tray only: title, size, dates and a cover per highlight. The items
+    /// are fetched the way a story is, through [`Self::stories`]'s endpoint
+    /// with the highlight's id in place of the account's — see
+    /// [`Self::highlight`].
+    ///
+    /// Verified live in August 2026 against `www.instagram.com` with a web
+    /// session. The web client itself has moved to a GraphQL query for this
+    /// (`PolarisProfileStoryHighlightsTrayContentQuery`), which is a POST and
+    /// therefore not a route this crate takes; the REST tray still answers.
+    ///
+    /// An account with no highlights answers with an empty tray, and a
+    /// private account the viewer does not follow is expected to as well — a
+    /// reel is not served to somebody who may not see it.
+    pub async fn highlights_tray(&self, pk: Pk, username: &str) -> Result<Vec<Highlight>, IgError> {
+        let tray: HighlightsTray = self
+            .get(
+                &format!("/api/v1/highlights/{pk}/highlights_tray/"),
+                &[],
+                &profile_page(username),
+            )
+            .await?;
+        Ok(tray.tray)
+    }
+
+    /// The items of one highlight. One request.
+    ///
+    /// The same endpoint as [`Self::stories`], asked with `highlight:<id>` in
+    /// place of an account id; `reels_media` tells the two apart by the prefix,
+    /// the way it serves an archive day as `archiveDay:<id>`. Like a story,
+    /// **reading it does not tell anybody you looked**: the browser registers a
+    /// view of a highlight item through the very same Relay mutation it uses
+    /// for a story, with the highlight as the reel — seen forty-two times in
+    /// the August 2026 capture — and this project has no code that could send
+    /// it. `crates/snob-core/tests/no_seen.rs` names it and reads the source.
+    ///
+    /// `id` is the tray's spelling, prefix included. `None` means the highlight
+    /// answered with nothing, which is what an id that no longer exists does.
+    pub async fn highlight(&self, id: &str) -> Result<Option<Reel>, IgError> {
+        let envelope: ReelsMedia = self
+            .get(
+                "/api/v1/feed/reels_media/",
+                &[("reel_ids", id)],
+                // In a browser a highlight opens at an address of its own,
+                // under `stories/highlights/`, carrying the bare id.
+                &format!(
+                    "stories/highlights/{}/",
+                    id.strip_prefix("highlight:").unwrap_or(id)
+                ),
+            )
+            .await?;
+        Ok(envelope.reel())
     }
 
     /// The stories an account has up right now. One request.
@@ -806,6 +916,202 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+    /// The profile carries what the page opens with, and the reader keeps it.
+    ///
+    /// The fixture is the shape of a live answer from August 2026, with the
+    /// names changed: counters as `edge_*` objects, the mutual preview as a
+    /// GraphQL edge list, the highlight count as a bare number and the
+    /// category as an empty string for an account that has none.
+    #[tokio::test]
+    async fn the_profile_page_fields_are_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users/web_profile_info/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"user":{"id":"7","username":"someone","full_name":"Some One",
+                "biography":"hello","external_url":null,"is_private":true,"is_verified":false,
+                "followed_by_viewer":true,"follows_viewer":true,"requested_by_viewer":false,
+                "has_requested_viewer":false,"edge_followed_by":{"count":244},
+                "edge_follow":{"count":319},"highlight_reel_count":2,
+                "edge_mutual_followed_by":{"count":33,"edges":[{"node":{"username":"ana"}},
+                {"node":{"username":"luis"}},{"node":{"username":"eva"}}]},
+                "is_business_account":false,"category_name":"",
+                "edge_owner_to_timeline_media":{"count":0,"page_info":{"has_next_page":false,
+                "end_cursor":null},"edges":[]}}},"status":"ok"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let profile = client(&server)
+            .await
+            .web_profile_info("someone")
+            .await
+            .unwrap();
+        assert_eq!(profile.follower_count(), Some(244));
+        assert_eq!(profile.following_count(), Some(319));
+        assert_eq!(profile.posts.map(|e| e.count), Some(0));
+        assert_eq!(profile.follows_viewer, Some(true));
+        assert_eq!(profile.highlight_reel_count, Some(2));
+        assert_eq!(profile.biography.as_deref(), Some("hello"));
+        assert_eq!(profile.category_name.as_deref(), Some(""));
+        let mutual = profile.mutual.as_ref().expect("the preview is there");
+        assert_eq!(mutual.count, 33);
+        assert_eq!(mutual.names().collect::<Vec<_>>(), ["ana", "luis", "eva"]);
+    }
+
+    /// The tray: one request, made from the account's own page, and every
+    /// highlight with its id spelled the way the items are then asked for.
+    #[tokio::test]
+    async fn the_highlights_tray_is_read_from_the_profile_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/highlights/7/highlights_tray/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"tray":[{"id":"highlight:18053469532505617","reel_type":"highlight_reel",
+                "title":"trip","created_at":1709046039,"media_count":5,
+                "updated_timestamp":1783936407,"latest_reel_media":1783676630,
+                "cover_media":{"cropped_image_version":{"width":150,"height":150,
+                "url":"https://cdn.test/cover.jpg"}}},
+                {"id":"highlight:18301025209141860","title":"","media_count":6}],
+                "status":"ok"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tray = client(&server)
+            .await
+            .highlights_tray(Pk::new(7), "someone")
+            .await
+            .unwrap();
+        assert_eq!(tray.len(), 2);
+        assert_eq!(tray[0].id, "highlight:18053469532505617");
+        assert_eq!(tray[0].title.as_deref(), Some("trip"));
+        assert_eq!(tray[0].media_count, Some(5));
+        assert_eq!(
+            tray[0].updated_timestamp,
+            Some(snob_core::Epoch::new(1_783_936_407))
+        );
+        assert_eq!(
+            tray[0]
+                .cover_media
+                .as_ref()
+                .and_then(|c| c.cropped_image_version.as_ref())
+                .map(|p| p.url.as_str()),
+            Some("https://cdn.test/cover.jpg")
+        );
+        assert_eq!(tray[1].created_at, None);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://www.instagram.com/someone/"
+        );
+
+        // An account with none answers with an empty tray, not an error.
+        let empty = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"tray":[],"status":"ok"}"#),
+            )
+            .mount(&empty)
+            .await;
+        assert!(
+            client(&empty)
+                .await
+                .highlights_tray(Pk::new(7), "someone")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A highlight's items come from the stories endpoint, asked with the
+    /// prefixed id, from the highlight's own page, and parse as a reel.
+    #[tokio::test]
+    async fn a_highlight_is_a_reel_asked_for_by_its_prefixed_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/feed/reels_media/"))
+            .and(query_param("reel_ids", "highlight:18053469532505617"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"reels":{"highlight:18053469532505617":{"id":"highlight:18053469532505617",
+                "reel_type":"highlight_reel","title":"trip","media_count":1,
+                "user":{"pk":"7","username":"someone","is_private":true},
+                "items":[{"pk":"3678860419636956278","media_type":2,"taken_at":1752774358,
+                "image_versions2":{"candidates":[{"url":"https://cdn.test/a.jpg","width":720,
+                "height":1278}]},"video_versions":[{"url":"https://cdn.test/a.mp4","width":720,
+                "height":1278}]}]}},"reels_media":[{"id":"highlight:18053469532505617",
+                "items":[{"pk":"3678860419636956278","media_type":2,"taken_at":1752774358}]}],
+                "status":"ok"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let reel = client(&server)
+            .await
+            .highlight("highlight:18053469532505617")
+            .await
+            .unwrap()
+            .expect("the highlight has an item");
+        assert_eq!(reel.items.len(), 1);
+        assert_eq!(reel.items[0].pk, "3678860419636956278");
+        // Absent on every highlight item, which is why the field is optional.
+        assert_eq!(reel.items[0].expiring_at, None);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://www.instagram.com/stories/highlights/18053469532505617/"
+        );
+    }
+
+    /// The mutual list is a followers page by another name, twelve at a time,
+    /// asked from the dialog's own address, with the offset as the cursor.
+    #[tokio::test]
+    async fn the_mutual_list_pages_twelve_at_a_time_from_the_dialog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/friendships/7/mutual_followers/"))
+            .and(query_param("page_size", "12"))
+            .and(query_param("max_id", "12"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"users":[{"pk":65976219240,"username":"deeiv","full_name":"D",
+                "is_private":true,"is_verified":false}],"big_list":false,"page_size":12,
+                "status":"ok"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let page = client(&server)
+            .await
+            .mutual_followers_page(Pk::new(7), "someone", Some("12"))
+            .await
+            .unwrap();
+        assert_eq!(page.users.len(), 1);
+        assert_eq!(page.users[0].username, "deeiv");
+        assert_eq!(page.next_max_id, None, "the last page carries no cursor");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("referer")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://www.instagram.com/someone/followers/mutualOnly"
         );
     }
 }
