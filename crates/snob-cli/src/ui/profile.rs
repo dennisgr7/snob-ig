@@ -56,7 +56,7 @@ use crate::commands::stories::Story;
 use crate::engine;
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
-use crate::ui::browser::input::{self, Action, Raw, TICK, action_of, page};
+use crate::ui::browser::input::{self, Action, Raw, TICK, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::highlights::{Folder, empty_note, keep_folder, stem_of, walk_in};
 use crate::ui::people::{Set, Shelf};
@@ -408,25 +408,38 @@ pub async fn browse(
                         },
                         CardRow::Highlights => {
                             let index = state.hl_col;
-                            match walk_in(app.client(), &media.tray, index, &mut media.folders)
-                                .await
-                            {
+                            let (result, stopped) = watching_cancel_keys(
+                                app.client().pacer().cancel_token(),
+                                walk_in(app.client(), &media.tray, index, &mut media.folders),
+                            )
+                            .await;
+                            match result {
                                 Ok(true) => state.level = Level::Inside { index },
                                 Ok(false) => note = empty_note(index),
                                 Err(e) => note = format!("Could not open it: {e}"),
+                            }
+                            if let Some(code) = stopped.leave() {
+                                break code;
                             }
                         }
                     },
                     Action::Download => {
                         if here == CardRow::Highlights {
-                            note = keep_folder(
-                                app.client(),
-                                &media.tray,
-                                state.hl_col,
-                                &mut media.folders,
-                                &mut receipts,
+                            let (folder_note, stopped) = watching_cancel_keys(
+                                app.client().pacer().cancel_token(),
+                                keep_folder(
+                                    app.client(),
+                                    &media.tray,
+                                    state.hl_col,
+                                    &mut media.folders,
+                                    &mut receipts,
+                                ),
                             )
                             .await;
+                            note = folder_note;
+                            if let Some(code) = stopped.leave() {
+                                break code;
+                            }
                         }
                     }
                     Action::Redraw => tui.terminal.clear()?,
@@ -447,7 +460,15 @@ pub async fn browse(
                     Action::Down => state.level = Level::Actions { selected: 1 },
                     Action::Open => {
                         if selected == 0 {
-                            note = pfp_open(app, profile, &mut media, &scratch).await;
+                            let (text, stopped) = watching_cancel_keys(
+                                app.client().pacer().cancel_token(),
+                                pfp_open(app, profile, &mut media, &scratch),
+                            )
+                            .await;
+                            note = text;
+                            if let Some(code) = stopped.leave() {
+                                break code;
+                            }
                         } else {
                             state.ask = Ask::Scan;
                             state.level = Level::Card;
@@ -455,7 +476,15 @@ pub async fn browse(
                     }
                     Action::Download => {
                         if selected == 0 {
-                            note = pfp_keep(app, profile, &mut media, &mut receipts).await;
+                            let (text, stopped) = watching_cancel_keys(
+                                app.client().pacer().cancel_token(),
+                                pfp_keep(app, profile, &mut media, &mut receipts),
+                            )
+                            .await;
+                            note = text;
+                            if let Some(code) = stopped.leave() {
+                                break code;
+                            }
                         }
                     }
                     Action::Back => state.level = Level::Card,
@@ -488,30 +517,39 @@ pub async fn browse(
                     Action::First => state.stories_selected = 0,
                     Action::Last => state.stories_selected = total.saturating_sub(1),
                     Action::Open => {
-                        note = match crate::ui::stories::open(
-                            app.client(),
-                            &profile.username,
-                            &media.stories,
-                            state.stories_selected,
-                            &scratch,
-                            &mut media.stories_opened,
+                        let (result, stopped) = watching_cancel_keys(
+                            app.client().pacer().cancel_token(),
+                            crate::ui::stories::open(
+                                app.client(),
+                                &profile.username,
+                                &media.stories,
+                                state.stories_selected,
+                                &scratch,
+                                &mut media.stories_opened,
+                            ),
                         )
-                        .await
-                        {
+                        .await;
+                        note = match result {
                             Ok(path) => format!("Opened {}", path.display()),
                             Err(e) => format!("Could not open it: {e}"),
                         };
+                        if let Some(code) = stopped.leave() {
+                            break code;
+                        }
                     }
                     Action::Download => {
-                        note = match crate::ui::stories::keep(
-                            app.client(),
-                            &profile.username,
-                            &media.stories,
-                            state.stories_selected,
-                            &mut media.stories_opened,
+                        let (result, stopped) = watching_cancel_keys(
+                            app.client().pacer().cancel_token(),
+                            crate::ui::stories::keep(
+                                app.client(),
+                                &profile.username,
+                                &media.stories,
+                                state.stories_selected,
+                                &mut media.stories_opened,
+                            ),
                         )
-                        .await
-                        {
+                        .await;
+                        note = match result {
                             Ok(path) => {
                                 let line = format!("Saved {}", path.display());
                                 receipts.push(line.clone());
@@ -519,6 +557,9 @@ pub async fn browse(
                             }
                             Err(e) => format!("Could not save it: {e}"),
                         };
+                        if let Some(code) = stopped.leave() {
+                            break code;
+                        }
                     }
                     Action::Back => state.level = Level::Card,
                     Action::Redraw => tui.terminal.clear()?,
@@ -551,30 +592,39 @@ pub async fn browse(
                     Action::First => folder.selected = 0,
                     Action::Last => folder.selected = total.saturating_sub(1),
                     Action::Open => {
-                        note = match crate::ui::stories::open(
-                            app.client(),
-                            &stem,
-                            items,
-                            folder.selected,
-                            &scratch,
-                            &mut folder.opened,
+                        let (result, stopped) = watching_cancel_keys(
+                            app.client().pacer().cancel_token(),
+                            crate::ui::stories::open(
+                                app.client(),
+                                &stem,
+                                items,
+                                folder.selected,
+                                &scratch,
+                                &mut folder.opened,
+                            ),
                         )
-                        .await
-                        {
+                        .await;
+                        note = match result {
                             Ok(path) => format!("Opened {}", path.display()),
                             Err(e) => format!("Could not open it: {e}"),
                         };
+                        if let Some(code) = stopped.leave() {
+                            break code;
+                        }
                     }
                     Action::Download => {
-                        note = match crate::ui::stories::keep(
-                            app.client(),
-                            &stem,
-                            items,
-                            folder.selected,
-                            &mut folder.opened,
+                        let (result, stopped) = watching_cancel_keys(
+                            app.client().pacer().cancel_token(),
+                            crate::ui::stories::keep(
+                                app.client(),
+                                &stem,
+                                items,
+                                folder.selected,
+                                &mut folder.opened,
+                            ),
                         )
-                        .await
-                        {
+                        .await;
+                        note = match result {
                             Ok(path) => {
                                 let line = format!("Saved {}", path.display());
                                 receipts.push(line.clone());
@@ -582,6 +632,9 @@ pub async fn browse(
                             }
                             Err(e) => format!("Could not save it: {e}"),
                         };
+                        if let Some(code) = stopped.leave() {
+                            break code;
+                        }
                     }
                     Action::Back => state.level = Level::Card,
                     Action::Redraw => tui.terminal.clear()?,

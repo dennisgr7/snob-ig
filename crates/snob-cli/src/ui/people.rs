@@ -103,6 +103,12 @@ struct State {
     /// Indices into the current set's people that the query lets through.
     /// The whole list when the query is empty.
     shown: Vec<usize>,
+    /// The shown rows, ready to draw: one entry per entry of `shown`, built
+    /// by `refilter` and read on every frame. `printable` walks every
+    /// character and allocates, and the width scan is another walk — doing
+    /// both for the whole list inside `draw` was most of what the idle loop
+    /// did, at every 150 ms tick.
+    prepared: Vec<Prepared>,
     /// The selected row of the current level's list.
     selected: usize,
     /// The tray row to come back to after walking out of a set.
@@ -172,33 +178,39 @@ pub(crate) fn browse_in(
         level: if flat { Level::Inside(0) } else { Level::Tray },
         mode: Mode::Moving,
         query: String::new(),
-        shown: (0..shelf.sets.first().map_or(0, |s| s.people.len())).collect(),
+        shown: Vec::new(),
+        prepared: Vec::new(),
         selected: 0,
         tray_selected: 0,
     };
-    if !flat {
-        state.shown = Vec::new();
+    if flat {
+        // An empty query lets everything through, so this is "show the whole
+        // set" — and it is the one place the prepared rows are built from.
+        refilter(shelf, &mut state);
     }
 
     let mut note = String::new();
     let mut list = TableState::default();
     let mut page_rows = 1usize;
+    let mut redraw = true;
 
     loop {
-        let rows_here = rows_in(shelf, &state);
-        state.selected = state.selected.min(rows_here.saturating_sub(1));
-        list.select(Some(state.selected));
-        tui.terminal.draw(|frame| {
-            draw(
-                frame,
-                shelf,
-                &state,
-                &note,
-                colors,
-                &mut list,
-                &mut page_rows,
-            );
-        })?;
+        if redraw {
+            let rows_here = rows_in(shelf, &state);
+            state.selected = state.selected.min(rows_here.saturating_sub(1));
+            list.select(Some(state.selected));
+            tui.terminal.draw(|frame| {
+                draw(
+                    frame,
+                    shelf,
+                    &state,
+                    &note,
+                    colors,
+                    &mut list,
+                    &mut page_rows,
+                );
+            })?;
+        }
 
         let event = match input::read(TICK) {
             Ok(event) => event,
@@ -215,6 +227,10 @@ pub(crate) fn browse_in(
         if !matches!(event, Raw::Tick | Raw::Resized) {
             note.clear();
         }
+        // Nothing here animates, so a timer tick with nothing new to say is
+        // the idle case — and redrawing on it rebuilt every row 6.7 times a
+        // second while the list just sat there.
+        redraw = !matches!(event, Raw::Tick);
 
         let level_before = state.level;
         let step = match state.mode {
@@ -276,7 +292,37 @@ fn refilter(shelf: &Shelf<'_>, state: &mut State) {
         })
         .map(|(i, _)| i)
         .collect();
+    state.prepared = state
+        .shown
+        .iter()
+        .map(|&i| prepare(&shelf.sets[index].people[i]))
+        .collect();
     state.selected = 0;
+}
+
+/// One shown account, ready to draw. See `State::prepared` for why this is
+/// done here and not in `draw`.
+struct Prepared {
+    /// `@username`, already through `printable`.
+    username: String,
+    /// The full name through `printable`; empty when there is none.
+    full_name: String,
+    /// Display columns of `username`, the `@` included.
+    user_width: usize,
+    name_width: usize,
+    badges: Option<&'static str>,
+}
+
+fn prepare(person: &User) -> Prepared {
+    let username = format!("@{}", person.safe_username());
+    let full_name = person.safe_full_name().unwrap_or_default();
+    Prepared {
+        user_width: measure_text_width(&username),
+        name_width: measure_text_width(&full_name),
+        badges: attributes_of(person),
+        username,
+        full_name,
+    }
 }
 
 /// One key while the arrows own the list.
@@ -494,16 +540,15 @@ fn draw(
                 inner,
             );
         }
-        Level::Inside(index) => {
-            let set = &shelf.sets[index];
+        Level::Inside(_) => {
             frame.render_stateful_widget(
                 Table::new(
                     state
-                        .shown
+                        .prepared
                         .iter()
                         .enumerate()
-                        .map(|(row, &i)| person_row(&set.people[i], row == state.selected, colors)),
-                    columns(set.people, &state.shown, inner.width),
+                        .map(|(row, person)| person_row(person, row == state.selected, colors)),
+                    columns(&state.prepared, inner.width),
                 )
                 .column_spacing(2)
                 .row_highlight_style(tui::selection())
@@ -603,23 +648,22 @@ fn footer_line(shelf: &Shelf<'_>, state: &State, note: &str, colors: bool) -> Li
 /// Narrow terminals drop whole columns rather than clip them: the badge
 /// falls away first, then the full name, and the username column is the one
 /// that never goes.
-fn columns(people: &[User], shown: &[usize], width: u16) -> Vec<Constraint> {
-    let user_w = shown
+fn columns(prepared: &[Prepared], width: u16) -> Vec<Constraint> {
+    let user_w = prepared
         .iter()
-        .map(|&i| measure_text_width(&people[i].safe_username()) + 1)
+        .map(|p| p.user_width)
         .max()
         .unwrap_or(1)
         .clamp(12, 26) as u16;
-    let name_w = shown
+    let name_w = prepared
         .iter()
-        .filter_map(|&i| people[i].safe_full_name())
-        .map(|n| measure_text_width(&n))
+        .map(|p| p.name_width)
         .max()
         .unwrap_or(0)
         .min(32) as u16;
     // The widest badge is "verified, private". Left-aligned: badges are
     // words, not numbers.
-    let badge_w = if shown.iter().any(|&i| attributes_of(&people[i]).is_some()) {
+    let badge_w = if prepared.iter().any(|p| p.badges.is_some()) {
         17u16
     } else {
         0
@@ -639,12 +683,12 @@ fn columns(people: &[User], shown: &[usize], width: u16) -> Vec<Constraint> {
 /// One account as a table row: the username, the full name, and the badges
 /// dim at the end — dim except on the selection, where the reverse video is
 /// the emphasis and a dim run inside it would mute it.
-fn person_row(person: &User, selected: bool, colors: bool) -> Row<'static> {
+fn person_row(person: &Prepared, selected: bool, colors: bool) -> Row<'static> {
     let mut cells = vec![
-        Cell::from(format!("@{}", person.safe_username())),
-        Cell::from(person.safe_full_name().unwrap_or_default()),
+        Cell::from(person.username.clone()),
+        Cell::from(person.full_name.clone()),
     ];
-    if let Some(attributes) = attributes_of(person) {
+    if let Some(attributes) = person.badges {
         cells.push(if colors && !selected {
             Cell::from(attributes).style(Style::new().add_modifier(Modifier::DIM))
         } else {
@@ -697,6 +741,7 @@ mod tests {
             mode: Mode::Moving,
             query: String::new(),
             shown: Vec::new(),
+            prepared: Vec::new(),
             selected: 0,
             tray_selected: 0,
         };
@@ -860,6 +905,7 @@ mod tests {
             mode: Mode::Moving,
             query: String::new(),
             shown: Vec::new(),
+            prepared: Vec::new(),
             selected: 1,
             tray_selected: 0,
         };
@@ -984,11 +1030,10 @@ mod tests {
     fn narrow_terminals_drop_whole_columns() {
         let mut flagged = person(1, "somebody", Some("Some Body"));
         flagged.is_private = Some(true);
-        let people = [flagged];
-        let shown = vec![0usize];
-        let wide = columns(&people, &shown, 80);
+        let prepared = vec![prepare(&flagged)];
+        let wide = columns(&prepared, 80);
         assert_eq!(wide.len(), 3, "username, name, badge");
-        let narrow = columns(&people, &shown, 30);
+        let narrow = columns(&prepared, 30);
         assert!(narrow.len() < 3, "something was dropped whole");
         assert!(!narrow.is_empty(), "the username survives");
     }

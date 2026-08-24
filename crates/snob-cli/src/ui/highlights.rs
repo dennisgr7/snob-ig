@@ -39,7 +39,7 @@ use crate::commands::highlights::{Entry, Tray, items_of_entry};
 use crate::commands::stories::{Saved, Story, save_story};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
-use crate::ui::browser::input::{Action, Next, TICK, next, page};
+use crate::ui::browser::input::{Action, Next, TICK, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
 
@@ -193,45 +193,72 @@ pub async fn browse(
             Action::First => selected = 0,
             Action::Last => selected = total.saturating_sub(1),
             Action::Open => match level {
-                Level::Tray => match walk_in(client, tray, selected, &mut folders).await {
-                    Ok(true) => level = Level::Inside(selected),
-                    Ok(false) => note = empty_note(selected),
-                    Err(e) => note = format!("Could not open it: {e}"),
-                },
+                Level::Tray => {
+                    let (result, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        walk_in(client, tray, selected, &mut folders),
+                    )
+                    .await;
+                    match result {
+                        Ok(true) => level = Level::Inside(selected),
+                        Ok(false) => note = empty_note(selected),
+                        Err(e) => note = format!("Could not open it: {e}"),
+                    }
+                    if let Some(code) = stopped.leave() {
+                        break code;
+                    }
+                }
                 Level::Inside(index) => {
                     let folder = &mut folders[index];
                     let items = folder.items.as_deref().unwrap_or_default();
-                    note = match crate::ui::stories::open(
-                        client,
-                        &stem_of(tray, index),
-                        items,
-                        selected,
-                        &scratch,
-                        &mut folder.opened,
+                    let (result, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        crate::ui::stories::open(
+                            client,
+                            &stem_of(tray, index),
+                            items,
+                            selected,
+                            &scratch,
+                            &mut folder.opened,
+                        ),
                     )
-                    .await
-                    {
+                    .await;
+                    note = match result {
                         Ok(path) => format!("Opened {}", path.display()),
                         Err(e) => format!("Could not open it: {e}"),
                     };
+                    if let Some(code) = stopped.leave() {
+                        break code;
+                    }
                 }
             },
             Action::Download => match level {
                 Level::Tray => {
-                    note = keep_folder(client, tray, selected, &mut folders, &mut receipts).await;
+                    let (folder_note, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        keep_folder(client, tray, selected, &mut folders, &mut receipts),
+                    )
+                    .await;
+                    note = folder_note;
+                    if let Some(code) = stopped.leave() {
+                        break code;
+                    }
                 }
                 Level::Inside(index) => {
                     let folder = &mut folders[index];
                     let items = folder.items.as_deref().unwrap_or_default();
-                    note = match crate::ui::stories::keep(
-                        client,
-                        &stem_of(tray, index),
-                        items,
-                        selected,
-                        &mut folder.opened,
+                    let (result, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        crate::ui::stories::keep(
+                            client,
+                            &stem_of(tray, index),
+                            items,
+                            selected,
+                            &mut folder.opened,
+                        ),
                     )
-                    .await
-                    {
+                    .await;
+                    note = match result {
                         Ok(path) => {
                             let line = format!("Saved {}", path.display());
                             receipts.push(line.clone());
@@ -239,6 +266,9 @@ pub async fn browse(
                         }
                         Err(e) => format!("Could not save it: {e}"),
                     };
+                    if let Some(code) = stopped.leave() {
+                        break code;
+                    }
                 }
             },
             Action::Back => {

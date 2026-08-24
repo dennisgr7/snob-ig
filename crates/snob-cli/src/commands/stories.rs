@@ -104,6 +104,11 @@ pub struct Stories {
 }
 
 pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    // `-i` refused before the session opens and before anything is spent,
+    // like a bad `-o` — the expensive order to find out in is the other one.
+    if args.action.interactive {
+        crate::ui::people::check_drawable()?;
+    }
     let app = common::app(&secrets, paths, false)?;
     common::refuse_during_cooldown(&app, "no request can be made")?;
 

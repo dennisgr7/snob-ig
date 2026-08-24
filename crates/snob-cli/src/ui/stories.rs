@@ -41,7 +41,7 @@ use snob_store::paths::AppPaths;
 use crate::commands::stories::{Stories, Story, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
 use crate::output;
-use crate::ui::browser::input::{Action, Next, TICK, next, page};
+use crate::ui::browser::input::{Action, Next, TICK, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
 
@@ -131,30 +131,39 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
             Action::First => selected = 0,
             Action::Last => selected = stories.items.len() - 1,
             Action::Open => {
-                note = match open(
-                    client,
-                    &stories.username,
-                    &stories.items,
-                    selected,
-                    &scratch,
-                    &mut opened,
+                let (result, stopped) = watching_cancel_keys(
+                    client.pacer().cancel_token(),
+                    open(
+                        client,
+                        &stories.username,
+                        &stories.items,
+                        selected,
+                        &scratch,
+                        &mut opened,
+                    ),
                 )
-                .await
-                {
+                .await;
+                note = match result {
                     Ok(path) => format!("Opened {}", path.display()),
                     Err(e) => format!("Could not open it: {e}"),
                 };
+                if let Some(code) = stopped.leave() {
+                    break code;
+                }
             }
             Action::Download => {
-                note = match keep(
-                    client,
-                    &stories.username,
-                    &stories.items,
-                    selected,
-                    &mut opened,
+                let (result, stopped) = watching_cancel_keys(
+                    client.pacer().cancel_token(),
+                    keep(
+                        client,
+                        &stories.username,
+                        &stories.items,
+                        selected,
+                        &mut opened,
+                    ),
                 )
-                .await
-                {
+                .await;
+                note = match result {
                     // Twice on purpose: the note is for now, the receipt is
                     // for after the alternate screen has taken the note away.
                     Ok(path) => {
@@ -164,6 +173,9 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
                     }
                     Err(e) => format!("Could not save it: {e}"),
                 };
+                if let Some(code) = stopped.leave() {
+                    break code;
+                }
             }
             // A flat list has no level to go up to.
             Action::Back => {}

@@ -47,9 +47,12 @@
 //! four keys do not need it. The kitty protocol exists to disambiguate
 //! Shift+Enter and Ctrl+Enter, which nothing here binds.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use snob_ig::pace::CancelToken;
 
 /// How long the browser waits before waking up to look at the terminal size.
 ///
@@ -179,6 +182,94 @@ pub fn action_of(key: KeyEvent) -> Action {
         KeyCode::Esc | KeyCode::Char('q') if plain => Action::Quit,
         _ => Action::None,
     }
+}
+
+/// Whether the keyboard ended a fetch early, and what the person meant by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The future ran to its own end.
+    No,
+    /// `q`: stop what is in flight and leave the browser cleanly.
+    ///
+    /// Esc is deliberately not a stop. In a browser with levels it means "up
+    /// one level", and a canceled pacer token stays canceled — a browser
+    /// that stayed open after one would refuse every fetch it has left.
+    /// Leaving is the only thing a cancellation can be followed by, and `q`
+    /// and Ctrl+C are the two keys that already mean leaving everywhere.
+    Quit,
+    /// Ctrl+C: stop and leave saying so.
+    Interrupt,
+}
+
+impl Stopped {
+    /// The way out of the browser loop, when this asks for one.
+    pub fn leave(self) -> Option<crate::exit::ExitCode> {
+        match self {
+            Stopped::No => None,
+            Stopped::Quit => Some(crate::exit::ExitCode::Ok),
+            Stopped::Interrupt => Some(crate::exit::ExitCode::Interrupted),
+        }
+    }
+}
+
+/// How often the fetch watcher wakes to look for a stop key. Shorter than
+/// [`TICK`]: it is also the longest a finished fetch waits for the watcher
+/// to notice it can stand down.
+const WATCH: Duration = Duration::from_millis(50);
+
+/// Runs a fetch with the keyboard still alive.
+///
+/// Raw mode delivers Ctrl+C as a key event, never as a signal — so during an
+/// `.await` inside a browser loop *neither* cancellation route used to exist:
+/// the `interrupt::install` task never fires, and the key loop is not
+/// running. A story that stalls against its 60-second timeout held the whole
+/// terminal hostage. This watches the keyboard on a blocking thread while
+/// the future runs; Ctrl+C and `q` cancel `cancel` — the token every
+/// request and CDN download already races — so the future resolves promptly
+/// with a canceled error and the caller leaves through [`Stopped::leave`].
+///
+/// Keys that are not a stop are deliberately consumed and dropped: type-ahead
+/// against a busy browser replays against whatever frame comes next, and a
+/// buffered `d` is a download nobody watched themselves ask for.
+pub async fn watching_cancel_keys<T>(
+    cancel: &CancelToken,
+    fut: impl std::future::Future<Output = T>,
+) -> (T, Stopped) {
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = done.clone();
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            while !done.load(Ordering::Relaxed) {
+                match read(WATCH) {
+                    // Bound by key rather than through `action_of`: Esc also
+                    // maps to `Action::Quit` there, and Esc is not a stop —
+                    // see `Stopped::Quit`.
+                    Ok(Raw::Key(key)) => {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        if key.code == KeyCode::Char('c') && ctrl {
+                            cancel.cancel();
+                            return Stopped::Interrupt;
+                        }
+                        if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+                            cancel.cancel();
+                            return Stopped::Quit;
+                        }
+                    }
+                    Ok(_) => {}
+                    // A keyboard that cannot be read is the loop's own error
+                    // to hit; the watcher just stands down.
+                    Err(_) => return Stopped::No,
+                }
+            }
+            Stopped::No
+        })
+    };
+
+    let out = fut.await;
+    done.store(true, Ordering::Relaxed);
+    let stopped = watcher.await.unwrap_or(Stopped::No);
+    (out, stopped)
 }
 
 /// How far Page Up and Page Down move, given how many rows the list has.
