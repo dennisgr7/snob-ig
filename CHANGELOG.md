@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **Ctrl+C reaches a download in flight.** Inside every browser the keyboard
+  now stays live while a story, a highlight or a picture is being fetched:
+  Ctrl+C stops the request where it stands and leaves saying so, `q` stops it
+  and leaves cleanly. A stalled fetch used to hold the whole terminal until
+  its own timeout, because raw mode swallows the signal and the key loop was
+  not running.
+
+- **A pre-release review closed four holes before they shipped.** The scratch
+  directory under the shared temporary folder is created and swept without
+  ever following a link somebody else planted at its predictable name, and
+  `snob purge` removes such a link as the link itself; `snob watch check`
+  redacts a Slack or Discord webhook address the way `status` already did,
+  in the terminal and in `--json`; a profile's `external_url` is filtered
+  like every other server-supplied field before it reaches a terminal or a
+  markdown file; and the setup wizard refuses an `Authorization` header in
+  the free-form header question — the keyring prompt one question later is
+  where that value belongs, not `watch.toml` in the clear.
+
+- **Smaller fixes from the same review.** The account browser no longer
+  rebuilds every row several times a second while idle; `snob stories -i`
+  and `snob highlights -i` refuse a terminal that cannot draw before
+  spending their two requests, like every other command; two runs saving the
+  same story into one directory can no longer publish each other's
+  truncated bytes; a monitor's first tick during a cooldown exits 5 and
+  says `rate_limited` in `--json` instead of a bare error; an unfollow no
+  longer refuses on a relationship field Instagram merely left out; a
+  cooldown landing mid-login skips validation instead of discarding the
+  fresh session; a failed screen write can no longer leave the shell in raw
+  mode; and the `Saved ...` receipts survive a draw error instead of
+  vanishing with the alternate screen.
+
 - **The browsers take the whole screen.** Every interactive view — the story,
   highlight, picture and account browsers, and the profile card — now opens on
   the terminal's alternate screen, drawn with `ratatui`: a rounded frame with
