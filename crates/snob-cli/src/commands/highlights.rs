@@ -500,7 +500,7 @@ fn list_items(
 
     let mut text = match format {
         Format::Json | Format::Ndjson => items_json(tray, number, items, format)?,
-        _ => items_table(tray, number, items, Presentation::detect(destination)),
+        _ => items_table(items, Presentation::detect(destination)),
     };
     text.push('\n');
     output::write_rendered(&Rendered::Text(text), destination)?;
@@ -586,7 +586,7 @@ fn tray_table(tray: &Tray, presentation: Presentation) -> String {
     table.to_string()
 }
 
-fn items_table(tray: &Tray, number: usize, items: &[Story], presentation: Presentation) -> String {
+fn items_table(items: &[Story], presentation: Presentation) -> String {
     let mut table = Table::new();
     table.load_preset(presets::UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -604,7 +604,6 @@ fn items_table(tray: &Tray, number: usize, items: &[Story], presentation: Presen
         table.enforce_styling();
     }
 
-    let _ = (tray, number);
     for (index, story) in items.iter().enumerate() {
         table.add_row([
             Cell::new(index + 1),

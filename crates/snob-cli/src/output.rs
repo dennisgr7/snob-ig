@@ -252,15 +252,6 @@ pub fn write_bytes(bytes: &[u8], destination: Option<&Path>) -> Result<()> {
     }
 }
 
-/// [`write_new`] for bytes that are not a rendering; see [`write_bytes`].
-pub fn write_bytes_new(bytes: &[u8], path: &Path) -> Result<()> {
-    create_new(path)?
-        .write_all(bytes)
-        .with_context(|| format!("could not write {}", path.display()))?;
-    ui::info(&format!("Written to {}", path.display()));
-    Ok(())
-}
-
 /// Writes to a name **this program chose**, refusing to touch anything that is
 /// already there.
 ///
