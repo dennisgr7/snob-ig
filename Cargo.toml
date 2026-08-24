@@ -144,22 +144,45 @@ console = "0.16"
 # What it was built with is the `windows` feature and nothing else, so the crate
 # was in the tree with its whole reason for existing switched off.
 #
-# Turning `events` and `bracketed-paste` on is what the story browser reads keys
-# with, and it costs **zero new crates on Windows and macOS** and two on Linux
-# (`signal-hook` and `signal-hook-mio`; `mio` itself arrives with tokio). The
-# measured price of the whole browser rewrite is 18,432 bytes, against 106,496
-# for the ratatui answer to the same problem. Both numbers are in AGENTS.md.
+# `events` and `bracketed-paste` are what the browsers read keys with, and they
+# cost **zero new crates on Windows and macOS** and two on Linux (`signal-hook`
+# and `signal-hook-mio`; `mio` itself arrives with tokio). ratatui draws through
+# this same copy: its `crossterm_0_29` feature (below) resolves to the one
+# crossterm in the tree, which `cargo tree -i crossterm` confirms -- and which
+# is also what lets a `KeyEvent` read by `ui/browser/input.rs` be the very type
+# ratatui's backend speaks, with no conversion layer.
 #
-# `default-features = false` is load-bearing and not tidiness: the defaults add
-# `derive-more`, which drags in `convert_case`, `darling`, `darling_core`,
-# `darling_macro` and `ident_case` -- five crates that weigh nothing in the
-# binary, because they are macros, and everything in build time and in what
-# `cargo deny` has to clear. Measured: the binary is byte-identical with and
-# without them.
+# `default-features = false` states what *this* crate uses; it no longer prunes
+# the tree. `ratatui-crossterm` asks for crossterm with its defaults on, and
+# features are additive, so `derive-more` -- with `convert_case`, `darling`,
+# `darling_core`, `darling_macro` and `ident_case` -- rides along regardless.
+# All five are proc-macros: the binary is byte-identical with and without them,
+# and what they cost is build time and five more crates for `cargo deny` to
+# clear. Do not "fix" this line into carrying defaults because of that; the
+# narrow list is documentation of use, and it is what pares the tree again the
+# day the wide request upstream goes away.
 #
 # Read `ui/browser/input.rs` for what this buys that `console` cannot give,
 # starting with the two defects it closes.
 crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
+# What the interactive views draw with: the browsers and the profile card on the
+# alternate screen, the menu in a small inline viewport. It replaced a
+# hand-rolled line-diff renderer (`Screen`/`Viewport`) once the profile card
+# crossed the line AGENTS.md had drawn in advance -- focusable rows, sliding
+# chip windows, sub-views and a filter input are the "second pane / navigable
+# table" case the old decision named as its own reversal. The measured cost of
+# the adoption is recorded in AGENTS.md next to the decision.
+#
+# `default-features = false` and one feature. `crossterm_0_29` is the backend,
+# pinned to the workspace's crossterm so there is one copy (see above). What the
+# defaults would add and this line refuses: `underline-color` (nothing here
+# underlines in color), `macros` (`ratatui-macros`, sugar over constructors this
+# code writes out), `all-widgets` (the calendar widget and the `time` crate with
+# it), and `layout-cache` (a cache for layout solves; three constraints at a
+# 150 ms tick do not need one). `palette` stays off on doctrine, not size: the
+# views speak the 16 ANSI colors so the user's theme decides what they mean,
+# and a crate whose purpose is mixing RGB would be an attractive nuisance.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 # Hands a downloaded story to whatever the user already opens pictures and
 # videos with. `default-features = false` drops the two optional Linux
 # dependencies -- `zbus` and `url` -- which exist for the "reveal in file

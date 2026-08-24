@@ -280,23 +280,37 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
     menu::choose(prompt, labels)
 }
 
-/// Undoes what a menu or the browser did to the terminal, for an exit that
+/// Undoes what a menu or a browser did to the terminal, for an exit that
 /// runs no destructors.
 ///
-/// Both hide the cursor while they are up and put the terminal in raw mode to
-/// read keys, and both restore the two on the way out through guards. The
-/// release profile is `panic = "abort"` and the forced-quit path calls
-/// `exit(130)`, so neither guard runs on those ways out — and neither an
-/// invisible cursor nor a raw terminal is scoped to this program. They stay
-/// that way for the rest of the shell session, long after the user has
-/// forgotten what they pressed.
+/// All of them hide the cursor and put the terminal in raw mode to read keys;
+/// the browsers additionally take the alternate screen and turn bracketed
+/// paste on. Every one restores itself on the way out through a guard — but
+/// the release profile is `panic = "abort"` and the forced-quit path calls
+/// `exit(130)`, so no guard runs on those ways out, and none of those modes is
+/// scoped to this program. A shell left on the alternate screen in raw mode
+/// with no cursor stays that way long after the user has forgotten what they
+/// pressed.
 ///
-/// Idempotent and safe with no terminal: `console` writes the cursor sequence
-/// to stderr and does nothing if that is not a terminal, and leaving raw mode
-/// a terminal was never in is a no-op.
+/// The alternate screen is left before raw mode, so the shell's next prompt is
+/// drawn on the real screen in a cooked terminal rather than flashing inside
+/// the buffer that is about to vanish.
+///
+/// Idempotent and safe with no terminal: `?1049l` outside the alternate screen
+/// and `?2004l` with paste already off are defined no-ops, writing to a
+/// non-terminal stderr fails silently, and leaving raw mode a terminal was
+/// never in is a no-op.
 pub fn restore_terminal() {
+    use crossterm::cursor::Show;
+    use crossterm::event::DisableBracketedPaste;
+    use crossterm::terminal::LeaveAlternateScreen;
+    let _ = crossterm::execute!(
+        std::io::stderr(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = console::Term::stderr().show_cursor();
 }
 
 /// What every command says when there is no session, said once.
@@ -513,10 +527,15 @@ mod tests {
     }
 }
 
-/// Drawing and key-reading for the interactive story list. See its own header
-/// for what it costs against the terminal-UI framework it is not.
+/// Key-reading and the per-session scratch directory for the interactive
+/// views.
 pub mod browser;
 pub mod menu;
+pub mod people;
+pub mod pfp;
+pub mod profile;
+/// The terminal guard and shared chrome every interactive view draws through.
+pub mod tui;
 
 /// The interactive story list.
 pub mod highlights;

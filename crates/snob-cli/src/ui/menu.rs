@@ -1,18 +1,15 @@
 //! A short list to pick one line of with the arrow keys.
 //!
-//! This used to be `dialoguer::Select`, which was the crate's one use in the
-//! program -- every other question here is a typed line or a yes/no -- and it
-//! was kept for a two-entry menu while the story browser already drew a list
-//! with a highlighted row out of `crossterm` keys and `console` drawing. The
-//! pieces were here; this is the menu made of them. Two crates left with it,
-//! and with them the reason `ui::restore_terminal` existed in the shape it
-//! had: a prompt that hides the cursor and cannot be trusted to show it again
-//! on a forced exit.
+//! This used to be `dialoguer::Select`; now it is the one interactive view
+//! that does **not** take the alternate screen. It lives in the middle of a
+//! wizard's questions — `snob login`, `snob watch setup` — so it draws in an
+//! inline viewport exactly as tall as itself ([`Tui::inline`]), and on the
+//! way out it clears that viewport and leaves the prompt with the answer
+//! beside it, where the list was, in the flow of questions around it.
 //!
 //! What it keeps from the prompt it replaced: the look (a pointer on the
-//! selected line, the prompt above, and on the way out the prompt with the
-//! answer beside it where the list was), Enter to choose, Esc to decline,
-//! and the selection stopping at the ends rather than wrapping -- a list of
+//! selected line, the prompt above), Enter to choose, Esc to decline, and
+//! the selection stopping at the ends rather than wrapping -- a list of
 //! three that wraps is one where Down on the last line lands on the first,
 //! which reads as a mistake.
 //!
@@ -23,8 +20,13 @@
 
 use anyhow::{Context, Result};
 use console::Term;
+use ratatui::Frame;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use super::browser::input::{self, Action, Next};
+use super::tui::{self, Tui};
 
 /// Draws the list of `labels` under `prompt` and waits for a choice.
 ///
@@ -34,41 +36,24 @@ use super::browser::input::{self, Action, Next};
 /// is the gate, asked before this is reached -- so this assumes a terminal on
 /// both standard input and standard error.
 pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
-    let term = Term::stderr();
-    let rows = labels.len();
+    let rows = u16::try_from(labels.len() + 1).unwrap_or(u16::MAX);
+    let mut tui = Tui::inline(rows).context("could not read the terminal")?;
+    let colors = tui::colors_enabled();
     let mut selected = 0usize;
 
-    // Raw mode for the keys, restored by the guard on every way out of this
-    // function; the cursor hidden while the list is up, restored by its own
-    // guard for the same reason. A panic runs neither -- the release profile
-    // aborts -- and `ui::restore_terminal` is the backstop for that.
-    let _keys = input::Session::enter().context("could not read the terminal")?;
-    let _cursor = HiddenCursor::hide(&term);
-
-    let width = usize::from(term.size().1).max(20);
-    for line in render(prompt, labels, selected, width) {
-        term.write_line(&line)?;
-    }
-
     let outcome = loop {
+        tui.terminal
+            .draw(|frame| draw(frame, prompt, labels, selected, colors))?;
         match input::next(std::time::Duration::from_secs(60))? {
             Next::Tick | Next::Resized => continue,
-            Next::Do(action) => match step(selected, rows, action) {
+            Next::Do(action) => match step(selected, labels.len(), action) {
                 Step::Stay => continue,
-                Step::Move(to) => {
-                    selected = to;
-                    // Redrawn in place: up over the list, then the same rows
-                    // again. `clear_last_lines` moves the cursor up and
-                    // clears, which is the whole repaint for a list this size.
-                    term.clear_last_lines(rows + 1)?;
-                    for line in render(prompt, labels, selected, width) {
-                        term.write_line(&line)?;
-                    }
-                }
+                Step::Move(to) => selected = to,
                 Step::Choose => break Some(selected),
                 Step::Decline => break None,
                 Step::Interrupt => {
-                    term.clear_last_lines(rows + 1)?;
+                    tui.terminal.clear()?;
+                    drop(tui);
                     anyhow::bail!("canceled");
                 }
             },
@@ -76,12 +61,16 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
     };
 
     // What stays on screen: the question and its answer, where the list was.
-    term.clear_last_lines(rows + 1)?;
+    // `clear` empties the viewport and leaves the cursor at its first row;
+    // the guard drops before anything is printed, so the line below lands in
+    // a cooked terminal.
+    tui.terminal.clear()?;
+    drop(tui);
     let answer = match outcome {
         Some(index) => labels[index],
         None => "(none)",
     };
-    term.write_line(&format!(
+    Term::stderr().write_line(&format!(
         "{} {} {}",
         console::style("?").green().for_stderr(),
         prompt,
@@ -90,33 +79,46 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
     Ok(outcome)
 }
 
-/// The lines the menu draws, for a test to read.
+/// Draws the prompt and one row per label into the inline viewport.
 ///
-/// Every row is cut to the terminal width by display columns, the way the
-/// browser's rows are, so a long label cannot wrap and leave a line behind
-/// that `clear_last_lines` does not know about. Styling is applied only where
-/// `console` says a terminal wants it, which is also what makes the plain
-/// form testable: with `NO_COLOR` set the rows are exactly the text.
-pub fn render(prompt: &str, labels: &[&str], selected: usize, width: usize) -> Vec<String> {
+/// A long label is clipped at the viewport's edge by the renderer itself --
+/// the cell buffer has nowhere to wrap to -- which is what the old string
+/// renderer had to arrange by hand.
+fn draw(frame: &mut Frame<'_>, prompt: &str, labels: &[&str], selected: usize, colors: bool) {
     let mut lines = Vec::with_capacity(labels.len() + 1);
-    lines.push(format!(
-        "{} {}",
-        console::style("?").green().for_stderr(),
-        console::truncate_str(prompt, width.saturating_sub(2), "…")
-    ));
-    for (index, label) in labels.iter().enumerate() {
-        let label = console::truncate_str(label, width.saturating_sub(2), "…");
-        if index == selected {
-            lines.push(format!(
-                "{} {}",
-                console::style("›").cyan().for_stderr(),
-                console::style(label).cyan().for_stderr()
-            ));
+    lines.push(Line::from(vec![
+        if colors {
+            Span::styled("?", Style::new().fg(Color::Green))
         } else {
-            lines.push(format!("  {label}"));
+            Span::raw("?")
+        },
+        Span::raw(format!(" {prompt}")),
+    ]));
+    for (index, label) in labels.iter().enumerate() {
+        if index == selected {
+            // The pointer keeps the accent; the label itself is bold, not
+            // colored — `tui::selection` documents why a selection never
+            // names a color, and this menu is no exception.
+            lines.push(Line::from(vec![
+                if colors {
+                    Span::styled("› ", Style::new().fg(Color::Cyan))
+                } else {
+                    Span::raw("› ")
+                },
+                if colors {
+                    Span::styled(
+                        (*label).to_string(),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw((*label).to_string())
+                },
+            ]));
+        } else {
+            lines.push(Line::from(format!("  {label}")));
         }
     }
-    lines
+    frame.render_widget(Paragraph::new(lines), frame.area());
 }
 
 /// What one key does to a selection of `len` rows.
@@ -147,24 +149,11 @@ pub fn step(selected: usize, len: usize, action: Action) -> Step {
     }
 }
 
-/// Hides the cursor for as long as it lives.
-struct HiddenCursor<'a>(&'a Term);
-
-impl<'a> HiddenCursor<'a> {
-    fn hide(term: &'a Term) -> Self {
-        let _ = term.hide_cursor();
-        Self(term)
-    }
-}
-
-impl Drop for HiddenCursor<'_> {
-    fn drop(&mut self) {
-        let _ = self.0.show_cursor();
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
     /// The selection stops at the ends. `dialoguer` did the same, and a list
@@ -200,24 +189,52 @@ mod tests {
     /// line for the prompt, one per label, the selected one marked.
     #[test]
     fn the_rows_are_the_prompt_and_one_line_per_label() {
-        console::set_colors_enabled_stderr(false);
-        let rows = render("How?", &["browser", "paste"], 1, 80);
-        assert_eq!(rows, vec!["? How?", "  browser", "› paste"]);
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, "How?", &["browser", "paste"], 1, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(0), "? How?");
+        assert_eq!(row(1), "  browser");
+        assert_eq!(row(2), "› paste");
     }
 
-    /// A label wider than the terminal is cut, not wrapped: a wrapped row is
-    /// a line the repaint does not know about and cannot clear.
+    /// The selected label is bold, never a color: the pointer keeps the
+    /// accent, and a selection that named a color would be the one place in
+    /// the program contradicting `tui::selection`.
+    #[test]
+    fn the_selected_label_is_bold_not_colored() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, "How?", &["browser", "paste"], 1, true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // Row 2 is the selected label; column 2 is its first letter.
+        assert!(
+            buffer[(2, 2)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(buffer[(2, 2)].fg, ratatui::style::Color::Reset);
+    }
+
+    /// A label wider than the viewport is clipped at its edge by the cell
+    /// buffer itself: there is no row for it to wrap onto.
     #[test]
     fn a_long_label_is_cut_to_the_width() {
-        console::set_colors_enabled_stderr(false);
         let long = "x".repeat(100);
-        let rows = render("?", &[&long], 0, 30);
-        for row in &rows {
-            assert!(
-                console::measure_text_width(row) <= 30,
-                "{} columns: {row}",
-                console::measure_text_width(row)
-            );
-        }
+        let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, "?", &[long.as_str()], 0, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.area.width, 30, "the buffer is the clamp");
     }
 }

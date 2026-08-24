@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+- **The browsers take the whole screen.** Every interactive view — the story,
+  highlight, picture and account browsers, and the profile card — now opens on
+  the terminal's alternate screen, drawn with `ratatui`: a rounded frame with
+  the view's name on it, a scrollbar when the list does not fit, the hints on
+  the bottom edge, and in the account lists a real cursor at the end of the
+  `/` filter as you type. The keys are exactly the ones the browsers already
+  had. Leaving puts your terminal back the way it was, and what you saved
+  while inside is said again where the prompt returns — `Saved
+  ./someone-3.jpg` survives in your scrollback even though the frame does
+  not. The wizard menus (`snob login`, `snob watch setup`) stay in the flow
+  of their questions, redrawn with the same renderer in place. A pipe,
+  `--format`, `-o` and `--no-interactive` print exactly as before.
+
+- **Every list is a real table, and the question looks you in the eye.** The
+  account lists put the username, the full name and the badges in columns
+  that line up on every row; stories and highlights get named columns —
+  `kind`, `posted`, `left`, `taken` — because a date and a countdown do not
+  explain themselves. The profile card is a centered column with air in it:
+  the handle and the badges on the frame, the person's name and bio inside,
+  the counters as three tiles with the number under its label, and the
+  highlights as chips without the brackets. The walk-this-list question is
+  no longer a line hidden on the bottom edge: it opens as a small framed
+  window in the middle of the screen, over a dimmed card, with `y`, `n` and
+  Esc spelled out — and no default, so Enter cannot start a three-hundred
+  page walk by accident. The actions submenu opens the same way, over the
+  card instead of replacing it. Failures now say so in red; receipts stay
+  yellow.
+
+- **`snob profile` opens as a card on a terminal.** The account's page with
+  one cursor over it: Up/Down move between rows, Left/Right along the
+  horizontal ones, Enter opens what is under the cursor. "Actions on this
+  account" is a submenu — the profile picture (Enter looks at it, D saves
+  it) and a scan; the stories open below the bio; "followed by N you follow"
+  walks the mutual list at the click rather than at the fetch, so opening a
+  profile costs about three requests; followers and following open from the
+  stored list when it still answers, and otherwise ask first, with the size
+  named — on somebody else's account that question is the consent question.
+  The highlights are a horizontal strip that behaves like the highlights
+  browser: Enter walks in, D saves a whole one. A pipe, `--format`, `-o`
+  and `--no-interactive` print the document exactly as before.
+
+- **`snob pfp` shows the picture before you keep it.** On a terminal it
+  opens a one-row viewer — Enter hands the full-size picture to the system
+  viewer, D saves it here, q leaves. `-o`, `--no-interactive` and a
+  redirected stdout download exactly as before.
+
+- **The lists open as a browser on a terminal.** `snob unfollowers` — and
+  the same on `fans`, `friends`, `followers`, `following` and `scan` — moves
+  through the result with the arrow keys when standard input, output and
+  error are all a terminal and nothing asked for the printed form: Enter
+  opens the account's profile in your browser, `/` narrows the list as you
+  type, Esc clears the filter, `q` leaves. `scan` starts at a tray of the
+  five lists with their counts and Enter walks into one. A pipe, a redirect,
+  `--format` and `-o` print exactly as before, `--no-interactive` prints on
+  a terminal too, and `-i` forces the browser — the same rule the media
+  browsers settled.
+
+- **A crossing's finished walk keeps its progress bar.** The followers bar
+  used to be reset and reused for the following list, so a glance away and
+  back showed a nearly-full bar sitting at zero. Each walk draws its own bar
+  now; a finished one freezes into a line — the name, the bar, the count and
+  how long it took — and the next walk draws below it. The rest between
+  pages is dimmed and counts down in place, and the page number is gone from
+  the bar: pages are how the API paginates, not how anybody counts their
+  followers.
+
 - **The browsers are now the default on a terminal.** `snob stories` and
   `snob highlights` open their arrow-key browser when standard input, output
   and error are all a terminal and nothing else was asked for; a pipe, a

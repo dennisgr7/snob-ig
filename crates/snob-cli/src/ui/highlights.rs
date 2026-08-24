@@ -2,12 +2,12 @@
 //! inside each one the story browser's own moves.
 //!
 //! One loop over two levels rather than two loops, because the terminal
-//! machinery — the raw-mode session, the diffing screen, the scratch
-//! directory — is per *session*, and leaving a folder must not tear any of it
-//! down. Everything terminal-shaped is `ui::stories`' and `ui::browser`'s:
-//! the drawing split, the inline-not-alternate-screen decision and the
-//! not-a-framework decision are argued there and in AGENTS.md, and this file
-//! adds none of its own.
+//! machinery — the `Tui` guard and the scratch directory — is per *session*,
+//! and leaving a folder must not tear any of it down. Everything
+//! terminal-shaped is `ui::stories`' and `ui::tui`'s: the guard, the chrome,
+//! the receipt contract for what the alternate screen takes away, and the
+//! items view itself, which is `stories::draw_items_view` so the two
+//! browsers cannot drift apart. This file adds none of its own.
 //!
 //! What the levels change is only what a row is and what the three verbs do.
 //! At the tray a row is a folder: Enter walks in, D keeps everything in it,
@@ -25,24 +25,23 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use console::{Term, style};
+use console::Term;
+use ratatui::Frame;
+use ratatui::layout::Constraint;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Cell, HighlightSpacing, Row, Table, TableState};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 
-use crate::commands::highlights::{Tray, items_of_entry};
+use crate::commands::highlights::{Entry, Tray, items_of_entry};
 use crate::commands::stories::{Saved, Story, save_story};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
-use crate::ui::browser::input::{Action, Next, Session, TICK, next, page};
+use crate::ui::browser::input::{Action, Next, TICK, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::browser::screen::Screen;
-use crate::ui::browser::viewport::Viewport;
-
-/// Rows given up to everything that is not a list entry: the heading, the
-/// blank line under it, and the footer. The story browser's number, because
-/// it is the story browser's layout.
-const CHROME_ROWS: usize = 3;
+use crate::ui::tui::{self, Tui};
 
 /// Where the browser is, and what the arrow keys therefore move.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,15 +52,15 @@ enum Level {
 }
 
 /// Everything remembered about one entry across the session.
-struct Folder {
+pub(crate) struct Folder {
     /// `None` until first opened; kept after, so walking out and back in
     /// costs nothing.
-    items: Option<Vec<Story>>,
+    pub(crate) items: Option<Vec<Story>>,
     /// What the system viewer was handed, per item, so Enter twice is one
     /// request. Sized with `items`.
-    opened: Vec<Option<PathBuf>>,
+    pub(crate) opened: Vec<Option<PathBuf>>,
     /// The row the selection was on when the user walked out.
-    selected: usize,
+    pub(crate) selected: usize,
 }
 
 /// Drives the two lists until the user leaves them.
@@ -88,7 +87,7 @@ pub async fn browse(
     snob_store::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    let _session = Session::enter().map_err(|e| {
+    let mut tui = Tui::fullscreen().map_err(|e| {
         ExitError::new(
             ExitCode::Error,
             format!("the terminal would not go into raw mode: {e}"),
@@ -96,6 +95,7 @@ pub async fn browse(
         .with_hint("--no-interactive prints the listing; --download saves without one")
     })?;
 
+    let colors = tui::colors_enabled();
     let mut folders: Vec<Folder> = tray
         .entries
         .iter()
@@ -108,10 +108,9 @@ pub async fn browse(
     let mut level = Level::Tray;
     let mut tray_selected = start.unwrap_or(0);
     let mut note = String::new();
-    let mut screen = Screen::new();
-    let mut view = Viewport::new(1);
-
-    term.hide_cursor().ok();
+    let mut receipts: Vec<String> = Vec::new();
+    let mut list = TableState::default();
+    let mut page_rows = 1usize;
 
     // `-i` on a numbered entry opens it before the first frame, and a folder
     // that cannot be opened leaves the user at the tray with the reason in
@@ -137,21 +136,38 @@ pub async fn browse(
             Level::Inside(index) => folders[index].selected,
         };
 
-        view.height = Screen::usable_rows(&term)
-            .saturating_sub(CHROME_ROWS)
-            .max(1);
-        view.follow(selected, total);
-        let rows = match level {
-            Level::Tray => tray_frame(tray, &folders, selected, &view, &note, &term),
-            Level::Inside(index) => items_frame(tray, index, &folders[index], &view, &note, &term),
-        };
-        screen.draw(&term, &rows)?;
-        note.clear();
+        list.select(Some(selected));
+        tui.terminal.draw(|frame| match level {
+            Level::Tray => {
+                draw_tray(
+                    frame,
+                    tray,
+                    &folders,
+                    &mut list,
+                    &note,
+                    colors,
+                    &mut page_rows,
+                );
+            }
+            Level::Inside(index) => {
+                draw_items(
+                    frame,
+                    tray,
+                    index,
+                    &folders[index],
+                    &mut list,
+                    &note,
+                    colors,
+                    &mut page_rows,
+                );
+            }
+        })?;
 
         let event = match next(TICK) {
             Ok(event) => event,
             Err(e) => {
-                term.show_cursor().ok();
+                drop(tui);
+                tui::print_receipts(&receipts);
                 return Err(ExitError::new(
                     ExitCode::Error,
                     format!("the keyboard could not be read: {e}"),
@@ -164,13 +180,16 @@ pub async fn browse(
             Next::Tick | Next::Resized => continue,
             Next::Do(action) => action,
         };
+        note.clear();
 
         let level_before = level;
         match action {
             Action::Up => selected = selected.saturating_sub(1),
             Action::Down => selected = (selected + 1).min(total.saturating_sub(1)),
-            Action::PageUp => selected = selected.saturating_sub(page(&view)),
-            Action::PageDown => selected = (selected + page(&view)).min(total.saturating_sub(1)),
+            Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
+            Action::PageDown => {
+                selected = (selected + page(page_rows)).min(total.saturating_sub(1));
+            }
             Action::First => selected = 0,
             Action::Last => selected = total.saturating_sub(1),
             Action::Open => match level {
@@ -199,7 +218,7 @@ pub async fn browse(
             },
             Action::Download => match level {
                 Level::Tray => {
-                    note = keep_folder(client, tray, selected, &mut folders).await;
+                    note = keep_folder(client, tray, selected, &mut folders, &mut receipts).await;
                 }
                 Level::Inside(index) => {
                     let folder = &mut folders[index];
@@ -213,7 +232,11 @@ pub async fn browse(
                     )
                     .await
                     {
-                        Ok(path) => format!("Saved {}", path.display()),
+                        Ok(path) => {
+                            let line = format!("Saved {}", path.display());
+                            receipts.push(line.clone());
+                            line
+                        }
                         Err(e) => format!("Could not save it: {e}"),
                     };
                 }
@@ -225,23 +248,27 @@ pub async fn browse(
                     level = Level::Tray;
                 }
             }
-            Action::Redraw => screen.invalidate(),
+            Action::Redraw => tui.terminal.clear()?,
             Action::Quit => break ExitCode::Ok,
             Action::Interrupt => break ExitCode::Interrupted,
             Action::None => {}
         }
         // The write-back. Skipped when the arm changed levels: `selected`
-        // still belongs to the level the keys were read at.
+        // still belongs to the level the keys were read at. The scroll offset
+        // starts over with the level, and the first draw pulls the remembered
+        // selection back into view.
         if level == level_before {
             match level {
                 Level::Tray => tray_selected = selected,
                 Level::Inside(index) => folders[index].selected = selected,
             }
+        } else {
+            list = TableState::default();
         }
     };
 
-    screen.finish(&term).ok();
-    term.show_cursor().ok();
+    drop(tui);
+    tui::print_receipts(&receipts);
     Ok(outcome)
 }
 
@@ -249,7 +276,7 @@ pub async fn browse(
 /// browser and `-d` write the very same names. One definition on the command
 /// side would be nicer still, but the command counts from one and this file
 /// from zero, and a function is where that difference is written once.
-fn stem_of(tray: &Tray, index: usize) -> String {
+pub(crate) fn stem_of(tray: &Tray, index: usize) -> String {
     format!("{}-{}", printable(&tray.username), index + 1)
 }
 
@@ -257,7 +284,7 @@ fn stem_of(tray: &Tray, index: usize) -> String {
 ///
 /// `Ok(false)` is a folder with nothing in it — deleted since the tray was
 /// fetched, or genuinely empty — which is not worth walking into.
-async fn walk_in(
+pub(crate) async fn walk_in(
     client: &IgClient,
     tray: &Tray,
     index: usize,
@@ -280,13 +307,15 @@ async fn walk_in(
 ///
 /// One at a time rather than through `download_many`, which reports each
 /// file on standard error as it lands — lines that would tear the frame this
-/// browser is holding. The note line is the browser's one place to speak,
-/// and it gets the tally.
-async fn keep_folder(
+/// browser is holding. The note line is the browser's one place to speak, and
+/// it gets the tally; when anything was saved, the tally also joins the
+/// receipts, because the alternate screen takes the note away on exit.
+pub(crate) async fn keep_folder(
     client: &IgClient,
     tray: &Tray,
     index: usize,
     folders: &mut [Folder],
+    receipts: &mut Vec<String>,
 ) -> String {
     match walk_in(client, tray, index, folders).await {
         Ok(true) => {}
@@ -304,188 +333,289 @@ async fn keep_folder(
             Err(_) => failed += 1,
         }
     }
-    if failed == 0 {
+    let note = if failed == 0 {
         format!("Saved {kept} of highlight {} here", index + 1)
     } else {
         format!(
             "Saved {kept} of {total} from highlight {}; {failed} failed",
             index + 1
         )
+    };
+    if kept > 0 {
+        receipts.push(note.clone());
     }
+    note
 }
 
 /// The note for a folder with nothing to show.
-fn empty_note(index: usize) -> String {
+pub(crate) fn empty_note(index: usize) -> String {
     format!("Highlight {} is empty", index + 1)
 }
 
-/// The tray as rows to draw. Touches no terminal; `term` answers one
-/// question, whether there is color.
-fn tray_frame(
+/// Draws the tray: folders in named columns, because a count and a date do
+/// not explain themselves the way a title does.
+fn draw_tray(
+    frame: &mut Frame<'_>,
     tray: &Tray,
     folders: &[Folder],
-    selected: usize,
-    view: &Viewport,
+    list: &mut TableState,
     note: &str,
-    term: &Term,
-) -> Vec<String> {
+    colors: bool,
+    page_rows: &mut usize,
+) {
     let total = tray.entries.len();
-    let mut rows = Vec::with_capacity(view.height + CHROME_ROWS);
+    let selected = list.selected().unwrap_or(0);
+    let area = frame.area();
 
-    let position = if total > view.height {
-        format!("  [{}/{total}]", selected + 1)
-    } else {
-        String::new()
-    };
-    rows.push(format!(
-        "{}{}",
-        style(format!(
-            "Highlights of @{} - {total} kept",
-            printable(&tray.username)
-        ))
-        .bold(),
-        style(position).dim()
-    ));
-    rows.push(String::new());
-
-    for index in view.range(total) {
-        let entry = &tray.entries[index];
-        // The count the session has seen beats the count the tray declared,
-        // and the tray's number is honestly a declaration: "9 declared"
-        // against "9 items" once the folder has been opened.
-        let count = match folders[index].items.as_ref() {
-            Some(items) => match items.len() {
-                1 => "1 item".to_string(),
-                n => format!("{n} items"),
-            },
-            None => match entry.declared_items {
-                Some(1) => "1 item".to_string(),
-                Some(n) => format!("{n} items"),
-                None => "-".to_string(),
-            },
-        };
-        let mut body = format!(
-            "{:>2}. {:<24} {count}",
-            index + 1,
-            if entry.title.is_empty() {
-                "-"
-            } else {
-                &entry.title
-            },
-        );
-        if let Some(at) = entry.updated_at {
-            body.push_str(&format!(", updated {}", report::dated(at)));
-        }
-        let is_selected = index == selected;
-        let marker = if is_selected { ">" } else { " " };
-        let body = if is_selected && term.features().colors_supported() {
-            style(body).reverse().to_string()
-        } else {
-            body
-        };
-        rows.push(format!("{marker} {body}"));
+    let mut block = tui::view_block(
+        format!("Highlights · @{} · {total} kept", printable(&tray.username)),
+        colors,
+        tui::list_padding(area),
+    );
+    let inner = block.inner(area);
+    // One row of the interior belongs to the header.
+    let viewport = (inner.height as usize).saturating_sub(1).max(1);
+    *page_rows = viewport;
+    let fits = total <= viewport;
+    if !fits {
+        block = block.title_top(tui::position_line(selected, total, colors));
     }
+    block = block.title_bottom(if note.is_empty() {
+        tui::hint_line(
+            "↑↓ move · enter open · d save all of it · q quit".into(),
+            colors,
+        )
+    } else {
+        tui::outcome_line(note.to_string(), colors)
+    });
+    frame.render_widget(block, area);
 
-    rows.push(footer(
-        "up/down: move | enter: open | d: save all of it | q: quit",
-        view,
-        total,
-        note,
-    ));
-    rows
+    *list.offset_mut() = tui::scrolled_offset(list.offset(), selected, total, viewport, 2);
+    // Never narrower than its own header, or the word "highlight" clips.
+    let title_w = tray
+        .entries
+        .iter()
+        .map(|e| console::measure_text_width(&e.title))
+        .max()
+        .unwrap_or(1)
+        .clamp(9, 28) as u16;
+    frame.render_stateful_widget(
+        Table::new(
+            tray.entries
+                .iter()
+                .zip(folders)
+                .enumerate()
+                .map(|(index, (entry, folder))| tray_row(index, entry, folder, colors)),
+            [
+                Constraint::Length(3),
+                Constraint::Length(title_w),
+                Constraint::Length(8),
+                Constraint::Length(14),
+            ],
+        )
+        .header(tui::header_row(
+            &["", "highlight", "items", "updated"],
+            colors,
+        ))
+        .column_spacing(2)
+        .row_highlight_style(tui::selection())
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always),
+        inner,
+        list,
+    );
+    if !fits {
+        tui::scrollbar(frame, area, total, selected, viewport as u16);
+    }
 }
 
-/// One folder's items as rows to draw.
-fn items_frame(
+/// Draws one folder's items, under the folder's own name, through the one
+/// items view in `ui::stories` — minus the column a highlight item does not
+/// have: a kept story does not expire, so there is no `left`.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
+fn draw_items(
+    frame: &mut Frame<'_>,
     tray: &Tray,
     index: usize,
     folder: &Folder,
-    view: &Viewport,
+    list: &mut TableState,
     note: &str,
-    term: &Term,
-) -> Vec<String> {
+    colors: bool,
+    page_rows: &mut usize,
+) {
     let items = folder.items.as_deref().unwrap_or_default();
-    let total = items.len();
-    let selected = folder.selected;
     let entry = &tray.entries[index];
-    let mut rows = Vec::with_capacity(view.height + CHROME_ROWS);
-
-    let position = if total > view.height {
-        format!("  [{}/{total}]", selected + 1)
-    } else {
-        String::new()
-    };
     let name = if entry.title.is_empty() {
         format!("highlight {}", index + 1)
     } else {
         format!("\"{}\"", entry.title)
     };
-    rows.push(format!(
-        "{}{}",
-        style(format!(
-            "@{} - {name} - {total} {}",
+    crate::ui::stories::draw_items_view(
+        frame,
+        format!(
+            "@{} · {name} · {} {}",
             printable(&tray.username),
-            if total == 1 { "item" } else { "items" }
-        ))
-        .bold(),
-        style(position).dim()
-    ));
-    rows.push(String::new());
-
-    for row in view.range(total) {
-        let story = &items[row];
-        let body = format!(
-            "{:>2}. {:<7} {}{}",
-            row + 1,
-            crate::commands::stories::kind_label(story),
-            report::dated(story.taken_at),
-            if story.mentions.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "  {}",
-                    story
-                        .mentions
-                        .iter()
-                        .map(|m| format!("@{m}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            }
-        );
-        let is_selected = row == selected;
-        let marker = if is_selected { ">" } else { " " };
-        let body = if is_selected && term.features().colors_supported() {
-            style(body).reverse().to_string()
-        } else {
-            body
-        };
-        rows.push(format!("{marker} {body}"));
-    }
-
-    rows.push(footer(
-        "up/down: move | enter: open | d: download | left: back | q: quit",
-        view,
-        total,
+            items.len(),
+            if items.len() == 1 { "item" } else { "items" }
+        ),
+        "↑↓ move · enter open · d download · ← back · q quit",
+        items,
+        false,
+        list,
         note,
-    ));
-    rows
+        colors,
+        page_rows,
+    );
 }
 
-/// The last row: the note when there is one, the hint when there is not.
-fn footer(hint: &str, view: &Viewport, total: usize, note: &str) -> String {
-    if !note.is_empty() {
-        return style(note.to_string()).yellow().to_string();
+/// One folder as a table row: number dim, title, the best count known
+/// right-aligned under its name, and when it last grew, dim as an aside.
+///
+/// The count the session has seen beats the count the tray declared, and
+/// the tray's number is honestly a declaration until the folder has been
+/// opened.
+fn tray_row(index: usize, entry: &Entry, folder: &Folder, colors: bool) -> Row<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let count = match folder.items.as_ref() {
+        Some(items) => items.len().to_string(),
+        None => match entry.declared_items {
+            Some(n) => n.to_string(),
+            None => "-".to_string(),
+        },
+    };
+    let updated = entry.updated_at.map(report::dated).unwrap_or_default();
+    let number = Line::from(format!("{}.", index + 1)).right_aligned();
+    let title = if entry.title.is_empty() {
+        "-".to_string()
+    } else {
+        entry.title.clone()
+    };
+    let count = Line::from(count).right_aligned();
+    if !colors {
+        return Row::new(vec![
+            Cell::from(number),
+            Cell::from(title),
+            Cell::from(count),
+            Cell::from(updated),
+        ]);
     }
-    let mut hint = String::from(hint);
-    if view.more_above() || view.more_below(total) {
-        hint.push_str("   ");
-        hint.push(if view.more_above() { '\u{2191}' } else { ' ' });
-        hint.push(if view.more_below(total) {
-            '\u{2193}'
-        } else {
-            ' '
-        });
+    Row::new(vec![
+        Cell::from(number.style(dim)),
+        Cell::from(title),
+        Cell::from(count),
+        Cell::from(updated).style(dim),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use snob_core::Epoch;
+
+    use super::*;
+    use crate::commands::stories::Kind;
+
+    fn entry(title: &str, declared: Option<u64>) -> Entry {
+        Entry {
+            id: "highlight:1".into(),
+            title: title.into(),
+            declared_items: declared,
+            created_at: None,
+            updated_at: None,
+        }
     }
-    style(hint).dim().to_string()
+
+    fn folder(items: Option<usize>) -> Folder {
+        Folder {
+            items: items.map(|n| {
+                (0..n)
+                    .map(|_| Story {
+                        kind: Kind::Photo,
+                        taken_at: Epoch::new(1_700_000_000),
+                        expiring_at: None,
+                        url: None,
+                        mentions: Vec::new(),
+                    })
+                    .collect()
+            }),
+            opened: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// At 60x8 the padding is waived: border, header, data rows. The count
+    /// column carries the number the session has seen, not the declaration.
+    #[test]
+    fn the_tray_prefers_the_count_the_session_has_seen() {
+        let tray = Tray {
+            username: "someone".into(),
+            entries: vec![entry("trip", Some(9)), entry("", Some(3))],
+        };
+        let folders = vec![folder(Some(2)), folder(None)];
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut list = TableState::default();
+        list.select(Some(0));
+        let mut page_rows = 0usize;
+        terminal
+            .draw(|frame| {
+                draw_tray(frame, &tray, &folders, &mut list, "", false, &mut page_rows);
+            })
+            .unwrap();
+        assert!(row(&terminal, 0).contains("Highlights · @someone · 2 kept"));
+        let header = row(&terminal, 1);
+        assert!(header.contains("highlight"), "{header}");
+        assert!(header.contains("items"), "{header}");
+        // Opened once this session: the real count, not the declaration.
+        let first = row(&terminal, 2);
+        assert!(first.contains("1."), "{first}");
+        assert!(first.contains("trip"), "{first}");
+        assert!(first.contains('2'), "{first}");
+        // Never opened, no title: the declaration and a dash.
+        let second = row(&terminal, 3);
+        assert!(second.contains("2."), "{second}");
+        assert!(second.contains('-'), "{second}");
+        assert!(second.contains('3'), "{second}");
+        assert!(row(&terminal, 7).contains("save all of it"));
+    }
+
+    #[test]
+    fn a_folder_draws_under_its_own_name() {
+        let tray = Tray {
+            username: "someone".into(),
+            entries: vec![entry("trip", Some(1))],
+        };
+        let opened = folder(Some(1));
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut list = TableState::default();
+        list.select(Some(0));
+        let mut page_rows = 0usize;
+        terminal
+            .draw(|frame| {
+                draw_items(
+                    frame,
+                    &tray,
+                    0,
+                    &opened,
+                    &mut list,
+                    "",
+                    false,
+                    &mut page_rows,
+                );
+            })
+            .unwrap();
+        assert!(row(&terminal, 0).contains("@someone · \"trip\" · 1 item"));
+        assert!(row(&terminal, 1).contains("taken"), "the header names it");
+        let first = row(&terminal, 2);
+        assert!(first.contains("1."), "{first}");
+        assert!(first.contains("photo"), "{first}");
+        assert!(row(&terminal, 7).contains("← back"));
+    }
 }

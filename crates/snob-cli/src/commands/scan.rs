@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use snob_core::filters::Filter;
 use snob_core::model::{ListKind, User, printable};
+use snob_core::sets;
 use snob_core::{Epoch, Pk};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
@@ -84,6 +85,16 @@ struct Summary<'a> {
 pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     let filter = common::filter_from(&args.filter)?;
     let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
+    }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
     let mut app = common::open(&args.walk, &secrets, paths)?;
 
@@ -156,7 +167,46 @@ pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         following: &following_outcome,
     };
 
-    render_to(&summary, &destination)?;
+    // The browser instead of the document — the default at a terminal, the
+    // decision made above. A scan browses as a tray of the five
+    // lists the summary counts, crossings first because they are what the
+    // command exists to answer; Enter walks into one and shows the accounts
+    // the counts stand for. The sets are cut by the same filter as the
+    // counts, so a tray row and its summary line never disagree.
+    let browsed = if browses {
+        let crossings = [
+            (
+                "unfollowers",
+                filter.apply(sets::difference(&following, &followers)),
+            ),
+            (
+                "fans",
+                filter.apply(sets::difference(&followers, &following)),
+            ),
+            (
+                "friends",
+                filter.apply(sets::intersection(&followers, &following)),
+            ),
+            ("followers", filter.apply(followers.clone())),
+            ("following", filter.apply(following.clone())),
+        ];
+        let shelf = ui::people::Shelf {
+            title: format!("scan of @{target}"),
+            sets: crossings
+                .iter()
+                .map(|(label, people)| ui::people::Set {
+                    label: (*label).to_string(),
+                    people,
+                })
+                .collect(),
+        };
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        render_to(&summary, &destination)?;
+    }
 
     let mut line = format!(
         "account summary of @{target} - {}",
@@ -167,7 +217,10 @@ pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     }
     ui::info(&line);
 
-    Ok(ExitCode::Ok)
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => ExitCode::Ok,
+    })
 }
 
 /// How this summary names the account it is about.

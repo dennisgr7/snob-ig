@@ -138,13 +138,20 @@ a.verified   Verified Account verified
 33 accounts you follow that do not follow you back - 33 of 139 - 12 requests
 ```
 
-In a terminal that is a real table, with the usernames clickable where the
-terminal supports it. Down a pipe the output turns into JSON on its own, so
-something else can read it without being told to.
+That table is what a pipe, a redirect, `--format` or `--no-interactive`
+gets — JSON down a pipe on its own, a real table with clickable usernames
+where the terminal supports it.
 
 The other crossings are `snob fans` (they follow you, you do not follow them)
 and `snob friends` (you follow each other). `snob followers` and
 `snob following` print a list on its own.
+
+On a terminal any of the five opens as a list you move through with the
+arrow keys — Enter opens the account's profile in your browser, `/` narrows
+the list as you type, `q` leaves. In a pipe or a redirect it prints the
+table instead, `--format` and `-o` always print or write, and
+`--no-interactive` prints it on a terminal too, the same rule `stories` and
+`highlights` keep.
 
 ```bash
 snob profile someone
@@ -172,9 +179,17 @@ profile of @someone - 6 requests
 What you would see opening the profile, and nothing walked: the counters, the
 bio, whether you follow each other, the accounts you follow that follow them,
 the highlights and whether anything is up right now. Three or four requests
-for most accounts, one more per twelve people you have in common. Without a
-name it is your own page. `--format json` for a script, `--format md` for a
-note.
+for most accounts. Without a name it is your own page. `--format json` for a
+script, `--format md` for a note.
+
+On a terminal the profile opens as a card instead, with one cursor over it:
+arrow keys move, Enter opens what is under the cursor. The stories and the
+highlights open the way their own commands browse them, "followed by N you
+follow" opens the list of accounts behind the number, and followers or
+following ask before spending a walk — with the size named, so you know what
+a `y` costs. "Actions on this account" holds the rest: the profile picture
+(Enter looks at it, D saves it) and a scan. `--no-interactive` prints the
+document above, and a pipe always gets the printed form.
 
 ```bash
 snob scan
@@ -193,11 +208,19 @@ Everything about somebody else is what their profile already shows to anyone
 signed in — snob only reads it faster. It is still their account rather than
 yours, so snob asks before it starts on one. `-y` answers in advance.
 
+On a terminal `snob scan` opens the same picture as folders: the five lists
+with their counts, Enter walks into one, and inside it the arrow keys, `/`
+and Enter mean what they mean on any list. `--no-interactive` prints the
+summary instead, and a pipe always gets the printed form.
+
 ```bash
-snob pfp someone -o picture.jpg
+snob pfp someone
 ```
 
-Their profile picture at 1080x1080, which is not the size the web page serves.
+Their profile picture at 1080x1080, which is not the size the web page
+serves. On a terminal it opens a small viewer first — Enter looks at it, `D`
+keeps it, `q` leaves; `-o picture.jpg` or `--no-interactive` download it
+straight away, and `snob pfp someone > face.jpg` still writes the bytes.
 
 ```bash
 snob stories someone

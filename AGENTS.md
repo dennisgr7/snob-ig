@@ -88,8 +88,25 @@ re-litigation in a normal change.
     which the owner lifted in August 2026 after using the browsers: they are
     what a person at a terminal wants first, and the pipe, redirect and
     script cases the old rule protected are exactly the ones detection
-    refuses. There is still no REPL and no global interactive mode; a second
-    command language would need a second parser for every flag above.
+    refuses. **The list commands, `scan`, `profile` and `pfp` browse by the
+    same rule**: their browsers (`ui::people`, `ui::profile`, `ui::pfp`) are
+    the default at the same three-stream detection, `-i` forces it,
+    `--no-interactive` prints, and `--format` and `-o` print without needing
+    to say so. `profile` and `pfp` carry their own flag pair rather than
+    `BrowseArgs` — the group's conflicts name ids those commands do not have
+    — but all four groups feed `cli::browse_decision`, which is the one copy
+    of the ordering. The lists briefly kept the older
+    opt-in view — the listing *is* the answer, so never detect — and the
+    owner reversed it on 2026-08-24 after using both: what that view
+    protected is exactly what detection already refuses. The one difference
+    from the media group is that `-i` is a clap conflict beside `--format`
+    and `-o` rather than out-ranking them, because a list browser downloads
+    nothing and either flag would be accepted-and-ignored.
+    `BrowseArgs::browses` in `cli.rs` is the matrix, a test beside it holds
+    it, and the refusal where no terminal can be drawn is given before the
+    session opens, at `ui::people::check_drawable`. There is still no REPL and no global
+    interactive mode; a second command language would need a second parser
+    for every flag above.
   Two spellings are settled with the conventions. `--offline` is the one word
   for "spend no network" — the list commands and `whoami` both take it, and
   `--cache`, the name the lists used first, stays as a hidden alias the way
@@ -777,31 +794,45 @@ Two judgment calls worth understanding before touching them:
   listing that is actually on screen. Files are named `user-2-3.jpg`, tray
   number then item number, through the very `save_story` path stories go
   through; `commands::highlights` orchestrates, and `ui::highlights` is the
-  two-level browser on the same `ui::browser` pieces, with `Action::Back`
+  two-level browser on the same `ui::tui` and `ui::browser` pieces, with `Action::Back`
   (Left, Backspace) as the one key the flat story list does not use. The
   client half is `IgClient::highlights_tray` and `IgClient::highlight`, which
   is `reels_media` asked with `highlight:<id>`; a private account the viewer
   does not follow is answered from the profile without asking the tray, the
   same two sentences `profile` keeps apart.
-- **The story browser draws with `console` and reads keys with `crossterm`, and
-  is not built on a terminal-UI framework.** Measured in August 2026 by building
-  this tree twice: the browser as it stands is **+18,432 B and 0 new crates on
-  Windows and macOS** — `comfy-table` was already compiling `crossterm`, so
-  only its `events` and `bracketed-paste` features are new, and on Linux that
-  is `signal-hook` and `signal-hook-mio` — against **+106,496 B and +27
-  crates** for the same five behaviors on `ratatui` 0.30 with `crossterm` 0.29.
-  What the difference buys is a cell buffer with a diff and a Cassowary solver
-  (`kasuari`), plus `compact_str`, `castaway`, `lru`, `strum`, `itertools`,
-  `line-clipping` and `unicode-truncate`. A list of rows of text uses none of
-  it: a line diff is 115 lines and is in `ui/browser/screen.rs`.
-  **What would reverse this** is a second pane, a navigable table with columns,
-  or a view that scrolls independently of the focus. At that point the cell
-  buffer stops being overhead and starts being the right tool, and 106 KB is not
-  a lot to pay for it. One list with one highlighted row is not that point.
-  `termwiz` was measured too and is not close: **+688,640 B and 86 crates**, six
-  times `ratatui`, because it is WezTerm's whole terminal layer. `cursive` is
-  comparable to `ratatui` in size and wrong in shape — it owns the event loop,
-  and `browse` is an `async` function making HTTP requests between keystrokes.
+- **The interactive views draw with `ratatui` and read keys with `crossterm`
+  through `ui::browser::input`.** The framework was once measured and declined
+  for a flat list — a hand-rolled line diff answered the same five behaviors
+  for +18,432 B against ratatui's +106,496 B and +27 crates — and the record
+  named its own reversal: a second pane, a navigable table with columns, or a
+  view that scrolls independently of the focus. The profile card is that
+  point several times over (focusable rows, sliding chip windows, sub-views,
+  a filter with a live query), so the trade went the other way and the line
+  diff (`ui/browser/screen.rs`) and viewport arithmetic left with it. The
+  declaration is `ratatui` 0.30 with `default-features = false` and only
+  `crossterm_0_29`, which shares the one `crossterm` the tree already
+  compiles; the workspace manifest's comment carries what the refused default
+  features would have added, and the cost table below carries the measured
+  price. What ratatui is *not* used for: reading keys (`ui::browser::input`
+  closes two real defects there and stays), capability questions (`console`
+  still decides color and attendance), and every printed form — a pipe,
+  `--format`, `-o` and `--no-interactive` never touch it.
+  **The browsers take the alternate screen; the menu does not.** Leaving the
+  alternate screen takes the last frame with it, so each browser collects
+  receipt lines (`Saved ./someone-3.jpg`) and prints them on the real screen
+  after its guard drops — the answer the user came for survives in scrollback,
+  which is the contract the old inline drawing kept by other means.
+  `ui::tui::Tui` is the one guard (raw mode, alternate screen, bracketed
+  paste, cursor), there is never more than one, and the profile card lends
+  its own to `people::browse_in` rather than letting a second be built.
+  `ui::restore_terminal` undoes all four modes unconditionally, because
+  `panic = "abort"` and the forced-quit `exit(130)` run no destructors.
+  The alternatives stay declined: `termwiz` is **+688,640 B and 86 crates**,
+  six times ratatui, because it is WezTerm's whole terminal layer; `cursive`
+  is comparable to ratatui in size and wrong in shape — it owns the event
+  loop, and `browse` is an `async` function making HTTP requests between
+  keystrokes, which is also why the loops here stay hand-written over
+  `input::next` rather than adopting any framework's runtime.
 - **Stories are handed to the system viewer and are not drawn in the terminal.**
   Re-examined in August 2026 against what terminals actually do now, because
   2026 genuinely moved: kitty's graphics protocol is no longer kitty's alone —
@@ -836,8 +867,9 @@ Two judgment calls worth understanding before touching them:
   If it is ever wanted anyway, the only defensible shape is `image` with
   `jpeg`+`png`, the kitty protocol written by hand with a DA1 probe and a hard
   timeout, **for photo stories only**, with `opener` for video and as the
-  fallback everywhere. That avoids `viuer`, `ratatui-image` and `ratatui`
-  entirely and still costs 3.9% of the binary.
+  fallback everywhere. That avoids `viuer` and `ratatui-image` (which does not
+  ride for free on the `ratatui` now in the tree — its decoders are its own
+  125 crates) and still costs 3.9% of the binary.
 
 ## State
 
@@ -1188,15 +1220,14 @@ against.
 
 | | |
 |---|---|
-| Binary, aarch64-pc-windows-msvc | 5,885,952 B |
+| Binary, aarch64-pc-windows-msvc | 5,167,616 B, re-measured August 2026 with `ratatui` in the tree |
 | Binary, x86_64-pc-windows-msvc | larger by roughly a third |
 | Bundled SQLite | 532.6 KiB of `.text`, 9.4% |
 | The `xlsx` feature (`rust_xlsxwriter` + `zip` + `zopfli`) | ~498 KiB, 6.6%, for one of five output formats — behind the `xlsx` feature, on by default. Measured on x86_64 Windows, August 2026: **656,384 B, 9.3%**, and six crates, between the default build and `--no-default-features`, which is what the feature lets a source build leave out. The row used to credit the whole figure to the writer alone; `cargo tree -i zopfli` says otherwise — zopfli arrives through `zip`'s `deflate` umbrella, which `rust_xlsxwriter` asks for on its own, so the number is the feature's, not one crate's |
 | Static CRT on Windows | +126,976 B per binary |
 | `tracing-subscriber`'s `env-filter`, replaced by `Targets` | **−327,680 B, 4.4%**, −3 crates (`matchers`, `regex-automata`, `regex-syntax`), measured on x86_64 Windows release either side of the change |
-| Interactive story browser, rewritten | +18,432 B, 0.23%, 0 new crates on Windows |
-| `dialoguer`, replaced by `ui::menu` on the browser's own pieces | **−12,288 B**, −2 crates (`dialoguer`, `shell-words`), measured on aarch64-pc-windows-msvc release either side of the change. The crate's one use was a two-to-three entry menu; the browser already read keys and drew a highlighted list |
-| `ratatui` + `crossterm` for the same browser | +106,496 B, 1.32%, +27 crates — rejected |
+| `dialoguer`, replaced by `ui::menu` | **−12,288 B**, −2 crates (`dialoguer`, `shell-words`), measured on aarch64-pc-windows-msvc release either side of the change. The crate's one use was a two-to-three entry menu; the browsers already read keys and drew a highlighted list, and the menu now draws through the same `ratatui` inline viewport |
+| `ratatui` 0.30, `default-features = false`, `crossterm_0_29` — **adopted** for the interactive views | **+27 crates compiled** (counted August 2026 as the new lockfile entries that appear in `cargo tree -e normal,build`; 9 of them are the `derive-more`/`darling` proc-macro chain that rides in through `ratatui-crossterm` asking for crossterm's defaults, byte-identical in the binary). The lockfile gains 39 — `palette`, `time` and 10 more never compile, which is what the refused default features buy. The framework's price was measured before adopting it: **+106,496 B, 1.32%** for the five browser behaviors alone, built both ways on the same tree (x86_64). What reversed the old rejection is the profile card — focusable rows, sliding chip windows, sub-views, a filter input — which is the "second pane / navigable table" case the rejection itself named as its limit; the hand-rolled `screen.rs` line diff and `viewport.rs` left with the trade |
 | `clap` without its `color` feature | **−18,432 B**, 0.37%, −8 crates (`anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`, `colorchoice`, `utf8parse`, `is_terminal_polyfill`, `once_cell_polyfill`), measured on aarch64-pc-windows-msvc in August 2026, compiles with no code change — **kept**, because `snob --help` in color is a position and not an accident |
 | `zstd` out of `Accept-Encoding` | **−77,312 B**, 1.55%, −3 crates and −24.78 s of C compilation per cold build (`zstd-sys` is the one decoder that is not Rust), measured the same way — **kept**, because the header is Chrome's character for character and the project's whole wire posture is that it does not differ from a browser's where a server could see it |
 | `image` with only `jpeg`+`png`, the floor under any terminal image | +312,320 B, 3.9%, +17 crates — rejected |
@@ -1213,11 +1244,11 @@ them. Note that musl carries the Secret Service stack — 50 crates a Windows
 build does not have, counted with `cargo tree --target x86_64-unknown-linux-musl`
 in August 2026 — so it is not comparable.
 
-**The three terminal-interface rows are measured on `x86_64-pc-windows-msvc`**,
-not on ARM64 like the rest: they are deltas taken by building the same tree
-twice, which is the only honest way to price a library, and the host is what it
-is. The baseline they are against is 8,068,096 B, which is 1.37x the ARM64
-figure above and agrees with the second row. Deltas of this kind do not
+**The ratatui byte figure was measured on `x86_64-pc-windows-msvc`**, not on
+ARM64 like the rest: it is a delta taken by building the same tree twice,
+which is the only honest way to price a library, and the host is what it is.
+The baseline it was taken against is 8,068,096 B, which is 1.37x the ARM64
+figure of its day and agrees with the second row. Deltas of this kind do not
 transfer between targets exactly, but they do not change order of magnitude
 either.
 

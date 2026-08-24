@@ -343,13 +343,15 @@ pub(crate) fn kind_label(story: &Story) -> &'static str {
     story.kind.label()
 }
 
-/// "Aug 3 at 14:12, 7h 23m left".
-pub(crate) fn posted_and_left(story: &Story) -> String {
-    format!(
-        "{}, {} left",
-        report::stored_on(story.taken_at),
-        remaining(story.expiring_at)
-    )
+/// The browser's two time columns: when a story was posted, and what is left
+/// of it. The printed listing says the same facts as one sentence; these are
+/// the columns, and both shapes read off the same clock code below.
+pub(crate) fn posted_of(story: &Story) -> String {
+    report::stored_on(story.taken_at)
+}
+
+pub(crate) fn left_of(story: &Story) -> String {
+    remaining(story.expiring_at)
 }
 
 /// How long a story has left, or nothing when Instagram did not say.

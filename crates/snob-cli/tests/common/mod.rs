@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use snob_cli::app::{App, Viewer};
-use snob_cli::cli::{ConsentArgs, FilterArgs, ListArgs, OutputArgs, ProgressArgs, WalkArgs};
+use snob_cli::cli::{
+    BrowseArgs, ConsentArgs, FilterArgs, ListArgs, OutputArgs, ProgressArgs, WalkArgs,
+};
 use snob_core::Pk;
 use snob_core::budget::{RateBudget, UnlimitedRateBudget};
 use snob_core::session::{Session, SessionOrigin};
@@ -44,6 +46,7 @@ pub fn args() -> ListArgs {
         filter: FilterArgs::default(),
         output: OutputArgs::default(),
         limit: None,
+        browse: BrowseArgs::default(),
         walk: WalkArgs {
             progress: ProgressArgs { no_progress: true },
             consent: ConsentArgs { yes: true },

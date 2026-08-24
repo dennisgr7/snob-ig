@@ -44,11 +44,16 @@ serde_json.workspace = true
 # without building the whole document.
 serde.workspace = true
 console.workspace = true
-# Keys for the story browser, and nothing else in this program. It draws with
-# `console` and reads with this: the split is deliberate and the reasoning is on
-# `ui::browser::input`. Costs no new crate here -- comfy-table already compiles
-# it; see the workspace manifest.
+# Keys for the interactive views, and the terminal modes around them (raw mode,
+# alternate screen, bracketed paste). Reading stays here rather than in ratatui
+# because ratatui only writes; the reasoning is on `ui::browser::input`. Costs
+# no new crate here -- comfy-table already compiles it; see the workspace
+# manifest.
 crossterm.workspace = true
+# The interactive views' renderer: browsers and the profile card fullscreen,
+# the menu inline. The feature choices and the decision record are on the
+# workspace manifest and in AGENTS.md.
+ratatui.workspace = true
 opener.workspace = true
 indicatif.workspace = true
 supports-hyperlinks.workspace = true

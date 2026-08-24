@@ -34,6 +34,7 @@ use snob_store::secrets::SecretStore;
 
 use crate::cli::{Format, ProfileArgs, ProfileFormat};
 use crate::commands::common;
+use crate::commands::stories::{Story, story_from};
 use crate::engine::target;
 use crate::exit::ExitCode;
 use crate::output::{self, Presentation, Rendered};
@@ -56,6 +57,9 @@ const NAMES_SHOWN: usize = 3;
 /// What the page shows, reduced to what this command prints.
 #[derive(Debug)]
 pub struct Profile {
+    /// The account's id, kept so the interactive view can page and fetch
+    /// without re-resolving the name it already paid to resolve.
+    pub pk: snob_core::Pk,
     /// As Instagram spells it, not as it was typed.
     pub username: String,
     pub full_name: Option<String>,
@@ -77,8 +81,14 @@ pub struct Profile {
     /// account.
     pub mutual: Option<Mutual>,
     pub highlights: Visibility<Vec<Highlight>>,
-    /// How many stories are up right now.
-    pub stories_up: Visibility<usize>,
+    /// The address of the profile picture at the size the page serves —
+    /// the fallback [`crate::commands::pfp::picture`] takes, so looking at
+    /// the picture from the interactive view costs one request, not two.
+    pub pfp_url: Option<String>,
+    /// The stories up right now. The printed forms only ever say how many —
+    /// [`Profile::stories_up`] — and the interactive view opens them, which
+    /// is why the items are kept rather than counted and dropped.
+    pub stories: Visibility<Vec<Story>>,
     /// The date the summary describes. It is the moment it was read, and it is
     /// carried so the JSON dates itself like every other object here.
     pub read_at: Epoch,
@@ -138,6 +148,29 @@ pub struct Highlight {
     pub updated_at: Option<Epoch>,
 }
 
+impl Profile {
+    /// How many stories are up, which is all the printed forms say about
+    /// them. The items themselves are [`Profile::stories`]'s.
+    pub fn stories_up(&self) -> Visibility<usize> {
+        match &self.stories {
+            Visibility::Shown(items) => Visibility::Shown(items.len()),
+            Visibility::Hidden => Visibility::Hidden,
+        }
+    }
+}
+
+/// Whether [`fetch`] walks the mutual list or leaves it for a later click.
+///
+/// The printed document names the walked list, so the static path pays for
+/// it up front. The interactive view shows the count the page already sent
+/// and walks only when the number is opened — up to ten requests that a
+/// glance at a profile should not cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutualPolicy {
+    WalkNow,
+    Defer,
+}
+
 pub async fn run(args: ProfileArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
     // Settled before the session is opened and long before a request is
     // spent, like every destination here.
@@ -150,9 +183,17 @@ pub async fn run(args: ProfileArgs, secrets: SecretStore, paths: &AppPaths) -> R
     }
     output::check_destination(format, args.output.as_deref())?;
 
-    // No bar: a handful of requests does not need one, and the summary is
-    // short enough that a bar would outlast it.
-    let app = common::app(&secrets, paths, false)?;
+    // `-i` refused before the session opens and before anything is spent,
+    // like a bad `-o` — the expensive order to find out in is the other one.
+    if args.interactive {
+        crate::ui::people::check_drawable()?;
+    }
+    let browses = args.browses(crate::ui::a_human_would_watch_the_listing_scroll_by());
+
+    // A bar only for the browser, whose clicks can start real walks. The
+    // printed path stays barless: a handful of requests does not need one,
+    // and the summary is short enough that a bar would outlast it.
+    let mut app = common::app(&secrets, paths, browses)?;
     common::refuse_during_cooldown(&app, "no request can be made")?;
 
     let typed = match args.target.as_deref() {
@@ -163,12 +204,37 @@ pub async fn run(args: ProfileArgs, secrets: SecretStore, paths: &AppPaths) -> R
     };
 
     let before = app.client().pacer().spent();
-    let profile = fetch(app.client(), &typed, app.viewer().pk).await?;
-    let spent = app.client().pacer().spent().saturating_sub(before);
+    let policy = if browses {
+        // The browser pays for the mutual walk at the click that asks for it.
+        MutualPolicy::Defer
+    } else {
+        MutualPolicy::WalkNow
+    };
+    let profile = fetch(app.client(), &typed, app.viewer().pk, policy).await?;
 
     if app.cancel().is_canceled() {
         return Ok(ExitCode::Interrupted);
     }
+
+    // The card instead of the document — the default at a terminal, the
+    // decision made above. The closing line counts the whole session: the
+    // fetch plus whatever the clicks spent.
+    if browses {
+        // A pacer wait during the fetch may have drawn a bar; the card must
+        // not share the screen with it. `finish` also leaves the stack ready
+        // for the walks the clicks can start.
+        app.progress().finish();
+        let code =
+            crate::ui::profile::browse(&mut app, &profile, args.target.as_deref(), paths).await?;
+        let spent = app.client().pacer().spent().saturating_sub(before);
+        ui::info(&format!(
+            "profile of @{} - {}",
+            profile.username,
+            report::requests(spent)
+        ));
+        return Ok(code);
+    }
+    let spent = app.client().pacer().spent().saturating_sub(before);
 
     let presentation = Presentation::detect(args.output.as_deref());
     let hints = format == Format::Table && presentation.interactive;
@@ -201,7 +267,12 @@ pub async fn run(args: ProfileArgs, secrets: SecretStore, paths: &AppPaths) -> R
 /// `viewer` is the session's own id, which is what decides whether the
 /// account is the viewer's: compared by id rather than by name, because the
 /// session may not know its own name yet and a name can be spelled two ways.
-pub async fn fetch(client: &IgClient, typed: &str, viewer: snob_core::Pk) -> Result<Profile> {
+pub async fn fetch(
+    client: &IgClient,
+    typed: &str,
+    viewer: snob_core::Pk,
+    policy: MutualPolicy,
+) -> Result<Profile> {
     let info = client.web_profile_info(target::clean(typed)).await?;
     let own = info.id == viewer;
     let is_private = info.is_private.unwrap_or(false);
@@ -219,10 +290,35 @@ pub async fn fetch(client: &IgClient, typed: &str, viewer: snob_core::Pk) -> Res
         they_requested: info.has_requested_viewer.unwrap_or(false),
     });
 
+    let mutual_count = info.mutual.as_ref().map(|m| m.count).unwrap_or(0);
+    let mutual_preview: Vec<String> = info
+        .mutual
+        .as_ref()
+        .map(|m| m.names().map(printable).collect())
+        .unwrap_or_default();
     let mutual = if own {
         None
     } else {
-        Some(mutual_list(client, &info).await?)
+        Some(match policy {
+            MutualPolicy::WalkNow => {
+                mutuals(
+                    client,
+                    info.id,
+                    &info.username,
+                    mutual_count,
+                    mutual_preview,
+                )
+                .await?
+            }
+            // Nothing spent and nothing claimed: an empty, incomplete list is
+            // "not walked yet", which is exactly what it is.
+            MutualPolicy::Defer => Mutual {
+                count: mutual_count,
+                preview: mutual_preview,
+                people: Vec::new(),
+                complete: false,
+            },
+        })
     };
 
     let highlights = if visible {
@@ -241,14 +337,18 @@ pub async fn fetch(client: &IgClient, typed: &str, viewer: snob_core::Pk) -> Res
         Visibility::Hidden
     };
 
-    let stories_up = if visible {
+    let stories = if visible {
         let reel = client.stories(info.id, &info.username).await?;
-        Visibility::Shown(reel.map(|r| r.items.len()).unwrap_or(0))
+        Visibility::Shown(
+            reel.map(|r| r.items.iter().map(story_from).collect())
+                .unwrap_or_default(),
+        )
     } else {
         Visibility::Hidden
     };
 
     Ok(Profile {
+        pk: info.id,
         username: printable(&info.username),
         full_name: info
             .full_name
@@ -281,7 +381,11 @@ pub async fn fetch(client: &IgClient, typed: &str, viewer: snob_core::Pk) -> Res
         relation,
         mutual,
         highlights,
-        stories_up,
+        pfp_url: info
+            .profile_pic_url_hd
+            .clone()
+            .or(info.profile_pic_url.clone()),
+        stories,
         read_at: snob_core::clock::now(),
     })
 }
@@ -292,13 +396,17 @@ pub async fn fetch(client: &IgClient, typed: &str, viewer: snob_core::Pk) -> Res
 /// from the mutual endpoint, and the walk stops when it says there is no next
 /// page or at [`MUTUAL_PAGE_CAP`], whichever is first. A count of zero spends
 /// nothing: there is nothing to name.
-async fn mutual_list(client: &IgClient, info: &snob_ig::model::WebProfileInfo) -> Result<Mutual> {
-    let count = info.mutual.as_ref().map(|m| m.count).unwrap_or(0);
-    let preview: Vec<String> = info
-        .mutual
-        .as_ref()
-        .map(|m| m.names().map(printable).collect())
-        .unwrap_or_default();
+///
+/// Takes the pieces rather than the wire struct, so the interactive view —
+/// which deferred the walk and holds only a [`Profile`] — can pay for it at
+/// the click that asks for it.
+pub(crate) async fn mutuals(
+    client: &IgClient,
+    pk: snob_core::Pk,
+    username: &str,
+    count: u64,
+    preview: Vec<String>,
+) -> Result<Mutual> {
     if count == 0 {
         return Ok(Mutual {
             count,
@@ -313,7 +421,7 @@ async fn mutual_list(client: &IgClient, info: &snob_ig::model::WebProfileInfo) -
     let mut complete = false;
     for _ in 0..MUTUAL_PAGE_CAP {
         let page = client
-            .mutual_followers_page(info.id, &info.username, cursor.as_deref())
+            .mutual_followers_page(pk, username, cursor.as_deref())
             .await?;
         people.extend(page.users.iter().map(User::from));
         match page.next_max_id.filter(|c| !c.is_empty()) {
@@ -366,7 +474,7 @@ fn as_json(profile: &Profile) -> serde_json::Value {
         )),
         Visibility::Hidden => Visibility::Hidden,
     };
-    let stories_up = match profile.stories_up {
+    let stories_up = match profile.stories_up() {
         Visibility::Shown(n) => Visibility::Shown(serde_json::json!(n)),
         Visibility::Hidden => Visibility::Hidden,
     };
@@ -450,7 +558,7 @@ fn others(n: u64) -> String {
 }
 
 /// The flags a name is shown with, as the page shows them next to it.
-fn badges(profile: &Profile) -> Vec<&'static str> {
+pub(crate) fn badges(profile: &Profile) -> Vec<&'static str> {
     let mut badges = Vec::new();
     if profile.is_verified {
         badges.push("verified");
@@ -465,7 +573,7 @@ fn count(n: Option<u64>) -> String {
     n.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
 }
 
-fn relation_line(relation: Relation) -> String {
+pub(crate) fn relation_line(relation: Relation) -> String {
     let you = match (relation.you_follow, relation.you_requested) {
         (true, _) => "you follow them",
         (false, true) => "you asked to follow them",
@@ -573,7 +681,7 @@ fn as_text(profile: &Profile, explicit_target: bool, hints: bool) -> String {
                 .to_string(),
         ),
     }
-    match profile.stories_up {
+    match profile.stories_up() {
         Visibility::Shown(0) => rows.push(format!("{:<14}none", "Stories up:")),
         Visibility::Shown(n) => rows.push(format!("{:<14}{n}", "Stories up:")),
         Visibility::Hidden => {}
@@ -585,7 +693,7 @@ fn as_text(profile: &Profile, explicit_target: bool, hints: bool) -> String {
             "{:<14}snob scan{suffix}        followers and following, crossed (walks both lists)",
             "Next:"
         ));
-        if matches!(profile.stories_up, Visibility::Shown(n) if n > 0) {
+        if matches!(profile.stories_up(), Visibility::Shown(n) if n > 0) {
             rows.push(format!(
                 "{:<14}snob stories{suffix}     see and download what is up",
                 ""
@@ -706,7 +814,7 @@ fn as_markdown(profile: &Profile) -> String {
             s.push_str("Highlights and stories are not visible: the account is private and you do not follow it.\n");
         }
     }
-    match profile.stories_up {
+    match profile.stories_up() {
         Visibility::Shown(0) => s.push_str("\nNothing up right now.\n"),
         Visibility::Shown(1) => s.push_str("\n1 story up right now.\n"),
         Visibility::Shown(n) => s.push_str(&format!("\n{n} stories up right now.\n")),
@@ -753,8 +861,19 @@ mod tests {
         }
     }
 
+    fn story() -> Story {
+        Story {
+            kind: crate::commands::stories::Kind::Photo,
+            taken_at: Epoch::new(0),
+            expiring_at: None,
+            url: None,
+            mentions: Vec::new(),
+        }
+    }
+
     fn sample() -> Profile {
         Profile {
+            pk: Pk::new(7),
             username: "someone".to_string(),
             full_name: Some("Some One".to_string()),
             biography: Some("first line\nsecond line".to_string()),
@@ -786,7 +905,8 @@ mod tests {
                 items: Some(5),
                 updated_at: None,
             }]),
-            stories_up: Visibility::Shown(2),
+            pfp_url: None,
+            stories: Visibility::Shown(vec![story(), story()]),
             read_at: Epoch::new(0),
         }
     }
@@ -831,7 +951,7 @@ mod tests {
     fn a_private_account_you_do_not_follow_says_what_it_keeps_back() {
         let mut profile = sample();
         profile.highlights = Visibility::Hidden;
-        profile.stories_up = Visibility::Hidden;
+        profile.stories = Visibility::Hidden;
         let text = as_text(&profile, true, false);
         assert!(text.contains("not visible"), "{text}");
         assert!(!text.contains("Stories up"), "{text}");

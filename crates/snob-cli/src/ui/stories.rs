@@ -1,29 +1,23 @@
 //! The interactive story list: arrow keys, Enter to look, D to keep.
 //!
-//! **It draws with `console` and reads keys with `crossterm`**, and the split
-//! is the whole design. `console` is already here, it measures display columns
-//! and it knows what a terminal supports, so it keeps the drawing. Reading is
-//! the half it cannot do: `Term::read_key` has no timeout, reports no resize,
-//! parses no modified key and enables no bracketed paste -- and the last two of
-//! those were not gaps but defects, because `ESC[1;2D` from Shift+Left ended up
-//! reaching this list as a `D` and downloading a story. `ui::browser::input`
-//! has the details next to the code that closes them, and it costs no new crate
-//! on Windows or macOS, because `comfy-table` was compiling `crossterm` already.
+//! **It draws with `ratatui` and reads keys through `ui::browser::input`.**
+//! Reading is not ratatui's half -- ratatui only writes -- and the input
+//! module closes two real defects (`ESC[1;2D` from Shift+Left reaching a list
+//! as a `D` that downloads, an unbracketed paste pressing its own letters)
+//! with the reasoning next to the code. Drawing goes through `ui::tui`: one
+//! guard for the terminal modes, the chrome every view shares, and ratatui's
+//! cell diff underneath, so an unchanged frame writes nothing and an idle
+//! browser waking on its timer sends no bytes. AGENTS.md carries the decision
+//! record for the framework, including what its adoption measured.
 //!
-//! What is deliberately not taken is the rest of a terminal-UI framework.
-//! `ratatui` answers the same problem for **106,496 bytes and 27 crates** in
-//! this binary, against **18,432 bytes and none**, and what the difference buys
-//! is a cell buffer and a layout solver that a list of rows of text does not
-//! use. AGENTS.md carries both numbers and the case that would reverse them.
-//!
-//! Everything is drawn on **standard error**, and the list stays inline rather
-//! than taking the alternate screen. Standard output belongs to the listing, so
-//! `snob stories someone --interactive` can still be run beside a redirect
-//! without a full-screen interface landing in the file -- the same reasoning
-//! `ui::confirm` gives about asking questions on the right stream. Inline
-//! rather than full-screen because the last thing this prints, `Saved
-//! ./someone-3.jpg`, is the answer the user came for, and the alternate screen
-//! takes it away on exit along with the terminal's own search and selection.
+//! Everything is drawn on **standard error**, on the **alternate screen**.
+//! Standard output belongs to the listing, so `snob stories someone
+//! --interactive` beside a redirect still leaves the file empty -- the same
+//! reasoning `ui::confirm` gives about asking questions on the right stream.
+//! The alternate screen takes the frame away on exit, so the answer the user
+//! came for is said again on the real screen: every `Saved ./someone-3.jpg`
+//! is collected while the browser runs and printed as a receipt after the
+//! guard drops. `ui::tui` carries that contract.
 //!
 //! What it does **not** do is render the picture in the terminal. That decision
 //! was re-examined in August 2026 against what terminals actually support now,
@@ -34,7 +28,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use console::{Term, style};
+use console::Term;
+use ratatui::Frame;
+use ratatui::layout::Constraint;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Cell, HighlightSpacing, Row, Table, TableState};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
@@ -42,14 +41,9 @@ use snob_store::paths::AppPaths;
 use crate::commands::stories::{Stories, Story, bytes_of, default_name, extension_of};
 use crate::exit::{ExitCode, ExitError};
 use crate::output;
-use crate::ui::browser::input::{Action, Next, Session, TICK, next, page};
+use crate::ui::browser::input::{Action, Next, TICK, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::browser::screen::Screen;
-use crate::ui::browser::viewport::Viewport;
-
-/// Rows the list gives up to everything that is not a story: the heading, the
-/// blank line under it, and the footer.
-const CHROME_ROWS: usize = 3;
+use crate::ui::tui::{self, Tui};
 
 /// Drives the list until the user leaves it.
 ///
@@ -72,9 +66,9 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
 
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    // Taken before the cursor is hidden and dropped after it is shown, so that
-    // an early return cannot leave a terminal in raw mode with no cursor.
-    let _session = Session::enter().map_err(|e| {
+    // The whole claim on the terminal -- raw mode, alternate screen, paste,
+    // cursor -- in one guard, so an early return cannot leave any of it on.
+    let mut tui = Tui::fullscreen().map_err(|e| {
         ExitError::new(
             ExitCode::Error,
             format!("the terminal would not go into raw mode: {e}"),
@@ -82,31 +76,32 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
         .with_hint("--no-interactive prints the listing; --download saves without one")
     })?;
 
+    let colors = tui::colors_enabled();
     let mut selected = 0usize;
+    let mut list = TableState::default();
     let mut opened: Vec<Option<PathBuf>> = vec![None; stories.items.len()];
     let mut note = String::new();
-    let mut screen = Screen::new();
-    let mut view = Viewport::new(1);
+    let mut receipts: Vec<String> = Vec::new();
+    let mut page_rows = 1usize;
 
-    term.hide_cursor().ok();
     let outcome = loop {
-        // Recomputed from the terminal's *current* size on every frame rather
-        // than updated when a resize is reported. Nothing is then ever laid out
-        // against a size that has gone, so a resize event that was coalesced,
-        // delivered late or missed entirely cannot leave the list wrong.
-        view.height = Screen::usable_rows(&term)
-            .saturating_sub(CHROME_ROWS)
-            .max(1);
-        view.follow(selected, stories.items.len());
-        screen.draw(&term, &frame(stories, selected, &view, &note, &term))?;
-        note.clear();
+        // The selection is this loop's; the state keeps only the scroll
+        // offset, which is what makes the list follow the selection with two
+        // rows of margin. Layout is against the terminal's *current* size on
+        // every draw, so a resize event that was coalesced, delivered late or
+        // missed entirely cannot leave the list wrong.
+        list.select(Some(selected));
+        tui.terminal.draw(|frame| {
+            draw(frame, stories, &mut list, &note, colors, &mut page_rows);
+        })?;
 
         let event = match next(TICK) {
             Ok(event) => event,
             // Said on the way out rather than written into `note`, which the
             // next redraw would have shown and there is no next redraw.
             Err(e) => {
-                term.show_cursor().ok();
+                drop(tui);
+                tui::print_receipts(&receipts);
                 return Err(ExitError::new(
                     ExitCode::Error,
                     format!("the keyboard could not be read: {e}"),
@@ -116,19 +111,22 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
         };
 
         let action = match event {
-            // Both mean the same thing here: go round, re-read the size, and
-            // draw. An unchanged frame writes nothing, so an idle browser
-            // waiting for a resize sends no bytes at all.
+            // Both mean the same thing here: go round and draw. The next draw
+            // reads the new size, and an unchanged frame writes nothing, so an
+            // idle browser waiting for a resize sends no bytes at all.
             Next::Tick | Next::Resized => continue,
             Next::Do(action) => action,
         };
+        // A note stays up until the user does something else, not until the
+        // next timer tick wipes it.
+        note.clear();
 
         match action {
             Action::Up => selected = selected.saturating_sub(1),
             Action::Down => selected = (selected + 1).min(stories.items.len() - 1),
-            Action::PageUp => selected = selected.saturating_sub(page(&view)),
+            Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
             Action::PageDown => {
-                selected = (selected + page(&view)).min(stories.items.len() - 1);
+                selected = (selected + page(page_rows)).min(stories.items.len() - 1);
             }
             Action::First => selected = 0,
             Action::Last => selected = stories.items.len() - 1,
@@ -157,13 +155,23 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
                 )
                 .await
                 {
-                    Ok(path) => format!("Saved {}", path.display()),
+                    // Twice on purpose: the note is for now, the receipt is
+                    // for after the alternate screen has taken the note away.
+                    Ok(path) => {
+                        let line = format!("Saved {}", path.display());
+                        receipts.push(line.clone());
+                        line
+                    }
                     Err(e) => format!("Could not save it: {e}"),
                 };
             }
             // A flat list has no level to go up to.
             Action::Back => {}
-            Action::Redraw => screen.invalidate(),
+            // For after anything else has written to the terminal behind the
+            // renderer's back: a diffing renderer is only ever as right as its
+            // belief about what is on screen, and on Windows ConPTY coalesces
+            // positioned writes into fragments no renderer can predict.
+            Action::Redraw => tui.terminal.clear()?,
             Action::Quit => break ExitCode::Ok,
             // Raw mode is what makes this reachable. Outside it, Ctrl+C either
             // raises `SIGINT` or fires the console control handler, and the
@@ -174,98 +182,219 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
         }
     };
 
-    screen.finish(&term).ok();
-    term.show_cursor().ok();
+    drop(tui);
+    tui::print_receipts(&receipts);
     Ok(outcome)
 }
 
-/// Turns the list into the rows to draw, and touches no terminal.
+/// Draws one frame: the shared chrome, the table, and the scrollbar when the
+/// table does not fit.
 ///
-/// Plain `String`s rather than writes, so that the renderer can diff them and
-/// so that what a frame says is a value somebody could assert on. `term` is
-/// borrowed for one question -- whether there is color -- and for nothing else.
-fn frame(
+/// `page_rows` is written with how many rows the list got, which is what Page
+/// Up and Page Down move by -- the keyboard arms cannot see the layout, so the
+/// draw leaves the one number they need behind.
+fn draw(
+    frame: &mut Frame<'_>,
     stories: &Stories,
-    selected: usize,
-    view: &Viewport,
+    list: &mut TableState,
     note: &str,
-    term: &Term,
-) -> Vec<String> {
-    let total = stories.items.len();
-    let mut rows = Vec::with_capacity(view.height + CHROME_ROWS);
+    colors: bool,
+    page_rows: &mut usize,
+) {
+    draw_items_view(
+        frame,
+        format!(
+            "Stories · @{} · {} up",
+            printable(&stories.username),
+            stories.items.len()
+        ),
+        "↑↓ move · enter open · d download · q quit",
+        &stories.items,
+        true,
+        list,
+        note,
+        colors,
+        page_rows,
+    );
+}
 
+/// The one items view, drawn under whatever title and hints its owner gives
+/// it. The story browser, the inside of a highlight folder, and the profile
+/// card's sub-views are all this function, so they cannot drift apart.
+///
+/// `with_left` is what varies: a live story says what is left of it, a kept
+/// one only when it was taken.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
+pub(crate) fn draw_items_view(
+    frame: &mut Frame<'_>,
+    title: String,
+    hint: &str,
+    items: &[Story],
+    with_left: bool,
+    list: &mut TableState,
+    note: &str,
+    colors: bool,
+    page_rows: &mut usize,
+) {
+    let total = items.len();
+    let selected = list.selected().unwrap_or(0);
+    let area = frame.area();
+
+    let mut block = tui::view_block(title, colors, tui::list_padding(area));
+    let inner = block.inner(area);
+    // One row of the interior belongs to the header.
+    let viewport = (inner.height as usize).saturating_sub(1).max(1);
+    *page_rows = viewport;
     // Only when some of the list is off screen. On a list that fits, a counter
     // is one more thing to read that says nothing.
-    let position = if total > view.height {
-        format!("  [{}/{total}]", selected + 1)
-    } else {
-        String::new()
-    };
-    rows.push(format!(
-        "{}{}",
-        style(format!(
-            "Stories of @{} - {total} up",
-            printable(&stories.username)
-        ))
-        .bold(),
-        style(position).dim()
-    ));
-    rows.push(String::new());
-
-    for index in view.range(total) {
-        let story = &stories.items[index];
-        let body = format!(
-            "{:>2}. {:<7} {}{}",
-            index + 1,
-            crate::commands::stories::kind_label(story),
-            crate::commands::stories::posted_and_left(story),
-            if story.mentions.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "  {}",
-                    story
-                        .mentions
-                        .iter()
-                        .map(|m| format!("@{m}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            }
-        );
-        let is_selected = index == selected;
-        // Two markers, and both earn their place. Reverse video is the one that
-        // is visible from across a desk, and it is reverse video rather than a
-        // color because there is no color that is legible on every background:
-        // the user already told their terminal what its foreground and
-        // background are, and this borrows them. The `>` is what is left when
-        // there is no styling at all, which `console` decides from `NO_COLOR`,
-        // `TERM` and whether anyone is attending.
-        let marker = if is_selected { ">" } else { " " };
-        let body = if is_selected && term.features().colors_supported() {
-            style(body).reverse().to_string()
-        } else {
-            body
-        };
-        rows.push(format!("{marker} {body}"));
+    let fits = total <= viewport;
+    if !fits {
+        block = block.title_top(tui::position_line(selected, total, colors));
     }
-
-    rows.push(if note.is_empty() {
-        let mut hint = String::from("up/down: move | enter: open | d: download | q: quit");
-        if view.more_above() || view.more_below(total) {
-            hint.push_str("   ");
-            hint.push(if view.more_above() { '\u{2191}' } else { ' ' });
-            hint.push(if view.more_below(total) {
-                '\u{2193}'
-            } else {
-                ' '
-            });
-        }
-        style(hint).dim().to_string()
+    block = block.title_bottom(if note.is_empty() {
+        tui::hint_line(hint.to_string(), colors)
     } else {
-        style(note.to_string()).yellow().to_string()
+        tui::outcome_line(note.to_string(), colors)
     });
-    rows
+    frame.render_widget(block, area);
+
+    *list.offset_mut() = tui::scrolled_offset(list.offset(), selected, total, viewport, 2);
+    let mut widths = story_widths(items, with_left);
+    let header: &[&str] = if with_left {
+        &["", "kind", "posted", "left", "mentions"]
+    } else {
+        // A kept story's date is `report::dated`, not the story browser's
+        // wording, so its column is re-measured.
+        widths[2] = Constraint::Length(
+            items
+                .iter()
+                .map(|s| crate::report::dated(s.taken_at).len())
+                .max()
+                .unwrap_or(6)
+                .max(5) as u16,
+        );
+        &["", "kind", "taken", "mentions"]
+    };
+    let rows = items.iter().enumerate().map(|(index, story)| {
+        if with_left {
+            story_row(index, story, colors)
+        } else {
+            item_row(
+                index,
+                crate::commands::stories::kind_label(story),
+                crate::report::dated(story.taken_at),
+                None,
+                &story.mentions,
+                colors,
+            )
+        }
+    });
+    frame.render_stateful_widget(
+        Table::new(rows, widths)
+            .header(tui::header_row(header, colors))
+            .column_spacing(2)
+            .row_highlight_style(tui::selection())
+            // What is left of the selection when there is no styling at all.
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always),
+        inner,
+        list,
+    );
+    if !fits {
+        tui::scrollbar(frame, area, total, selected, viewport as u16);
+    }
+}
+
+/// The columns a list of story items needs, measured from the items rather
+/// than guessed: a `photo` and an `unknown` are different widths, and a date
+/// column sized for August is wrong in September. Only `Length` -- the spare
+/// width stays unused on the right, keeping a rail on the left instead of
+/// scattering three facts across a two-hundred-column terminal.
+pub(crate) fn story_widths(items: &[Story], with_left: bool) -> Vec<Constraint> {
+    let kind = items
+        .iter()
+        .map(|s| crate::commands::stories::kind_label(s).len())
+        .max()
+        .unwrap_or(5) as u16;
+    let posted = items
+        .iter()
+        .map(|s| crate::commands::stories::posted_of(s).len())
+        .max()
+        .unwrap_or(6) as u16;
+    let mut widths = vec![
+        Constraint::Length(3),
+        Constraint::Length(kind.max(4)),
+        Constraint::Length(posted.max(6)),
+    ];
+    if with_left {
+        let left = items
+            .iter()
+            .map(|s| crate::commands::stories::left_of(s).len())
+            .max()
+            .unwrap_or(4) as u16;
+        widths.push(Constraint::Length(left.max(4)));
+    }
+    widths.push(Constraint::Fill(1));
+    widths
+}
+
+/// One story as a table row: number dim and right-aligned, kind, when it was
+/// posted, what is left of it, mentions in cyan.
+pub(crate) fn story_row(index: usize, story: &Story, colors: bool) -> Row<'static> {
+    item_row(
+        index,
+        crate::commands::stories::kind_label(story),
+        crate::commands::stories::posted_of(story),
+        Some(crate::commands::stories::left_of(story)),
+        &story.mentions,
+        colors,
+    )
+}
+
+/// The row every view that lists story items draws -- this browser, the
+/// highlight folders, the profile card's sub-views -- so they cannot drift
+/// apart. What varies between them is only the time columns: a story says
+/// when it was posted and what is left of it, a highlight item only when it
+/// was taken (`left` is `None` and the column does not exist).
+pub(crate) fn item_row(
+    index: usize,
+    kind: &str,
+    posted: String,
+    left: Option<String>,
+    mentions: &[String],
+    colors: bool,
+) -> Row<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let number = Line::from(format!("{}.", index + 1)).right_aligned();
+    let mut cells = vec![
+        if colors {
+            Cell::from(number.style(dim))
+        } else {
+            Cell::from(number)
+        },
+        Cell::from(kind.to_string()),
+        Cell::from(posted),
+    ];
+    if let Some(left) = left {
+        cells.push(if colors {
+            Cell::from(left).style(dim)
+        } else {
+            Cell::from(left)
+        });
+    }
+    if !mentions.is_empty() {
+        let joined = mentions
+            .iter()
+            .map(|m| format!("@{m}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        cells.push(if colors {
+            Cell::from(joined).style(Style::new().fg(Color::Cyan))
+        } else {
+            Cell::from(joined)
+        });
+    }
+    Row::new(cells)
 }
 
 /// Writes the story into the scratch directory and hands it to the system
@@ -337,4 +466,131 @@ pub(crate) async fn keep(
         .write_all(&bytes)
         .with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use snob_core::Epoch;
+
+    use super::*;
+    use crate::commands::stories::Kind;
+
+    fn story(mentions: &[&str]) -> Story {
+        Story {
+            kind: Kind::Photo,
+            taken_at: Epoch::new(1_700_000_000),
+            expiring_at: None,
+            url: None,
+            mentions: mentions.iter().map(|m| (*m).to_string()).collect(),
+        }
+    }
+
+    fn listing(count: usize) -> Stories {
+        Stories {
+            username: "someone".into(),
+            items: (0..count).map(|_| story(&[])).collect(),
+        }
+    }
+
+    /// Draws once into a buffer nobody sees, which is what makes a frame a
+    /// value somebody can assert on.
+    fn rendered(
+        stories: &Stories,
+        selected: usize,
+        note: &str,
+        colors: bool,
+        size: (u16, u16),
+    ) -> (Terminal<TestBackend>, usize) {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        let mut list = TableState::default();
+        list.select(Some(selected));
+        let mut page_rows = 0usize;
+        terminal
+            .draw(|frame| draw(frame, stories, &mut list, note, colors, &mut page_rows))
+            .unwrap();
+        (terminal, page_rows)
+    }
+
+    fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// At 50x10 the frame is: border, padding row, header, five data rows,
+    /// padding row is absorbed by the bottom border. The columns have names
+    /// because a date and a countdown do not explain themselves.
+    #[test]
+    fn the_frame_says_whose_stories_and_how_to_drive_them() {
+        let (terminal, page_rows) = rendered(&listing(3), 0, "", false, (50, 10));
+        assert!(row(&terminal, 0).contains("Stories · @someone · 3 up"));
+        let header = row(&terminal, 2);
+        assert!(header.contains("kind"), "{header}");
+        assert!(header.contains("posted"), "{header}");
+        let first = row(&terminal, 3);
+        assert!(first.contains("1."), "{first}");
+        assert!(first.contains("photo"), "{first}");
+        assert!(row(&terminal, 9).contains("enter open"));
+        // Borders, the padding row and the header leave six rows of page.
+        assert_eq!(page_rows, 6);
+    }
+
+    #[test]
+    fn a_note_takes_the_hints_place() {
+        let (terminal, _) = rendered(&listing(3), 0, "Saved ./someone-1.jpg", false, (50, 10));
+        let bottom = row(&terminal, 9);
+        assert!(bottom.contains("Saved ./someone-1.jpg"));
+        assert!(!bottom.contains("enter open"));
+    }
+
+    #[test]
+    fn the_position_appears_only_when_the_list_overflows() {
+        let (overflowing, _) = rendered(&listing(20), 4, "", false, (50, 8));
+        assert!(row(&overflowing, 0).contains("5/20"));
+        let (fitting, _) = rendered(&listing(3), 0, "", false, (50, 10));
+        assert!(!row(&fitting, 0).contains("1/3"));
+    }
+
+    #[test]
+    fn the_selected_row_is_reverse_video_when_styling_is_on() {
+        let (terminal, _) = rendered(&listing(3), 1, "", true, (50, 10));
+        let buffer = terminal.backend().buffer();
+        // Data rows start at y 3 (border, padding, header); the second story
+        // is y 4, and the selection covers the row band.
+        assert!(
+            buffer[(4, 4)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(4, 3)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn a_mention_rides_on_its_story_row() {
+        let stories = Stories {
+            username: "someone".into(),
+            items: vec![story(&["ana", "bob"])],
+        };
+        // Short terminal: the padding is waived, rows start under the header.
+        let (terminal, _) = rendered(&stories, 0, "", false, (60, 6));
+        assert!(row(&terminal, 2).contains("@ana @bob"));
+    }
+
+    /// The widths come off the items: a countdown column is as wide as its
+    /// widest countdown, never a guess.
+    #[test]
+    fn the_columns_are_measured_from_the_items() {
+        let widths = story_widths(&listing(2).items, true);
+        assert_eq!(widths.len(), 5);
+        assert_eq!(widths[1], Constraint::Length(5), "photo is five columns");
+        let without = story_widths(&listing(2).items, false);
+        assert_eq!(without.len(), 4, "no left column for highlight items");
+    }
 }

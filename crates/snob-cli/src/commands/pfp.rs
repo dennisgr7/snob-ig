@@ -18,9 +18,17 @@ use crate::commands::common;
 use crate::engine::target;
 use crate::exit::ExitCode;
 use crate::output::{self, Rendered};
+use crate::report;
 use crate::ui;
 
 pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    // `-i` refused before the session opens and before anything is spent,
+    // like a bad `-o` — the expensive order to find out in is the other one.
+    if args.interactive {
+        crate::ui::people::check_drawable()?;
+    }
+    let browses = args.browses(crate::ui::a_human_would_watch_the_listing_scroll_by());
+
     // No bar: three requests do not need one, and the picture goes to standard
     // output when there is no `-o`.
     let app = common::app(&secrets, paths, false)?;
@@ -35,10 +43,25 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
     // milliseconds, and `start_cooldown` reads a row it finds inside the last
     // day as a repeat offense: one 429 during `snob pfp` became two strikes
     // and four hours instead of one strike and two.
+    let before = app.client().pacer().spent();
     let picture = fetch(app.client(), &args.target).await?;
+    let spent = app.client().pacer().spent().saturating_sub(before);
 
     if app.cancel().is_canceled() {
         return Ok(ExitCode::Interrupted);
+    }
+
+    // The viewer instead of the download — the default at a terminal, the
+    // decision made above. The row says what the picture is; the closing
+    // line says what it cost, once the terminal is back.
+    if browses {
+        let code = crate::ui::pfp::browse(&picture, paths)?;
+        ui::info(&format!(
+            "profile picture of @{} - {}",
+            printable(&picture.username),
+            report::requests(spent)
+        ));
+        return Ok(code);
     }
 
     // Said before the file is written, so a smaller picture is not a caveat
@@ -68,13 +91,27 @@ pub async fn run(args: PfpArgs, secrets: SecretStore, paths: &AppPaths) -> Resul
     Ok(ExitCode::Ok)
 }
 
-struct Picture {
+pub(crate) struct Picture {
     /// As Instagram spells it, not as it was typed.
-    username: String,
+    pub(crate) username: String,
     url: String,
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     /// Which of the two pictures arrived. The command exists for one of them.
-    source: Source,
+    pub(crate) source: Source,
+}
+
+#[cfg(test)]
+impl Picture {
+    /// A picture the viewer's tests can hold without a fetch. Here rather
+    /// than in the test, because `url` is private on purpose.
+    pub(crate) fn for_tests(username: &str, bytes: Vec<u8>) -> Self {
+        Self {
+            username: username.into(),
+            url: String::new(),
+            bytes,
+            source: Source::FullSize { size: None },
+        }
+    }
 }
 
 impl Picture {
@@ -83,7 +120,7 @@ impl Picture {
     /// The URL is no guide: Instagram's signed links carry `stp=dst-jpg`, an
     /// instruction to the CDN to convert, so a path ending in `.webp` regularly
     /// returns JPEG. The first bytes do not have that problem.
-    fn extension(&self) -> &'static str {
+    pub(crate) fn extension(&self) -> &'static str {
         let bytes = self.bytes.as_slice();
         // WebP puts its marker after a four-byte length, hence the offset.
         let webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
@@ -119,9 +156,29 @@ impl std::fmt::Debug for Picture {
 /// allowance quietly stops meaning what it says.
 async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
     let profile = client.web_profile_info(target::clean(typed)).await?;
+    picture(
+        client,
+        profile.id,
+        &profile.username,
+        profile.profile_pic_url_hd.or(profile.profile_pic_url),
+    )
+    .await
+}
 
+/// The half after the name is resolved: the by-id lookup, the choice of URL,
+/// and the picture itself. One paced request plus the CDN.
+///
+/// Split from [`fetch`] so the interactive profile view — which already paid
+/// to resolve the name and holds the pk and the page's fallback address —
+/// can look at the picture for one request instead of two.
+pub(crate) async fn picture(
+    client: &IgClient,
+    pk: snob_core::Pk,
+    username: &str,
+    fallback: Option<String>,
+) -> Result<Picture> {
     // The full-size picture only comes from the by-id endpoint, so this spends
-    // a second request on it. `web_profile_info` has a field named
+    // a request on it. `web_profile_info` has a field named
     // `profile_pic_url_hd`, but what it hands back is a URL carrying an
     // instruction to the CDN to downscale to 320x320 — and that instruction is
     // covered by the URL's signature, so it cannot simply be stripped off.
@@ -132,7 +189,7 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
     // command that appeared to
     // work — and it can be the 429 that has just put the account in cooldown,
     // so the next command refusing came with no explanation anywhere.
-    let (full_size, why_not) = match client.user_info(profile.id).await {
+    let (full_size, why_not) = match client.user_info(pk).await {
         Ok(info) => (info.and_then(|i| i.hd_profile_pic_url_info), None),
         Err(e) => (None, Some(e.to_string())),
     };
@@ -146,13 +203,10 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
                 size: p.width.zip(p.height),
             },
         ),
-        None => match profile.profile_pic_url_hd.or(profile.profile_pic_url) {
+        None => match fallback {
             Some(url) => (url, Source::Smaller { why: why_not }),
             None => {
-                return Err(anyhow!(
-                    "@{} has no profile picture",
-                    printable(&profile.username)
-                ));
+                return Err(anyhow!("@{} has no profile picture", printable(username)));
             }
         },
     };
@@ -160,7 +214,7 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
     // The CDN is not Instagram's API and does not count against its budget.
     let bytes = client.download(&url).await?;
     Ok(Picture {
-        username: profile.username,
+        username: username.to_string(),
         url,
         bytes,
         source,
@@ -173,7 +227,7 @@ async fn fetch(client: &IgClient, typed: &str) -> Result<Picture> {
 /// no dimensions, which would collapse into the same `None` as not having
 /// answered at all — and those are the two cases the whole command turns on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Source {
+pub(crate) enum Source {
     /// The by-id endpoint answered. The size is what it declared, not what was
     /// measured: nothing here decodes the image.
     FullSize { size: Option<(u32, u32)> },
@@ -184,6 +238,16 @@ enum Source {
 }
 
 impl Source {
+    /// What the viewer's row calls the picture: the size when the by-id
+    /// endpoint declared one, and an honest word for the fallback.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::FullSize { size: Some((w, h)) } => format!("{w}x{h}"),
+            Self::FullSize { size: None } => "full size".to_string(),
+            Self::Smaller { .. } => "the smaller profile-page size".to_string(),
+        }
+    }
+
     /// What to tell the user before the file is written, if anything.
     ///
     /// Said **before** the write, so it does not read as a caveat attached to

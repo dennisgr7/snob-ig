@@ -24,6 +24,16 @@ pub async fn run(
 ) -> Result<ExitCode> {
     let filter = common::filter_from(&args.filter)?;
     let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
+    }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
     let mut app = common::open(&args.walk, &secrets, paths)?;
 
@@ -37,12 +47,27 @@ pub async fn run(
 
     let common::Narrowed { shown, kept, total } = common::narrow(found, &filter, args.limit);
 
-    destination.write(&shown)?;
+    // The browser instead of the listing — the default at a terminal, the
+    // decision made above. An empty result is not browsed: there is nothing
+    // to move over, and the summary line already says the count.
+    let browsed = if browses && !shown.is_empty() {
+        let shelf = ui::people::Shelf::flat(format!("{kind} of {subject}"), &shown);
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        destination.write(&shown)?;
+    }
     print_summary(&shown, kept, total, &outcome, kind);
     // A plain list is the one place a partial answer is still worth having:
     // every account in it really is in the list, only some are missing. So it
-    // prints, says so, and exits with what stopped it.
-    Ok(outcome.exit_code_for_a_printed_result())
+    // prints, says so, and exits with what stopped it. Leaving the browser
+    // with Ctrl+C outranks that: it is the freshest thing the user said.
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => outcome.exit_code_for_a_printed_result(),
+    })
 }
 
 /// The singular of a list's name. `Display` gives the plural, and for

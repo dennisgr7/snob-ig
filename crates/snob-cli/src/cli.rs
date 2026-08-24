@@ -407,6 +407,9 @@ pub struct ListArgs {
     pub limit: Option<usize>,
 
     #[command(flatten)]
+    pub browse: BrowseArgs,
+
+    #[command(flatten)]
     pub walk: WalkArgs,
 }
 
@@ -424,7 +427,93 @@ pub struct ScanArgs {
     pub output: OutputArgs,
 
     #[command(flatten)]
+    pub browse: BrowseArgs,
+
+    #[command(flatten)]
     pub walk: WalkArgs,
+}
+
+/// The list commands' way into the account browser. One definition, like
+/// [`ConsentArgs`], so the flags and their conflicts cannot drift between the
+/// six commands that take them.
+///
+/// **The browser is the default at a human terminal**, the same rule the
+/// media browsers keep and for the same reason the owner gave when lifting
+/// the old opt-in there: the browsers are what a person at a terminal wants
+/// first. The first cut of this group took the other view — the listing *is*
+/// the answer, so never detect — and the owner reversed it on 2026-08-24
+/// after using both. What that view protected is still protected, by the
+/// same detection the media commands use: a pipe, a redirect and a script
+/// are exactly the runs `attending` refuses, so scrollback, the terminal's
+/// own search and `snob unfollowers | wc -l` all still read the printed
+/// form. [`BrowseArgs::browses`] is [`MediaActionArgs::browses`] minus the
+/// verbs lists do not have, and the matrix is a test the same way.
+///
+/// One conflict is stricter than the media group's: `-i` is refused beside
+/// `--format` and `-o` rather than out-ranking them, because a list browser
+/// downloads nothing — there is no later step for a format or a destination
+/// to apply to, so accepting either would be accepting-and-ignoring it.
+/// `--no-interactive` conflicts with `-i` alone: beside `--format` or `-o`
+/// it is redundant rather than ignored — each of those already prints — and
+/// a script that says it defensively should not break.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct BrowseArgs {
+    /// Move through the result with the arrow keys: Enter opens the
+    /// account's profile, "/" filters as you type. The default on a
+    /// terminal; this forces it, and fails where no terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with_all = ["format", "path"])]
+    pub interactive: bool,
+
+    /// Print the result and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+}
+
+impl BrowseArgs {
+    /// Whether this run takes the terminal over.
+    ///
+    /// The order is the contract, and it is [`MediaActionArgs::browses`]'s:
+    /// what was *said* wins over what is detected — `-i` first, then anything
+    /// that already asks for the printed or written form — and only a run
+    /// that asked for nothing at all falls to detection. `attending` is
+    /// [`crate::ui::a_human_would_watch_the_listing_scroll_by`]: all three
+    /// streams a terminal, because the browser reads keys, draws on standard
+    /// error and *withholds* the result from standard output.
+    ///
+    /// A pure function of its inputs so the whole matrix is testable without
+    /// a terminal; the caller supplies the one detected bit.
+    pub fn browses(&self, printed_form_asked: bool, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            printed_form_asked,
+            attending,
+        )
+    }
+}
+
+/// The one rule every browse group applies: what was *said* wins over what
+/// is detected — `-i` first, then anything that already asked for the
+/// printed or written form — and only a run that asked for nothing at all
+/// falls to detection.
+///
+/// One function rather than four copies of the ordering, because the
+/// ordering is the contract and four copies of a contract drift. The groups
+/// stay separate structs — their conflicts differ, and clap conflicts are
+/// declared per command — but the decision they feed is this one.
+fn browse_decision(
+    interactive: bool,
+    no_interactive: bool,
+    printed_form_asked: bool,
+    attending: bool,
+) -> bool {
+    if interactive {
+        return true;
+    }
+    if no_interactive || printed_form_asked {
+        return false;
+    }
+    attending
 }
 
 /// Which accounts a list keeps.
@@ -802,6 +891,32 @@ pub struct ProfileArgs {
     /// Write the result to a file instead of standard output
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+
+    // Not [`BrowseArgs`], deliberately: that group's conflicts name the ids
+    // `format` and `path`, and this command's `-o` field is `output` — clap
+    // refuses unknown ids, and `Cli::command().debug_assert()` holds it.
+    // The rule itself is shared through [`browse_decision`].
+    /// Browse the profile with the arrow keys: Enter opens what is under the
+    /// cursor. The default on a terminal; this forces it, and fails where no
+    /// terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with_all = ["format", "output"])]
+    pub interactive: bool,
+
+    /// Print the profile and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+}
+
+impl ProfileArgs {
+    /// Whether this run takes the terminal over. See [`browse_decision`].
+    pub fn browses(&self, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            self.format.is_some() || self.output.is_some(),
+            attending,
+        )
+    }
 }
 
 #[derive(Args, Debug)]
@@ -812,6 +927,28 @@ pub struct PfpArgs {
     /// Destination file
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+
+    /// Look at the picture before deciding: Enter opens it in the system
+    /// viewer, D saves it here. The default on a terminal; this forces it,
+    /// and fails where no terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with = "output")]
+    pub interactive: bool,
+
+    /// Download the picture and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+}
+
+impl PfpArgs {
+    /// Whether this run takes the terminal over. See [`browse_decision`].
+    pub fn browses(&self, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            self.output.is_some(),
+            attending,
+        )
+    }
 }
 
 /// What `-d/--download` selects, decided at the parser so a typo is exit 2
@@ -1176,6 +1313,147 @@ mod tests {
     fn offline_and_refresh_are_mutually_exclusive() {
         let result = Cli::try_parse_from(["snob", "followers", "--offline", "--refresh"]);
         assert!(result.is_err());
+    }
+
+    /// `-i` on a list command withholds the printed listing, so it is refused
+    /// beside anything that names the printed or written form — accepted and
+    /// ignored is the shape the format enums exist to refuse. It composes
+    /// with everything that narrows the *result*: the browser shows what the
+    /// listing would have shown.
+    #[test]
+    fn the_list_browser_conflicts_with_the_printed_forms_and_composes_with_the_rest() {
+        for command in ["unfollowers", "fans", "friends", "followers", "following"] {
+            assert!(
+                Cli::try_parse_from(["snob", command, "-i"]).is_ok(),
+                "{command} takes -i"
+            );
+            for said_a_form in [vec!["--format", "json"], vec!["-o", "list.csv"]] {
+                let mut line = vec!["snob", command, "-i"];
+                line.extend(said_a_form.iter());
+                assert!(
+                    Cli::try_parse_from(&line).is_err(),
+                    "{command} -i beside {said_a_form:?} would be accepted and ignored"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["snob", "unfollowers", "-i", "--limit", "5", "--offline"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["snob", "scan", "-i"]).is_ok(),
+            "scan browses its five lists as a tray"
+        );
+        assert!(Cli::try_parse_from(["snob", "scan", "-i", "--format", "json"]).is_err());
+
+        // The two spellings contradict each other and clap says so; beside
+        // the flags that already print, --no-interactive is redundant and
+        // allowed, so a defensive script survives.
+        assert!(Cli::try_parse_from(["snob", "unfollowers", "--no-interactive", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "snob",
+                "unfollowers",
+                "--no-interactive",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "scan", "--no-interactive"]).is_ok());
+    }
+
+    /// The list commands' half of the take-over matrix, the same shape as
+    /// the media one below: what was said beats what was detected, and only
+    /// a run that asked for nothing at all listens to the detection bit.
+    #[test]
+    fn the_list_browser_is_the_default_only_when_nothing_else_was_asked_for() {
+        let browse = |line: &[&str]| {
+            let Command::Unfollowers(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("unfollowers");
+            };
+            let printed = args.output.format.is_some() || args.output.path.is_some();
+            (args.browse, printed)
+        };
+
+        // Nothing asked for: the detection bit decides.
+        let (bare, printed) = browse(&["snob", "unfollowers"]);
+        assert!(bare.browses(printed, true));
+        assert!(!bare.browses(printed, false), "a pipe never gets a browser");
+
+        // Forced on: a terminal that cannot browse is an error, not a print.
+        let (forced, printed) = browse(&["snob", "unfollowers", "-i"]);
+        assert!(forced.browses(printed, false));
+
+        // Every explicit route to the printed form wins over an attending
+        // terminal. (`-i` beside these is a clap conflict, tested above.)
+        for line in [
+            &["snob", "unfollowers", "--no-interactive"][..],
+            &["snob", "unfollowers", "--format", "json"][..],
+            &["snob", "unfollowers", "-o", "list.csv"][..],
+        ] {
+            let (static_asked, printed) = browse(line);
+            assert!(
+                !static_asked.browses(printed, true),
+                "{line:?} must not open the browser"
+            );
+        }
+    }
+
+    /// `profile` and `pfp` carry their own browse pair — their `-o`/`--format`
+    /// ids differ from the lists', so [`BrowseArgs`] cannot be flattened in —
+    /// but the decision they feed is the shared one, and this is its matrix.
+    #[test]
+    fn profile_and_pfp_follow_the_same_browse_rule() {
+        // Said beats detected, and only a bare run listens to detection.
+        assert!(
+            browse_decision(true, false, false, false),
+            "-i wins outright"
+        );
+        assert!(!browse_decision(false, true, false, true));
+        assert!(!browse_decision(false, false, true, true));
+        assert!(browse_decision(false, false, false, true));
+        assert!(!browse_decision(false, false, false, false));
+
+        let profile = |line: &[&str]| {
+            let Command::Profile(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("profile");
+            };
+            args
+        };
+        assert!(profile(&["snob", "profile"]).browses(true));
+        assert!(!profile(&["snob", "profile"]).browses(false));
+        assert!(profile(&["snob", "profile", "-i"]).browses(false));
+        assert!(!profile(&["snob", "profile", "--no-interactive"]).browses(true));
+        assert!(!profile(&["snob", "profile", "--format", "json"]).browses(true));
+        assert!(!profile(&["snob", "profile", "-o", "out.md"]).browses(true));
+
+        let pfp = |line: &[&str]| {
+            let Command::Pfp(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("pfp");
+            };
+            args
+        };
+        assert!(pfp(&["snob", "pfp", "x"]).browses(true));
+        assert!(!pfp(&["snob", "pfp", "x"]).browses(false));
+        assert!(pfp(&["snob", "pfp", "x", "-i"]).browses(false));
+        assert!(!pfp(&["snob", "pfp", "x", "--no-interactive"]).browses(true));
+        assert!(!pfp(&["snob", "pfp", "x", "-o", "face.jpg"]).browses(true));
+
+        // The conflicts: -i beside a printed or written form is refused, the
+        // two spellings contradict each other, and --no-interactive beside a
+        // form that already prints stays redundant-and-allowed.
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "--format", "json"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "-o", "out.md"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "--no-interactive"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "profile", "--no-interactive", "--format", "json"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "pfp", "x", "-i", "-o", "f.jpg"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "pfp", "x", "-i", "--no-interactive"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "pfp", "x", "--no-interactive", "-o", "f.jpg"]).is_ok()
+        );
     }
 
     /// `--cache` was the spelling until August 2026; a script written against

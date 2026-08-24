@@ -1,11 +1,11 @@
-//! Keys for the story browser, read through `crossterm` rather than
+//! Keys for the interactive views, read through `crossterm` rather than
 //! `console::Term::read_key`.
 //!
-//! This is the one place in the program that does not read keys with `console`,
-//! and the split is deliberate: `console` still draws everything, because it
-//! measures display columns and knows what a terminal supports, and it is only
-//! the *reading* that moved. Two of the reasons are defects rather than
-//! improvements, and they are why this is the change that mattered most.
+//! Reading is its own module because it is its own problem: `ratatui` only
+//! writes, and `console` -- which still asks the capability questions and
+//! prints everything outside the views -- reads keys badly. Two of the
+//! reasons are defects rather than improvements, and they are why this is
+//! the change that mattered most.
 //!
 //! **Shift+Left used to download a story.** `console`'s escape parser
 //! understands `ESC [ <letter>` and `ESC [ <digit> ~`, and nothing else -- it
@@ -34,7 +34,12 @@
 //!   `WINDOW_BUFFER_SIZE_EVENT`, which `console` does not merely fail to report
 //!   -- its `read_key_event` loop skips every record that is not a `KEY_EVENT`,
 //!   so it consumes and discards it.
-//! - **Raw mode that lasts.** See [`Session`].
+//! - **Raw mode that lasts.** `read_single_key` calls `tcsetattr` twice
+//!   around every keypress, so between two keys the terminal is back in
+//!   canonical mode with `ECHO` on: anything typed while a browser is off
+//!   fetching megabytes from the CDN would echo into the frame. The raw mode
+//!   these views hold for the whole session lives on [`crate::ui::tui::Tui`],
+//!   with the rest of the terminal claim.
 //!
 //! What is **not** taken: mouse tracking, focus events and the kitty keyboard
 //! protocol. Mouse capture breaks the terminal's own text selection, which is
@@ -42,67 +47,22 @@
 //! four keys do not need it. The kitty protocol exists to disambiguate
 //! Shift+Enter and Ctrl+Enter, which nothing here binds.
 
-use std::io::stderr;
 use std::time::Duration;
 
-use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-
-use super::viewport::Viewport;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// How long the browser waits before waking up to look at the terminal size.
 ///
 /// An unchanged frame writes nothing, so the cost of a wake-up is one
-/// `GetConsoleScreenBufferInfo` or `TIOCGWINSZ` and a comparison of two
-/// vectors of strings. Short enough that a resize looks immediate, long enough
-/// that an idle browser is not a spin.
+/// `GetConsoleScreenBufferInfo` or `TIOCGWINSZ` and a cell-buffer diff that
+/// finds nothing to send. Short enough that a resize looks immediate, long
+/// enough that an idle browser is not a spin.
+///
+/// The raw mode these reads depend on is the guard's — `ui::tui::Tui` turns
+/// it on for the whole session, which is also what makes Ctrl+C answerable:
+/// under crossterm's raw mode it is a `KeyEvent` carrying `CONTROL`, on both
+/// platforms, which is something a program can decide about.
 pub const TICK: Duration = Duration::from_millis(150);
-
-/// Raw mode and bracketed paste, held for as long as the browser is up.
-///
-/// **Raw mode for the session, not for one read**, and that is the difference
-/// from `console`. `read_single_key` calls `tcsetattr` twice around every
-/// keypress, so between two keys the terminal is back in canonical mode with
-/// `ECHO` on: anything typed while the browser is off fetching a story from the
-/// CDN is echoed into the middle of the frame and then delivered as a line when
-/// the next read starts. A story can be several megabytes, so that window is
-/// not theoretical.
-///
-/// It is also what makes Ctrl+C answerable. `Term::read_key` calls
-/// `read_single_key(false)`; `cfmakeraw` has already cleared `ISIG`, so on Unix
-/// Ctrl+C arrives as `Key::Char('\x03')` and never as `Key::CtrlC`, and on
-/// Windows `ENABLE_PROCESSED_INPUT` stays on so it never reaches the read at
-/// all. Under crossterm's raw mode it is a `KeyEvent` carrying `CONTROL`, on
-/// both platforms, which is something a program can decide about.
-///
-/// A guard rather than two calls, so that leaving through an error puts the
-/// terminal back. **It does not run on a panic** -- the release profile is
-/// `panic = "abort"`, so no destructor does -- and what covers that case is not
-/// this program: every interactive shell's line editor sets the terminal modes
-/// it wants before it prompts.
-pub struct Session;
-
-impl Session {
-    pub fn enter() -> std::io::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        // Not fatal. A terminal that will not turn bracketed paste on is a
-        // terminal where paste behaves the way it did before, which is a state
-        // the browser is already prepared for -- so this is worth having and
-        // not worth refusing to start over.
-        execute!(stderr(), EnableBracketedPaste).ok();
-        Ok(Self)
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        execute!(stderr(), DisableBracketedPaste).ok();
-        crossterm::terminal::disable_raw_mode().ok();
-    }
-}
 
 /// What the browser understands, resolved from a key.
 ///
@@ -141,21 +101,50 @@ pub enum Next {
     Tick,
 }
 
-/// Waits up to `timeout` for something to happen.
-pub fn next(timeout: Duration) -> std::io::Result<Next> {
+/// What came back from the terminal, before any binding is applied.
+///
+/// For the one browser that has a text mode: while the account list is being
+/// filtered, a `q` is a letter of somebody's name and not a way out, so the
+/// binding cannot be decided here. Everything else keeps reading through
+/// [`next`], which applies [`action_of`] and swallows pastes — a browser with
+/// no text mode has nowhere safe to put one.
+pub enum Raw {
+    /// A key going down. Releases are already filtered out — on Windows the
+    /// console reports both, and without the filter every keystroke would
+    /// count twice.
+    Key(KeyEvent),
+    /// A paste, whole, thanks to bracketed paste. The caller decides whether
+    /// it is text to keep or noise to drop.
+    Paste(String),
+    Resized,
+    Tick,
+}
+
+/// Waits up to `timeout` for something to happen, and hands it over unbound.
+pub fn read(timeout: Duration) -> std::io::Result<Raw> {
     if !event::poll(timeout)? {
-        return Ok(Next::Tick);
+        return Ok(Raw::Tick);
     }
     Ok(match event::read()? {
-        Event::Resize(..) => Next::Resized,
-        // Swallowed whole, and that is the entire fix. Without mode 2004 the
-        // same paste arrives as its characters and some of them are commands.
-        Event::Paste(_) => Next::Do(Action::None),
+        Event::Resize(..) => Raw::Resized,
+        Event::Paste(text) => Raw::Paste(text),
         // `KeyEventKind` matters on Windows, where the console reports the
         // release of a key as well as the press. Without this filter every
         // keystroke moves the selection twice.
-        Event::Key(key) if key.kind == KeyEventKind::Press => Next::Do(action_of(key)),
-        _ => Next::Do(Action::None),
+        Event::Key(key) if key.kind == KeyEventKind::Press => Raw::Key(key),
+        _ => Raw::Tick,
+    })
+}
+
+/// Waits up to `timeout` for something to happen.
+pub fn next(timeout: Duration) -> std::io::Result<Next> {
+    Ok(match read(timeout)? {
+        Raw::Tick => Next::Tick,
+        Raw::Resized => Next::Resized,
+        // Swallowed whole, and that is the entire fix. Without mode 2004 the
+        // same paste arrives as its characters and some of them are commands.
+        Raw::Paste(_) => Next::Do(Action::None),
+        Raw::Key(key) => Next::Do(action_of(key)),
     })
 }
 
@@ -192,13 +181,13 @@ pub fn action_of(key: KeyEvent) -> Action {
     }
 }
 
-/// How far Page Up and Page Down move.
+/// How far Page Up and Page Down move, given how many rows the list has.
 ///
 /// What is on screen less one row, so that the row the selection was on stays
 /// visible after the jump and there is something to read the new position
 /// against. Not input, but it belongs beside the two keys that ask for it.
-pub fn page(vp: &Viewport) -> usize {
-    vp.height.saturating_sub(1).max(1)
+pub fn page(height: usize) -> usize {
+    height.saturating_sub(1).max(1)
 }
 
 #[cfg(test)]
@@ -307,8 +296,8 @@ mod tests {
 
     #[test]
     fn a_page_leaves_one_row_of_overlap() {
-        assert_eq!(page(&Viewport::new(20)), 19);
+        assert_eq!(page(20), 19);
         // And never zero, or Page Down would not move.
-        assert_eq!(page(&Viewport::new(1)), 1);
+        assert_eq!(page(1), 1);
     }
 }

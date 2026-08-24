@@ -48,6 +48,15 @@ impl SetOp {
         }
     }
 
+    /// The command's own name: what `-i`'s heading calls the result.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unfollowers => "unfollowers",
+            Self::Fans => "fans",
+            Self::Friends => "friends",
+        }
+    }
+
     /// The list the results come out of.
     fn base(self) -> ListKind {
         match self {
@@ -84,6 +93,16 @@ pub async fn run(
 ) -> Result<ExitCode> {
     let filter = common::filter_from(&args.filter)?;
     let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
+    }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
     let mut app = common::open(&args.walk, &secrets, paths)?;
 
@@ -116,7 +135,18 @@ pub async fn run(
         total,
     } = common::narrow(result, &filter, args.limit);
 
-    destination.write(&result)?;
+    // The browser instead of the listing — the default at a terminal, the
+    // decision made above. An empty result is not browsed: there is nothing
+    // to move over, and the summary line already says the count.
+    let browsed = if browses && !result.is_empty() {
+        let shelf = ui::people::Shelf::flat(format!("{} of {subject}", op.name()), &result);
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        destination.write(&result)?;
+    }
 
     print_summary(
         op,
@@ -130,8 +160,13 @@ pub async fn run(
 
     // Decided by what stopped the **base** list alone. The list crossed
     // against is not consulted: it was refused outright by
-    // `check_against_list`, well before there was a result to code.
-    Ok(base_outcome.exit_code_for_a_printed_result())
+    // `check_against_list`, well before there was a result to code. Leaving
+    // the browser with Ctrl+C outranks it: it is the freshest thing the user
+    // said.
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => base_outcome.exit_code_for_a_printed_result(),
+    })
 }
 
 /// The check that stops a false result from being reported.

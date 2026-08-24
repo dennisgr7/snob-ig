@@ -88,6 +88,35 @@ fn is_still_good(snapshot: &snapshots::Snapshot, declared: Option<u64>, max_age_
     fresh && unchanged
 }
 
+/// A stored list that still answers, if there is one — for a caller that
+/// already holds today's counter and wants to know whether opening the list
+/// will cost anything before asking anybody about spending.
+///
+/// The interactive profile view is that caller: the counter came off
+/// `web_profile_info` moments ago, so comparing against it is the same
+/// honesty [`is_still_good`] gives the poll, without spending the poll. The
+/// members are returned rather than the snapshot, because the one thing the
+/// caller does with a fresh list is show it.
+pub(crate) fn fresh_members(
+    app: &App,
+    account: snob_core::Pk,
+    kind: ListKind,
+    declared: Option<u64>,
+    max_age: std::time::Duration,
+) -> Result<Option<Vec<User>>> {
+    let Some(snapshot) = snapshots::latest_complete(app.db().conn(), account, kind)? else {
+        return Ok(None);
+    };
+    if !is_still_good(
+        &snapshot,
+        declared,
+        i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX),
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(snapshots::members(app.db().conn(), snapshot.id)?))
+}
+
 fn serve(
     app: &App,
     snapshot: &snapshots::Snapshot,
