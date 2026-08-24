@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/snob-ig", "crates/snob-core", "crates/snob-store", "crates/snob-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"

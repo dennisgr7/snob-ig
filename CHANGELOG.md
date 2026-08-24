@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-08-24
 
 - **Ctrl+C reaches a download in flight.** Inside every browser the keyboard
   now stays live while a story, a highlight or a picture is being fetched:
