@@ -120,15 +120,25 @@ pub(super) fn say_what_was_given_up(given_up: usize) {
     if given_up == 0 {
         return;
     }
+    eprintln!("warning: {}", given_up_sentence(given_up));
+}
+
+/// The abandoned-reports sentence, plural tuple and all, written once.
+///
+/// `status` prints the same event -- rows the sweep marked `expired` -- and
+/// carried a second copy of this string with its own agreement tuple; the two
+/// had already drifted over punctuation, which is the small end of the way
+/// copies drift.
+pub(super) fn given_up_sentence(given_up: usize) -> String {
     let (subject, what) = if given_up == 1 {
         ("report was", "what it said is")
     } else {
         ("reports were", "what they said is")
     };
-    eprintln!(
-        "warning: {given_up} {subject} given up on for being too old to be news; \
+    format!(
+        "{given_up} {subject} given up on for being too old to be news; \
          {what} not reported a second time."
-    );
+    )
 }
 
 /// Returned as lines rather than printed, so a test can read them without

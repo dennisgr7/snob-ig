@@ -35,7 +35,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use console::{Term, measure_text_width};
+use console::measure_text_width;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -156,27 +156,15 @@ pub async fn browse(
     typed: Option<&str>,
     paths: &AppPaths,
 ) -> Result<ExitCode> {
-    let term = Term::stderr();
-    if !term.is_term() {
-        return Err(
-            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("--no-interactive prints the profile; --format and -o shape it")
-                .into(),
-        );
-    }
-
     // Before this session's own directory is made, so that a run which never
     // gets that far still tidies up after the ones before it.
     snob_store::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    let mut tui = Tui::fullscreen().map_err(|e| {
-        ExitError::new(
-            ExitCode::Error,
-            format!("the terminal would not go into raw mode: {e}"),
-        )
-        .with_hint("--no-interactive prints the profile; --format and -o shape it")
-    })?;
+    // Both refusals -- no terminal, raw mode refused -- live in
+    // `tui::claim_fullscreen`, with this view's hint on each.
+    let mut tui =
+        tui::claim_fullscreen("--no-interactive prints the profile; --format and -o shape it")?;
 
     let own = app.viewer().pk == profile.pk;
     let rows = card_rows(profile);
@@ -224,435 +212,442 @@ pub async fn browse(
     let mut list = TableState::default();
     let mut page_rows = 1usize;
 
-    let outcome = loop {
-        match state.level {
-            Level::Stories => list.select(Some(state.stories_selected)),
-            Level::Inside { index } => list.select(Some(media.folders[index].selected)),
-            Level::Card | Level::Actions { .. } => {}
-        }
-        tui.terminal.draw(|frame| match state.level {
-            Level::Card => draw_card(frame, profile, &media, &state, &rows, own, &note, colors),
-            Level::Actions { selected } => {
-                // The card stays underneath: the submenu acts on the account
-                // the card shows, and losing sight of it helps nobody.
-                draw_card(frame, profile, &media, &state, &rows, own, &note, colors);
-                draw_actions_panel(frame, profile, selected, &note, colors);
+    // The loop runs inside a block so that every way out — a draw that
+    // fails included — passes through the guard's drop and the receipts:
+    // an error that returned straight through `?` took every "Saved ..."
+    // line down with the alternate screen.
+    let outcome: Result<ExitCode> = async {
+        loop {
+            match state.level {
+                Level::Stories => list.select(Some(state.stories_selected)),
+                Level::Inside { index } => list.select(Some(media.folders[index].selected)),
+                Level::Card | Level::Actions { .. } => {}
             }
-            Level::Stories => crate::ui::stories::draw_items_view(
-                frame,
-                format!(
-                    "Stories · @{} · {} up",
-                    printable(&profile.username),
-                    media.stories.len()
-                ),
-                "↑↓ move · enter open · d download · ← back · q quit",
-                &media.stories,
-                true,
-                &mut list,
-                &note,
-                colors,
-                &mut page_rows,
-            ),
-            Level::Inside { index } => {
-                let folder = &media.folders[index];
-                let items = folder.items.as_deref().unwrap_or_default();
-                crate::ui::stories::draw_items_view(
+            tui.terminal.draw(|frame| match state.level {
+                Level::Card => draw_card(frame, profile, &media, &state, &rows, own, &note, colors),
+                Level::Actions { selected } => {
+                    // The card stays underneath: the submenu acts on the account
+                    // the card shows, and losing sight of it helps nobody.
+                    draw_card(frame, profile, &media, &state, &rows, own, &note, colors);
+                    draw_actions_panel(frame, profile, selected, &note, colors);
+                }
+                Level::Stories => crate::ui::stories::draw_items_view(
                     frame,
                     format!(
-                        "@{} · {} · {} items",
+                        "Stories · @{} · {} up",
                         printable(&profile.username),
-                        entry_title(&media.tray.entries[index]),
-                        items.len()
+                        media.stories.len()
                     ),
                     "↑↓ move · enter open · d download · ← back · q quit",
-                    items,
-                    false,
+                    &media.stories,
+                    true,
                     &mut list,
                     &note,
                     colors,
                     &mut page_rows,
-                );
-            }
-        })?;
-
-        let event = match input::read(TICK) {
-            Ok(event) => event,
-            Err(e) => {
-                drop(tui);
-                tui::print_receipts(&receipts);
-                return Err(ExitError::new(
-                    ExitCode::Error,
-                    format!("the keyboard could not be read: {e}"),
-                )
-                .into());
-            }
-        };
-        let key = match event {
-            Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
-            Raw::Key(key) => key,
-        };
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // A note stays up until the user does something else, not until the
-        // next timer tick wipes it -- but never under a pending question,
-        // whose branch writes its own.
-        if state.ask == Ask::None {
-            note.clear();
-        }
-
-        // A pending question owns the keyboard: y runs it, n or Esc declines,
-        // Ctrl+C still interrupts, and everything else — `q` included — is
-        // ignored rather than quietly quitting mid-question.
-        if state.ask != Ask::None {
-            match key.code {
-                KeyCode::Char('c') if ctrl => break ExitCode::Interrupted,
-                KeyCode::Char('y') | KeyCode::Char('Y') if plain => {
-                    let pending = std::mem::replace(&mut state.ask, Ask::None);
-                    let after = match pending {
-                        Ask::List(kind) => {
-                            consent_was_given(app, typed, own);
-                            walk_and_open(app, &mut tui, &mut receipts, typed, profile, kind)
-                                .await?
-                        }
-                        Ask::Scan => {
-                            consent_was_given(app, typed, own);
-                            scan_and_open(app, &mut tui, &mut receipts, typed, profile).await?
-                        }
-                        Ask::None => After::Stay(String::new()),
-                    };
-                    match after {
-                        After::Stay(text) => note = text,
-                        After::Leave(code) => break code,
-                    }
+                ),
+                Level::Inside { index } => {
+                    let folder = &media.folders[index];
+                    let items = folder.items.as_deref().unwrap_or_default();
+                    crate::ui::stories::draw_items_view(
+                        frame,
+                        format!(
+                            "@{} · {} · {} items",
+                            printable(&profile.username),
+                            entry_title(&media.tray.entries[index]),
+                            items.len()
+                        ),
+                        "↑↓ move · enter open · d download · ← back · q quit",
+                        items,
+                        false,
+                        &mut list,
+                        &note,
+                        colors,
+                        &mut page_rows,
+                    );
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if plain => {
-                    state.ask = Ask::None;
-                    note = "Nothing walked".to_string();
-                }
-                _ => {}
-            }
-            continue;
-        }
+            })?;
 
-        let level_before = state.level;
-        match state.level {
-            Level::Card => {
-                let here = rows[state.row.min(rows.len() - 1)];
-                // Left and Right move the column on the horizontal rows, and
-                // must not reach `action_of`, whose Left is Back and whose
-                // Right is Open.
-                if plain && matches!(here, CardRow::Counts | CardRow::Highlights) {
-                    let (col, len) = match here {
-                        CardRow::Counts => (&mut state.counts_col, 3),
-                        CardRow::Highlights => (&mut state.hl_col, media.tray.entries.len()),
-                        _ => unreachable!(),
-                    };
-                    match key.code {
-                        KeyCode::Left => {
-                            *col = col.saturating_sub(1);
-                            continue;
-                        }
-                        KeyCode::Right => {
-                            *col = (*col + 1).min(len.saturating_sub(1));
-                            continue;
-                        }
-                        _ => {}
-                    }
+            let event = match input::read(TICK) {
+                Ok(event) => event,
+                Err(e) => {
+                    return Err(ExitError::new(
+                        ExitCode::Error,
+                        format!("the keyboard could not be read: {e}"),
+                    )
+                    .into());
                 }
-                match action_of(key) {
-                    Action::Up => state.row = state.row.saturating_sub(1),
-                    Action::Down => state.row = (state.row + 1).min(rows.len() - 1),
-                    Action::First => state.row = 0,
-                    Action::Last => state.row = rows.len() - 1,
-                    Action::Open => match here {
-                        CardRow::Actions => state.level = Level::Actions { selected: 0 },
-                        CardRow::Stories => state.level = Level::Stories,
-                        CardRow::FollowedBy => {
-                            match followed_by_open(
-                                app,
-                                &mut tui,
-                                &mut receipts,
-                                profile,
-                                &mut media,
-                            )
-                            .await?
-                            {
-                                After::Stay(text) => note = text,
-                                After::Leave(code) => break code,
+            };
+            let key = match event {
+                Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
+                Raw::Key(key) => key,
+            };
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // A note stays up until the user does something else, not until the
+            // next timer tick wipes it -- but never under a pending question,
+            // whose branch writes its own.
+            if state.ask == Ask::None {
+                note.clear();
+            }
+
+            // A pending question owns the keyboard: y runs it, n or Esc declines,
+            // Ctrl+C still interrupts, and everything else — `q` included — is
+            // ignored rather than quietly quitting mid-question.
+            if state.ask != Ask::None {
+                match key.code {
+                    KeyCode::Char('c') if ctrl => break Ok(ExitCode::Interrupted),
+                    KeyCode::Char('y') | KeyCode::Char('Y') if plain => {
+                        let pending = std::mem::replace(&mut state.ask, Ask::None);
+                        let after = match pending {
+                            Ask::List(kind) => {
+                                consent_was_given(app, typed, own);
+                                walk_and_open(app, &mut tui, &mut receipts, typed, profile, kind)
+                                    .await?
                             }
+                            Ask::Scan => {
+                                consent_was_given(app, typed, own);
+                                scan_and_open(app, &mut tui, &mut receipts, typed, profile).await?
+                            }
+                            Ask::None => After::Stay(String::new()),
+                        };
+                        match after {
+                            After::Stay(text) => note = text,
+                            After::Leave(code) => break Ok(code),
                         }
-                        CardRow::Counts => match state.counts_col {
-                            0 => note = "Posts are not browsable yet".to_string(),
-                            col => {
-                                let kind = if col == 1 {
-                                    ListKind::Followers
-                                } else {
-                                    ListKind::Following
-                                };
-                                match list_open(
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if plain => {
+                        state.ask = Ask::None;
+                        note = "Nothing walked".to_string();
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let level_before = state.level;
+            match state.level {
+                Level::Card => {
+                    let here = rows[state.row.min(rows.len() - 1)];
+                    // Left and Right move the column on the horizontal rows, and
+                    // must not reach `action_of`, whose Left is Back and whose
+                    // Right is Open.
+                    if plain && matches!(here, CardRow::Counts | CardRow::Highlights) {
+                        let (col, len) = match here {
+                            CardRow::Counts => (&mut state.counts_col, 3),
+                            CardRow::Highlights => (&mut state.hl_col, media.tray.entries.len()),
+                            _ => unreachable!(),
+                        };
+                        match key.code {
+                            KeyCode::Left => {
+                                *col = col.saturating_sub(1);
+                                continue;
+                            }
+                            KeyCode::Right => {
+                                *col = (*col + 1).min(len.saturating_sub(1));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    match action_of(key) {
+                        Action::Up => state.row = state.row.saturating_sub(1),
+                        Action::Down => state.row = (state.row + 1).min(rows.len() - 1),
+                        Action::First => state.row = 0,
+                        Action::Last => state.row = rows.len() - 1,
+                        Action::Open => match here {
+                            CardRow::Actions => state.level = Level::Actions { selected: 0 },
+                            CardRow::Stories => state.level = Level::Stories,
+                            CardRow::FollowedBy => {
+                                match followed_by_open(
                                     app,
                                     &mut tui,
                                     &mut receipts,
                                     profile,
-                                    kind,
-                                    &mut state,
+                                    &mut media,
                                 )
                                 .await?
                                 {
                                     After::Stay(text) => note = text,
-                                    After::Leave(code) => break code,
+                                    After::Leave(code) => break Ok(code),
+                                }
+                            }
+                            CardRow::Counts => match state.counts_col {
+                                0 => note = "Posts are not browsable yet".to_string(),
+                                col => {
+                                    let kind = if col == 1 {
+                                        ListKind::Followers
+                                    } else {
+                                        ListKind::Following
+                                    };
+                                    match list_open(
+                                        app,
+                                        &mut tui,
+                                        &mut receipts,
+                                        profile,
+                                        kind,
+                                        &mut state,
+                                    )
+                                    .await?
+                                    {
+                                        After::Stay(text) => note = text,
+                                        After::Leave(code) => break Ok(code),
+                                    }
+                                }
+                            },
+                            CardRow::Highlights => {
+                                let index = state.hl_col;
+                                let (result, stopped) = watching_cancel_keys(
+                                    app.client().pacer().cancel_token(),
+                                    walk_in(app.client(), &media.tray, index, &mut media.folders),
+                                )
+                                .await;
+                                match result {
+                                    Ok(true) => state.level = Level::Inside { index },
+                                    Ok(false) => note = empty_note(index),
+                                    Err(e) => note = format!("Could not open it: {e}"),
+                                }
+                                if let Some(code) = stopped.leave() {
+                                    break Ok(code);
                                 }
                             }
                         },
-                        CardRow::Highlights => {
-                            let index = state.hl_col;
-                            let (result, stopped) = watching_cancel_keys(
-                                app.client().pacer().cancel_token(),
-                                walk_in(app.client(), &media.tray, index, &mut media.folders),
-                            )
-                            .await;
-                            match result {
-                                Ok(true) => state.level = Level::Inside { index },
-                                Ok(false) => note = empty_note(index),
-                                Err(e) => note = format!("Could not open it: {e}"),
-                            }
-                            if let Some(code) = stopped.leave() {
-                                break code;
+                        Action::Download => {
+                            if here == CardRow::Highlights {
+                                let (folder_note, stopped) = watching_cancel_keys(
+                                    app.client().pacer().cancel_token(),
+                                    keep_folder(
+                                        app.client(),
+                                        &media.tray,
+                                        state.hl_col,
+                                        &mut media.folders,
+                                        &mut receipts,
+                                    ),
+                                )
+                                .await;
+                                note = folder_note;
+                                if let Some(code) = stopped.leave() {
+                                    break Ok(code);
+                                }
                             }
                         }
-                    },
-                    Action::Download => {
-                        if here == CardRow::Highlights {
-                            let (folder_note, stopped) = watching_cancel_keys(
+                        Action::Redraw => tui.terminal.clear()?,
+                        Action::Quit => break Ok(ExitCode::Ok),
+                        Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        Action::Back | Action::PageUp | Action::PageDown | Action::None => {}
+                    }
+                }
+                Level::Actions { selected } => {
+                    // Esc closes the submenu rather than the program; `q` still
+                    // quits, through `action_of`.
+                    if plain && key.code == KeyCode::Esc {
+                        state.level = Level::Card;
+                        continue;
+                    }
+                    match action_of(key) {
+                        Action::Up => state.level = Level::Actions { selected: 0 },
+                        Action::Down => state.level = Level::Actions { selected: 1 },
+                        Action::Open => {
+                            if selected == 0 {
+                                let (text, stopped) = watching_cancel_keys(
+                                    app.client().pacer().cancel_token(),
+                                    pfp_open(app, profile, &mut media, &scratch),
+                                )
+                                .await;
+                                note = text;
+                                if let Some(code) = stopped.leave() {
+                                    break Ok(code);
+                                }
+                            } else {
+                                state.ask = Ask::Scan;
+                                state.level = Level::Card;
+                            }
+                        }
+                        Action::Download => {
+                            if selected == 0 {
+                                let (text, stopped) = watching_cancel_keys(
+                                    app.client().pacer().cancel_token(),
+                                    pfp_keep(app, profile, &mut media, &mut receipts),
+                                )
+                                .await;
+                                note = text;
+                                if let Some(code) = stopped.leave() {
+                                    break Ok(code);
+                                }
+                            }
+                        }
+                        Action::Back => state.level = Level::Card,
+                        Action::Redraw => tui.terminal.clear()?,
+                        Action::Quit => break Ok(ExitCode::Ok),
+                        Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        _ => {}
+                    }
+                }
+                Level::Stories => {
+                    if plain && key.code == KeyCode::Esc {
+                        state.level = Level::Card;
+                        continue;
+                    }
+                    let total = media.stories.len();
+                    match action_of(key) {
+                        Action::Up => {
+                            state.stories_selected = state.stories_selected.saturating_sub(1)
+                        }
+                        Action::Down => {
+                            state.stories_selected =
+                                (state.stories_selected + 1).min(total.saturating_sub(1));
+                        }
+                        Action::PageUp => {
+                            state.stories_selected =
+                                state.stories_selected.saturating_sub(page(page_rows));
+                        }
+                        Action::PageDown => {
+                            state.stories_selected = (state.stories_selected + page(page_rows))
+                                .min(total.saturating_sub(1));
+                        }
+                        Action::First => state.stories_selected = 0,
+                        Action::Last => state.stories_selected = total.saturating_sub(1),
+                        Action::Open => {
+                            let (result, stopped) = watching_cancel_keys(
                                 app.client().pacer().cancel_token(),
-                                keep_folder(
+                                crate::ui::stories::open(
                                     app.client(),
-                                    &media.tray,
-                                    state.hl_col,
-                                    &mut media.folders,
-                                    &mut receipts,
+                                    &profile.username,
+                                    &media.stories,
+                                    state.stories_selected,
+                                    &scratch,
+                                    &mut media.stories_opened,
                                 ),
                             )
                             .await;
-                            note = folder_note;
+                            note = match result {
+                                Ok(path) => format!("Opened {}", path.display()),
+                                Err(e) => format!("Could not open it: {e}"),
+                            };
                             if let Some(code) = stopped.leave() {
-                                break code;
+                                break Ok(code);
                             }
                         }
-                    }
-                    Action::Redraw => tui.terminal.clear()?,
-                    Action::Quit => break ExitCode::Ok,
-                    Action::Interrupt => break ExitCode::Interrupted,
-                    Action::Back | Action::PageUp | Action::PageDown | Action::None => {}
-                }
-            }
-            Level::Actions { selected } => {
-                // Esc closes the submenu rather than the program; `q` still
-                // quits, through `action_of`.
-                if plain && key.code == KeyCode::Esc {
-                    state.level = Level::Card;
-                    continue;
-                }
-                match action_of(key) {
-                    Action::Up => state.level = Level::Actions { selected: 0 },
-                    Action::Down => state.level = Level::Actions { selected: 1 },
-                    Action::Open => {
-                        if selected == 0 {
-                            let (text, stopped) = watching_cancel_keys(
+                        Action::Download => {
+                            let (result, stopped) = watching_cancel_keys(
                                 app.client().pacer().cancel_token(),
-                                pfp_open(app, profile, &mut media, &scratch),
+                                crate::ui::stories::keep(
+                                    app.client(),
+                                    &profile.username,
+                                    &media.stories,
+                                    state.stories_selected,
+                                    &mut media.stories_opened,
+                                ),
                             )
                             .await;
-                            note = text;
+                            note = match result {
+                                Ok(path) => {
+                                    let line = format!("Saved {}", path.display());
+                                    receipts.push(line.clone());
+                                    line
+                                }
+                                Err(e) => format!("Could not save it: {e}"),
+                            };
                             if let Some(code) = stopped.leave() {
-                                break code;
+                                break Ok(code);
                             }
-                        } else {
-                            state.ask = Ask::Scan;
-                            state.level = Level::Card;
                         }
+                        Action::Back => state.level = Level::Card,
+                        Action::Redraw => tui.terminal.clear()?,
+                        Action::Quit => break Ok(ExitCode::Ok),
+                        Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        Action::None => {}
                     }
-                    Action::Download => {
-                        if selected == 0 {
-                            let (text, stopped) = watching_cancel_keys(
+                }
+                Level::Inside { index } => {
+                    if plain && key.code == KeyCode::Esc {
+                        state.level = Level::Card;
+                        continue;
+                    }
+                    let stem = stem_of(&media.tray, index);
+                    let folder = &mut media.folders[index];
+                    let items = folder.items.as_deref().unwrap_or_default();
+                    let total = items.len();
+                    match action_of(key) {
+                        Action::Up => folder.selected = folder.selected.saturating_sub(1),
+                        Action::Down => {
+                            folder.selected = (folder.selected + 1).min(total.saturating_sub(1));
+                        }
+                        Action::PageUp => {
+                            folder.selected = folder.selected.saturating_sub(page(page_rows));
+                        }
+                        Action::PageDown => {
+                            folder.selected =
+                                (folder.selected + page(page_rows)).min(total.saturating_sub(1));
+                        }
+                        Action::First => folder.selected = 0,
+                        Action::Last => folder.selected = total.saturating_sub(1),
+                        Action::Open => {
+                            let (result, stopped) = watching_cancel_keys(
                                 app.client().pacer().cancel_token(),
-                                pfp_keep(app, profile, &mut media, &mut receipts),
+                                crate::ui::stories::open(
+                                    app.client(),
+                                    &stem,
+                                    items,
+                                    folder.selected,
+                                    &scratch,
+                                    &mut folder.opened,
+                                ),
                             )
                             .await;
-                            note = text;
+                            note = match result {
+                                Ok(path) => format!("Opened {}", path.display()),
+                                Err(e) => format!("Could not open it: {e}"),
+                            };
                             if let Some(code) = stopped.leave() {
-                                break code;
+                                break Ok(code);
                             }
                         }
+                        Action::Download => {
+                            let (result, stopped) = watching_cancel_keys(
+                                app.client().pacer().cancel_token(),
+                                crate::ui::stories::keep(
+                                    app.client(),
+                                    &stem,
+                                    items,
+                                    folder.selected,
+                                    &mut folder.opened,
+                                ),
+                            )
+                            .await;
+                            note = match result {
+                                Ok(path) => {
+                                    let line = format!("Saved {}", path.display());
+                                    receipts.push(line.clone());
+                                    line
+                                }
+                                Err(e) => format!("Could not save it: {e}"),
+                            };
+                            if let Some(code) = stopped.leave() {
+                                break Ok(code);
+                            }
+                        }
+                        Action::Back => state.level = Level::Card,
+                        Action::Redraw => tui.terminal.clear()?,
+                        Action::Quit => break Ok(ExitCode::Ok),
+                        Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        Action::None => {}
                     }
-                    Action::Back => state.level = Level::Card,
-                    Action::Redraw => tui.terminal.clear()?,
-                    Action::Quit => break ExitCode::Ok,
-                    Action::Interrupt => break ExitCode::Interrupted,
-                    _ => {}
                 }
             }
-            Level::Stories => {
-                if plain && key.code == KeyCode::Esc {
-                    state.level = Level::Card;
-                    continue;
-                }
-                let total = media.stories.len();
-                match action_of(key) {
-                    Action::Up => state.stories_selected = state.stories_selected.saturating_sub(1),
-                    Action::Down => {
-                        state.stories_selected =
-                            (state.stories_selected + 1).min(total.saturating_sub(1));
-                    }
-                    Action::PageUp => {
-                        state.stories_selected =
-                            state.stories_selected.saturating_sub(page(page_rows));
-                    }
-                    Action::PageDown => {
-                        state.stories_selected =
-                            (state.stories_selected + page(page_rows)).min(total.saturating_sub(1));
-                    }
-                    Action::First => state.stories_selected = 0,
-                    Action::Last => state.stories_selected = total.saturating_sub(1),
-                    Action::Open => {
-                        let (result, stopped) = watching_cancel_keys(
-                            app.client().pacer().cancel_token(),
-                            crate::ui::stories::open(
-                                app.client(),
-                                &profile.username,
-                                &media.stories,
-                                state.stories_selected,
-                                &scratch,
-                                &mut media.stories_opened,
-                            ),
-                        )
-                        .await;
-                        note = match result {
-                            Ok(path) => format!("Opened {}", path.display()),
-                            Err(e) => format!("Could not open it: {e}"),
-                        };
-                        if let Some(code) = stopped.leave() {
-                            break code;
-                        }
-                    }
-                    Action::Download => {
-                        let (result, stopped) = watching_cancel_keys(
-                            app.client().pacer().cancel_token(),
-                            crate::ui::stories::keep(
-                                app.client(),
-                                &profile.username,
-                                &media.stories,
-                                state.stories_selected,
-                                &mut media.stories_opened,
-                            ),
-                        )
-                        .await;
-                        note = match result {
-                            Ok(path) => {
-                                let line = format!("Saved {}", path.display());
-                                receipts.push(line.clone());
-                                line
-                            }
-                            Err(e) => format!("Could not save it: {e}"),
-                        };
-                        if let Some(code) = stopped.leave() {
-                            break code;
-                        }
-                    }
-                    Action::Back => state.level = Level::Card,
-                    Action::Redraw => tui.terminal.clear()?,
-                    Action::Quit => break ExitCode::Ok,
-                    Action::Interrupt => break ExitCode::Interrupted,
-                    Action::None => {}
-                }
-            }
-            Level::Inside { index } => {
-                if plain && key.code == KeyCode::Esc {
-                    state.level = Level::Card;
-                    continue;
-                }
-                let stem = stem_of(&media.tray, index);
-                let folder = &mut media.folders[index];
-                let items = folder.items.as_deref().unwrap_or_default();
-                let total = items.len();
-                match action_of(key) {
-                    Action::Up => folder.selected = folder.selected.saturating_sub(1),
-                    Action::Down => {
-                        folder.selected = (folder.selected + 1).min(total.saturating_sub(1));
-                    }
-                    Action::PageUp => {
-                        folder.selected = folder.selected.saturating_sub(page(page_rows));
-                    }
-                    Action::PageDown => {
-                        folder.selected =
-                            (folder.selected + page(page_rows)).min(total.saturating_sub(1));
-                    }
-                    Action::First => folder.selected = 0,
-                    Action::Last => folder.selected = total.saturating_sub(1),
-                    Action::Open => {
-                        let (result, stopped) = watching_cancel_keys(
-                            app.client().pacer().cancel_token(),
-                            crate::ui::stories::open(
-                                app.client(),
-                                &stem,
-                                items,
-                                folder.selected,
-                                &scratch,
-                                &mut folder.opened,
-                            ),
-                        )
-                        .await;
-                        note = match result {
-                            Ok(path) => format!("Opened {}", path.display()),
-                            Err(e) => format!("Could not open it: {e}"),
-                        };
-                        if let Some(code) = stopped.leave() {
-                            break code;
-                        }
-                    }
-                    Action::Download => {
-                        let (result, stopped) = watching_cancel_keys(
-                            app.client().pacer().cancel_token(),
-                            crate::ui::stories::keep(
-                                app.client(),
-                                &stem,
-                                items,
-                                folder.selected,
-                                &mut folder.opened,
-                            ),
-                        )
-                        .await;
-                        note = match result {
-                            Ok(path) => {
-                                let line = format!("Saved {}", path.display());
-                                receipts.push(line.clone());
-                                line
-                            }
-                            Err(e) => format!("Could not save it: {e}"),
-                        };
-                        if let Some(code) = stopped.leave() {
-                            break code;
-                        }
-                    }
-                    Action::Back => state.level = Level::Card,
-                    Action::Redraw => tui.terminal.clear()?,
-                    Action::Quit => break ExitCode::Ok,
-                    Action::Interrupt => break ExitCode::Interrupted,
-                    Action::None => {}
-                }
+            // The scroll offset belongs to the level it was scrolled at.
+            if state.level != level_before {
+                list = TableState::default();
             }
         }
-        // The scroll offset belongs to the level it was scrolled at.
-        if state.level != level_before {
-            list = TableState::default();
-        }
-    };
+    }
+    .await;
 
     drop(tui);
     tui::print_receipts(&receipts);
-    Ok(outcome)
+    outcome
 }
 
 /// One highlight of the profile as the tray type the fetchers take.

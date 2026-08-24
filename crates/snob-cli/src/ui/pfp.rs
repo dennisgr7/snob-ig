@@ -21,7 +21,6 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use console::Term;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
@@ -34,31 +33,18 @@ use crate::exit::{ExitCode, ExitError};
 use crate::output;
 use crate::ui::browser::input::{Action, Next, TICK, next};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::tui::{self, Tui};
+use crate::ui::tui;
 
 /// Drives the row until the user leaves it.
 pub(crate) fn browse(picture: &Picture, paths: &AppPaths) -> Result<ExitCode> {
-    let term = Term::stderr();
-    if !term.is_term() {
-        return Err(
-            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("--no-interactive downloads the picture; -o says where")
-                .into(),
-        );
-    }
-
     // Before this session's own directory is made, so that a run which never
     // gets that far still tidies up after the ones before it.
     snob_store::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    let mut tui = Tui::fullscreen().map_err(|e| {
-        ExitError::new(
-            ExitCode::Error,
-            format!("the terminal would not go into raw mode: {e}"),
-        )
-        .with_hint("--no-interactive downloads the picture; -o says where")
-    })?;
+    // Both refusals -- no terminal, raw mode refused -- live in
+    // `tui::claim_fullscreen`, with this view's hint on each.
+    let mut tui = tui::claim_fullscreen("--no-interactive downloads the picture; -o says where")?;
 
     let colors = tui::colors_enabled();
     let mut note = String::new();
@@ -66,56 +52,64 @@ pub(crate) fn browse(picture: &Picture, paths: &AppPaths) -> Result<ExitCode> {
     // Enter twice is one write: the scratch file is kept for the session.
     let mut opened: Option<PathBuf> = None;
 
-    let outcome = loop {
-        tui.terminal
-            .draw(|frame| draw(frame, picture, &note, colors))?;
+    // The loop runs inside a closure so that every way out — a draw that
+    // fails included — passes through the guard's drop and the receipts:
+    // an error that returned straight through `?` took every "Saved ..."
+    // line down with the alternate screen.
+    let outcome = (|| -> Result<ExitCode> {
+        loop {
+            tui.terminal
+                .draw(|frame| draw(frame, picture, &note, colors))?;
 
-        let event = match next(TICK) {
-            Ok(event) => event,
-            Err(e) => {
-                drop(tui);
-                tui::print_receipts(&receipts);
-                return Err(ExitError::new(
-                    ExitCode::Error,
-                    format!("the keyboard could not be read: {e}"),
-                )
-                .into());
-            }
-        };
-        let action = match event {
-            Next::Tick | Next::Resized => continue,
-            Next::Do(action) => action,
-        };
-        note.clear();
+            let event = match next(TICK) {
+                Ok(event) => event,
+                Err(e) => {
+                    return Err(ExitError::new(
+                        ExitCode::Error,
+                        format!("the keyboard could not be read: {e}"),
+                    )
+                    .into());
+                }
+            };
+            let action = match event {
+                Next::Tick | Next::Resized => continue,
+                Next::Do(action) => action,
+            };
+            note.clear();
 
-        match action {
-            Action::Open => {
-                note = match open(picture, &scratch, &mut opened) {
-                    Ok(path) => format!("Opened {}", path.display()),
-                    Err(e) => format!("Could not open it: {e}"),
-                };
+            match action {
+                Action::Open => {
+                    note = match open(picture, &scratch, &mut opened) {
+                        Ok(path) => format!("Opened {}", path.display()),
+                        Err(e) => format!("Could not open it: {e}"),
+                    };
+                }
+                Action::Download => {
+                    note = match keep(picture) {
+                        Ok(path) => {
+                            let line = format!("Saved {}", path.display());
+                            receipts.push(line.clone());
+                            line
+                        }
+                        Err(e) => format!("Could not save it: {e}"),
+                    };
+                }
+                Action::Redraw => tui.terminal.clear()?,
+                Action::Quit => break Ok(ExitCode::Ok),
+                Action::Interrupt => break Ok(ExitCode::Interrupted),
+                // One row: there is nowhere for the selection to move, and
+                // Back is not a way out — leaving a view and leaving the
+                // program are different intentions, the way `input::Action`'s
+                // own doc draws the line, and every other flat view lets
+                // Back fall through.
+                _ => {}
             }
-            Action::Download => {
-                note = match keep(picture) {
-                    Ok(path) => {
-                        let line = format!("Saved {}", path.display());
-                        receipts.push(line.clone());
-                        line
-                    }
-                    Err(e) => format!("Could not save it: {e}"),
-                };
-            }
-            Action::Redraw => tui.terminal.clear()?,
-            Action::Quit | Action::Back => break ExitCode::Ok,
-            Action::Interrupt => break ExitCode::Interrupted,
-            // One row: there is nowhere for the selection to move.
-            _ => {}
         }
-    };
+    })();
 
     drop(tui);
     tui::print_receipts(&receipts);
-    Ok(outcome)
+    outcome
 }
 
 /// Draws the one row inside the shared chrome. The row is always the

@@ -36,7 +36,7 @@
 //! it, which is the terminal's own way of saying where typing goes.
 
 use anyhow::Result;
-use console::{Term, measure_text_width};
+use console::measure_text_width;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Position};
@@ -138,22 +138,10 @@ pub fn check_drawable() -> Result<()> {
 
 /// Drives the list until the user leaves it, with a terminal of its own.
 pub fn browse(shelf: &Shelf<'_>) -> Result<ExitCode> {
-    let term = Term::stderr();
-    if !term.is_term() {
-        return Err(
-            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("--no-interactive prints the listing; --format and -o shape it")
-                .into(),
-        );
-    }
-
-    let mut tui = Tui::fullscreen().map_err(|e| {
-        ExitError::new(
-            ExitCode::Error,
-            format!("the terminal would not go into raw mode: {e}"),
-        )
-        .with_hint("--no-interactive prints the listing; --format and -o shape it")
-    })?;
+    // Both refusals -- no terminal, raw mode refused -- live in
+    // `tui::claim_fullscreen`, with this view's hint on each.
+    let mut tui =
+        tui::claim_fullscreen("--no-interactive prints the listing; --format and -o shape it")?;
 
     let mut receipts: Vec<String> = Vec::new();
     let outcome = browse_in(&mut tui, shelf, &mut receipts);

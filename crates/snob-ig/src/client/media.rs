@@ -239,13 +239,16 @@ struct Tee<'a, W: std::io::Write> {
 
 impl<W: std::io::Write> std::io::Write for Tee<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The sink writes first, and the head copies only what it accepted.
+        // Copying before asking meant a short write put the same bytes into
+        // the head twice: `write_all` retries with `&buf[n..]`, and the head
+        // still had room for them.
+        let written = self.sink.write(buf)?;
         let room = HEAD_BYTES.saturating_sub(self.head.bytes.len());
         if room > 0 {
-            self.head
-                .bytes
-                .extend_from_slice(&buf[..buf.len().min(room)]);
+            self.head.bytes.extend_from_slice(&buf[..written.min(room)]);
         }
-        self.sink.write(buf)
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

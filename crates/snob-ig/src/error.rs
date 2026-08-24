@@ -433,6 +433,15 @@ pub fn declares_failure(body: &str) -> bool {
         /// [`GraphqlError`] is where that is spelled out.
         #[serde(default)]
         errors: Option<Vec<serde_json::Value>>,
+        /// Read only to qualify `errors`. GraphQL permits an answer that
+        /// carries both -- a field-level complaint beside a mutation that
+        /// was performed -- and the refusal this gate exists for arrives
+        /// with `data: null`. Treating the partial answer as a total one
+        /// reported a follow Instagram had carried out as a failure, and
+        /// worse, let the request be replayed over a write that had already
+        /// happened.
+        #[serde(default)]
+        data: Option<serde_json::Value>,
     }
 
     let Ok(envelope) = serde_json::from_str::<Envelope>(body) else {
@@ -441,7 +450,11 @@ pub fn declares_failure(body: &str) -> bool {
     envelope.status.as_deref() == Some("fail")
         || envelope.spam == Some(true)
         || envelope.require_login == Some(true)
-        || envelope.errors.is_some_and(|errors| !errors.is_empty())
+        || (envelope.errors.is_some_and(|errors| !errors.is_empty())
+            && envelope
+                .data
+                .as_ref()
+                .is_none_or(serde_json::Value::is_null))
 }
 
 /// Translates an Instagram error response into the matching error.

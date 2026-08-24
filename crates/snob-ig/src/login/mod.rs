@@ -142,6 +142,14 @@ pub async fn validate(
         Ok(()) => {
             session.mark_validated();
         }
+        // The pacer re-reads the cooldown table before every request, so one
+        // written by another process between the pre-check above and this
+        // request arrives here as `InCooldown`. It is the same fact the
+        // pre-check answers `Skipped` for, and it must not cost the person
+        // the session they just produced.
+        Err(crate::error::IgError::InCooldown { until_ms }) => {
+            return Ok(ValidationOutcome::Skipped { until_ms });
+        }
         Err(e) if e.invalidates_session() => return Err(e.into()),
         Err(e) if e.is_login_tolerable() => {
             tracing::warn!(error = %e, "could not confirm the session");

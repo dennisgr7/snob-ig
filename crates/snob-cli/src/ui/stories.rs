@@ -28,7 +28,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use console::Term;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};
@@ -43,22 +42,13 @@ use crate::exit::{ExitCode, ExitError};
 use crate::output;
 use crate::ui::browser::input::{Action, Next, TICK, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::tui::{self, Tui};
+use crate::ui::tui;
 
 /// Drives the list until the user leaves it.
 ///
 /// Downloads are made once and kept: moving up and down a list of ten stories
 /// and opening three of them twice is three requests to the CDN, not six.
 pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> Result<ExitCode> {
-    let term = Term::stderr();
-    if !term.is_term() {
-        return Err(
-            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("--no-interactive prints the listing; --download saves without one")
-                .into(),
-        );
-    }
-
     // Before this session's own directory is made, so that a run which never
     // gets that far still tidies up after the ones before it. See
     // `ABANDONED_AFTER`, and `AppPaths::story_scratch` for where these live.
@@ -66,15 +56,10 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
 
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    // The whole claim on the terminal -- raw mode, alternate screen, paste,
-    // cursor -- in one guard, so an early return cannot leave any of it on.
-    let mut tui = Tui::fullscreen().map_err(|e| {
-        ExitError::new(
-            ExitCode::Error,
-            format!("the terminal would not go into raw mode: {e}"),
-        )
-        .with_hint("--no-interactive prints the listing; --download saves without one")
-    })?;
+    // Both refusals -- no terminal, raw mode refused -- live in
+    // `tui::claim_fullscreen`, with this view's hint on each.
+    let mut tui =
+        tui::claim_fullscreen("--no-interactive prints the listing; --download saves without one")?;
 
     let colors = tui::colors_enabled();
     let mut selected = 0usize;
@@ -84,119 +69,124 @@ pub async fn browse(client: &IgClient, stories: &Stories, paths: &AppPaths) -> R
     let mut receipts: Vec<String> = Vec::new();
     let mut page_rows = 1usize;
 
-    let outcome = loop {
-        // The selection is this loop's; the state keeps only the scroll
-        // offset, which is what makes the list follow the selection with two
-        // rows of margin. Layout is against the terminal's *current* size on
-        // every draw, so a resize event that was coalesced, delivered late or
-        // missed entirely cannot leave the list wrong.
-        list.select(Some(selected));
-        tui.terminal.draw(|frame| {
-            draw(frame, stories, &mut list, &note, colors, &mut page_rows);
-        })?;
+    // The loop runs inside a block so that every way out — a draw that
+    // fails included — passes through the guard's drop and the receipts:
+    // an error that returned straight through `?` took every "Saved ..."
+    // line down with the alternate screen.
+    let outcome: Result<ExitCode> = async {
+        loop {
+            // The selection is this loop's; the state keeps only the scroll
+            // offset, which is what makes the list follow the selection with two
+            // rows of margin. Layout is against the terminal's *current* size on
+            // every draw, so a resize event that was coalesced, delivered late or
+            // missed entirely cannot leave the list wrong.
+            list.select(Some(selected));
+            tui.terminal.draw(|frame| {
+                draw(frame, stories, &mut list, &note, colors, &mut page_rows);
+            })?;
 
-        let event = match next(TICK) {
-            Ok(event) => event,
-            // Said on the way out rather than written into `note`, which the
-            // next redraw would have shown and there is no next redraw.
-            Err(e) => {
-                drop(tui);
-                tui::print_receipts(&receipts);
-                return Err(ExitError::new(
-                    ExitCode::Error,
-                    format!("the keyboard could not be read: {e}"),
-                )
-                .into());
-            }
-        };
-
-        let action = match event {
-            // Both mean the same thing here: go round and draw. The next draw
-            // reads the new size, and an unchanged frame writes nothing, so an
-            // idle browser waiting for a resize sends no bytes at all.
-            Next::Tick | Next::Resized => continue,
-            Next::Do(action) => action,
-        };
-        // A note stays up until the user does something else, not until the
-        // next timer tick wipes it.
-        note.clear();
-
-        match action {
-            Action::Up => selected = selected.saturating_sub(1),
-            Action::Down => selected = (selected + 1).min(stories.items.len() - 1),
-            Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
-            Action::PageDown => {
-                selected = (selected + page(page_rows)).min(stories.items.len() - 1);
-            }
-            Action::First => selected = 0,
-            Action::Last => selected = stories.items.len() - 1,
-            Action::Open => {
-                let (result, stopped) = watching_cancel_keys(
-                    client.pacer().cancel_token(),
-                    open(
-                        client,
-                        &stories.username,
-                        &stories.items,
-                        selected,
-                        &scratch,
-                        &mut opened,
-                    ),
-                )
-                .await;
-                note = match result {
-                    Ok(path) => format!("Opened {}", path.display()),
-                    Err(e) => format!("Could not open it: {e}"),
-                };
-                if let Some(code) = stopped.leave() {
-                    break code;
+            let event = match next(TICK) {
+                Ok(event) => event,
+                // Said on the way out rather than written into `note`, which the
+                // next redraw would have shown and there is no next redraw.
+                Err(e) => {
+                    return Err(ExitError::new(
+                        ExitCode::Error,
+                        format!("the keyboard could not be read: {e}"),
+                    )
+                    .into());
                 }
-            }
-            Action::Download => {
-                let (result, stopped) = watching_cancel_keys(
-                    client.pacer().cancel_token(),
-                    keep(
-                        client,
-                        &stories.username,
-                        &stories.items,
-                        selected,
-                        &mut opened,
-                    ),
-                )
-                .await;
-                note = match result {
-                    // Twice on purpose: the note is for now, the receipt is
-                    // for after the alternate screen has taken the note away.
-                    Ok(path) => {
-                        let line = format!("Saved {}", path.display());
-                        receipts.push(line.clone());
-                        line
+            };
+
+            let action = match event {
+                // Both mean the same thing here: go round and draw. The next draw
+                // reads the new size, and an unchanged frame writes nothing, so an
+                // idle browser waiting for a resize sends no bytes at all.
+                Next::Tick | Next::Resized => continue,
+                Next::Do(action) => action,
+            };
+            // A note stays up until the user does something else, not until the
+            // next timer tick wipes it.
+            note.clear();
+
+            match action {
+                Action::Up => selected = selected.saturating_sub(1),
+                Action::Down => selected = (selected + 1).min(stories.items.len() - 1),
+                Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
+                Action::PageDown => {
+                    selected = (selected + page(page_rows)).min(stories.items.len() - 1);
+                }
+                Action::First => selected = 0,
+                Action::Last => selected = stories.items.len() - 1,
+                Action::Open => {
+                    let (result, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        open(
+                            client,
+                            &stories.username,
+                            &stories.items,
+                            selected,
+                            &scratch,
+                            &mut opened,
+                        ),
+                    )
+                    .await;
+                    note = match result {
+                        Ok(path) => format!("Opened {}", path.display()),
+                        Err(e) => format!("Could not open it: {e}"),
+                    };
+                    if let Some(code) = stopped.leave() {
+                        break Ok(code);
                     }
-                    Err(e) => format!("Could not save it: {e}"),
-                };
-                if let Some(code) = stopped.leave() {
-                    break code;
                 }
+                Action::Download => {
+                    let (result, stopped) = watching_cancel_keys(
+                        client.pacer().cancel_token(),
+                        keep(
+                            client,
+                            &stories.username,
+                            &stories.items,
+                            selected,
+                            &mut opened,
+                        ),
+                    )
+                    .await;
+                    note = match result {
+                        // Twice on purpose: the note is for now, the receipt is
+                        // for after the alternate screen has taken the note away.
+                        Ok(path) => {
+                            let line = format!("Saved {}", path.display());
+                            receipts.push(line.clone());
+                            line
+                        }
+                        Err(e) => format!("Could not save it: {e}"),
+                    };
+                    if let Some(code) = stopped.leave() {
+                        break Ok(code);
+                    }
+                }
+                // A flat list has no level to go up to.
+                Action::Back => {}
+                // For after anything else has written to the terminal behind the
+                // renderer's back: a diffing renderer is only ever as right as its
+                // belief about what is on screen, and on Windows ConPTY coalesces
+                // positioned writes into fragments no renderer can predict.
+                Action::Redraw => tui.terminal.clear()?,
+                Action::Quit => break Ok(ExitCode::Ok),
+                // Raw mode is what makes this reachable. Outside it, Ctrl+C either
+                // raises `SIGINT` or fires the console control handler, and the
+                // browser never hears about it -- which is what used to happen, and
+                // what the arm this replaces claimed it was catching.
+                Action::Interrupt => break Ok(ExitCode::Interrupted),
+                Action::None => {}
             }
-            // A flat list has no level to go up to.
-            Action::Back => {}
-            // For after anything else has written to the terminal behind the
-            // renderer's back: a diffing renderer is only ever as right as its
-            // belief about what is on screen, and on Windows ConPTY coalesces
-            // positioned writes into fragments no renderer can predict.
-            Action::Redraw => tui.terminal.clear()?,
-            Action::Quit => break ExitCode::Ok,
-            // Raw mode is what makes this reachable. Outside it, Ctrl+C either
-            // raises `SIGINT` or fires the console control handler, and the
-            // browser never hears about it -- which is what used to happen, and
-            // what the arm this replaces claimed it was catching.
-            Action::Interrupt => break ExitCode::Interrupted,
-            Action::None => {}
         }
-    };
+    }
+    .await;
 
     drop(tui);
     tui::print_receipts(&receipts);
-    Ok(outcome)
+    outcome
 }
 
 /// Draws one frame: the shared chrome, the table, and the scrollbar when the

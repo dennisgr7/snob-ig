@@ -25,7 +25,6 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use console::Term;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
@@ -41,7 +40,7 @@ use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui::browser::input::{Action, Next, TICK, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::tui::{self, Tui};
+use crate::ui::tui;
 
 /// Where the browser is, and what the arrow keys therefore move.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,27 +72,15 @@ pub async fn browse(
     start: Option<usize>,
     paths: &AppPaths,
 ) -> Result<ExitCode> {
-    let term = Term::stderr();
-    if !term.is_term() {
-        return Err(
-            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
-                .with_hint("--no-interactive prints the listing; --download saves without one")
-                .into(),
-        );
-    }
-
     // Before this session's own directory is made, so that a run which never
     // gets that far still tidies up after the ones before it.
     snob_store::paths::sweep_old_scratch(&paths.stories_root(), ABANDONED_AFTER);
     let scratch = Scratch::new(paths.story_scratch())?;
 
-    let mut tui = Tui::fullscreen().map_err(|e| {
-        ExitError::new(
-            ExitCode::Error,
-            format!("the terminal would not go into raw mode: {e}"),
-        )
-        .with_hint("--no-interactive prints the listing; --download saves without one")
-    })?;
+    // Both refusals -- no terminal, raw mode refused -- live in
+    // `tui::claim_fullscreen`, with this view's hint on each.
+    let mut tui =
+        tui::claim_fullscreen("--no-interactive prints the listing; --download saves without one")?;
 
     let colors = tui::colors_enabled();
     let mut folders: Vec<Folder> = tray
@@ -123,183 +110,188 @@ pub async fn browse(
         }
     }
 
-    let outcome = loop {
-        let total = match level {
-            Level::Tray => tray.entries.len(),
-            Level::Inside(index) => folders[index].items.as_ref().map_or(0, Vec::len),
-        };
-        // A copy, moved by the arms below and written back only while the
-        // level it belongs to is still the one on screen -- walking into a
-        // folder must not write the tray's row over the folder's.
-        let mut selected = match level {
-            Level::Tray => tray_selected,
-            Level::Inside(index) => folders[index].selected,
-        };
+    // The loop runs inside a block so that every way out — a draw that
+    // fails included — passes through the guard's drop and the receipts:
+    // an error that returned straight through `?` took every "Saved ..."
+    // line down with the alternate screen.
+    let outcome: Result<ExitCode> = async {
+        loop {
+            let total = match level {
+                Level::Tray => tray.entries.len(),
+                Level::Inside(index) => folders[index].items.as_ref().map_or(0, Vec::len),
+            };
+            // A copy, moved by the arms below and written back only while the
+            // level it belongs to is still the one on screen -- walking into a
+            // folder must not write the tray's row over the folder's.
+            let mut selected = match level {
+                Level::Tray => tray_selected,
+                Level::Inside(index) => folders[index].selected,
+            };
 
-        list.select(Some(selected));
-        tui.terminal.draw(|frame| match level {
-            Level::Tray => {
-                draw_tray(
-                    frame,
-                    tray,
-                    &folders,
-                    &mut list,
-                    &note,
-                    colors,
-                    &mut page_rows,
-                );
-            }
-            Level::Inside(index) => {
-                draw_items(
-                    frame,
-                    tray,
-                    index,
-                    &folders[index],
-                    &mut list,
-                    &note,
-                    colors,
-                    &mut page_rows,
-                );
-            }
-        })?;
-
-        let event = match next(TICK) {
-            Ok(event) => event,
-            Err(e) => {
-                drop(tui);
-                tui::print_receipts(&receipts);
-                return Err(ExitError::new(
-                    ExitCode::Error,
-                    format!("the keyboard could not be read: {e}"),
-                )
-                .into());
-            }
-        };
-
-        let action = match event {
-            Next::Tick | Next::Resized => continue,
-            Next::Do(action) => action,
-        };
-        note.clear();
-
-        let level_before = level;
-        match action {
-            Action::Up => selected = selected.saturating_sub(1),
-            Action::Down => selected = (selected + 1).min(total.saturating_sub(1)),
-            Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
-            Action::PageDown => {
-                selected = (selected + page(page_rows)).min(total.saturating_sub(1));
-            }
-            Action::First => selected = 0,
-            Action::Last => selected = total.saturating_sub(1),
-            Action::Open => match level {
+            list.select(Some(selected));
+            tui.terminal.draw(|frame| match level {
                 Level::Tray => {
-                    let (result, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        walk_in(client, tray, selected, &mut folders),
-                    )
-                    .await;
-                    match result {
-                        Ok(true) => level = Level::Inside(selected),
-                        Ok(false) => note = empty_note(selected),
-                        Err(e) => note = format!("Could not open it: {e}"),
-                    }
-                    if let Some(code) = stopped.leave() {
-                        break code;
-                    }
+                    draw_tray(
+                        frame,
+                        tray,
+                        &folders,
+                        &mut list,
+                        &note,
+                        colors,
+                        &mut page_rows,
+                    );
                 }
                 Level::Inside(index) => {
-                    let folder = &mut folders[index];
-                    let items = folder.items.as_deref().unwrap_or_default();
-                    let (result, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        crate::ui::stories::open(
-                            client,
-                            &stem_of(tray, index),
-                            items,
-                            selected,
-                            &scratch,
-                            &mut folder.opened,
-                        ),
-                    )
-                    .await;
-                    note = match result {
-                        Ok(path) => format!("Opened {}", path.display()),
-                        Err(e) => format!("Could not open it: {e}"),
-                    };
-                    if let Some(code) = stopped.leave() {
-                        break code;
-                    }
+                    draw_items(
+                        frame,
+                        tray,
+                        index,
+                        &folders[index],
+                        &mut list,
+                        &note,
+                        colors,
+                        &mut page_rows,
+                    );
                 }
-            },
-            Action::Download => match level {
-                Level::Tray => {
-                    let (folder_note, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        keep_folder(client, tray, selected, &mut folders, &mut receipts),
+            })?;
+
+            let event = match next(TICK) {
+                Ok(event) => event,
+                Err(e) => {
+                    return Err(ExitError::new(
+                        ExitCode::Error,
+                        format!("the keyboard could not be read: {e}"),
                     )
-                    .await;
-                    note = folder_note;
-                    if let Some(code) = stopped.leave() {
-                        break code;
-                    }
+                    .into());
                 }
-                Level::Inside(index) => {
-                    let folder = &mut folders[index];
-                    let items = folder.items.as_deref().unwrap_or_default();
-                    let (result, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        crate::ui::stories::keep(
-                            client,
-                            &stem_of(tray, index),
-                            items,
-                            selected,
-                            &mut folder.opened,
-                        ),
-                    )
-                    .await;
-                    note = match result {
-                        Ok(path) => {
-                            let line = format!("Saved {}", path.display());
-                            receipts.push(line.clone());
-                            line
+            };
+
+            let action = match event {
+                Next::Tick | Next::Resized => continue,
+                Next::Do(action) => action,
+            };
+            note.clear();
+
+            let level_before = level;
+            match action {
+                Action::Up => selected = selected.saturating_sub(1),
+                Action::Down => selected = (selected + 1).min(total.saturating_sub(1)),
+                Action::PageUp => selected = selected.saturating_sub(page(page_rows)),
+                Action::PageDown => {
+                    selected = (selected + page(page_rows)).min(total.saturating_sub(1));
+                }
+                Action::First => selected = 0,
+                Action::Last => selected = total.saturating_sub(1),
+                Action::Open => match level {
+                    Level::Tray => {
+                        let (result, stopped) = watching_cancel_keys(
+                            client.pacer().cancel_token(),
+                            walk_in(client, tray, selected, &mut folders),
+                        )
+                        .await;
+                        match result {
+                            Ok(true) => level = Level::Inside(selected),
+                            Ok(false) => note = empty_note(selected),
+                            Err(e) => note = format!("Could not open it: {e}"),
                         }
-                        Err(e) => format!("Could not save it: {e}"),
-                    };
-                    if let Some(code) = stopped.leave() {
-                        break code;
+                        if let Some(code) = stopped.leave() {
+                            break Ok(code);
+                        }
+                    }
+                    Level::Inside(index) => {
+                        let folder = &mut folders[index];
+                        let items = folder.items.as_deref().unwrap_or_default();
+                        let (result, stopped) = watching_cancel_keys(
+                            client.pacer().cancel_token(),
+                            crate::ui::stories::open(
+                                client,
+                                &stem_of(tray, index),
+                                items,
+                                selected,
+                                &scratch,
+                                &mut folder.opened,
+                            ),
+                        )
+                        .await;
+                        note = match result {
+                            Ok(path) => format!("Opened {}", path.display()),
+                            Err(e) => format!("Could not open it: {e}"),
+                        };
+                        if let Some(code) = stopped.leave() {
+                            break Ok(code);
+                        }
+                    }
+                },
+                Action::Download => match level {
+                    Level::Tray => {
+                        let (folder_note, stopped) = watching_cancel_keys(
+                            client.pacer().cancel_token(),
+                            keep_folder(client, tray, selected, &mut folders, &mut receipts),
+                        )
+                        .await;
+                        note = folder_note;
+                        if let Some(code) = stopped.leave() {
+                            break Ok(code);
+                        }
+                    }
+                    Level::Inside(index) => {
+                        let folder = &mut folders[index];
+                        let items = folder.items.as_deref().unwrap_or_default();
+                        let (result, stopped) = watching_cancel_keys(
+                            client.pacer().cancel_token(),
+                            crate::ui::stories::keep(
+                                client,
+                                &stem_of(tray, index),
+                                items,
+                                selected,
+                                &mut folder.opened,
+                            ),
+                        )
+                        .await;
+                        note = match result {
+                            Ok(path) => {
+                                let line = format!("Saved {}", path.display());
+                                receipts.push(line.clone());
+                                line
+                            }
+                            Err(e) => format!("Could not save it: {e}"),
+                        };
+                        if let Some(code) = stopped.leave() {
+                            break Ok(code);
+                        }
+                    }
+                },
+                Action::Back => {
+                    // At the tray there is nowhere further out that is not
+                    // leaving, and leaving is q's job alone.
+                    if let Level::Inside(_) = level {
+                        level = Level::Tray;
                     }
                 }
-            },
-            Action::Back => {
-                // At the tray there is nowhere further out that is not
-                // leaving, and leaving is q's job alone.
-                if let Level::Inside(_) = level {
-                    level = Level::Tray;
+                Action::Redraw => tui.terminal.clear()?,
+                Action::Quit => break Ok(ExitCode::Ok),
+                Action::Interrupt => break Ok(ExitCode::Interrupted),
+                Action::None => {}
+            }
+            // The write-back. Skipped when the arm changed levels: `selected`
+            // still belongs to the level the keys were read at. The scroll offset
+            // starts over with the level, and the first draw pulls the remembered
+            // selection back into view.
+            if level == level_before {
+                match level {
+                    Level::Tray => tray_selected = selected,
+                    Level::Inside(index) => folders[index].selected = selected,
                 }
+            } else {
+                list = TableState::default();
             }
-            Action::Redraw => tui.terminal.clear()?,
-            Action::Quit => break ExitCode::Ok,
-            Action::Interrupt => break ExitCode::Interrupted,
-            Action::None => {}
         }
-        // The write-back. Skipped when the arm changed levels: `selected`
-        // still belongs to the level the keys were read at. The scroll offset
-        // starts over with the level, and the first draw pulls the remembered
-        // selection back into view.
-        if level == level_before {
-            match level {
-                Level::Tray => tray_selected = selected,
-                Level::Inside(index) => folders[index].selected = selected,
-            }
-        } else {
-            list = TableState::default();
-        }
-    };
+    }
+    .await;
 
     drop(tui);
     tui::print_receipts(&receipts);
-    Ok(outcome)
+    outcome
 }
 
 /// `someone-2` for the entry at `index` — the command's own stem, so the

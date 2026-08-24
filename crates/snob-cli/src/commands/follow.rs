@@ -172,9 +172,14 @@ fn already_done(
         Verb::Follow if profile.requested_by_viewer == Some(true) => Some(format!(
             "You have already asked to follow @{name}, and they have not answered yet."
         )),
+        // Both facts have to be *known*: `!= Some(true)` read an absent
+        // `requested_by_viewer` as "no pending request", which is the exact
+        // assumption the doc-comment above forbids -- an unfollow that would
+        // have withdrawn a pending request was refused on a field Instagram
+        // merely left out.
         Verb::Unfollow
             if profile.followed_by_viewer == Some(false)
-                && profile.requested_by_viewer != Some(true) =>
+                && profile.requested_by_viewer == Some(false) =>
         {
             Some(format!("You do not follow @{name}."))
         }
@@ -293,7 +298,7 @@ mod tests {
     #[test]
     fn a_relationship_that_already_holds_costs_no_request() {
         assert!(already_done(Verb::Follow, &profile(Some(true), None), "x").is_some());
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), None), "x").is_some());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(false)), "x").is_some());
         assert!(already_done(Verb::Follow, &profile(Some(false), Some(true)), "x").is_some());
     }
 
@@ -304,6 +309,9 @@ mod tests {
     fn an_unknown_relationship_is_not_treated_as_settled() {
         assert!(already_done(Verb::Follow, &profile(None, None), "x").is_none());
         assert!(already_done(Verb::Unfollow, &profile(None, None), "x").is_none());
+        // Half-known is still unknown: not following, but with the pending
+        // request unreported, unfollow may still have a request to withdraw.
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), None), "x").is_none());
     }
 
     /// A pending request is not a follow, and unfollow has something to do

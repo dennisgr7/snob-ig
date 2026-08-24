@@ -796,8 +796,21 @@ mod unix_impl {
                 if libc::dup2(from_browser_write, CHILD_WRITE_FD as libc::c_int) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                libc::close(to_browser_write);
-                libc::close(from_browser_read);
+                // Closed by the numbers captured before the fork — and
+                // `libc::pipe` hands out the lowest free descriptors, so with
+                // nothing else open those numbers are 3 and 4: exactly where
+                // the two `dup2`s above just installed the protocol ends. A
+                // blind `close(4)` then closed the pipe the child was about
+                // to speak on. A descriptor sitting on a protocol number is
+                // either already the right end or was already replaced by
+                // `dup2`, so there is nothing left to close either way.
+                for stray in [to_browser_write, from_browser_read] {
+                    if stray != CHILD_READ_FD as libc::c_int
+                        && stray != CHILD_WRITE_FD as libc::c_int
+                    {
+                        libc::close(stray);
+                    }
+                }
                 Ok(())
             });
         }

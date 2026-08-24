@@ -20,6 +20,43 @@ use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
 
+/// The three forms either media listing has, and the refusal for the others —
+/// so `-o out.xlsx` cannot fall through to a table with a spreadsheet's name
+/// on it. One copy for `stories` and both levels of `highlights`: the guard
+/// began inline in `stories`, was parameterized in `highlights`, and the two
+/// had already started spelling the same refusal from two homes.
+pub fn checked_format(
+    format: Option<crate::cli::StoryFormat>,
+    destination: Option<&std::path::Path>,
+    what: &str,
+) -> Result<Format> {
+    let format = output::effective_format(format.map(Into::into), destination);
+    if matches!(format, Format::Csv | Format::Xlsx | Format::Md) {
+        anyhow::bail!(
+            "{what} has no {} form; it can be a table, json or ndjson",
+            format!("{format:?}").to_ascii_lowercase()
+        );
+    }
+    output::check_destination(format, destination)?;
+    Ok(format)
+}
+
+/// The header row of a media table, bold when color is on. Shared for the
+/// same reason as [`checked_format`]: three listings, one way to draw it.
+pub fn header_cells(names: &[&str], presentation: Presentation) -> Vec<comfy_table::Cell> {
+    names
+        .iter()
+        .map(|name| {
+            let cell = comfy_table::Cell::new(name);
+            if presentation.color {
+                cell.add_attribute(comfy_table::Attribute::Bold)
+            } else {
+                cell
+            }
+        })
+        .collect()
+}
+
 /// What opening a session produced, for the one caller that has something
 /// to do without one.
 ///

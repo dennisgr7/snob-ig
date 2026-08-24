@@ -152,10 +152,13 @@ impl Pace {
     /// counted — slowing down must not turn into knocking more often.
     ///
     /// The cost is that a walk takes about three times as long, and the resume
-    /// window is measured from when it started. Somewhere past four thousand
-    /// accounts an interrupted walk stops being resumable and begins again from
-    /// the top. That is the right trade anyway: a walk that long no longer
-    /// describes a single moment, which is what the window is there to protect.
+    /// window is measured from when it started. Somewhere past two thousand
+    /// accounts on the followers list — which answers about 25 a page whatever
+    /// is asked, see `per_page` — or four thousand on the following list,
+    /// where 50 is honored, an interrupted walk stops being resumable and
+    /// begins again from the top. That is the right trade anyway: a walk that
+    /// long no longer describes a single moment, which is what the window is
+    /// there to protect.
     pub fn third_party() -> Self {
         Self {
             micro_pause_ms: (1_500, 4_000),

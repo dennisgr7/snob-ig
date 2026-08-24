@@ -117,21 +117,13 @@ impl Picture {
 impl Picture {
     /// Names the file after what actually arrived rather than after the URL.
     ///
-    /// The URL is no guide: Instagram's signed links carry `stp=dst-jpg`, an
-    /// instruction to the CDN to convert, so a path ending in `.webp` regularly
-    /// returns JPEG. The first bytes do not have that problem.
+    /// `stories::extension_of` is the one sniffer -- this held a
+    /// byte-for-byte copy of its WebP, PNG and JPEG arms, and the doc on the
+    /// other one already pointed here. Its extra `ftyp` arm costs nothing: a
+    /// profile picture that somehow arrives as MP4 is more honestly named
+    /// `.mp4` than mislabeled `.jpg`.
     pub(crate) fn extension(&self) -> &'static str {
-        let bytes = self.bytes.as_slice();
-        // WebP puts its marker after a four-byte length, hence the offset.
-        let webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
-
-        match bytes {
-            _ if webp => "webp",
-            [0x89, b'P', b'N', b'G', ..] => "png",
-            // JPEG is both the common case and the sensible guess for anything
-            // unrecognizable: it is what Instagram serves almost everywhere.
-            _ => "jpg",
-        }
+        crate::commands::stories::extension_of(&self.bytes)
     }
 }
 

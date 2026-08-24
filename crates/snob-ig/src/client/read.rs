@@ -162,8 +162,14 @@ impl IgClient {
             // **except** when it is one the user has to act on. A cooldown or a
             // dead session recorded on this request is a fact about the account
             // that would otherwise be swallowed by an error about serialization.
+            //
+            // `is_push_back`, not `cooldown_for`: that is the table of answers
+            // that *open* a cooldown, and it says `None` for `InCooldown` --
+            // the pacer's backstop reporting one that already exists, which
+            // another process can write between the two requests. That one is
+            // exactly as much a fact the user has to act on.
             Err(second) => {
-                if crate::error::cooldown_for(&second).is_some() || second.invalidates_session() {
+                if second.is_push_back() || second.invalidates_session() {
                     Err(second)
                 } else {
                     Err(failure)

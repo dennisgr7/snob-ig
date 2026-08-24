@@ -39,7 +39,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use comfy_table::{Attribute as Style, Cell, ContentArrangement, Table, presets};
+use comfy_table::{Cell, ContentArrangement, Table, presets};
 use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
@@ -469,7 +469,7 @@ fn list_tray(
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
-    let format = checked_format(format, destination, "a highlight listing")?;
+    let format = common::checked_format(format, destination, "a highlight listing")?;
 
     let mut text = match format {
         Format::Json | Format::Ndjson => tray_json(tray, format)?,
@@ -496,7 +496,7 @@ fn list_items(
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
-    let format = checked_format(format, destination, "a highlight's listing")?;
+    let format = common::checked_format(format, destination, "a highlight's listing")?;
 
     let mut text = match format {
         Format::Json | Format::Ndjson => items_json(tray, number, items, format)?,
@@ -511,39 +511,6 @@ fn list_items(
     Ok(ExitCode::Ok)
 }
 
-/// The three forms either listing has, and the refusal for the others —
-/// `stories`' rule, applied to both levels here so `-o out.xlsx` cannot fall
-/// through to a table with a spreadsheet's name on it.
-fn checked_format(
-    format: Option<StoryFormat>,
-    destination: Option<&Path>,
-    what: &str,
-) -> Result<Format> {
-    let format = output::effective_format(format.map(Into::into), destination);
-    if matches!(format, Format::Csv | Format::Xlsx | Format::Md) {
-        anyhow::bail!(
-            "{what} has no {} form; it can be a table, json or ndjson",
-            format!("{format:?}").to_ascii_lowercase()
-        );
-    }
-    output::check_destination(format, destination)?;
-    Ok(format)
-}
-
-fn header_cells(names: &[&str], presentation: Presentation) -> Vec<Cell> {
-    names
-        .iter()
-        .map(|name| {
-            let cell = Cell::new(name);
-            if presentation.color {
-                cell.add_attribute(Style::Bold)
-            } else {
-                cell
-            }
-        })
-        .collect()
-}
-
 fn tray_table(tray: &Tray, presentation: Presentation) -> String {
     let mut table = Table::new();
     table.load_preset(presets::UTF8_FULL_CONDENSED);
@@ -551,7 +518,7 @@ fn tray_table(tray: &Tray, presentation: Presentation) -> String {
     if let Some(width) = presentation.width {
         table.set_width(width);
     }
-    table.set_header(header_cells(
+    table.set_header(common::header_cells(
         &["#", "Title", "Items", "Updated"],
         presentation,
     ));
@@ -596,7 +563,7 @@ fn items_table(items: &[Story], presentation: Presentation) -> String {
     // No "Gone in": nothing in a highlight is going anywhere, which is what a
     // highlight is. The date carries the year instead of the hour for the
     // same reason -- see `report::dated`.
-    table.set_header(header_cells(
+    table.set_header(common::header_cells(
         &["#", "Kind", "Posted", "Mentions"],
         presentation,
     ));

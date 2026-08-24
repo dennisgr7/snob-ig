@@ -198,16 +198,9 @@ pub fn status(args: WatchStatusArgs, paths: &AppPaths) -> Result<ExitCode> {
         crate::ui::say!();
     }
     if owed.given_up > 0 {
-        let (subject, what) = if owed.given_up == 1 {
-            ("report was", "What it said is")
-        } else {
-            ("reports were", "What they said is")
-        };
-        crate::ui::say!(
-            "{} {subject} given up on for being too old to be news. {what} not reported \
-             a second time.",
-            owed.given_up
-        );
+        // `say::given_up_sentence`, so the run's warning and this line cannot
+        // drift apart over the one event they both describe.
+        crate::ui::say!("{}", super::say::given_up_sentence(owed.given_up));
     }
     if owed.waiting > 0 {
         let (subject, it) = if owed.waiting == 1 {

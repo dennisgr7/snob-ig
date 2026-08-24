@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use comfy_table::{Attribute as Style, Cell, ContentArrangement, Table, presets};
+use comfy_table::{Cell, ContentArrangement, Table, presets};
 use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
@@ -262,17 +262,7 @@ fn list(
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
-    let format = output::effective_format(format.map(Into::into), destination);
-    // `StoryFormat` keeps `--format` to the three forms a listing has, and
-    // the extension of `-o` went round it: `-o out.xlsx` fell through to the
-    // table and reported "Written to out.xlsx" over a box-drawing text file.
-    if matches!(format, Format::Csv | Format::Xlsx | Format::Md) {
-        anyhow::bail!(
-            "a story listing has no {} form; it can be a table, json or ndjson",
-            format!("{format:?}").to_ascii_lowercase()
-        );
-    }
-    output::check_destination(format, destination)?;
+    let format = common::checked_format(format, destination, "a story listing")?;
 
     // Every rendering ends in a newline, like `output::render`'s do. Neither
     // `serde_json::to_string_pretty` nor comfy-table adds one, and without it
@@ -303,18 +293,10 @@ fn as_table(stories: &Stories, presentation: Presentation) -> String {
     if let Some(width) = presentation.width {
         table.set_width(width);
     }
-    table.set_header(
-        ["#", "Kind", "Posted", "Gone in", "Mentions"]
-            .iter()
-            .map(|name| {
-                let cell = Cell::new(name);
-                if presentation.color {
-                    cell.add_attribute(Style::Bold)
-                } else {
-                    cell
-                }
-            }),
-    );
+    table.set_header(common::header_cells(
+        &["#", "Kind", "Posted", "Gone in", "Mentions"],
+        presentation,
+    ));
     if presentation.color {
         table.enforce_styling();
     }
@@ -725,8 +707,10 @@ pub(crate) async fn bytes_of(client: &IgClient, story: &Story) -> Result<Vec<u8>
 ///
 /// The URL is no guide: Instagram's signed links carry `stp=dst-jpg`, an
 /// instruction to the CDN to convert, so a path ending in `.webp` regularly
-/// returns JPEG. The same reasoning as `pfp::Picture::extension`, with MP4
-/// added — its `ftyp` box sits at offset four, after the box length.
+/// returns JPEG. The one sniffer -- `pfp::Picture::extension` reads through
+/// it too. MP4's `ftyp` box sits at offset four, after the box length, and
+/// JPEG is both the common case and the sensible guess for anything
+/// unrecognizable: it is what Instagram serves almost everywhere.
 pub(crate) fn extension_of(bytes: &[u8]) -> &'static str {
     let webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
     match bytes {

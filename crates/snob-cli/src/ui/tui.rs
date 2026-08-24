@@ -101,17 +101,27 @@ impl Tui {
 
     /// Hands the terminal back -- cooked, real screen, cursor shown -- so
     /// somebody else may write to it. Idempotent.
+    ///
+    /// `active` moves only on success. It used to be cleared first, so an
+    /// escape write that failed returned before `disable_raw_mode` with the
+    /// flag already saying "nothing to undo" — and `Drop`'s own `suspend`
+    /// then took the early exit, handing the shell back still in raw mode.
+    /// Raw mode is also dropped whatever became of the escape writes: it is
+    /// the one mode that makes the shell unusable, and a write that failed
+    /// is no reason to keep it.
     pub fn suspend(&mut self) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        self.active = false;
-        if self.fullscreen {
-            crossterm::execute!(stderr(), DisableBracketedPaste, LeaveAlternateScreen, Show)?;
+        let modes = if self.fullscreen {
+            crossterm::execute!(stderr(), DisableBracketedPaste, LeaveAlternateScreen, Show)
         } else {
-            crossterm::execute!(stderr(), DisableBracketedPaste, Show)?;
-        }
-        disable_raw_mode()
+            crossterm::execute!(stderr(), DisableBracketedPaste, Show)
+        };
+        let raw = disable_raw_mode();
+        modes.and(raw)?;
+        self.active = false;
+        Ok(())
     }
 
     /// Takes the claim back and repaints from nothing: whatever was drawn
@@ -121,10 +131,17 @@ impl Tui {
             return Ok(());
         }
         enable_raw_mode()?;
-        if self.fullscreen {
-            crossterm::execute!(stderr(), EnterAlternateScreen, EnableBracketedPaste, Hide)?;
+        let modes = if self.fullscreen {
+            crossterm::execute!(stderr(), EnterAlternateScreen, EnableBracketedPaste, Hide)
         } else {
-            crossterm::execute!(stderr(), EnableBracketedPaste, Hide)?;
+            crossterm::execute!(stderr(), EnableBracketedPaste, Hide)
+        };
+        if let Err(e) = modes {
+            // Raw mode is on and half the modes may be too. `active` is still
+            // false, so `Drop` would undo nothing: hand the whole terminal
+            // back now, the same recovery `enter` runs.
+            crate::ui::restore_terminal();
+            return Err(e);
         }
         self.active = true;
         self.terminal.clear()
@@ -135,6 +152,36 @@ impl Drop for Tui {
     fn drop(&mut self) {
         let _ = self.suspend();
     }
+}
+
+/// The whole entry, shared by every browser: the terminal check and the
+/// claim, each refusal carrying the view's own hint about the flags that
+/// work without one.
+///
+/// Five views spelled both blocks out verbatim, and only the hint ever
+/// differed — which is the shape drift starts from. The check reads standard
+/// error, like everything the views draw; standard output is deliberately
+/// not consulted, because the listing it would protect is exactly what the
+/// browser withholds.
+pub fn claim_fullscreen(hint: &str) -> anyhow::Result<Tui> {
+    use crate::exit::{ExitCode, ExitError};
+
+    if !console::Term::stderr().is_term() {
+        return Err(
+            ExitError::new(ExitCode::Error, "--interactive needs a terminal to draw on")
+                .with_hint(hint)
+                .into(),
+        );
+    }
+    // The whole claim on the terminal -- raw mode, alternate screen, paste,
+    // cursor -- in one guard, so an early return cannot leave any of it on.
+    Ok(Tui::fullscreen().map_err(|e| {
+        ExitError::new(
+            ExitCode::Error,
+            format!("the terminal would not go into raw mode: {e}"),
+        )
+        .with_hint(hint)
+    })?)
 }
 
 /// Whether the views may style at all. `console` decides -- `NO_COLOR`,
