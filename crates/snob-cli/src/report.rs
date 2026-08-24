@@ -635,12 +635,16 @@ pub fn counters_unknowable(username: &str) -> String {
 /// It is the tick's own refusal rather than a report, so it names no command:
 /// there was nothing wrong with what the user asked for, and the next run may
 /// well answer it.
-pub fn refuse_nothing_looked_at(name: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "nothing could be looked at for @{} this time, and nothing is stored \
-         about that account yet to report against",
-        printable(name)
+pub fn refuse_nothing_looked_at(name: &str, code: ExitCode) -> anyhow::Error {
+    ExitError::new(
+        code,
+        format!(
+            "nothing could be looked at for @{} this time, and nothing is stored \
+             about that account yet to report against",
+            printable(name)
+        ),
     )
+    .into()
 }
 
 /// A name the monitor was pointed at and has never walked.

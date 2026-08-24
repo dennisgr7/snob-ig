@@ -39,6 +39,7 @@ use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
 use crate::ui;
+use crate::ui::browser::scratch::ABANDONED_AFTER;
 
 /// Ceiling on one downloaded story.
 ///
@@ -479,13 +480,13 @@ pub(crate) enum Saved {
 /// which refuses a name that appeared between the look and the open. The
 /// doc on `output::write_new` says why the creation has to be the check.
 ///
-/// **The file is written to `<stem>.part` and renamed at the end.** The
+/// **The file is written to `<stem>.<pid>.part` and renamed at the end.** The
 /// bytes stream to disk through `IgClient::download_to` -- the download used
 /// to sit in memory whole, then get copied once more for the write -- and a
 /// stream that stops halfway must not leave a truncated file under the real
 /// name, where the look above would take it for a finished one. A `.part` is
-/// removed on any failure here; one left by a killed process is removed the
-/// next time the same story is asked for.
+/// removed on any failure here; one left by a killed process is removed by
+/// age the next time the same story is asked for.
 /// `stem_base` is what comes before the number in the file name: the username
 /// for a story, the username and the highlight's number for a highlight item.
 /// Filtered here, because it carries a name that came off the server.
@@ -507,8 +508,14 @@ pub(crate) async fn save_story(
         .as_deref()
         .ok_or_else(|| anyhow!("story {number} has no downloadable version"))?;
 
-    let part = dir.join(format!("{stem}.part"));
-    let _ = std::fs::remove_file(&part);
+    // The scratch name carries the process id, so two runs saving into the
+    // same directory never share one. The blind `remove_file` this replaced
+    // unlinked a sibling's half-written download, and the survivor's rename
+    // then published the *other* process's truncated bytes under the final
+    // name. `create_new` stays the only arbiter for this process's own name;
+    // a `.part` an earlier killed run abandoned is cleared by age instead.
+    sweep_stale_parts(dir, &stem);
+    let part = dir.join(format!("{stem}.{}.part", std::process::id()));
     let mut file = output::create_new(&part)?;
     let downloaded = match client.download_to(url, MAX_STORY_BYTES, &mut file).await {
         Ok(downloaded) => downloaded,
@@ -540,6 +547,40 @@ pub(crate) async fn save_story(
         );
     }
     Ok(Saved::Now(path))
+}
+
+/// Removes `.part` files for this stem that no live download can still own.
+///
+/// A `.part` younger than [`ABANDONED_AFTER`] may be a sibling process still
+/// streaming -- its mtime moves with every written chunk -- and is left
+/// alone. Failures are ignored: this is housekeeping, and the story saves
+/// either way.
+fn sweep_stale_parts(dir: &Path, stem: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `user-3.part` and `user-3.<pid>.part` both belong to this stem;
+        // `user-33.part` does not, which is what the dot after the stem asks.
+        let ours = name
+            .strip_prefix(stem)
+            .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".part"));
+        if !ours {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > ABANDONED_AFTER)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The file a story with this stem was saved to earlier, if any extension

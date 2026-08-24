@@ -1068,17 +1068,14 @@ impl MediaActionArgs {
     /// A pure function of its inputs so the whole matrix is testable without
     /// a terminal; the caller supplies the one detected bit.
     pub fn browses(&self, format_given: bool, attending: bool) -> bool {
-        if self.interactive {
-            return true;
-        }
-        if self.no_interactive
-            || self.selection().is_some()
-            || self.output.is_some()
-            || format_given
-        {
-            return false;
-        }
-        attending
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            // A selection or a destination asks for the downloaded form the
+            // way a format asks for the printed one.
+            self.selection().is_some() || self.output.is_some() || format_given,
+            attending,
+        )
     }
 }
 

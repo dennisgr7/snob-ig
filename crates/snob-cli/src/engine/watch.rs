@@ -505,23 +505,32 @@ impl TickReport {
         if self.looked() {
             return ExitCode::Ok;
         }
-        // Every list was refused. The most specific reason wins: a cooldown is
-        // something that lifts, and saying so is more use than "error".
-        self.lists
-            .iter()
-            .find_map(|list| match list.skipped {
-                Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
-                // What Instagram said beats what the store had to record, which
-                // is the rule `ListOutcome::stopped_by` exists for and the one
-                // `exit::from_stop_reason` names in its own doc: whichever of
-                // the two a command happens to read must not change the answer.
-                Some(Skipped::Incomplete(reason, said)) => {
-                    Some(said.unwrap_or_else(|| ExitCode::from_stop_reason(reason)))
-                }
-                _ => None,
-            })
-            .unwrap_or(ExitCode::Error)
+        refused_outcome(&self.lists)
     }
+}
+
+/// The most specific reason every list on a run was refused. A cooldown is
+/// something that lifts, and saying so is more use than "error".
+///
+/// Shared between [`TickReport::outcome`] and the refusal `tick` raises when
+/// it has no stored account to report against, so the two cannot drift:
+/// `snob watch once someone` during a cooldown exits the same way whether or
+/// not that account had ever been walked before.
+fn refused_outcome(lists: &[TickList]) -> ExitCode {
+    lists
+        .iter()
+        .find_map(|list| match list.skipped {
+            Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
+            // What Instagram said beats what the store had to record, which
+            // is the rule `ListOutcome::stopped_by` exists for and the one
+            // `exit::from_stop_reason` names in its own doc: whichever of
+            // the two a command happens to read must not change the answer.
+            Some(Skipped::Incomplete(reason, said)) => {
+                Some(said.unwrap_or_else(|| ExitCode::from_stop_reason(reason)))
+            }
+            _ => None,
+        })
+        .unwrap_or(ExitCode::Error)
 }
 
 /// Goes and looks, then reports what changed since the last time it did.
@@ -619,8 +628,13 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         (None, None) => app.viewer().pk,
         (None, Some(name)) => {
             let name = target::clean(name);
-            accounts::find_pk_by_username(app.db().conn(), name)?
-                .ok_or_else(|| crate::report::refuse_nothing_looked_at(name))?
+            // The refusal carries the code `outcome()` would have produced,
+            // not a bare error: a first tick during a cooldown used to exit 1
+            // where the same tick on a walked account exits 5, and the `--json`
+            // stream said `"error"` about a state that lifts on its own.
+            accounts::find_pk_by_username(app.db().conn(), name)?.ok_or_else(|| {
+                crate::report::refuse_nothing_looked_at(name, refused_outcome(&lists))
+            })?
         }
     };
 
