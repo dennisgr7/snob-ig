@@ -228,7 +228,16 @@ jobs:
             # so it does not depend on who the runner is. gzip -n because gzip
             # writes its own timestamp into the header as well, which is the one
             # everybody forgets.
-            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            #
+            # Those flags are GNU tar's, and macOS ships BSD tar as `tar` --
+            # which refuses --sort=name outright. The runner image carries GNU
+            # tar as `gtar`, so that name is preferred wherever it exists. The
+            # fallback to plain `tar` is for Linux, where it is GNU; a macOS
+            # host without gtar still fails loudly on the first flag rather
+            # than quietly building an archive whose bytes depend on the
+            # filesystem, which is the reproducibility this step exists for.
+            tar="$(command -v gtar || command -v tar)"
+            "$tar" --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
               -C staging -cf - "$name" | gzip -n > "$name.tar.gz"
           fi
 
