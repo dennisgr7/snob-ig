@@ -1402,7 +1402,10 @@ async fn a_story_is_downloaded_under_the_name_the_listing_implies() {
 
 /// A download that stopped halfway leaves a `.part`, never a truncated file
 /// under the real name -- which the look-before-fetch above would otherwise
-/// take for a finished one. The next ask for the same story replaces it.
+/// take for a finished one. The next ask for the same story sweeps one old
+/// enough to be abandoned; it is removed **by age**, not blindly, because a
+/// fresh `.part` may be a sibling process still streaming -- the blind
+/// remove this replaced let two runs publish each other's truncated bytes.
 #[tokio::test]
 async fn a_leftover_part_file_is_replaced_and_never_taken_for_the_story() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1411,7 +1414,17 @@ async fn a_leftover_part_file_is_replaced_and_never_taken_for_the_story() {
     log_in(tmp.path(), &instagram);
     let here = tmp.path().join("here");
     std::fs::create_dir(&here).unwrap();
-    std::fs::write(here.join("me-1.part"), b"half of").unwrap();
+    let leftover = here.join("me-1.part");
+    std::fs::write(&leftover, b"half of").unwrap();
+    // Aged past ABANDONED_AFTER, the way a killed run's leftover really is by
+    // the time somebody asks again. A fresh one is deliberately left alone.
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&leftover)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(stale))
+        .unwrap();
 
     let out = snob_from(
         &here,
@@ -1754,7 +1767,11 @@ async fn unfollowing_somebody_you_do_not_follow_sends_nothing() {
         .and(url_path("/api/v1/users/web_profile_info/"))
         .and(query_param("username", "stranger"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"data":{"user":{"id":"9002","username":"stranger","followed_by_viewer":false}}}"#,
+            // Both facts said, on purpose: an absent `requested_by_viewer` is
+            // unknown, and unknown sends the request rather than assuming --
+            // there may be a pending request to withdraw. Only the fully
+            // known "not following, nothing pending" costs no request.
+            r#"{"data":{"user":{"id":"9002","username":"stranger","followed_by_viewer":false,"requested_by_viewer":false}}}"#,
         ))
         // Ahead of the catch-all mounted by `fake_instagram`, which answers for
         // any username with the session's own account. At equal priority
