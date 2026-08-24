@@ -6,13 +6,13 @@
 //! and costs two requests.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, StopReason, User};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_core::model::{ListKind, User};
 use snob_core::sets;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::cli::ListArgs;
-use crate::commands::common::{self, Session};
+use crate::commands::common;
 use crate::engine::{self, ListOutcome, ResultSource};
 use crate::exit::ExitCode;
 use crate::report;
@@ -45,6 +45,15 @@ impl SetOp {
                 "friend, you follow each other",
                 "friends, following each other",
             ),
+        }
+    }
+
+    /// The command's own name: what `-i`'s heading calls the result.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unfollowers => "unfollowers",
+            Self::Fans => "fans",
+            Self::Friends => "friends",
         }
     }
 
@@ -82,17 +91,25 @@ pub async fn run(
     paths: &AppPaths,
     op: SetOp,
 ) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
+    }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
-    let Session::Open(mut app) = common::open(&args, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // The list being crossed against comes first. If it turns out incomplete
     // there is no result to give, so it is worth finding out before spending
     // the second walk.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let (against, against_outcome) =
         common::walk_named(&mut app, &args, op.against(), &subject, |outcome| {
             check_against_list(op, outcome)
@@ -107,19 +124,29 @@ pub async fn run(
 
     engine::cooldown::check_same_moment(&against_outcome, &base_outcome)?;
 
-    let mut result = match op {
+    let result = match op {
         SetOp::Unfollowers | SetOp::Fans => sets::difference(&base, &against),
         SetOp::Friends => sets::intersection(&base, &against),
     };
 
-    let total = result.len();
-    result = filter.apply(result);
-    let kept = result.len();
-    if let Some(cap) = args.limit {
-        result.truncate(cap);
-    }
+    let common::Narrowed {
+        shown: result,
+        kept,
+        total,
+    } = common::narrow(result, &filter, args.limit);
 
-    destination.write(&result)?;
+    // The browser instead of the listing — the default at a terminal, the
+    // decision made above. An empty result is not browsed: there is nothing
+    // to move over, and the summary line already says the count.
+    let browsed = if browses && !result.is_empty() {
+        let shelf = ui::people::Shelf::flat(format!("{} of {subject}", op.name()), &result);
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        destination.write(&result)?;
+    }
 
     print_summary(
         op,
@@ -131,7 +158,15 @@ pub async fn run(
         &against_outcome,
     );
 
-    Ok(exit_code(&base_outcome))
+    // Decided by what stopped the **base** list alone. The list crossed
+    // against is not consulted: it was refused outright by
+    // `check_against_list`, well before there was a result to code. Leaving
+    // the browser with Ctrl+C outranks it: it is the freshest thing the user
+    // said.
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => base_outcome.exit_code_for_a_printed_result(),
+    })
 }
 
 /// The check that stops a false result from being reported.
@@ -154,25 +189,6 @@ fn check_against_list(op: SetOp, outcome: &ListOutcome) -> Result<()> {
         outcome,
         op.misreads_as(),
     ))
-}
-
-/// What a crossing exits with, decided by what stopped the **base** list.
-///
-/// The list crossed *against* is not consulted here at all: it is refused
-/// outright by `check_against_list`, well before there is a result to code.
-///
-/// `PageLimit` sits with `Completed` for the reason `cli.rs` gives at the top
-/// of its exit table — a cap the user asked for is not a failure — and for the
-/// reason this very function's caller already acts on: the result was written
-/// and the shortfall was warned about, not refused. Left to `is_complete` the
-/// two disagreed, so `snob unfollowers --max-pages 2` exited 1 while
-/// `snob following --max-pages 2` exited 0 for the identical stop reason. The
-/// arm is the same one `lists::exit_code` spells out.
-fn exit_code(base: &ListOutcome) -> ExitCode {
-    match base.reason {
-        StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        _ => base.exit_code(),
-    }
 }
 
 fn print_summary(
@@ -228,29 +244,22 @@ fn summary_line(
     ));
 
     // When it is stored, say so and say from when. This read only the counts,
-    // so `snob unfollowers --cache` a month later printed a line that could not
+    // so `snob unfollowers --offline` a month later printed a line that could not
     // be told apart from a crossing walked five minutes ago — while `snob
-    // followers --cache` says "list stored on 07/07 at 14:12" for the very same
+    // followers --offline` says "list stored on 07/07 at 14:12" for the very same
     // capture. `Provenance`'s own doc names an answer that does not say where it
     // came from as half of the defect it was written for.
     //
-    // The older of the two dates, because a crossing is only as recent as its
-    // staler half. `check_same_moment` is what stops the two being far apart at
-    // all, so this is completeness rather than a correction.
     if base_outcome.source() == ResultSource::Cached
         || against_outcome.source() == ResultSource::Cached
     {
         line.push_str(&format!(
             " - lists stored on {}",
-            report::stored_on(base_outcome.taken_at.min(against_outcome.taken_at))
+            report::stored_on_the_older_of(base_outcome.taken_at, against_outcome.taken_at)
         ));
     }
 
-    if total_requests > 0 {
-        line.push_str(&format!(" - {}", report::requests(total_requests)));
-    } else {
-        line.push_str(" - without touching the network");
-    }
+    line.push_str(&report::spent(total_requests));
     line
 }
 
@@ -264,22 +273,24 @@ fn proportion(part: usize, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::model::StopReason;
+    use snob_core::{Epoch, Pk};
 
     fn outcome(reason: StopReason) -> ListOutcome {
         ListOutcome {
             provenance: engine::Provenance::Walked,
             reason,
             requests: 1,
-            started_at: 0,
-            taken_at: 0,
-            account_pk: 1,
+            started_at: Epoch::default(),
+            taken_at: Epoch::default(),
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,
         }
     }
 
-    fn stored(taken_at: i64) -> ListOutcome {
+    fn stored(taken_at: Epoch) -> ListOutcome {
         ListOutcome {
             provenance: engine::Provenance::CacheFlag,
             requests: 0,
@@ -291,11 +302,13 @@ mod tests {
     /// A cap the user asked for is not a failure, on either side of a crossing.
     ///
     /// The result is written and the shortfall warned about, `cli.rs` promises
-    /// 0 for it in as many words, and `lists::exit_code` has the arm — so
-    /// `snob unfollowers --max-pages 2` exiting 1 while `snob following
-    /// --max-pages 2` exits 0 was two answers to one stop reason.
+    /// 0 for it in as many words — so `snob unfollowers --max-pages 2` exiting
+    /// 1 while `snob following --max-pages 2` exits 0 was two answers to one
+    /// stop reason. The two commands ask one method now; this pins the
+    /// crossing's side of it.
     #[test]
     fn a_base_list_stopped_by_the_page_cap_still_exits_zero() {
+        let exit_code = ListOutcome::exit_code_for_a_printed_result;
         assert_eq!(exit_code(&outcome(StopReason::PageLimit)), ExitCode::Ok);
         assert_eq!(exit_code(&outcome(StopReason::Completed)), ExitCode::Ok);
 
@@ -310,9 +323,9 @@ mod tests {
 
     /// A crossing served from storage says so, and says from when.
     ///
-    /// The line read only the counts, so `snob unfollowers --cache` a month
+    /// The line read only the counts, so `snob unfollowers --offline` a month
     /// later was indistinguishable from a crossing walked five minutes ago —
-    /// while `snob followers --cache` says "list stored on 07/07 at 14:12" for
+    /// while `snob followers --offline` says "list stored on 07/07 at 14:12" for
     /// the very same capture. The counts are right and `check_same_moment`
     /// blocks the dangerous case, so this is completeness rather than a
     /// correction; but an answer that does not say where it came from is half
@@ -320,7 +333,7 @@ mod tests {
     #[test]
     fn a_crossing_served_from_storage_says_when_it_is_from() {
         // Two captures a day apart. The line has to name the older.
-        let older = 1_700_000_000;
+        let older = Epoch::new(1_700_000_000);
         let line = summary_line(
             SetOp::Unfollowers,
             3,
@@ -328,7 +341,7 @@ mod tests {
             3,
             412,
             &stored(older),
-            &stored(older + 24 * 3_600),
+            &stored(older + std::time::Duration::from_secs(24 * 3_600)),
         );
 
         assert!(

@@ -18,17 +18,18 @@
 //! and one per configured account for its counters. A `POST` to the user's own
 //! webhook is not an Instagram request at all.
 //!
-//! It returns facts. Which of them is worth a red line, and what the sentence
-//! says, is `commands::watch_setup`'s question.
+//! It returns facts. What the sentence says is `commands::watch::say`'s
+//! question, and whether a monitoring system should go red about it is
+//! `commands::watch::status`'s.
 
-use snob_core::Pk;
-use snob_core::secrets::SecretStore;
-use snob_core::store::snapshots;
-use snob_core::store::watch as watch_store;
+use snob_core::{Epoch, EpochMs, Pk};
+use snob_store::secrets::SecretStore;
+use snob_store::store::snapshots;
+use snob_store::store::watch as watch_store;
 
 use crate::exit::ExitCode;
-use snob_core::watch::config::WatchConfig;
 use snob_core::watch::schedule::{self, Schedule};
+use snob_store::config::WatchConfig;
 
 use crate::app::App;
 
@@ -75,15 +76,68 @@ impl Verdict {
 
 /// One thing that was checked.
 ///
-/// `problem` carries the underlying error as it was reported, which is data
-/// rather than wording: it is whatever the schedule parser, Instagram or the
-/// user's own server said, and inventing a sentence for it here would lose the
-/// only detail that identifies the cause.
+/// `problem` says what is wrong and never how it reads.
+/// `commands::watch::say::problem_line` turns it into the sentence, the same
+/// way that module turns a [`super::watch::Skipped`] into one.
 #[derive(Debug, Clone)]
 pub struct Checked {
     pub what: What,
     pub verdict: Verdict,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
+}
+
+/// What is wrong with something that was checked.
+///
+/// Nine of these were English sentences built inside this module, which is the
+/// module rule the wrong way round: `engine` returns data and where the data
+/// came from, and never decides how anything looks. They are variants now and
+/// the words are `commands::watch::say`'s, so `check`'s terminal output and its
+/// `--json` are two renderings of one answer rather than one rendering and a
+/// copy of it.
+///
+/// [`Problem::Foreign`] is what stopped this being done for a long time: some
+/// of these lines carry text this program did not write — what the schedule
+/// parser refused, what Instagram answered, what the user's own receiver said —
+/// and inventing a sentence for those would lose the only detail that
+/// identifies the cause. It is one variant among twelve rather than a reason
+/// for the other eleven to be strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// There is no `watch.toml`, so a bare `snob watch` has nothing to run on.
+    NothingConfigured,
+    /// The schedule is well formed and names no moment that exists. `0 0 31 2
+    /// *` is the standing example.
+    NeverFires,
+    /// The scheduler refused the file, and said why. The text is the
+    /// scheduler's.
+    Unbuildable(String),
+    /// Nothing was asked about this, because the account is in cooldown until
+    /// then. Turning the moment into a date is `report`'s job, like every other
+    /// date the tool prints.
+    InCooldown { until_ms: EpochMs },
+    /// An unattended run may not read this account, which is a fact about the
+    /// file and not about the network. `in_cooldown` is the line for an account
+    /// a cooldown also stopped anything else being checked about — the same
+    /// condition, with one clause more.
+    NoRecordedConsent { in_cooldown: bool },
+    /// The session did not answer, so nothing could be asked about anybody.
+    SessionSilent,
+    /// There is no session at all.
+    NoSession,
+    /// The session carries no username and Instagram did not name the account
+    /// either, so there is nothing to ask the profile endpoint with.
+    NoUsername,
+    /// The id came from search, which carries no counters — so this run cannot
+    /// tell a truncated list from a complete one.
+    CountersUnknowable,
+    /// Nothing has been reported on yet, so the first scheduled run has nothing
+    /// to compare against and will say nothing.
+    FirstRunLaysTheBaseline,
+    /// `--no-webhook`, so the address was checked and not used.
+    NotPosted,
+    /// Whatever the schedule parser, the store, Instagram or the user's own
+    /// server said, carried through unchanged.
+    Foreign(String),
 }
 
 /// What was checked, and what was learned about it.
@@ -92,7 +146,7 @@ pub enum What {
     /// No `watch.toml` at all, so there is nothing else to check.
     NotConfigured,
     /// The schedule, and the next few moments it fires at.
-    Schedule { next: Vec<i64> },
+    Schedule { next: Vec<Epoch> },
     /// The session, and which backend the secret store landed on.
     Session {
         viewer: Option<String>,
@@ -118,7 +172,7 @@ pub enum What {
     /// Whether there is anything to compare the first scheduled run against.
     Baseline {
         /// When the newest capture of each list was taken. Empty means none.
-        taken_at: Vec<(snob_core::model::ListKind, i64)>,
+        taken_at: Vec<(snob_core::model::ListKind, Epoch)>,
     },
 }
 
@@ -154,7 +208,7 @@ impl CheckReport {
         self.checked.iter().any(|c| wants_a_baseline(&c.what))
     }
 
-    fn push(&mut self, what: What, verdict: Verdict, problem: Option<String>) {
+    fn push(&mut self, what: What, verdict: Verdict, problem: Option<Problem>) {
         self.checked.push(Checked {
             what,
             verdict,
@@ -173,11 +227,11 @@ const MOMENTS_SHOWN: usize = 3;
 /// session at all, and because it is what catches a file the scheduler would
 /// refuse at every run — `config::parse` reads TOML and a schema number, not
 /// what the values mean.
-pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
+pub fn schedule_of(schedule: &Schedule, now: Epoch) -> Checked {
     let mut next = Vec::new();
     let mut at = now;
     for _ in 0..MOMENTS_SHOWN {
-        match schedule::next_moment(schedule, Some(at), at, &chrono::Local) {
+        match schedule::next_after(schedule, Some(at), at, &chrono::Local) {
             Some(moment) if moment > at => {
                 next.push(moment);
                 at = moment;
@@ -191,9 +245,7 @@ pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
     } else {
         Verdict::Ok
     };
-    let problem = next
-        .is_empty()
-        .then(|| "this schedule never fires: no moment it names exists".to_string());
+    let problem = next.is_empty().then_some(Problem::NeverFires);
 
     Checked {
         what: What::Schedule { next },
@@ -211,7 +263,7 @@ pub fn schedule_of(schedule: &Schedule, now: i64) -> Checked {
 pub fn without_a_session(
     configured: Option<&WatchConfig>,
     schedule: Option<&Result<Schedule, String>>,
-    now: i64,
+    now: Epoch,
 ) -> CheckReport {
     let mut report = CheckReport::default();
 
@@ -219,7 +271,7 @@ pub fn without_a_session(
         report.push(
             What::NotConfigured,
             Verdict::Warned,
-            Some(crate::report::NOTHING_CONFIGURED.to_string()),
+            Some(Problem::NothingConfigured),
         );
     }
 
@@ -228,7 +280,7 @@ pub fn without_a_session(
         Some(Err(why)) => report.push(
             What::Schedule { next: Vec::new() },
             Verdict::Failed,
-            Some(format!("this schedule cannot be built: {why}")),
+            Some(Problem::Unbuildable(why.clone())),
         ),
         None => {}
     }
@@ -246,11 +298,17 @@ pub async fn with_a_session(
     report: &mut CheckReport,
 ) {
     // **Nothing is spent during a cooldown**, and this is the one request path
-    // in the tool that did not say so. `Pacer::clear_to_send` charges the
-    // budget but never reads the `cooldowns` table — every other caller gates
-    // explicitly — so a command built to be polled was knocking on a door
+    // in the tool that did not say so. `Pacer::clear_to_send` charged the
+    // budget without ever reading the `cooldowns` table — every other caller
+    // gated explicitly — so a command built to be polled was knocking on a door
     // Instagram had just closed, once per configured account, on whatever
     // interval a monitoring system polls at.
+    //
+    // `Pacer::clear` reads the table now, so this gate is no longer the only
+    // thing standing here. It stays because the two answer differently and this
+    // one is the answer a person wants: the backstop refuses with an error, and
+    // what somebody running `check` needs is the line below — a warning that
+    // says how long is left and lets the rest of the report be produced.
     //
     // Reported rather than skipped in silence: a cooldown is exactly the sort
     // of thing somebody running `check` wants to be told about, and it lifts on
@@ -279,7 +337,7 @@ pub async fn with_a_session(
                     backend: secrets.backend().as_str(),
                 },
                 verdict: Verdict::Failed,
-                problem: Some(e.to_string()),
+                problem: Some(Problem::Foreign(e.to_string())),
             });
             return;
         }
@@ -300,7 +358,7 @@ pub async fn with_a_session(
                 backend: secrets.backend().as_str(),
             },
             verdict: Verdict::Failed,
-            problem: Some(e.to_string()),
+            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
         },
     };
     let session_works = session.verdict == Verdict::Ok;
@@ -352,14 +410,11 @@ pub async fn with_a_session(
 /// Warned rather than Failed: a cooldown lifts on its own, and it is exactly
 /// the sort of thing somebody running `check` wants to be told rather than have
 /// skipped in silence.
-fn waiting_out(what: What, until_ms: i64) -> Checked {
+fn waiting_out(what: What, until_ms: EpochMs) -> Checked {
     Checked {
         what,
         verdict: Verdict::Warned,
-        problem: Some(format!(
-            "not checked: the account is in cooldown until {}",
-            crate::report::cooldown_ends_at(until_ms)
-        )),
+        problem: Some(Problem::InCooldown { until_ms }),
     }
 }
 
@@ -372,7 +427,7 @@ fn waiting_out(what: What, until_ms: i64) -> Checked {
 /// warning because a cooldown happened to be standing made `check` exit 0 about
 /// a monitor that cannot run at all — from the command whose whole job is to
 /// answer that question before a run does.
-fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
+fn not_asked_about(account: &super::watch::Watched, until_ms: EpochMs) -> Checked {
     let may_run_unattended = account.may_run_unattended();
     let what = What::Account {
         target: account.name().map(str::to_string),
@@ -388,10 +443,7 @@ fn not_asked_about(account: &super::watch::Watched, until_ms: i64) -> Checked {
     Checked {
         what,
         verdict: Verdict::Failed,
-        problem: Some(format!(
-            "{} (and it is in cooldown, so nothing else was checked)",
-            crate::report::NO_RECORDED_CONSENT
-        )),
+        problem: Some(Problem::NoRecordedConsent { in_cooldown: true }),
     }
 }
 
@@ -426,7 +478,7 @@ async fn account_of(
             Checked {
                 what,
                 verdict: Verdict::Warned,
-                problem: Some("not checked: the session is not responding".to_string()),
+                problem: Some(Problem::SessionSilent),
             },
             None,
         );
@@ -469,11 +521,7 @@ async fn account_of(
                         Checked {
                             what,
                             verdict: Verdict::Warned,
-                            problem: Some(
-                                "not checked: the session carries no username, and Instagram \
-                                 did not name the account either"
-                                    .to_string(),
-                            ),
+                            problem: Some(Problem::NoUsername),
                         },
                         None,
                     );
@@ -483,7 +531,7 @@ async fn account_of(
                         Checked {
                             what,
                             verdict: Verdict::Failed,
-                            problem: Some(e.to_string()),
+                            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
                         },
                         None,
                     );
@@ -501,13 +549,29 @@ async fn account_of(
                 following: profile.following_count(),
                 may_run_unattended,
             };
-            let verdict = if may_run_unattended {
-                Verdict::Ok
-            } else {
+            // Counters that cannot be known are the preflight's own subject.
+            // Half of what `check` is for is finding the truncation wall before
+            // six hours of walking, and that check is a comparison against the
+            // declared size — so on an account whose profile Instagram will not
+            // serve, and whose id therefore came from search, the preflight can
+            // no longer make the promise it exists to make. A warning rather
+            // than a failure: the run would still work, and only what would
+            // stop one reaches the exit code.
+            let counters_unknown = !profile.counters_are_knowable();
+            let verdict = if !may_run_unattended {
                 Verdict::Failed
+            } else if counters_unknown {
+                Verdict::Warned
+            } else {
+                Verdict::Ok
             };
-            let problem =
-                (!may_run_unattended).then(|| crate::report::NO_RECORDED_CONSENT.to_string());
+            let problem = if !may_run_unattended {
+                Some(Problem::NoRecordedConsent { in_cooldown: false })
+            } else if counters_unknown {
+                Some(Problem::CountersUnknowable)
+            } else {
+                None
+            };
             (
                 Checked {
                     what,
@@ -521,7 +585,7 @@ async fn account_of(
             Checked {
                 what,
                 verdict: Verdict::Failed,
-                problem: Some(e.to_string()),
+                problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
             },
             None,
         ),
@@ -596,7 +660,7 @@ pub async fn webhook_of(
                 signed,
             },
             verdict: Verdict::Failed,
-            problem: Some(other.error().to_string()),
+            problem: Some(Problem::Foreign(other.error().to_string())),
         },
     }
 }
@@ -634,7 +698,7 @@ fn reported_baseline(
     app: &App,
     pk: Pk,
     kind: snob_core::model::ListKind,
-) -> Result<Option<i64>, snob_core::store::StoreError> {
+) -> Result<Option<Epoch>, snob_store::store::StoreError> {
     let Some(id) = watch_store::mark(app.db().conn(), pk, kind)?.and_then(|m| m.snapshot_id) else {
         return Ok(None);
     };
@@ -659,7 +723,7 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
                 return Checked {
                     what: What::Baseline { taken_at },
                     verdict: Verdict::Warned,
-                    problem: Some(e.to_string()),
+                    problem: Some(Problem::Foreign(e.to_string())),
                 };
             }
         }
@@ -670,11 +734,7 @@ pub fn baseline_of(app: &App, pk: Pk) -> Checked {
     Checked {
         what,
         verdict: if wants { Verdict::Warned } else { Verdict::Ok },
-        problem: wants.then(|| {
-            "the first scheduled run lays the baseline down and reports no changes; \
-             the second one onwards reports them"
-                .to_string()
-        }),
+        problem: wants.then_some(Problem::FirstRunLaysTheBaseline),
     }
 }
 
@@ -692,22 +752,23 @@ mod tests {
     /// `NotConfigured` warning does not cover it, because a file exists.
     #[test]
     fn a_schedule_the_scheduler_refuses_is_reported_rather_than_omitted() {
-        let configured = snob_core::watch::config::parse(
+        let configured = snob_store::config::parse(
             "schema = 1\nevery = \"5m\"\n",
             std::path::Path::new("watch.toml"),
         )
         .expect("config::parse reads TOML and a schema number, not what the values mean");
         let refused: Result<Schedule, String> = Err("5m is too often".to_string());
 
-        let report = without_a_session(Some(&configured), Some(&refused), 1_700_000_000);
+        let report =
+            without_a_session(Some(&configured), Some(&refused), Epoch::new(1_700_000_000));
 
         assert_eq!(report.verdict(), Verdict::Failed);
         assert_eq!(report.checked.len(), 1, "{:?}", report.checked);
         assert!(
-            report.checked[0]
-                .problem
-                .as_deref()
-                .is_some_and(|p| p.contains("5m is too often")),
+            matches!(
+                &report.checked[0].problem,
+                Some(Problem::Unbuildable(why)) if why.contains("5m is too often")
+            ),
             "the line has to carry what the scheduler said: {:?}",
             report.checked
         );
@@ -737,7 +798,7 @@ mod tests {
     #[test]
     fn a_schedule_names_the_moments_it_will_fire_at() {
         let schedule = Schedule::every(Duration::from_secs(6 * 3_600)).unwrap();
-        let checked = schedule_of(&schedule, 1_700_000_000);
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
 
         assert_eq!(checked.verdict, Verdict::Ok);
         let What::Schedule { next } = checked.what else {
@@ -756,7 +817,7 @@ mod tests {
     #[test]
     fn a_schedule_that_never_fires_is_a_failure_rather_than_a_wait() {
         let schedule = Schedule::cron("0 0 31 2 *").unwrap();
-        let checked = schedule_of(&schedule, 1_700_000_000);
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
 
         assert_eq!(checked.verdict, Verdict::Failed);
         assert!(checked.problem.is_some());
@@ -766,7 +827,7 @@ mod tests {
     /// there has no schedule to run on, and saying so is the whole job.
     #[test]
     fn nothing_configured_is_reported_rather_than_passed_over() {
-        let report = without_a_session(None, None, 1_700_000_000);
+        let report = without_a_session(None, None, Epoch::new(1_700_000_000));
 
         assert_eq!(report.verdict(), Verdict::Warned);
         assert!(matches!(

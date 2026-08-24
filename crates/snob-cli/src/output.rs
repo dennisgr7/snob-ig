@@ -16,9 +16,26 @@ use snob_core::model::{User, printable};
 use crate::cli::Format;
 use crate::ui;
 
+/// The six JSON keys of `User`, in the order the struct declares them: the
+/// column set every row format shares.
+///
+/// `csv` and `xlsx` each had a frozen copy, identical, with a comment on the
+/// second pointing at the first instead of a constant tying them. Here, above
+/// the `xlsx` feature gate, so the build without the feature still has the
+/// one definition. A test below holds the list to the struct's actual keys.
+pub(crate) const USER_COLUMNS: [&str; 6] = [
+    "pk",
+    "username",
+    "full_name",
+    "is_private",
+    "is_verified",
+    "pfp_url",
+];
+
 pub(crate) mod csv;
 pub(crate) mod md;
 pub(crate) mod table;
+#[cfg(feature = "xlsx")]
 pub(crate) mod xlsx;
 
 /// How the result will be seen.
@@ -122,6 +139,15 @@ fn format_from_extension(path: &Path) -> Option<Format> {
 /// Refuses up front what would only fail once the walk had already been paid
 /// for. Called before the first request, never after.
 pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<()> {
+    // Before the walk, like every other refusal here: a build without the
+    // feature still parses `--format xlsx` and still reads the extension, so
+    // the answer has to be given here and not after the requests were spent.
+    #[cfg(not(feature = "xlsx"))]
+    if format == Format::Xlsx {
+        return Err(anyhow!(
+            "this build of snob was made without the \"xlsx\" format; use csv, json, ndjson or md"
+        ));
+    }
     if format == Format::Xlsx && destination.is_none() {
         return Err(anyhow!(
             "the \"xlsx\" format is a binary file; write it with -o (for example -o result.xlsx)"
@@ -167,9 +193,14 @@ pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBu
     let usable = !stem.is_empty()
         && stem.len() <= 64
         && !stem.starts_with('.')
+        // The hyphen is what `stories` puts between the name and the number,
+        // and it was not here -- so `snob stories --download` refused every
+        // name it invented, lowercase ASCII included, after the bytes had
+        // been fetched. A separator on no platform, and nothing a username
+        // can carry, so it says nothing about the account.
         && stem
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
         && !RESERVED.contains(&device.as_str());
 
     if !usable {
@@ -203,6 +234,24 @@ pub fn write(
     write_rendered(&render(users, format, presentation)?, destination)
 }
 
+/// [`write_rendered`] for bytes that are not a rendering.
+///
+/// A story is a file that arrived; wrapping it in `Rendered::Bytes` meant
+/// copying the whole thing once more -- up to the story ceiling -- to hand a
+/// borrowed slice to a writer that only ever reads one. `Rendered` stays for
+/// what is rendered.
+pub fn write_bytes(bytes: &[u8], destination: Option<&Path>) -> Result<()> {
+    match destination {
+        Some(path) => {
+            std::fs::write(path, bytes)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            ui::info(&format!("Written to {}", path.display()));
+            Ok(())
+        }
+        None => write_stdout(bytes),
+    }
+}
+
 /// Writes to a name **this program chose**, refusing to touch anything that is
 /// already there.
 ///
@@ -212,6 +261,21 @@ pub fn write(
 /// writing afterwards leaves a gap — a whole network download wide, in `pfp` —
 /// in which the name can become a symlink to somewhere else.
 pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
+    create_new(path)?
+        .write_all(rendered.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))?;
+
+    ui::info(&format!("Written to {}", path.display()));
+    Ok(())
+}
+
+/// Opens a file that must not already exist, readable by this account only.
+///
+/// The creation is the check: looking first and writing afterwards leaves a
+/// gap in which the name can become a link to somewhere else. Shared by
+/// [`write_new`] and by the story browser, which writes into its scratch
+/// directory and says nothing about it.
+pub fn create_new(path: &Path) -> Result<std::fs::File> {
     use std::fs::OpenOptions;
 
     let mut options = OpenOptions::new();
@@ -227,47 +291,37 @@ pub fn write_new(rendered: &Rendered, path: &Path) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
+    options
         .open(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    file.write_all(rendered.as_bytes())
-        .with_context(|| format!("could not write {}", path.display()))?;
-
-    ui::info(&format!("Written to {}", path.display()));
-    Ok(())
+        .with_context(|| format!("could not create {}", path.display()))
 }
 
 /// Writes an already-rendered result to the destination, with the same
 /// file-vs-stdout behavior every command shares.
 pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result<()> {
-    match destination {
-        Some(path) => {
-            std::fs::write(path, rendered.as_bytes())
-                .with_context(|| format!("could not write {}", path.display()))?;
-            // The path goes as plain text, not as a file:// link, which some
-            // terminals highlight but cannot open.
-            ui::info(&format!("Written to {}", path.display()));
-        }
-        None => {
-            let stdout = std::io::stdout();
-            let mut locked = stdout.lock();
-            // Not `.ok()` on either call. Standard output is line-buffered, so
-            // at this point the tail of the result is still in the buffer and
-            // the flush is where a full disk reports itself. Discarded, `snob
-            // pfp someone > face.jpg` on a full filesystem printed nothing,
-            // exited 0, and left a truncated JPEG behind.
-            //
-            // A closed reader is the one exception, and it is not a failure:
-            // `snob followers | head -20` is a reader that has finished, and on
-            // Windows there is no SIGPIPE to end the process the way it does on
-            // Unix. Reporting "could not write the result" and exiting non-zero
-            // there would make a normal shell idiom look like an error.
-            for step in [locked.write_all(rendered.as_bytes()), locked.flush()] {
-                match step {
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                    other => other.context("could not write the result")?,
-                }
-            }
+    write_bytes(rendered.as_bytes(), destination)
+}
+
+/// The result, on standard output, for a reader that may have left.
+///
+/// Not `.ok()` on either call. Standard output is line-buffered, so at this
+/// point the tail of the result is still in the buffer and the flush is where
+/// a full disk reports itself. Discarded, `snob pfp someone > face.jpg` on a
+/// full filesystem printed nothing, exited 0, and left a truncated JPEG
+/// behind.
+///
+/// A closed reader is the one exception, and it is not a failure: `snob
+/// followers | head -20` is a reader that has finished, and on Windows there
+/// is no SIGPIPE to end the process the way it does on Unix. Reporting "could
+/// not write the result" and exiting non-zero there would make a normal shell
+/// idiom look like an error.
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    for step in [locked.write_all(bytes), locked.flush()] {
+        match step {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => other.context("could not write the result")?,
         }
     }
     Ok(())
@@ -275,7 +329,10 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
 
 fn render(users: &[User], format: Format, presentation: Presentation) -> Result<Rendered> {
     if format == Format::Xlsx {
+        #[cfg(feature = "xlsx")]
         return Ok(Rendered::Bytes(xlsx::workbook(users)?));
+        #[cfg(not(feature = "xlsx"))]
+        anyhow::bail!("this build of snob was made without the \"xlsx\" format");
     }
     Ok(Rendered::Text(match format {
         // The drawn table is for someone watching it appear. Down a pipe or
@@ -306,11 +363,12 @@ fn render(users: &[User], format: Format, presentation: Presentation) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn users() -> Vec<User> {
         vec![
             User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one".into(),
                 full_name: Some("One".into()),
                 is_private: None,
@@ -318,7 +376,7 @@ mod tests {
                 pfp_url: None,
             },
             User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two".into(),
                 full_name: None,
                 is_private: None,
@@ -361,6 +419,7 @@ mod tests {
     }
 
     /// Every format a list can be asked for now produces something.
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_list_renders_in_every_format() {
         for f in [
@@ -378,6 +437,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_spreadsheet_reaches_the_file_as_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -438,6 +498,19 @@ mod tests {
         }
     }
 
+    /// Without the feature the refusal comes first, before a walk is paid for,
+    /// and names the formats that are there.
+    #[cfg(not(feature = "xlsx"))]
+    #[test]
+    fn a_build_without_xlsx_refuses_the_format_up_front() {
+        let error = check_destination(Format::Xlsx, Some(Path::new("x.xlsx"))).unwrap_err();
+        assert!(
+            error.to_string().contains("without the \"xlsx\" format"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "xlsx")]
     #[test]
     fn a_spreadsheet_needs_a_file_to_go_to() {
         let error = check_destination(Format::Xlsx, None).unwrap_err();
@@ -480,6 +553,15 @@ mod tests {
         // started from.
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path();
+
+        // What `stories` and `pfp` actually invent has to pass, or the refusal
+        // above is the only outcome the command can have -- which it was.
+        for good in ["someone-1", "some.one-12", "a_b.c", "x"] {
+            assert!(
+                default_path(here, good, "jpg").is_ok(),
+                "{good:?} is a name this tool invents"
+            );
+        }
 
         for bad in [
             "nul",
@@ -555,5 +637,36 @@ mod tests {
         let payload = vec![0x50, 0x4b, 0x03, 0x04, 0x00, 0xff];
         write_rendered(&Rendered::Bytes(payload.clone()), Some(&path)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+}
+
+#[cfg(test)]
+mod user_columns_tests {
+    /// The columns are a projection of `User`'s serialized shape, so the
+    /// authority is the struct itself: serialize one with every field set and
+    /// compare the key sets. The *order* cannot be read back -- serde_json
+    /// sorts an object's keys -- so order stays a reviewed fact; what this
+    /// holds is that a field added to `User` fails here first, which is the
+    /// reminder to decide its column everywhere at once.
+    #[test]
+    fn the_shared_columns_are_the_struct_keys() {
+        let user = snob_core::model::User {
+            pk: snob_core::Pk::new(1),
+            username: "a".to_string(),
+            full_name: Some("b".to_string()),
+            is_private: Some(true),
+            is_verified: Some(false),
+            pfp_url: Some("https://example.test/p.jpg".to_string()),
+        };
+        let value = serde_json::to_value(&user).expect("a user serializes");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("a user is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut columns = super::USER_COLUMNS.to_vec();
+        columns.sort_unstable();
+        assert_eq!(keys, columns, "serde_json answers the keys sorted");
     }
 }

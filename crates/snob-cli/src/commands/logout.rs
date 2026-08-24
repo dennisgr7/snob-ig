@@ -1,6 +1,6 @@
 use anyhow::Result;
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::SecretStore;
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::SecretStore;
 
 use crate::cli::LogoutArgs;
 use crate::exit::ExitCode;
@@ -19,7 +19,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
 
     match (&removal, had_session) {
         (Ok(()), true) => {
-            println!("Session deleted.");
+            crate::ui::say!("Session deleted.");
             // Worth saying: nothing was closed on Instagram's side, because
             // that would be a write and snob does not write.
             ui::info(
@@ -27,7 +27,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
                  \"Active sessions\" in the app's settings.",
             );
         }
-        (Ok(()), false) => println!("There was no session stored."),
+        (Ok(()), false) => crate::ui::say!("There was no session stored."),
         // Nothing is claimed here. What refused says so itself, printed by
         // `main`, and "the session is still active on Instagram" would read as
         // though the local copy were the part that had gone.
@@ -59,10 +59,10 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
         // the session, which was still in the keyring. `purge::execute`
         // already collects its failures for exactly this.
         (true, true) => match std::fs::remove_dir_all(&profile) {
-            Ok(()) => println!("Browser profile deleted."),
+            Ok(()) => crate::ui::say!("Browser profile deleted."),
             Err(e) => profile_failure = Some(e),
         },
-        (true, false) => println!("There is no browser profile to delete."),
+        (true, false) => crate::ui::say!("There is no browser profile to delete."),
         // Deleting the stored session leaves the browser one behind, and
         // someone who just ran logout reasonably believes the credential is
         // gone from their machine. It is not.

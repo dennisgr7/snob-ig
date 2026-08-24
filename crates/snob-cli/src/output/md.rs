@@ -68,7 +68,7 @@ fn link(user: &User) -> String {
 /// of `x](http://evil.test)` produced a second, working link to somewhere else,
 /// sitting in the row as though this file had put it there. The destination is
 /// a separate problem with a separate answer: `User::profile_url` encodes.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace('[', "\\[")
@@ -80,10 +80,11 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn user() -> User {
         User {
-            pk: 1,
+            pk: Pk::new(1),
             username: "one".into(),
             full_name: Some("One Person".into()),
             is_private: None,

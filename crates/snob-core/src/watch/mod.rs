@@ -7,12 +7,13 @@
 //! of the project already keeps between what a thing *is* and how it is
 //! presented.
 
-pub mod config;
 pub mod diff;
+pub mod outcome;
 pub mod schedule;
 pub mod sign;
 
 pub use diff::{Basis, ListDiff, Rename};
+pub use outcome::{RecordedOutcome, RunOutcome};
 pub use schedule::{Due, Schedule, ScheduleError, Weekday};
 
 /// Everything one run found about one account.
@@ -46,12 +47,12 @@ impl Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pk;
     use crate::model::User;
+    use crate::{Epoch, Pk};
 
-    fn user(pk: Pk) -> User {
+    fn user(pk: u64) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: format!("u{pk}"),
             full_name: None,
             is_private: None,
@@ -73,11 +74,11 @@ mod tests {
     fn a_rename_alone_still_counts_as_a_change() {
         let changes = Changes {
             renamed: vec![Rename {
-                pk: 7,
+                pk: Pk::new(7),
                 history_id: 7,
                 from: "before".into(),
                 to: "after".into(),
-                at: 1_000,
+                at: Epoch::new(1_000),
             }],
             ..Default::default()
         };

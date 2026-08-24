@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/snob-ig", "crates/snob-core", "crates/snob-cli"]
+members = ["crates/snob-ig", "crates/snob-core", "crates/snob-store", "crates/snob-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -11,13 +11,14 @@ repository = "https://github.com/dennisgr7/snob-ig"
 
 [workspace.dependencies]
 snob-core = { path = "crates/snob-core" }
+snob-store = { path = "crates/snob-store" }
 snob-ig = { path = "crates/snob-ig" }
 
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 # The TLS backend is **not** listed here. It is chosen per platform, in
 # crates/snob-ig/Cargo.toml, and the reason is written out there.
 # No `cookies`: nothing here keeps a cookie jar — the session travels as an
@@ -40,7 +41,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 # to read the answer is worse than not announcing it. `deflate` was the one
 # missing, so the header did not match the comment that asked for it.
 
-reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "gzip", "deflate", "brotli", "zstd"] }
+# `form` is what the two writes send their body as, and it costs nothing: it
+# pulls `serde_urlencoded`, which `query` already put in the tree. Encoding the
+# body by hand would have been the same crate graph and one more place to get
+# percent-encoding wrong.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "query", "form", "gzip", "deflate", "brotli", "zstd"] }
 # Depended on only to turn one feature back on. reqwest declares rustls with
 # `default-features = false`, which drops `prefer-post-quantum` — and without it
 # the client advertises the hybrid group X25519MLKEM768 in `supported_groups`
@@ -49,35 +54,159 @@ reqwest = { version = "0.13", default-features = false, features = ["http2", "qu
 # Chrome does: Chrome puts the hybrid first and sends its share. Enabling it
 # costs about a kilobyte on the handshake.
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
-clap = { version = "4", features = ["derive"] }
-# No `fallible_uint` on purpose: without that feature `params![pk]` does not
-# compile for a u64, so the compiler forces everything through pk_to_sql.
+# Mozilla's published root certificates, in full X.509 form, for `--strict-roots`.
+# `webpki-roots` would not do: it publishes trust anchors, and `tls_certs_only`
+# takes certificates. Only compiled for the four rustls targets -- the schannel
+# one has no way to say "these roots and no others", and refuses the flag.
+webpki-root-certs = "1"
+# `env` so the two secrets a command line can carry -- the CSRF token and the
+# webhook signing key -- can come from the environment instead of argv, where
+# every local user can read them. It costs nothing: the feature is a few
+# lines in clap_builder.
+clap = { version = "4", features = ["derive", "env"] }
+# No `fallible_uint` on purpose: without that feature no `u64` can be a
+# parameter or a column, so the compiler forces every one of them through a
+# named conversion rather than through a silent cast.
+# **An account id no longer depends on this**, and that is the stronger half:
+# `snob_core::Pk` is a newtype that implements neither `ToSql` nor `FromSql`,
+# so `params![pk]` does not compile whatever this feature says, and
+# `store::pk_to_sql` / `pk_from_sql` are the only road. The feature stays off
+# for everything else in the schema that is counted rather than identified.
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 fastrand = "2.5"
 chrono = "0.4"
 directories = "6"
-# Windows and Linux (zbus) come with the defaults; macOS has to be asked for
-keyring = { version = "4", features = ["apple-native-keyring-store"] }
+# `keyring-core` plus one store per platform, rather than the `keyring` crate
+# that used to wrap them. The keyring project split in 2026 and `keyring 4.x`
+# now calls itself sample code; what it does on each platform is one line
+# picking exactly these stores and handing them to `keyring_core::set_default_store`,
+# which is what `secrets::use_the_platform_store` does directly.
+#
+# Two things came with going direct, and the second is why it was worth doing.
+# `default-features = false` on the Windows store drops its `search` feature and
+# `regex` and `aho-corasick` with it -- 863,744 bytes, 11.4% of both Windows
+# binaries, for an API nothing here calls. And the store's `persistence`
+# modifier is a supported way to ask for `CRED_PERSIST_LOCAL_MACHINE`, which
+# `keyring`'s own `Entry` did not expose; see `secrets::entry_for` for what that
+# closes and for the experiment that showed the change is safe to ship.
+#
+# The target names are unchanged by construction: these are the same stores in
+# the same default configuration `keyring 4` was already building.
+keyring-core = "1"
+windows-native-keyring-store = { version = "1", default-features = false }
+# `keychain` is not a default: the crate refuses to compile on macOS without it
+# or `protected`, and `protected` is the one that needs a code-signed
+# application, which this is deliberately not. The `keyring` wrapper used to
+# turn this on for us, and dropping it dropped the feature with it -- caught by
+# cross-checking the target rather than by a macOS release failing.
+apple-native-keyring-store = { version = "1", default-features = false, features = ["keychain"] }
+# `crypto-rust` rather than the OpenSSL default, for the same reason the webhook
+# signs with RustCrypto: this project does not link a C crypto library.
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 comfy-table = "7"
 indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
 rust_xlsxwriter = "0.97"
-# Only to read Instagram's export. `deflate` is what a zip holding JSON uses;
+# Only to read Instagram's export. Deflate is what a zip holding JSON uses;
 # rust_xlsxwriter already pulls this crate in, so the features are kept narrow
 # rather than adding a second copy of the compression code.
-zip = { version = "8", default-features = false, features = ["deflate"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dialoguer = { version = "0.12", default-features = false }
+#
+# The decoder feature by name, not the `deflate` umbrella: in zip 8 the umbrella
+# also turns on `deflate-zopfli`, a *compressor*, and the one use here is
+# `ZipArchive` reading an export. Today this changes nothing in the tree --
+# rust_xlsxwriter asks for the umbrella and features are additive -- but the
+# line states what this dependency is for, and the day the xlsx writer is
+# measured out (see AGENTS.md) zopfli leaves with it instead of staying behind
+# unasked-for.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# No `attributes`, which is a default feature. It exists for
+# `#[tracing::instrument]`, which nothing in this tree writes -- every event
+# here is an explicit `tracing::debug!`/`warn!` call -- and it is what keeps
+# `tracing-attributes` and its `syn` edge in the build. The external consumers
+# (`h2`, `hyper-util`) ask only for `std`, so dropping it here drops the
+# proc-macro from the tree. Same shape as `env-filter` below: build time and
+# one less crate for `cargo deny` to clear, not binary size.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# No `env-filter`. It exists to parse `RUST_LOG`'s full grammar -- span names,
+# field matchers, `[span{field=value}]` -- and to do that it compiles
+# `matchers`, `regex-automata` and `regex-syntax`: a complete regular-expression
+# engine, for a program whose two filters are `target=level` lists. The
+# `Targets` filter parses exactly that syntax with no regex behind it, and it is
+# what `main::init_tracing` builds. Same shape as dropping the Windows keyring's
+# `search` feature, which took `regex` and `aho-corasick` out of the tree.
+# `ansi` stays: it is what colors the level on a terminal, and costs one crate.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 console = "0.16"
+# **Already compiled into this binary before it was ever declared here**, by
+# `comfy-table`'s `tty` feature -- `cargo tree -i crossterm` shows the edge.
+# What it was built with is the `windows` feature and nothing else, so the crate
+# was in the tree with its whole reason for existing switched off.
+#
+# `events` and `bracketed-paste` are what the browsers read keys with, and they
+# cost **zero new crates on Windows and macOS** and two on Linux (`signal-hook`
+# and `signal-hook-mio`; `mio` itself arrives with tokio). ratatui draws through
+# this same copy: its `crossterm_0_29` feature (below) resolves to the one
+# crossterm in the tree, which `cargo tree -i crossterm` confirms -- and which
+# is also what lets a `KeyEvent` read by `ui/browser/input.rs` be the very type
+# ratatui's backend speaks, with no conversion layer.
+#
+# `default-features = false` states what *this* crate uses; it no longer prunes
+# the tree. `ratatui-crossterm` asks for crossterm with its defaults on, and
+# features are additive, so `derive-more` -- with `convert_case`, `darling`,
+# `darling_core`, `darling_macro` and `ident_case` -- rides along regardless.
+# All five are proc-macros: the binary is byte-identical with and without them,
+# and what they cost is build time and five more crates for `cargo deny` to
+# clear. Do not "fix" this line into carrying defaults because of that; the
+# narrow list is documentation of use, and it is what pares the tree again the
+# day the wide request upstream goes away.
+#
+# Read `ui/browser/input.rs` for what this buys that `console` cannot give,
+# starting with the two defects it closes.
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
+# What the interactive views draw with: the browsers and the profile card on the
+# alternate screen, the menu in a small inline viewport. It replaced a
+# hand-rolled line-diff renderer (`Screen`/`Viewport`) once the profile card
+# crossed the line AGENTS.md had drawn in advance -- focusable rows, sliding
+# chip windows, sub-views and a filter input are the "second pane / navigable
+# table" case the old decision named as its own reversal. The measured cost of
+# the adoption is recorded in AGENTS.md next to the decision.
+#
+# `default-features = false` and one feature. `crossterm_0_29` is the backend,
+# pinned to the workspace's crossterm so there is one copy (see above). What the
+# defaults would add and this line refuses: `underline-color` (nothing here
+# underlines in color), `macros` (`ratatui-macros`, sugar over constructors this
+# code writes out), `all-widgets` (the calendar widget and the `time` crate with
+# it), and `layout-cache` (a cache for layout solves; three constraints at a
+# 150 ms tick do not need one). `palette` stays off on doctrine, not size: the
+# views speak the 16 ANSI colors so the user's theme decides what they mean,
+# and a crate whose purpose is mixing RGB would be an attractive nuisance.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+# Hands a downloaded story to whatever the user already opens pictures and
+# videos with. `default-features = false` drops the two optional Linux
+# dependencies -- `zbus` and `url` -- which exist for the "reveal in file
+# manager" half nothing here calls; what is left is `bstr` on Linux, nothing at
+# all on macOS, and `normpath` plus `windows-sys` on Windows, where the version
+# is already the one this workspace pins.
+#
+# Preferred over invoking `cmd /C start` and `xdg-open` by hand, which is the
+# obvious dependency-free answer and is worse: on Windows it puts a command line
+# between this program and a file name, and `ShellExecuteW` -- which this crate
+# calls -- takes the path as a path.
+opener = { version = "0.8", default-features = false }
 url = "2"
-# Talking to a browser we launched, over the DevTools protocol. Loopback only,
-# so no TLS stack is pulled in: `connect` alone speaks ws:// and nothing more.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-base64 = "0.23"
+# Talking to a browser we launched, over the DevTools protocol. It used to be
+# `tokio-tungstenite` and `futures-util` over a loopback WebSocket; the protocol
+# now travels on two inherited pipes instead, which has no address for anything
+# else on the machine to connect to, and framing NUL-separated JSON needs no
+# library. `crates/snob-cli/src/pipe.rs` carries the reasoning and the cost.
+#
+# Only for the Unix half of that: `dup2` in a `pre_exec` hook is what puts the
+# two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
+# no such crate -- it goes through `windows-sys`, which is already here.
+libc = "0.2"
+base64 = "0.22"
 # Signing the monitor's webhook body. RustCrypto, pure Rust: the assembly
 # backends are optional features and stay off, which is what makes these build
 # on Windows ARM64 -- the target that has no LLVM and is the reason the TLS
@@ -89,7 +218,7 @@ base64 = "0.23"
 # from a template, because a serializer cannot put the reason for a value next
 # to it and this project puts the reason next to the thing it governs.
 # `default-features = false` drops the serializing half and `toml_edit` with it.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 hmac = "0.12"
 sha2 = { version = "0.10", default-features = false }
 # Already in the tree under `url`, so this costs no extra compilation. Used to
@@ -100,7 +229,21 @@ percent-encoding = "2"
 # Already in the tree through the Windows keyring backend, so this costs no
 # extra compilation. Used to clear the session cookie out of memory on drop.
 zeroize = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Globalization"] }
+# `Win32_Security_Authorization` and `Win32_Storage_FileSystem` are what the
+# data directory is given at creation, and they answer two separate findings
+# that landed in the same function. The DACL, so that a machine with a
+# non-default profile ACL does not leave the follower database readable by other
+# local accounts. And `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`, because a query
+# against the live Windows Search index returned files out of the browser
+# profile -- where a second copy of the session sits during a login.
+# `paths::create_private_dir` carries both.
+#
+# `Win32_System_Threading`, `Win32_System_Pipes`, `Win32_System_JobObjects` and
+# `Win32_Security` are the Windows half of launching the browser on a pipe:
+# `CreateProcessW` with the handle-inheritance blob `std::process::Command` does
+# not expose, and the job object that takes the browser down with this process
+# however this process dies.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Test-only
 wiremock = "0.6"
@@ -127,3 +270,50 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The lint policy, in the manifest rather than only on CI's command line.
+#
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings` is what
+# the `lint` job runs and it is unchanged; what this adds is that a contributor
+# who types plain `cargo clippy` — or whose editor runs it — gets the same
+# answer. A policy that only exists in a YAML file is one every local build
+# disagrees with until the pull request goes red.
+[workspace.lints.rust]
+# Linking this binary has made MSVC announce that it is creating an import
+# library, because a native dependency exports symbols. There is nothing to act
+# on, and it was the first thing printed on every build. Kept even though
+# Windows no longer links aws-lc: the message belongs to the linker, not to any
+# one dependency.
+#
+# At the workspace level rather than on `snob-cli`, because a crate cannot have
+# both `lints.workspace = true` and a `[lints]` table of its own. Nothing else
+# links a binary, so the widening costs nothing.
+linker_messages = "allow"
+
+[workspace.lints.clippy]
+# **The rule this project already keeps, made checkable.** Of the 57 `unsafe`
+# blocks in the tree, 50 already carry a `// SAFETY:` comment — the practice is
+# established, and what was missing was anything that noticed the fifty-first
+# going in without one. This is the cheapest possible ratchet: it changes no
+# code that is already right.
+#
+# Deliberately the only clippy lint named here, and not a group. `all` is
+# already on by default; `pedantic` and `nursery` would each land a few hundred
+# findings that have nothing to do with anything this project has got wrong, and
+# the settled position on that is that a lint earns its place by catching a
+# defect this codebase actually had.
+#
+# Not `unsafe_op_in_unsafe_fn`, which is the obvious companion and is moot
+# twice: it is warn-by-default in edition 2024, which this workspace is on, and
+# there is not one `unsafe fn` defined anywhere in the tree. Every unsafe here
+# is a block.
+undocumented_unsafe_blocks = "warn"
+# The second, and it clears the same bar. Six builders in the tree consume
+# and return `Self` -- `Pacer::with_cancel`, `Pacer::announcing`,
+# `Schedule::with_jitter`, `ExitError::with_hint`, `IgClient::with_base_url`,
+# `Session::minimal` -- and dropping the result of any of them is a silent
+# no-op. AGENTS.md records the defect: `login` and `whoami` built a `Pacer`
+# "and nothing else", losing the cancel token and the wait announcement, and
+# a lint that makes `Pacer::new(budget).with_cancel(token);` a warning is
+# the cheapest thing that would have noticed.
+return_self_not_must_use = "warn"

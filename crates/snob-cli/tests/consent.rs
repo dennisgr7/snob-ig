@@ -14,10 +14,11 @@
 //! answer is passed in rather than asked for. That is what
 //! `engine::ask_consent_with` exists for.
 
+use snob_core::Pk;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::Store;
 use url::Url;
 use wiremock::MockServer;
 
@@ -34,10 +35,9 @@ use common::{SID, UA, args_for};
 /// `yes` is the one field that has to differ from the shared fixture — the tests
 /// there would hang on the prompt, and these exist to reach it.
 fn args(target: &str) -> ListArgs {
-    ListArgs {
-        yes: false,
-        ..args_for(target)
-    }
+    let mut args = args_for(target);
+    args.walk.consent.yes = false;
+    args
 }
 
 /// No mock is mounted on purpose. Every test here asserts the answer arrives
@@ -74,7 +74,7 @@ async fn ask_as(
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -183,7 +183,7 @@ async fn your_own_name_never_needs_confirming_even_with_nobody_there() {
 #[tokio::test]
 async fn a_yes_given_in_advance_needs_no_terminal() {
     let mut args = args("@ghost");
-    args.yes = true;
+    args.walk.consent.yes = true;
 
     let (result, spent) = ask(&args, false).await;
     result.expect("-y is consent");
@@ -205,7 +205,7 @@ async fn a_yes_given_in_advance_needs_no_terminal() {
 #[tokio::test]
 async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
     use snob_core::model::{ListKind, StopReason, User};
-    use snob_core::store::{accounts, snapshots, users};
+    use snob_store::store::{accounts, snapshots, users};
 
     let server = MockServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -214,7 +214,7 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
     // A list of theirs that was walked at some point, which is what `--cache`
     // is for reading back.
     let ghost = User {
-        pk: 7,
+        pk: Pk::new(7),
         username: "ghost".into(),
         full_name: None,
         is_private: None,
@@ -222,13 +222,13 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
         pfp_url: None,
     };
     users::upsert(db.conn(), &ghost).unwrap();
-    accounts::upsert(db.conn(), 7, false).unwrap();
-    let opened = snapshots::begin(db.conn(), 7, ListKind::Followers, Some(1)).unwrap();
+    accounts::upsert(db.conn(), Pk::new(7), false).unwrap();
+    let opened = snapshots::begin(db.conn(), Pk::new(7), ListKind::Followers, Some(1)).unwrap();
     snapshots::save_page(
         &mut db,
         opened.id,
         &[User {
-            pk: 8,
+            pk: Pk::new(8),
             username: "someone".into(),
             full_name: None,
             is_private: None,
@@ -248,17 +248,15 @@ async fn a_cached_answer_about_somebody_else_needs_no_terminal() {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
 
     // No `-y`, no terminal — `cargo test` is not one — and somebody else's
     // account. Every ingredient of the refusal, and it must not come.
-    let args = ListArgs {
-        cache: true,
-        ..args("@ghost")
-    };
+    let mut args = args("@ghost");
+    args.walk.offline = true;
     let (users, outcome) = engine::list(&mut app, &args, ListKind::Followers)
         .await
         .expect("a local answer needs nobody's permission and nobody's terminal");
@@ -297,7 +295,7 @@ async fn an_answer_about_one_account_does_not_cover_another() {
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );

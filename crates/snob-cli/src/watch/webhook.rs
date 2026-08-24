@@ -252,7 +252,14 @@ impl WebhookClient {
 
 /// What the far end said, in one line.
 fn describe(status: reqwest::StatusCode, body: &str) -> String {
-    let excerpt: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Two hundred characters are kept, so sixty-four words is more than the
+    // excerpt can ever show; the body is the receiver's, up to four kilobytes,
+    // and this is the path a receiver that is down sends every retry through.
+    let excerpt: String = body
+        .split_whitespace()
+        .take(64)
+        .collect::<Vec<_>>()
+        .join(" ");
     if excerpt.is_empty() {
         return status.to_string();
     }
@@ -280,6 +287,13 @@ fn describe(status: reqwest::StatusCode, body: &str) -> String {
 ///
 /// The host and path are kept, because which address was meant is the whole
 /// content of every one of those messages.
+///
+/// **Except where the path is the credential.** A Slack incoming webhook is
+/// `/services/T…/B…/<secret>` and a Discord one `/api/webhooks/<id>/<token>`;
+/// there is no userinfo to clear because the whole secret is in the path,
+/// and keeping the path printed it on every `watch check`, in `--json`, and
+/// into the log of an unattended service. For those hosts the path stops at
+/// the segment that names the service, which is still enough to recognize.
 pub fn shown(url: &Url) -> String {
     let mut clean = url.clone();
     // Both calls fail only on a URL that cannot have a host -- `mailto:`, say --
@@ -287,7 +301,58 @@ pub fn shown(url: &Url) -> String {
     // it was in that case: there is no userinfo to clear.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
+
+    let secret_path = match clean.host_str() {
+        Some("hooks.slack.com") => Some("services"),
+        Some("discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com") => {
+            Some("webhooks")
+        }
+        _ => None,
+    };
+    if let Some(marker) = secret_path {
+        let segments: Vec<&str> = clean.path().split('/').filter(|s| !s.is_empty()).collect();
+        if let Some(at) = segments.iter().position(|s| *s == marker) {
+            let kept = segments[..=at].join("/");
+            clean.set_path(&format!("/{kept}/..."));
+        }
+    }
     clean.to_string()
+}
+
+/// The same refusals, asked of a configuration file rather than of a built
+/// client, and without touching the keyring.
+///
+/// **`snob watch status` had no way to ask this.** It builds the schedule, so a
+/// timetable the scheduler refuses is reported — but it never built the
+/// delivery, and `delivery_from` runs before anything is opened or spent. So a
+/// hand-edited `url = "n8n.local/hook"` with no scheme killed every invocation
+/// at the parse, `record_failed_run` was never reached, `watch_runs` stayed
+/// empty, and `status` answered "it has not run yet" with exit 0 for ever while
+/// printing the address as though it were fine. `snob watch check` reported the
+/// same file as failed: the fix had been applied to one probe and not the
+/// other.
+///
+/// Config-only on purpose. A missing token is a different question and one the
+/// keyring answers; what this asks is whether the address could work at all,
+/// which is a property of the file and available to a probe that has opened
+/// nothing.
+pub fn problem_with_config(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let url = match Url::parse(url) {
+        Ok(url) => url,
+        Err(e) => return Some(format!("the configured address cannot be used: {e}")),
+    };
+    let webhook = Webhook {
+        url,
+        headers: headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        key: None,
+    };
+    check(&webhook).err().map(|e| e.to_string())
 }
 
 pub fn check(webhook: &Webhook) -> Result<()> {
@@ -642,6 +707,22 @@ mod tests {
     fn the_shown_address_keeps_everything_but_the_credential() {
         let shown = shown(&Url::parse("https://alice:hunter2@host.test/hook?x=1").unwrap());
         assert_eq!(shown, "https://host.test/hook?x=1");
+    }
+
+    /// Where the path is the credential, the path is what goes.
+    #[test]
+    fn a_webhook_whose_path_is_the_secret_is_shown_without_it() {
+        let slack = Url::parse("https://hooks.slack.com/services/T0000/B0000/XXXXYYYY").unwrap();
+        assert_eq!(shown(&slack), "https://hooks.slack.com/services/...");
+        let discord =
+            Url::parse("https://discord.com/api/webhooks/123456/abcdef-token?wait=true").unwrap();
+        assert_eq!(
+            shown(&discord),
+            "https://discord.com/api/webhooks/...?wait=true"
+        );
+        // Anybody else's path is the address, and stays.
+        let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
+        assert_eq!(shown(&own), "https://n8n.local/webhook/snob");
     }
 
     /// `[::]` is what `0.0.0.0` is, and one was accepted while the other was

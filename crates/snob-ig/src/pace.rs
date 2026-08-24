@@ -5,7 +5,8 @@
 //! *fewer* requests. **They are not changed without a documented reason** —
 //! each one carries below what it is for, and that is what stops a number being
 //! quietly tuned down until the tool is asking far more of Instagram's service
-//! than answering the question needs.
+//! than answering the question needs. Slower is always an acceptable answer
+//! here; faster has to be argued for, and so far never has been.
 //!
 //! Two limits on what that provenance covers, both worth knowing before
 //! leaning on it:
@@ -21,12 +22,75 @@
 //!   in the same response. This walks both lists, so for a symmetric account it
 //!   spends roughly twice the requests for the same answer. What offsets that is
 //!   a budget that persists across runs, which the reference also does not have.
+//!
+//! **And there is a third limit, which is the honest one: nothing behind these
+//! numbers is a published rate.** An audit in August 2026 went looking for one
+//! and this is what there is, written down here because it is the sort of thing
+//! that gets rediscovered every year with nothing to argue against.
+//!
+//! The best public figure for this endpoint family is instaloader's
+//! field-report guess of 75 requests per 660 seconds for its non-GraphQL calls.
+//! Against that, this walks at about 172 in the same window — because the
+//! cadence was copied from a project that walks **GraphQL**, which is a
+//! different endpoint family with different weighting, and that difference was
+//! never noticed when the numbers were taken.
+//!
+//! **This is recorded, not proposed, and the arithmetic is why.** Slowing to
+//! instaloader's guess means about 8.8 seconds a request; a 235-page walk then
+//! takes 34 minutes against a 900-second resume window, so an interrupted walk
+//! could never be continued and would begin again at page one. Worse, a list
+//! that took 34 minutes to read no longer describes one moment, and one list
+//! describing one moment is worth more than the rate — the whole comparison
+//! rests on it, which is what `engine::cooldown::check_same_moment` exists to
+//! protect. Trading that away to match a number that is itself a guess would be
+//! paying a certain cost for an uncertain benefit.
+//!
+//! **One local measurement, August 2026, and the four reasons it settles
+//! nothing.** A real Chrome session against instagram.com was recorded over the
+//! DevTools Protocol and driven by hand — login, profiles, stories, follow,
+//! unfollow, block, unblock, like. In 251 seconds it made 193 requests to
+//! `/api/v1/` and the two GraphQL routes, and was refused none of them: no 429,
+//! no `Retry-After`, no rate-limit header of any kind. Scaled to the window
+//! used here that is about 507, against this walker's 172 and instaloader's 75.
+//!
+//! It is worth having for one thing only: it is the only number anybody here
+//! has taken rather than inherited, and it is evidence against slowing *down*
+//! to 75, which is not what a client on this endpoint family does.
+//!
+//! It is not evidence that 507 is safe, and the reasons are worth spelling out
+//! because a number in a comment gets quoted back as permission:
+//!
+//! - It is a 251-second observation extrapolated into an 11-minute window.
+//! - Its **shape** is wrong. Median gap between requests 105 ms, ninetieth
+//!   percentile 3.2 seconds: a browser bursts at page load and then sits while
+//!   somebody reads. A walk never sits.
+//! - Its **content** is wrong. Fifty-six distinct operations across half a
+//!   dozen surfaces, against one endpoint paged thousands of times — a browsing
+//!   session and a list walk are not the same load, and a rate taken from the
+//!   first says nothing about the second.
+//! - **Nothing in it was refused**, so it bounds nothing. The line is still
+//!   somewhere above the largest un-refused session anyone has recorded, which
+//!   is where it was before.
+//!
+//! The rate stays at 172. What the capture did produce is in
+//! `IgClient::note_push_back`: Instagram volunteers `x-ig-capacity-level` and
+//! `x-ig-peak-time` on its answers, and those are now written down when it
+//! pushes back — so that the run which finally *is* refused says what the load
+//! was at that moment. Acting on them is deliberately not done: they describe a
+//! datacenter's headroom, which is the same for everyone in that region, and
+//! the thing being managed here is a checkpoint on one account.
+//!
+//! One figure that is **not** evidence, because it is quoted at this problem
+//! constantly: the ubiquitous "200 calls per user per hour" is Meta's Graph API
+//! platform limit for `graph.facebook.com`. It has nothing to do with these
+//! endpoints, and anybody reaching for it here has the wrong document.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use snob_core::store::rate_budget::RateBudget;
+use snob_core::EpochMs;
+use snob_core::budget::RateBudget;
 
 /// Request cadence during a walk.
 #[derive(Debug, Clone, Copy)]
@@ -88,10 +152,13 @@ impl Pace {
     /// counted — slowing down must not turn into knocking more often.
     ///
     /// The cost is that a walk takes about three times as long, and the resume
-    /// window is measured from when it started. Somewhere past four thousand
-    /// accounts an interrupted walk stops being resumable and begins again from
-    /// the top. That is the right trade anyway: a walk that long no longer
-    /// describes a single moment, which is what the window is there to protect.
+    /// window is measured from when it started. Somewhere past two thousand
+    /// accounts on the followers list — which answers about 25 a page whatever
+    /// is asked, see `per_page` — or four thousand on the following list,
+    /// where 50 is honored, an interrupted walk stops being resumable and
+    /// begins again from the top. That is the right trade anyway: a walk that
+    /// long no longer describes a single moment, which is what the window is
+    /// there to protect.
     pub fn third_party() -> Self {
         Self {
             micro_pause_ms: (1_500, 4_000),
@@ -175,12 +242,14 @@ impl Pacer {
         self.spent.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
         self
     }
 
     /// Sets who gets told about a wait the budget imposed.
+    #[must_use]
     pub fn announcing(mut self, announce: Arc<dyn Fn(Duration) + Send + Sync>) -> Self {
         self.announce = Some(announce);
         self
@@ -190,7 +259,7 @@ impl Pacer {
     /// Instagram skips rate control entirely.
     #[doc(hidden)]
     pub fn unlimited() -> Self {
-        Self::new(Arc::new(snob_core::store::rate_budget::UnlimitedRateBudget))
+        Self::new(Arc::new(snob_core::budget::UnlimitedRateBudget))
     }
 
     pub fn cancel_token(&self) -> &CancelToken {
@@ -198,7 +267,7 @@ impl Pacer {
     }
 
     /// Until when the account is in cooldown, if it is.
-    pub fn cooldown(&self) -> Result<Option<i64>, crate::error::IgError> {
+    pub fn cooldown(&self) -> Result<Option<EpochMs>, crate::error::IgError> {
         self.budget
             .cooldown()
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
@@ -210,28 +279,49 @@ impl Pacer {
         &self,
         reason: &str,
         minimum: Duration,
-    ) -> Result<i64, crate::error::IgError> {
+    ) -> Result<EpochMs, crate::error::IgError> {
         self.budget
             .start_cooldown(reason, minimum)
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
-    /// Charges the budget for one request, off the async worker.
+    /// Reads the cooldown off the async worker, for the reason [`Self::reserve`]
+    /// gives about the one below it.
     ///
-    /// `reserve` opens an immediate transaction against a database this process
-    /// does not have to itself — the v2 service is meant to share it — so under
-    /// contention it sits on the five-second busy timeout. That is a long time
-    /// to hold a runtime worker, and this runs before every single request.
-    async fn reserve(&self) -> Result<Duration, crate::error::IgError> {
+    /// The same database, the same five-second busy timeout, and now the same
+    /// position: before every single request. [`Pacer::cooldown`] stays
+    /// synchronous because its callers are gates in `snob-cli` that run once,
+    /// with nothing else on the runtime waiting — this one runs in the hot path,
+    /// where a blocked worker is the Ctrl+C that does nothing.
+    ///
+    /// Public because the pager is the hot path too: it asked the synchronous
+    /// one once per page and once before the walk, on two workers, and a
+    /// second `snob` holding the write lock made each of those a stall of up
+    /// to the busy timeout during which an interrupt went nowhere.
+    pub async fn cooldown_off_thread(&self) -> Result<Option<EpochMs>, crate::error::IgError> {
+        let budget = Arc::clone(&self.budget);
+        tokio::task::spawn_blocking(move || budget.cooldown())
+            .await
+            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+    }
+
+    async fn charge(&self, write: bool) -> Result<Duration, crate::error::IgError> {
         let budget = Arc::clone(&self.budget);
         // `spawn_blocking` rather than `block_in_place`, which would be simpler
         // and needs no clone: `block_in_place` panics on a current-thread
         // runtime, and that is what `#[tokio::test]` builds by default. A tool
         // whose tests cannot run it is not a tool this code can use.
-        tokio::task::spawn_blocking(move || budget.reserve())
-            .await
-            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
-            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            if write {
+                budget.reserve_write()
+            } else {
+                budget.reserve()
+            }
+        })
+        .await
+        .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+        .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
     /// Takes a slot and waits for it. Every request goes through here.
@@ -248,11 +338,58 @@ impl Pacer {
     /// Before the reservation, not after: refusing to send and charging for it
     /// anyway is the one combination that helps nobody.
     pub(crate) async fn clear_to_send(&self) -> Result<(), crate::error::IgError> {
+        self.clear(false).await
+    }
+
+    /// The same for a write, which pays the read budgets and the write bucket.
+    ///
+    /// A separate method rather than a boolean on the one above, so that the
+    /// choice is made by which of `IgClient::get` and `IgClient::post` is
+    /// calling and not by an argument somebody could pass wrongly. There is no
+    /// way to send a follow or an unfollow that goes through the cheaper one.
+    pub(crate) async fn clear_to_send_write(&self) -> Result<(), crate::error::IgError> {
+        self.clear(true).await
+    }
+
+    async fn clear(&self, write: bool) -> Result<(), crate::error::IgError> {
         if self.cancel.is_canceled() {
             return Err(crate::error::IgError::Canceled);
         }
 
-        let owed = self.reserve().await?;
+        // **Nothing is spent during a cooldown**, and until this line that was
+        // the caller's business to remember. The budget charges its buckets
+        // without ever reading the `cooldowns` table, so the rule held only
+        // because every caller asked first — and one did not. `engine::check`
+        // was written to be polled by a monitoring system, and it knocked on a
+        // door Instagram had just closed, once per configured account, at
+        // whatever interval the poller ran at. The gate added there fixed that
+        // one; this is what stops the next.
+        //
+        // Here for the same reason the cancellation above is here: this is the
+        // one place every request passes through, so a caller that forgets can
+        // no longer spend. The explicit gates stay. They do two things a
+        // backstop cannot — refuse before asking the user for consent, and serve
+        // a stored list instead of failing — and this is the net underneath
+        // them, not their replacement.
+        //
+        // `SNOB_IGNORE_COOLDOWN` needed no thought: the escape hatch is read
+        // inside `SqliteRateBudget::cooldown`, so it answers `None` here exactly
+        // as it does at every other gate.
+        //
+        // Before the reservation, like the cancel: a refusal that charges for
+        // itself helps nobody.
+        if let Some(until_ms) = self.cooldown_off_thread().await? {
+            return Err(crate::error::IgError::InCooldown { until_ms });
+        }
+
+        // `charge` opens an immediate transaction against a database this
+        // process does not have to itself — the v2 service is meant to share
+        // it — so under contention it sits on the five-second busy timeout,
+        // off the async worker, before every single request. The public pair
+        // `clear_to_send`/`clear_to_send_write` stays two methods on purpose
+        // (the write budget is a different promise); these were two private
+        // wrappers under that door, unpacking a boolean the caller had.
+        let owed = self.charge(write).await?;
         // Counted at the reservation rather than at the answer: the budget has
         // been charged by now whatever the server goes on to say.
         self.spent.fetch_add(1, Ordering::Relaxed);
@@ -289,6 +426,16 @@ impl CancelToken {
 
     pub fn is_canceled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the run is canceled, and never otherwise.
+    ///
+    /// Public because [`crate::client::IgClient`] races it against a request in
+    /// flight. `sleep_or_cancel` covers a wait this program chose to take; this
+    /// covers the one it did not — a server holding the connection, where the
+    /// exit used to track the server's patience rather than the user's.
+    pub async fn canceled(&self) {
+        self.wait_for_cancel().await;
     }
 
     async fn wait_for_cancel(&self) {
@@ -433,5 +580,79 @@ mod tests {
             1,
             "a request that is refused is not charged for"
         );
+    }
+
+    use snob_core::budget::RateBudgetError;
+
+    /// A budget that is in cooldown and counts every reservation it is asked
+    /// for, so a test can assert that it was asked for none.
+    struct Cooling {
+        until_ms: EpochMs,
+        reserved: AtomicU32,
+    }
+
+    impl RateBudget for Cooling {
+        fn reserve(&self) -> Result<Duration, RateBudgetError> {
+            self.reserved.fetch_add(1, Ordering::Relaxed);
+            Ok(Duration::ZERO)
+        }
+
+        fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+            self.reserved.fetch_add(1, Ordering::Relaxed);
+            Ok(Duration::ZERO)
+        }
+
+        fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
+            Ok(Some(self.until_ms))
+        }
+
+        fn start_cooldown(
+            &self,
+            _reason: &str,
+            _minimum: Duration,
+        ) -> Result<EpochMs, RateBudgetError> {
+            Ok(self.until_ms)
+        }
+    }
+
+    /// Nothing is spent during a cooldown, whoever asks and whether or not they
+    /// remembered to check first.
+    ///
+    /// This is the backstop rather than the gates: every caller in `snob-cli`
+    /// asks `Pacer::cooldown` before it gets here, and one of them — the command
+    /// written to be polled by a monitoring system — did not, and spent a
+    /// request per configured account per poll against a door that was shut. The
+    /// budget charges its buckets without ever reading the `cooldowns` table, so
+    /// until `clear` read it the rule lived in eight places and held in seven.
+    #[tokio::test]
+    async fn nothing_is_cleared_to_send_during_a_cooldown() {
+        let until_ms = EpochMs::new(1_722_700_000_000);
+        let budget = Arc::new(Cooling {
+            until_ms,
+            reserved: AtomicU32::new(0),
+        });
+        let pacer = Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>);
+
+        let error = pacer.clear_to_send().await.unwrap_err();
+        assert!(
+            matches!(error, crate::error::IgError::InCooldown { until_ms: u } if u == until_ms),
+            "a read during a cooldown answers InCooldown, carrying when it lifts: {error:?}"
+        );
+
+        // A write pays out of a second bucket, so it gets its own arm here: a
+        // backstop that covered only reads would leave the one request class
+        // that earns the twelve-hour cooldown uncovered.
+        let error = pacer.clear_to_send_write().await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::IgError::InCooldown { until_ms: u } if u == until_ms
+        ));
+
+        assert_eq!(
+            budget.reserved.load(Ordering::Relaxed),
+            0,
+            "the refusal comes before the reservation, so neither bucket was charged"
+        );
+        assert_eq!(pacer.spent(), 0, "and nothing refused is reported as spent");
     }
 }

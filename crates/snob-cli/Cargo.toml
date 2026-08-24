@@ -21,27 +21,48 @@ path = "src/main.rs"
 # flags nor the code behind them. `cargo test --features testing` is what turns
 # them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
 [features]
+default = ["xlsx"]
+# The `.xlsx` export and the `zip` crate behind it. On by default, and the
+# released binary carries it; what the feature buys is that somebody building
+# from source can leave it out -- `rust_xlsxwriter` and `zopfli` are the
+# largest single feature cost in the tree, ~498 KiB for one of five formats,
+# and six crates that nothing else here pulls in. `commands::import` rides on
+# the same feature because it is the only other reader of `zip`.
+xlsx = ["dep:rust_xlsxwriter", "dep:zip"]
 testing = ["snob-ig/testing"]
 
 [dependencies]
 snob-core.workspace = true
+snob-store.workspace = true
 snob-ig.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
-dialoguer.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used for one derive: the envelope `cdp::reply_to` reads the message id off
+# without building the whole document.
+serde.workspace = true
 console.workspace = true
+# Keys for the interactive views, and the terminal modes around them (raw mode,
+# alternate screen, bracketed paste). Reading stays here rather than in ratatui
+# because ratatui only writes; the reasoning is on `ui::browser::input`. Costs
+# no new crate here -- comfy-table already compiles it; see the workspace
+# manifest.
+crossterm.workspace = true
+# The interactive views' renderer: browsers and the profile card fullscreen,
+# the menu inline. The feature choices and the decision record are on the
+# workspace manifest and in AGENTS.md.
+ratatui.workspace = true
+opener.workspace = true
 indicatif.workspace = true
 supports-hyperlinks.workspace = true
 # `custom_styling` is what makes the width calculation look past the escape
 # sequences an OSC 8 link puts around a username.
 comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
-rust_xlsxwriter.workspace = true
-zip.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
+rust_xlsxwriter = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -63,9 +84,24 @@ fastrand.workspace = true
 # `[::1]` does not parse as an address.
 url.workspace = true
 
+# Launching the browser with the debugging protocol on a pipe. Windows needs the
+# handle-inheritance blob and the job object; Unix needs `dup2`. Neither is
+# reachable through `std::process::Command`, and the reasoning is in
+# `src/pipe.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
+# Only so the test for `--tls-extra-root` can check its predicate against a real
+# certificate as well as against rejections: one that refuses everything also
+# passes a test made only of rejections. Pure data, so it builds on every target
+# including the one where narrowing is refused.
+webpki-root-certs.workspace = true
 
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key
@@ -77,21 +113,25 @@ maintainer = "dennisgr7 <70021856+dennisgr7@users.noreply.github.com>"
 section = "utils"
 priority = "optional"
 depends = "$auto"
+# **This paragraph has three other copies**, and they say the same thing because
+# they are the same claim: `packaging/render.sh` renders it into the winget
+# manifest, `packaging/winget/dennisgr7.snob.locale.en-US.yaml` is that render
+# committed, and `crates/snob-ig/src/lib.rs` states the rule for a reader of the
+# code. There is no generator over the four. They said "reads only: it never
+# follows, unfollows" for a whole version after `snob follow` shipped, so if one
+# of them moves, all four move.
 extended-description = """
 Walks an Instagram account's followers and following, crosses them, and reports \
 who does not follow you back, who you never followed back, and who you and \
-somebody else both know. Reads only: it never follows, unfollows, blocks or \
-removes anyone."""
+somebody else both know. Almost all of it reads: it changes exactly two things, \
+one account per command and after asking, which are following an account and \
+unfollowing one. It never blocks, never removes a follower, and never marks a \
+story as seen."""
 assets = [
     ["target/release/snob", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/snob/README.md", "644"],
     ["../../CHANGELOG.md", "usr/share/doc/snob/CHANGELOG.md", "644"],
 ]
 
-[lints.rust]
-# Linking this binary has made MSVC announce that it is creating an import
-# library, because a native dependency exports symbols. There is nothing to act
-# on, and it was the first thing printed on every build. Kept even though
-# Windows no longer links aws-lc: the message belongs to the linker, not to any
-# one dependency.
-linker_messages = "allow"
+[lints]
+workspace = true

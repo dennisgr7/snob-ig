@@ -85,7 +85,7 @@ pub fn refresh_user_agent(session: &mut Session) -> bool {
         return false;
     }
 
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     if session
         .user_agent_checked_at
         .is_some_and(|last| now - last < RECHECK_AFTER_SECS)
@@ -481,11 +481,12 @@ mod tests {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/100.0.0.0 Safari/537.36",
         );
-        session.user_agent_checked_at = Some(snob_core::store::now());
+        session.user_agent_checked_at = Some(snob_core::clock::now());
         assert!(!refresh_user_agent(&mut session));
 
         // Past the interval it looks again, whatever it then decides.
-        let stale = snob_core::store::now() - RECHECK_AFTER_SECS - 1;
+        let stale =
+            snob_core::clock::now() - std::time::Duration::from_secs(RECHECK_AFTER_SECS as u64 + 1);
         session.user_agent_checked_at = Some(stale);
         assert!(refresh_user_agent(&mut session));
 

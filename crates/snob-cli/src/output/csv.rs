@@ -8,15 +8,7 @@
 use anyhow::{Context, Result};
 use snob_core::model::{User, printable};
 
-/// The column names. Frozen along with the JSON keys they mirror.
-const HEADER: [&str; 6] = [
-    "pk",
-    "username",
-    "full_name",
-    "is_private",
-    "is_verified",
-    "pfp_url",
-];
+use crate::output::USER_COLUMNS as HEADER;
 
 /// One row per account.
 pub(crate) fn rows(users: &[User]) -> Result<String> {
@@ -116,11 +108,12 @@ fn clean(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
 
     fn users() -> Vec<User> {
         vec![
             User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one".into(),
                 full_name: Some("One Person".into()),
                 is_private: Some(false),
@@ -128,7 +121,7 @@ mod tests {
                 pfp_url: Some("https://example.test/a.jpg".into()),
             },
             User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two".into(),
                 full_name: None,
                 is_private: None,

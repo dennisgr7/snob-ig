@@ -5,42 +5,21 @@
 //! went to the wrong one would show up as a count on a server that was not
 //! meant to get it.
 
-use std::sync::Arc;
-
+use snob_core::Pk;
 use snob_core::secret::Secret;
-use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::rate_budget::UnlimitedRateBudget;
-use snob_core::store::{Store, deliveries};
 use snob_core::watch::sign;
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
+use snob_store::store::{Store, deliveries};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use snob_cli::app::{App, Viewer};
 use snob_cli::watch::webhook::{Attempt, Webhook, WebhookClient};
 
 mod common;
-use common::{SID, UA};
+use common::app;
 
 fn open_db(root: &std::path::Path) -> Store {
     Store::open_at(&root.join("test.db")).unwrap()
-}
-
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::new(Arc::new(UnlimitedRateBudget)))
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: 42,
-            username: Some("me".into()),
-        },
-    )
 }
 
 fn client_for(
@@ -324,6 +303,12 @@ async fn an_unreachable_address_is_a_temporary_failure() {
     // Dropping a `MockServer` and reusing its address would be the obvious way
     // to write this and is not reliable — the port can be taken again between
     // the drop and the request.
+    //
+    // On Windows this test takes about two seconds, and so does the preflight
+    // one below: Winsock retries the SYN after the RST before it reports
+    // WSAECONNREFUSED. That is per connection, not per port, so no other
+    // closed port is any faster — and the one spelling that would be is the
+    // freed `MockServer` address this comment says not to use. Accepted.
     let client = WebhookClient::new(Webhook {
         url: Url::parse("http://127.0.0.1:1/hook").unwrap(),
         headers: vec![],
@@ -346,13 +331,14 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let db = open_db(tmp.path());
     let app = app(&ig, db);
 
-    snob_core::store::users::ensure(app.db().conn(), 42).unwrap();
-    snob_core::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
+    snob_store::store::users::ensure(app.db().conn(), Pk::new(42)).unwrap();
+    snob_store::store::accounts::upsert(app.db().conn(), Pk::new(42), true).unwrap();
     // A moment the report is still young at. The queue refuses to hand back a
     // report older than `MAX_AGE_SECS` — news about last Tuesday is not news —
     // so a synthetic timestamp from 1970 would simply never be due.
-    let queued_at = 1_000_000;
-    let id = deliveries::enqueue(app.db().conn(), "run-1", 42, BODY, queued_at, None).unwrap();
+    let queued_at = snob_core::Epoch::new(1_000_000);
+    let id =
+        deliveries::enqueue(app.db().conn(), "run-1", Pk::new(42), BODY, queued_at, None).unwrap();
 
     // First attempt: the receiver is down.
     let down = MockServer::start().await;
@@ -366,7 +352,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     // Still owed, and the bytes are the ones that were signed.
     let owed = deliveries::due(
         app.db().conn(),
-        queued_at + 3_600,
+        queued_at + std::time::Duration::from_secs(3_600),
         10,
         "https://receiver.example",
     )
@@ -386,7 +372,13 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
         )
         .await;
     assert_eq!(outcome, Attempt::Delivered { status: 200 });
-    deliveries::delivered(app.db().conn(), id, 200, queued_at + 3_600).unwrap();
+    deliveries::delivered(
+        app.db().conn(),
+        id,
+        200,
+        queued_at + std::time::Duration::from_secs(3_600),
+    )
+    .unwrap();
 
     assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
     let requests = up.received_requests().await.unwrap();
@@ -477,7 +469,7 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
 /// A receiver that is not there is a failure worth a red line, not a warning.
 #[tokio::test]
 async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
-    use snob_cli::engine::check::{Verdict, What};
+    use snob_cli::engine::check::{Problem, Verdict, What};
 
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::method("POST"))
@@ -518,7 +510,11 @@ async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
          it answered from is the other half: {:?}",
         checked.what
     );
-    let problem = checked.problem.expect("it has to say what went wrong");
+    // `Foreign` and not a variant of its own: this is what the user's own
+    // receiver said, and that text is the only thing identifying the cause.
+    let Some(Problem::Foreign(problem)) = checked.problem else {
+        panic!("it has to say what went wrong: {:?}", checked.problem);
+    };
     assert!(
         !problem.contains("Failed {"),
         "Rust struct syntax in front of the person the command exists to help: {problem}"

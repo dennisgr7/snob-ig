@@ -111,8 +111,14 @@ fn the_walk_reaches_the_source_it_is_meant_to_read() {
 
     for anchor in [
         "crates/snob-core/src/lib.rs",
+        // One anchor per crate, so adding a crate to the workspace and not to
+        // this list is what fails rather than what goes unnoticed. `snob-store`
+        // was carved out of `snob-core` and every guard that reads sources —
+        // the keyring rule, the language rule, the story-view rule — has to
+        // reach it or it is checking three quarters of the tree.
+        "crates/snob-store/src/lib.rs",
         "crates/snob-cli/src/main.rs",
-        "crates/snob-ig/src/client.rs",
+        "crates/snob-ig/src/client/mod.rs",
     ] {
         assert!(
             found.iter().any(|f| f == anchor),

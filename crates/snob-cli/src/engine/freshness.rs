@@ -9,17 +9,16 @@
 
 use anyhow::Result;
 use snob_core::model::{ListKind, User};
-use snob_core::store::{accounts, now, snapshots};
+use snob_store::store::{accounts, now, snapshots};
 
 use crate::app::App;
-use crate::cli::ListArgs;
 use crate::engine::target::{Counters, Target};
-use crate::engine::{ListOutcome, Provenance, walk};
+use crate::engine::{ListOutcome, ListQuery, Provenance, walk};
 
 /// Polls, compares, and either serves what is stored or walks.
 pub async fn decide_and_fetch(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     stored: Option<snapshots::Snapshot>,
@@ -42,15 +41,13 @@ pub async fn decide_and_fetch(
             if let Some(snapshot) = &stored
                 && !args.refresh
             {
-                app.warn(&format!(
-                    "could not check for changes ({e}); using the stored list"
-                ));
+                app.warn(&crate::report::poll_failed_serving_stored(&e));
                 // Served, but with nothing said about whether it is still
                 // true. It is fine to print; it is not fine to cross against
                 // another list, and only the provenance can carry that.
                 return serve(app, snapshot, Provenance::PollFailed);
             }
-            app.warn(&format!("could not read the profile ({e})"));
+            app.warn(&crate::report::poll_failed(&e));
             None
         }
     };
@@ -61,7 +58,7 @@ pub async fn decide_and_fetch(
         // this could not hold, so nothing reaches here that would wrap — but
         // "it is checked somewhere else" is how the wrap got written in the
         // first place, and the next reader of a `Duration` inherits an answer
-        // this way rather than a hole. Same shape as `schedule.rs`.
+        // this way rather than a hole. Same shape as `watch::schedule`.
         && is_still_good(
             snapshot,
             declared,
@@ -89,6 +86,35 @@ fn is_still_good(snapshot: &snapshots::Snapshot, declared: Option<u64>, max_age_
     // same as knowing it stayed put.
     let unchanged = declared.is_some() && declared == snapshot.declared_count;
     fresh && unchanged
+}
+
+/// A stored list that still answers, if there is one — for a caller that
+/// already holds today's counter and wants to know whether opening the list
+/// will cost anything before asking anybody about spending.
+///
+/// The interactive profile view is that caller: the counter came off
+/// `web_profile_info` moments ago, so comparing against it is the same
+/// honesty [`is_still_good`] gives the poll, without spending the poll. The
+/// members are returned rather than the snapshot, because the one thing the
+/// caller does with a fresh list is show it.
+pub(crate) fn fresh_members(
+    app: &App,
+    account: snob_core::Pk,
+    kind: ListKind,
+    declared: Option<u64>,
+    max_age: std::time::Duration,
+) -> Result<Option<Vec<User>>> {
+    let Some(snapshot) = snapshots::latest_complete(app.db().conn(), account, kind)? else {
+        return Ok(None);
+    };
+    if !is_still_good(
+        &snapshot,
+        declared,
+        i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX),
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(snapshots::members(app.db().conn(), snapshot.id)?))
 }
 
 fn serve(
@@ -144,11 +170,12 @@ async fn poll(app: &mut App, target: &Target, kind: ListKind) -> Result<Option<u
 mod tests {
     use super::*;
     use snob_core::model::ListKind;
+    use snob_core::{Epoch, Pk};
 
-    fn snapshot(taken_at: i64, declared: Option<u64>) -> snapshots::Snapshot {
+    fn snapshot(taken_at: Epoch, declared: Option<u64>) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             kind: ListKind::Followers,
             started_at: taken_at,
             taken_at: Some(taken_at),
@@ -174,7 +201,10 @@ mod tests {
 
     #[test]
     fn an_old_list_is_walked_however_still_the_counter_is() {
-        let old = snapshot(now() - SIX_HOURS - 1, Some(300));
+        let old = snapshot(
+            now() - std::time::Duration::from_secs(SIX_HOURS as u64 + 1),
+            Some(300),
+        );
         assert!(!is_still_good(&old, Some(300), SIX_HOURS));
     }
 
@@ -186,7 +216,7 @@ mod tests {
     /// rather than walking everything.
     #[test]
     fn an_absurd_maximum_age_reuses_rather_than_walks() {
-        let ancient = snapshot(0, Some(300));
+        let ancient = snapshot(Epoch::default(), Some(300));
         let forever =
             i64::try_from(std::time::Duration::from_secs(u64::MAX).as_secs()).unwrap_or(i64::MAX);
 

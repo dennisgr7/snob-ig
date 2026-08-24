@@ -3,10 +3,27 @@
 //!
 //! These are ordinary HTTP request headers with a written specification:
 //! `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, `Priority` and
-//! `Accept-Language`. Instagram's own edge answers
-//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, which is the server saying out loud
-//! that headers of this kind change its reply — so getting them right is a
-//! correctness requirement, not a nicety.
+//! `Accept-Language`.
+//!
+//! **This used to open by saying Instagram's edge answers
+//! `Vary: Sec-Fetch-Site, Sec-Fetch-Mode`, and that getting these right was
+//! therefore a correctness requirement rather than a nicety. It does not.**
+//! Two browser captures in August 2026 recorded 4210 `Vary` headers across
+//! every route this tool touches: `Origin` 3130 times, `Origin` with
+//! `Accept-Encoding` 950, `Accept-Language, Cookie, Accept-Encoding` 126,
+//! `Accept-Encoding` alone 107, `Accept-Language, Cookie` 6. No `Sec-Fetch-*`,
+//! anywhere, including on all forty responses from the list endpoint this tool
+//! spends nearly every request on.
+//!
+//! The correction is worth having in full because it is the founding argument
+//! of this module and it was borrowed. What the same measurement *did* confirm
+//! is `Accept-Language`, which appears in `Vary` 132 times — so the value
+//! [`accept_language`] computes really does change Instagram's reply, which
+//! until then was an assumption.
+//!
+//! The headers stay regardless, on the reason below, which never needed the
+//! borrowed one: a browser sends them, and a request without them is the
+//! anomaly.
 //!
 //! **The rule is that the set has to agree with itself.** A request that
 //! declares Chrome 151 in its User-Agent and then sends no client hints at all
@@ -28,19 +45,19 @@
 //!
 //! The reason given for the first of those used to be that Chrome randomizes
 //! its ClientHello extension order, so there is nothing stable to copy. The
-//! premise is true and the conclusion has not held since 2023: JA4, which is
-//! what fingerprinting moved to, sorts the extension list before hashing it,
-//! precisely so that the shuffling changes nothing. There *is* something
-//! stable to copy. Three reasons that do hold, in the order they matter:
+//! premise is true and the conclusion has not held since 2023: JA4 sorts the
+//! extension list before hashing it, precisely so that the shuffling changes
+//! nothing. There *is* something stable to copy. Three reasons not to, in the
+//! order they matter:
 //!
-//! - **It is detection evasion, and that is not what this tool is for.**
-//!   Matching a browser's cryptographic identity is not making a request
-//!   honestly; it is making a program harder to recognize as a program. The
-//!   goal here is to lower the risk to a real account, not to be harder to
-//!   catch, and those two come apart exactly here.
-//! - Copying a handshake means leaving `rustls`, and with it the clean static
-//!   cross-compilation to five targets that is most of what "single binary, no
-//!   runtime" costs to keep.
+//! - **Copying a handshake is a claim to be a browser, and snob is not one.**
+//!   Sending headers that agree with each other is asking a question properly;
+//!   adopting somebody else's cryptographic identity is asserting something
+//!   untrue about who is asking. The line between those two is exactly here,
+//!   and this module stays on the near side of it.
+//! - It means leaving `rustls`, and with it the clean static cross-compilation
+//!   to five targets that is most of what "single binary, no runtime" costs to
+//!   keep.
 //! - It would buy nothing anyway. What decides whether Instagram throttles an
 //!   account is, in order, the address the requests come from, how many there
 //!   are, and how fast.
@@ -65,6 +82,20 @@ const PRIORITY_SINCE_CHROMIUM: u32 = 123;
 /// What Chromium sends on a fetch it did not prioritize itself: the default
 /// urgency, and incremental delivery.
 pub const FETCH_PRIORITY: &str = "u=1, i";
+
+/// And what it sends on a top-level navigation, which is the highest urgency
+/// there is: nothing on the page can start until the document arrives.
+///
+/// Split from the constant above because they are different requests, and the
+/// name of that one says so -- it is what Chromium sends **on a fetch**, and it
+/// was going out on the page fetch in `IgClient::page`, which is a navigation.
+///
+/// **Measured.** It was written down unsourced first, from RFC 9218, because
+/// the first capture kept only the headers a page set and `Priority` is added
+/// by the network stack. The second capture kept the wire headers and settled
+/// it: `u=0, i` on all six navigations, `u=1, i` on all 924 fetches and XHRs,
+/// and nothing else in between.
+pub const NAVIGATION_PRIORITY: &str = "u=0, i";
 
 /// From which Chromium offers `zstd` in `Accept-Encoding`.
 ///
@@ -191,7 +222,14 @@ fn system_locale() -> Option<String> {
 /// captures show a handful of fixed values that move when the bundle is
 /// rebuilt. It is the lowest-value header of the set and is sent only because
 /// the browser sends it.
-pub const ASBD_ID: &str = "198387";
+///
+/// **Updated from a capture rather than from a search.** Chrome 151 on
+/// instagram.com in August 2026 sends `359341`; the `198387` this held before
+/// is an older bundle's, and a value that stale is the kind of small
+/// inconsistency the header set exists to avoid. It moves when Instagram
+/// rebuilds, so it will go stale again — which is why it is worth a note that
+/// the way to refresh it is to look, not to guess.
+pub const ASBD_ID: &str = "359341";
 
 /// What the browser behind a User-Agent would say about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]

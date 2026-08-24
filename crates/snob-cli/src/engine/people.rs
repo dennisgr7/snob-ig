@@ -10,9 +10,10 @@
 //! two mutual acquaintances when there are nine is worse than naming none.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_core::model::{ListKind, User};
 use snob_core::sets;
-use snob_core::store::snapshots;
+use snob_store::store::snapshots;
 
 use crate::app::App;
 
@@ -28,7 +29,7 @@ use crate::app::App;
 pub struct InCommon {
     pub people: Vec<User>,
     /// When the capture of your own following finished.
-    pub taken_at: i64,
+    pub taken_at: Epoch,
 }
 
 impl InCommon {
@@ -38,7 +39,7 @@ impl InCommon {
     /// applied to the one stored answer no flag refreshes: `--refresh` walks
     /// the two lists of the account being scanned, not your own following, and
     /// `check_same_moment` compares only those two.
-    pub fn is_current(&self, max_age_secs: i64, now: i64) -> bool {
+    pub fn is_current(&self, max_age_secs: i64, now: Epoch) -> bool {
         now - self.taken_at <= max_age_secs
     }
 }
@@ -71,10 +72,12 @@ pub fn in_common(app: &App, followers: &[User]) -> Result<Option<InCommon>> {
 mod tests {
     use super::*;
 
+    /// The moment arrives as plain seconds and becomes an [`Epoch`] here, at
+    /// the edge, so the assertions below read as an age against `SIX_HOURS`.
     fn found(taken_at: i64) -> InCommon {
         InCommon {
             people: Vec::new(),
-            taken_at,
+            taken_at: Epoch::new(taken_at),
         }
     }
 
@@ -87,11 +90,11 @@ mod tests {
     fn a_stored_overlap_expires_like_every_other_stored_answer() {
         let now = 1_000_000;
 
-        assert!(found(now).is_current(SIX_HOURS, now));
+        assert!(found(now).is_current(SIX_HOURS, Epoch::new(now)));
         assert!(
-            found(now - SIX_HOURS).is_current(SIX_HOURS, now),
+            found(now - SIX_HOURS).is_current(SIX_HOURS, Epoch::new(now)),
             "the boundary is inclusive, like is_still_good's"
         );
-        assert!(!found(now - SIX_HOURS - 1).is_current(SIX_HOURS, now));
+        assert!(!found(now - SIX_HOURS - 1).is_current(SIX_HOURS, Epoch::new(now)));
     }
 }

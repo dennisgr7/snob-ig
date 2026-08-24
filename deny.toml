@@ -1,18 +1,22 @@
 # What CI checks Cargo.lock for. Run the same thing locally with
-# `cargo deny check advisories sources` — not a bare `cargo deny check`, which
-# runs all four and fails on the two the note below says are off on purpose.
+# `cargo deny check advisories sources licenses` — not a bare `cargo deny
+# check`, which runs all four and fails on the one the note below says is off
+# on purpose.
 #
-# Two checks are on, and the two that are not are left off on purpose:
+# Three checks are on. The one that is not is left off deliberately:
 #
-# - `licenses` needs an allow-list this tree does not yet have. It is not just
-#   MIT and Apache-2.0: `option-ext` is MPL-2.0, `webpki-root-certs` is
-#   CDLA-Permissive-2.0, `zlib-rs` is Zlib, and `aws-lc-sys` carries a
-#   seven-clause expression. A naive list fails on all of them at once, and a
-#   check that has to be silenced on its first run is a check nobody trusts.
 # - `bans` would flag eleven duplicate major versions that arrive through
 #   dependencies this project does not control. As a gate it would be
 #   permanently red; it belongs at `warn` first, and only after somebody has
 #   read the list.
+#
+# `licenses` was off for a while for want of an allow-list, and the list
+# below is the one that was missing: every entry beyond the two obvious ones
+# names the crate that brought it, so the next addition is a decision rather
+# than a silencing. The policy is permissive licenses only -- nothing with a
+# copyleft reach into this binary -- and MPL-2.0 is allowed as the one
+# file-scoped copyleft, on the usual reading that it does not reach a binary
+# that merely links the file.
 
 # **Audit the graph that ships, not every graph that could exist.**
 #
@@ -50,6 +54,54 @@ yanked = "deny"
 # An ignore list without them is how this check gets switched off entirely,
 # which is the same failure the language guard is warned about.
 ignore = []
+
+[licenses]
+version = 2
+# What `cargo deny list --layout license` reports for the shipping graph in
+# August 2026, one line per license with the crate that brought it where the
+# license is not one of the two everything uses.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  # `rustix`, `linux-raw-sys`: the LLVM exception is the one that lets the
+  # Apache-2.0 text be used in a static link without the patent clause
+  # biting; permissive in every reading.
+  "Apache-2.0 WITH LLVM-exception",
+  # `brotli`, `brotli-decompressor`, `subtle`, the two `alloc-*` crates, and
+  # one of `aws-lc-sys`'s expressions.
+  "BSD-3-Clause",
+  # `ryu`, which serde_json formats floats with.
+  "BSL-1.0",
+  # `dunce`, which `opener` normalizes Windows paths with.
+  "CC0-1.0",
+  "MIT-0",
+  # `webpki-root-certs`: Mozilla's root store as data. CDLA-Permissive is a
+  # data license, and this is the one crate here that is data rather than code.
+  "CDLA-Permissive-2.0",
+  # The rustls family and `aws-lc-rs`.
+  "ISC",
+  # `option-ext`, through `dirs-sys` through `directories`. File-scoped
+  # copyleft: modifications to that file have to be published, and nothing
+  # here modifies it. The one non-permissive entry, and the reason this list
+  # is a list and not a regex.
+  "MPL-2.0",
+  # ICU4X, which `url`'s IDNA handling is built on, and `unicode-ident`.
+  "Unicode-3.0",
+  # `memchr`, `csv`, `byteorder`, `aho-corasick`: public domain with a
+  # fallback.
+  "Unlicense",
+  "0BSD",
+  # `zlib-rs`, `miniz_oxide`, `foldhash`.
+  "Zlib",
+]
+# A license expression `cargo deny` is less than this sure it read correctly
+# is reported rather than trusted. 0.8 is the default and has never fired
+# on this tree; written so a change to it is a change somebody made.
+confidence-threshold = 0.8
+# A dependency leaving takes its license off the graph, and that must not
+# turn the check red for an entry nobody needs any more -- it should say so,
+# and somebody should then remove the entry above with its comment.
+unused-allowed-license = "warn"
 
 [sources]
 unknown-registry = "deny"

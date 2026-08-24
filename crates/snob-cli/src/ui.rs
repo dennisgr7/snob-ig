@@ -142,9 +142,9 @@ pub fn can_be_asked() -> bool {
 /// Stricter than [`can_be_asked`], and about a different pair of streams than
 /// the stdin-and-stdout one this replaced. A menu is not a line of text: it
 /// needs keys, which arrive on standard input, and it redraws itself with
-/// cursor movement on **standard error**, which is where `dialoguer` puts every
-/// prompt — `Select::interact_opt` builds a `Term::stderr()`. Standard output
-/// is the one stream a menu never touches.
+/// cursor movement on **standard error**, which is where `ui::menu` draws —
+/// it writes through a `Term::stderr()`, as the story browser does. Standard
+/// output is the one stream a menu never touches.
 ///
 /// Asking about the wrong two got it wrong in both directions: `snob login |
 /// tee log` refused to show a menu it could have drawn perfectly well, and
@@ -159,6 +159,25 @@ pub fn can_be_asked() -> bool {
 /// be asking a person something while the credential arrived from a file.
 pub fn can_show_a_menu() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Whether a media browser may open *instead of* the printed listing.
+///
+/// Stricter than [`can_show_a_menu`] by exactly one stream, and the third
+/// stream is the point. A browser needs what a menu needs — keys from
+/// standard input, drawing on standard error — but opening one also means
+/// **not printing the listing**, and the listing's stream is standard output.
+/// With stdout redirected, `snob stories someone > list.txt` is somebody
+/// collecting the listing while watching the terminal: both other streams are
+/// attended, a menu could be drawn, and drawing one would fill the file with
+/// nothing while a browser waited on keys. The listing wins wherever it was
+/// asked for; the browser replaces it only where it would have scrolled by.
+///
+/// This is the predicate behind defaulting to the browser at all — the
+/// explicit flags (`-i`, `--no-interactive`, and every action flag) are
+/// decided before it is consulted, in `MediaActionArgs::browses`.
+pub fn a_human_would_watch_the_listing_scroll_by() -> bool {
+    can_show_a_menu() && std::io::stdout().is_terminal()
 }
 
 /// Asks a question and reads one line back.
@@ -258,29 +277,40 @@ pub fn choose_login_method() -> Result<Option<LoginMethod>> {
 
 /// Picks one of several options with the arrow keys. `None` means Esc.
 pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
-    use dialoguer::theme::ColorfulTheme;
-
-    dialoguer::Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .items(labels)
-        .default(0)
-        .interact_opt()
-        .context("could not show the menu")
+    menu::choose(prompt, labels)
 }
 
-/// Undoes what a prompt did to the terminal, for an exit that runs no
-/// destructors.
+/// Undoes what a menu or a browser did to the terminal, for an exit that
+/// runs no destructors.
 ///
-/// `dialoguer` hides the cursor while a menu is up and shows it again on the
-/// way out. The release profile is `panic = "abort"` and the forced-quit path
-/// calls `exit(130)`, so neither of those runs its way out — and an invisible
-/// cursor is not scoped to this program. It stays that way for the rest of the
-/// shell session, long after the user has forgotten what they pressed.
+/// All of them hide the cursor and put the terminal in raw mode to read keys;
+/// the browsers additionally take the alternate screen and turn bracketed
+/// paste on. Every one restores itself on the way out through a guard — but
+/// the release profile is `panic = "abort"` and the forced-quit path calls
+/// `exit(130)`, so no guard runs on those ways out, and none of those modes is
+/// scoped to this program. A shell left on the alternate screen in raw mode
+/// with no cursor stays that way long after the user has forgotten what they
+/// pressed.
 ///
-/// Idempotent and safe with no terminal: `console` writes the sequence to
-/// stderr and does nothing if that is not a terminal.
+/// The alternate screen is left before raw mode, so the shell's next prompt is
+/// drawn on the real screen in a cooked terminal rather than flashing inside
+/// the buffer that is about to vanish.
+///
+/// Idempotent and safe with no terminal: `?1049l` outside the alternate screen
+/// and `?2004l` with paste already off are defined no-ops, writing to a
+/// non-terminal stderr fails silently, and leaving raw mode a terminal was
+/// never in is a no-op.
 pub fn restore_terminal() {
-    let _ = console::Term::stderr().show_cursor();
+    use crossterm::cursor::Show;
+    use crossterm::event::DisableBracketedPaste;
+    use crossterm::terminal::LeaveAlternateScreen;
+    let _ = crossterm::execute!(
+        std::io::stderr(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 /// What every command says when there is no session, said once.
@@ -296,6 +326,41 @@ pub fn no_session() {
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }
+
+/// A line of the result, on standard output -- `println!` that survives the
+/// reader leaving.
+///
+/// `println!` panics on a closed pipe, and Rust ignores `SIGPIPE`, so
+/// `snob watch status | head -1` and `snob whoami --json | jq -r .username`
+/// ended with a panic message and an undocumented exit status the moment the
+/// far end had read enough. `output::write_rendered` has tolerated a broken
+/// pipe for the lists since the start; the fifty-odd lines of prose that go
+/// to standard output did not. A closed pipe is the reader saying it has
+/// seen what it wanted, which is not an error of this program's.
+pub fn say_line(line: std::fmt::Arguments<'_>) {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    for step in [locked.write_fmt(line), locked.write_all(b"\n")] {
+        match step {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return,
+            // Anything else on standard output is the terminal going away,
+            // and there is nobody left to tell.
+            Err(_) => return,
+            Ok(()) => {}
+        }
+    }
+}
+
+/// `println!`, through [`say_line`]. Same arguments, same shape, one difference.
+macro_rules! say {
+    () => {
+        $crate::ui::say_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::ui::say_line(format_args!($($arg)*))
+    };
+}
+pub(crate) use say;
 
 pub fn info(message: &str) {
     eprintln!("{message}");
@@ -461,3 +526,17 @@ mod tests {
         assert!(!looks_like_console_dump(ua));
     }
 }
+
+/// Key-reading and the per-session scratch directory for the interactive
+/// views.
+pub mod browser;
+pub mod menu;
+pub mod people;
+pub mod pfp;
+pub mod profile;
+/// The terminal guard and shared chrome every interactive view draws through.
+pub mod tui;
+
+/// The interactive story list.
+pub mod highlights;
+pub mod stories;

@@ -1,6 +1,6 @@
 [package]
 name = "snob-ig"
-description = "Instagram private API client: endpoints, pagination and rate control"
+description = "Instagram web API client: endpoints, pagination and rate control"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -64,6 +64,9 @@ url.workspace = true
 # it will show both.
 [target.'cfg(not(all(windows, target_arch = "aarch64")))'.dependencies]
 reqwest = { workspace = true, features = ["rustls"] }
+# Only where narrowing the trust store is possible at all, which is the same
+# condition as rustls. `http::CAN_NARROW` is the same question asked in code.
+webpki-root-certs.workspace = true
 # Never named in the code: it is here to turn `prefer-post-quantum` on, and it
 # is under this cfg rather than in `[dependencies]` so that the target which
 # does not use rustls does not pull it in.
@@ -80,3 +83,6 @@ windows-sys.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 wiremock.workspace = true
+
+[lints]
+workspace = true

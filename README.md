@@ -5,12 +5,22 @@ Instagram from the terminal.
 It walks your followers and your following, crosses them, and answers the
 questions the app will not: who does not follow you back, who you never followed
 back, and who you and somebody else both know. It can also pull a profile
-picture at full size.
+picture at full size, and show or save the stories an account has up and the
+highlights its profile keeps.
+
+All of it is work you can already do by hand in the app, for as long as you have
+the patience: scroll two lists, compare them, long-press a picture. snob is the
+same work done in a terminal — quicker, scriptable, and with the answer in a
+format you can keep. It is the housekeeping the app has never put a button on,
+at the size one person's account actually is.
 
 One binary, no runtime, nothing to install alongside it. Windows and Linux on
 x86_64 and ARM64, macOS on Apple Silicon.
 
-**snob only ever reads.** It never follows, unfollows, blocks or removes anyone.
+**Almost all of snob reads.** It changes exactly two things, one account per
+command and after asking: `snob follow` and `snob unfollow`. It never blocks,
+never removes a follower, never likes, comments or messages, and never marks a
+story as seen.
 
 > **Early version.** Every command works and has been used against the real API.
 > Reading Instagram's own data export is planned and not built yet.
@@ -38,8 +48,14 @@ brew install snob
 # Check it against the published sums first, as every other channel here does.
 curl -fsSLO https://github.com/dennisgr7/snob-ig/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
+# And, with GitHub CLI, that it came out of this repository's release pipeline:
+gh attestation verify snob-v<version>-x86_64-unknown-linux-musl.deb --repo dennisgr7/snob-ig
 sudo apt install ./snob-v<version>-x86_64-unknown-linux-musl.deb
 ```
+
+The sums say a file is the one the release page lists; the attestation says
+who built it, which the sums cannot, because they are published on the same
+page. The install scripts below run the same check when `gh` is installed.
 
 The Linux builds are statically linked, so they carry no glibc version
 requirement and run on any distribution.
@@ -122,13 +138,58 @@ a.verified   Verified Account verified
 33 accounts you follow that do not follow you back - 33 of 139 - 12 requests
 ```
 
-In a terminal that is a real table, with the usernames clickable where the
-terminal supports it. Down a pipe the output turns into JSON on its own, so
-something else can read it without being told to.
+That table is what a pipe, a redirect, `--format` or `--no-interactive`
+gets — JSON down a pipe on its own, a real table with clickable usernames
+where the terminal supports it.
 
 The other crossings are `snob fans` (they follow you, you do not follow them)
 and `snob friends` (you follow each other). `snob followers` and
 `snob following` print a list on its own.
+
+On a terminal any of the five opens as a list you move through with the
+arrow keys — Enter opens the account's profile in your browser, `/` narrows
+the list as you type, `q` leaves. In a pipe or a redirect it prints the
+table instead, `--format` and `-o` always print or write, and
+`--no-interactive` prints it on a terminal too, the same rule `stories` and
+`highlights` keep.
+
+```bash
+snob profile someone
+```
+
+```
+@someone  Some One  (private)
+  a line of bio
+
+Followers:    244
+Following:    319
+Posts:        0
+
+You follow them, they follow you
+Followed by @ana, @luis, @eva and 30 others:
+  @ana @luis @eva @pat ...
+
+Highlights:   2
+   1  trip   5 items, updated Jul 13 at 10:53
+   2  home   6 items, updated Feb 9 at 10:08
+Stories up:   none
+profile of @someone - 6 requests
+```
+
+What you would see opening the profile, and nothing walked: the counters, the
+bio, whether you follow each other, the accounts you follow that follow them,
+the highlights and whether anything is up right now. Three or four requests
+for most accounts. Without a name it is your own page. `--format json` for a
+script, `--format md` for a note.
+
+On a terminal the profile opens as a card instead, with one cursor over it:
+arrow keys move, Enter opens what is under the cursor. The stories and the
+highlights open the way their own commands browse them, "followed by N you
+follow" opens the list of accounts behind the number, and followers or
+following ask before spending a walk — with the size named, so you know what
+a `y` costs. "Actions on this account" holds the rest: the profile picture
+(Enter looks at it, D saves it) and a scan. `--no-interactive` prints the
+document above, and a pipe always gets the printed form.
 
 ```bash
 snob scan
@@ -143,17 +204,67 @@ stored rather than from a request:
 snob scan someone
 ```
 
-Reading somebody else's lists costs their account nothing, but it is still
-somebody else's, so snob asks before it starts. `-y` answers in advance.
+Everything about somebody else is what their profile already shows to anyone
+signed in — snob only reads it faster. It is still their account rather than
+yours, so snob asks before it starts on one. `-y` answers in advance.
+
+On a terminal `snob scan` opens the same picture as folders: the five lists
+with their counts, Enter walks into one, and inside it the arrow keys, `/`
+and Enter mean what they mean on any list. `--no-interactive` prints the
+summary instead, and a pipe always gets the printed form.
 
 ```bash
-snob pfp someone -o picture.jpg
+snob pfp someone
 ```
 
-Their profile picture at 1080x1080, which is not the size the web page serves.
+Their profile picture at 1080x1080, which is not the size the web page
+serves. On a terminal it opens a small viewer first — Enter looks at it, `D`
+keeps it, `q` leaves; `-o picture.jpg` or `--no-interactive` download it
+straight away, and `snob pfp someone > face.jpg` still writes the bytes.
+
+```bash
+snob stories someone
+```
+
+On a terminal this opens a list you move through with the arrow keys — Enter
+opens the story in whatever you already open pictures and videos with, `D`
+keeps a copy, `q` leaves. In a pipe or a redirect it prints the numbered
+listing instead, and `--no-interactive` prints it on a terminal too.
+`--download 2` saves the second one, `--download 1,3` or `--download 2-4` a
+set, `--download all` the whole tray.
+
+```bash
+snob highlights someone
+```
+
+On a terminal the tray opens like folders: Enter walks in, Left or Backspace
+walks back out, `D` keeps one item or a whole highlight, depending on where
+you press it. In a pipe it prints the numbered tray, and `--no-interactive`
+prints it on a terminal too. `snob highlights someone 2` is the second one;
+on its listing `--download` means what it means on `stories`, and without the
+number `--download 2` saves everything in the second highlight,
+`--download all` the whole profile. Files land as `someone-2-3.jpg` — the
+highlight's number, then the item's.
+
+**Saving a story or a highlight does not mark it as seen.** Instagram registers a view with a
+separate request, and that request is a write — so it falls under the two-write
+rule below, and there is no code here that could send it. A test reads the whole
+source on every build to keep it that way. It follows from snob being a
+downloader rather than a viewer: nothing you do here lands in somebody's viewer
+list, in either direction.
+
+```bash
+snob unfollow someone
+```
+
+One of the two things snob changes, and it asks first. The other is
+`snob follow`. One account per command — see [staying a light client](#staying-a-light-client)
+for why there is no bulk mode — and they need a session with a CSRF token,
+which `snob login --browser` picks up on its own. If you logged in by pasting,
+`snob login --paste --csrftoken <token>` is how to add it.
 
 Every list takes `--format json|ndjson|csv|xlsx|md` and `-o file`, filters like
-`--only private` or `--no-verified`, and `--limit`. Run `snob --help` for the
+`--only private` or `--hide verified`, and `--limit`. Run `snob --help` for the
 rest.
 
 A username can be written with or without a leading `@`. If you write it on
@@ -358,17 +469,29 @@ snob purge
 It shows you the list and asks before deleting anything. Then remove the binary
 however you installed it.
 
-## The risk, and what the design does about it
+## Staying a light client
 
 There is no official API for any of this — Meta removed the followers endpoint
-in 2018 — so snob uses the private web API with your own session. That goes
-against Instagram's Terms of Use, and the realistic consequence for an
-individual is a verification checkpoint on their account.
+in 2018 — so snob asks the same web API the instagram.com page in your browser
+asks, signed in as you. Automating that is outside Instagram's Terms of Use, as
+it is for every tool in this category, and the realistic consequence for one
+person reading their own lists is that Instagram asks the account to verify
+itself.
 
-Most of the design exists to make that unlikely:
+So most of the design goes into being an unremarkable client — one that asks for
+what it needs, at a rate the service can absorb, and stops the moment it is told
+to:
 
-- **It never writes.** No follow, unfollow, block or remove-follower, ever. The
-  operations that get accounts banned are not in the tool at all.
+- **It writes two things, and nothing else.** `snob follow` and `snob unfollow`,
+  one account per command. No block, no remove-follower, no like, no comment,
+  no message, and nothing that marks a story as seen. Both ask before they send,
+  both come out of a budget of their own that allows one action every fifteen
+  minutes and at most three in a row, and there is **no bulk mode and no flag
+  that makes one**. That is deliberate rather than unfinished. What strains a
+  service is not the day's total but the burst — and the follow-then-unfollow
+  churn that automating a list makes easy is a growth-hacking trick, not
+  housekeeping, and not what this is for. Writing your own loop around it is
+  your business; shipping you the loop is not something snob will do.
 - **Requests are paced**, with the timings borrowed from
   [InstagramUnfollowers][iu], which has years of real use behind it, and only
   ever adjusted downwards. Nothing in snob can send a request without paying for
@@ -378,27 +501,31 @@ Most of the design exists to make that unlikely:
   retry loop: when a service says no, the answer is to stop asking, and pushing
   on is also how a momentary limit becomes a lasting one.
 - **Nothing is asked twice.** A recent list is reused from storage instead of
-  walked again, and an interrupted walk resumes rather than starting over.
+  walked again, and an interrupted walk resumes rather than starting over. The
+  cheapest request is the one that is never sent.
 - **The requests are well-formed.** The headers are derived from a browser
   actually installed on the machine, so they agree with each other instead of
-  describing something contradictory.
+  describing something that does not exist. snob does not dress itself up as a
+  browser; it just does not send a self-contradictory request.
 
-One part of this is not snob's to control, and it is the part that matters
-most. The single strongest signal Instagram has is **where the requests come
-from**: a home connection is treated very differently from a datacenter one,
-and the same endpoint that answers normally from a laptop can answer 429 on the
-very first request from a cloud address. So:
+One thing here is not snob's to control, and it decides more than any of the
+above: **where the requests come from**. Instagram serves a home connection and
+a datacenter one very differently, and the same endpoint that answers a laptop
+normally can answer 429 on the first request from a cloud address. That is a
+practical limit on where this runs usefully, so:
 
-- Run it from the connection you normally browse from.
-- A VPS, a VPN or a public proxy raises the odds of a checkpoint and can
-  shorten the life of the session. Running it in a homelab is supported and
-  works; it is not risk-free in the way running it on your own desktop is.
-- Try not to have the session in two places at once — snob on a server while
-  you browse Instagram at home is the kind of split Instagram notices.
+- Run it from the connection you normally browse from, and it behaves.
+- On a VPS, behind a VPN or through a public proxy, expect more throttling and
+  shorter-lived sessions. A homelab is supported and works well; a rented cloud
+  box often does not, and snob has no way around that and does not go looking
+  for one.
+- Keep one session in one place. Instagram treats an account that appears from
+  two networks at once as worth a second look, and it is not wrong to.
 
 None of that is a guarantee, and it is not offered as one. Walking a list of
-several thousand costs hundreds of requests however carefully they are spaced.
-Use it knowing that.
+several thousand costs hundreds of requests however carefully they are spaced,
+and that is real load on somebody else's service. Ask for it when you want the
+answer, not on a loop.
 
 ## Exit codes
 

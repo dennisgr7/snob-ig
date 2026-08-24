@@ -6,12 +6,12 @@
 //! anything, so nobody completes a two-factor login only to be told afterwards
 //! that there was nowhere to put the result.
 
-use anyhow::{Result, bail};
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::{Backend, SecretStore};
+use anyhow::{Context, Result, bail};
 use snob_core::session::Session;
 use snob_ig::login::{self, ValidationOutcome};
 use snob_ig::pace::{CancelToken, Pacer};
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::{Backend, SecretStore};
 
 use crate::cli::LoginArgs;
 use crate::exit::ExitCode;
@@ -105,17 +105,7 @@ fn who(session: &Session) -> String {
 /// changed nothing — a message that was simply false, and only the second press
 /// got out.
 fn pacer(paths: &AppPaths) -> Result<Pacer> {
-    crate::app::pacer(
-        paths,
-        // One line rather than a bar: this is a single request, so there is
-        // nothing for a bar to count.
-        std::sync::Arc::new(|waited: std::time::Duration| {
-            ui::info(&format!(
-                "The request budget is rationing; waiting {}.",
-                snob_core::duration::format(waited)
-            ));
-        }),
-    )
+    crate::app::pacer_saying_a_line(paths)
 }
 
 /// Works out the method: whatever the flags say, or whatever the user picks
@@ -211,15 +201,26 @@ async fn by_browser(
     // one rather than as a failure, so the result is held rather than unwrapped
     // until the browser has been shut down.
     let captured = capture(&found, args.user_agent.clone(), paths, &cancel).await;
+    // Whatever `capture` came back with. The profile holds a live session
+    // from the moment the form was submitted, and a Ctrl+C or a failure
+    // after that moment used to leave it on disk indefinitely, with nothing
+    // said -- the two exits below went round this line, so the default of
+    // "the profile does not outlive the login" held only on the path that
+    // succeeded.
+    if !args.keep_profile {
+        // Off the worker: the removal retries with sleeps adding up to five
+        // seconds, and this runtime has two workers, one of which has to stay
+        // free for the Ctrl+C task to run at all.
+        let profile = profile.clone();
+        tokio::task::spawn_blocking(move || discard_profile(&profile))
+            .await
+            .context("the profile could not be removed")?;
+    }
     if cancel.is_canceled() {
         ui::info("Login canceled.");
         return Ok(ExitCode::Interrupted);
     }
     let (cookies, user_agent) = captured?;
-
-    if !args.keep_profile {
-        discard_profile(&profile);
-    }
 
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
@@ -287,7 +288,7 @@ async fn capture(
     paths: &AppPaths,
     cancel: &CancelToken,
 ) -> Result<(login::BrowserCookies, String)> {
-    let mut cdp = cdp::Cdp::connect(cdp::launch(found, paths, cancel).await?).await?;
+    let mut cdp = cdp::Cdp::connect(cdp::launch(found, paths, cancel).await?, cancel).await?;
     let outcome = collect(&mut cdp, found, requested_user_agent, cancel).await;
     cdp.close().await;
     outcome
@@ -371,6 +372,25 @@ async fn by_paste(args: LoginArgs, store: SecretStore, pacer: Pacer) -> Result<E
     let mut session = login::session_from_paste(&sessionid, &chosen.user_agent)?;
     session.user_agent_pinned = chosen.pinned;
     session.browser = chosen.browser;
+    // Taken as given rather than prompted for, because it is not a credential
+    // in the sense the sessionid is — it is the CSRF double-submit token, which
+    // is worth nothing without the cookie — and because prompting for a second
+    // secret nobody needs would put a question in front of every paste login to
+    // serve the two commands that write. It still goes into a `Secret`: it is
+    // part of the session record, and everything in that record is handled the
+    // same way regardless of what it is worth on its own.
+    //
+    // Trimmed, and an empty value is left unset rather than stored blank.
+    // `cookie_header` skips an empty optional cookie, so a blank one would have
+    // been silently absent while `IgClient::post`'s guard saw `Some` and let
+    // the request go — a refusal moved from before the request to after it, for
+    // no reason.
+    session.csrftoken = args
+        .csrftoken
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(Into::into);
     finish(session, store, pacer, LoginMethod::Paste).await
 }
 
@@ -407,14 +427,14 @@ async fn finish(
 
     match outcome {
         ValidationOutcome::Confirmed => {
-            println!(
+            crate::ui::say!(
                 "Session stored for {} in the {}.",
                 who(&session),
                 store.describe()
             );
         }
         ValidationOutcome::Unconfirmed => {
-            println!("Session stored in the {}.", store.describe());
+            crate::ui::say!("Session stored in the {}.", store.describe());
             ui::warn(
                 "it could not be confirmed with Instagram because it is throttling \
                  requests. The session is probably valid; check in a few minutes \
@@ -422,7 +442,7 @@ async fn finish(
             );
         }
         ValidationOutcome::Skipped { until_ms } => {
-            println!("Session stored in the {}.", store.describe());
+            crate::ui::say!("Session stored in the {}.", store.describe());
             ui::warn(&format!(
                 "it was not checked: the account is in cooldown until {}, and during one \
                  nothing is spent — not even the single request this would cost. \

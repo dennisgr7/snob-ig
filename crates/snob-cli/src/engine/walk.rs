@@ -6,21 +6,21 @@
 //! run destructors.
 
 use anyhow::Result;
+use snob_core::Epoch;
 use snob_core::model::{ListKind, User};
-use snob_core::store::{now, snapshots};
 use snob_ig::pace::Pace;
 use snob_ig::pager::{ListRequest, ListWalker, WalkError};
+use snob_store::store::{now, snapshots};
 
 use crate::app::App;
-use crate::cli::ListArgs;
 use crate::engine::target::Target;
-use crate::engine::{ListOutcome, Provenance};
+use crate::engine::{ListOutcome, ListQuery, Provenance};
 use crate::exit::ExitCode;
 
 /// Walks the list, resuming an interrupted one when there is a usable one.
 pub async fn fetch(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     declared: Option<u64>,
@@ -104,8 +104,12 @@ pub async fn fetch(
     // "the session stopped working" — with the address that would have cleared
     // it, which `IgError::Checkpoint` carries precisely so it can be shown,
     // dropped on the way.
+    //
+    // Through `report`, because two of the client's messages end in advice
+    // about a `snob` subcommand and that half is `report`'s now. The line the
+    // user sees is the one they saw before, rejoined.
     let stopped_by = summary.error.map(|error| {
-        app.warn(&error.to_string());
+        app.warn(&crate::report::what_instagram_said(&error));
         ExitCode::from_ig_error(&error)
     });
 
@@ -138,7 +142,7 @@ struct Opened {
     /// interval this list covers: it does reflect everything from that page
     /// onward, and `snapshots::RESUME_WINDOW_SECS` has already decided a pause
     /// of that length is one capture.
-    started_at: i64,
+    started_at: Epoch,
     cursor: Option<String>,
     already_stored: usize,
 }
@@ -148,7 +152,7 @@ struct Opened {
 /// cleared out rather than piling up.
 fn open_snapshot(
     app: &App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
     target: &Target,
     declared: Option<u64>,

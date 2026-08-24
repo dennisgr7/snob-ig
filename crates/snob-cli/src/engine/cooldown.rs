@@ -6,23 +6,23 @@
 //! however old it is: stale beats nothing, and the warning names the date.
 
 use anyhow::Result;
+use snob_core::EpochMs;
 use snob_core::model::{ListKind, User};
-use snob_core::store::snapshots;
+use snob_store::store::snapshots;
 
 use crate::app::App;
-use crate::cli::ListArgs;
-use crate::engine::{ListOutcome, Provenance, target};
-use crate::report::{self, Blocked, cooldown_ends_at, stored_on};
+use crate::engine::{ListOutcome, ListQuery, Provenance, target};
+use crate::report::{self, Blocked};
 
 /// Serves what is stored, or explains why nothing can be.
 ///
 /// No confirmation is asked because nothing is enumerated, and `--max-age` is
-/// ignored for the same reason `--cache` ignores it.
+/// ignored for the same reason `--offline` ignores it.
 pub fn serve(
     app: &App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
-    until_ms: i64,
+    until_ms: EpochMs,
 ) -> Result<(Vec<User>, ListOutcome)> {
     if args.refresh {
         return Err(report::refuse_in_cooldown(until_ms, Blocked::RefreshWanted));
@@ -32,7 +32,7 @@ pub fn serve(
         None => app.viewer().pk,
         Some(typed) => {
             let username = target::clean(typed);
-            match snob_core::store::accounts::find_pk_by_username(app.db().conn(), username)? {
+            match snob_store::store::accounts::find_pk_by_username(app.db().conn(), username)? {
                 Some(pk) => pk,
                 None => {
                     return Err(report::refuse_in_cooldown(
@@ -51,13 +51,9 @@ pub fn serve(
         ));
     };
 
-    let when = cooldown_ends_at(until_ms);
     let taken_at = snapshot.taken_at.unwrap_or_default();
-    // The list is named because a crossing serves two of them, and two
-    // identical warnings in a row read like the same one printed twice.
-    app.warn(&format!(
-        "the account is in cooldown until {when}; serving the {kind} list stored on {}",
-        stored_on(taken_at)
+    app.warn(&report::serving_stored_in_cooldown(
+        until_ms, kind, taken_at,
     ));
 
     Ok((
@@ -72,7 +68,7 @@ pub fn serve(
 /// is the account as it is, and a counter-verified one was checked against it in
 /// this run, so its age is known to be harmless. The other three are stored
 /// lists that nothing looked at — during a cooldown nothing may be spent, on a
-/// failed poll nothing could be, and with `--cache` nothing was meant to be.
+/// failed poll nothing could be, and with `--offline` nothing was meant to be.
 ///
 /// Stitching two distant moments together invents arrivals and departures that
 /// never happened, which is the failure this whole tool is built not to have.
@@ -83,7 +79,7 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
     // Both sides have to carry evidence, not just neither side being a
     // cooldown. This used to ask the second question, and two of the three
     // paths that serve from storage answered it "no cooldown here" — so
-    // `snob unfollowers --cache` crossed June against August without so much
+    // `snob unfollowers --offline` crossed June against August without so much
     // as comparing the dates.
     if a.provenance.describes_now() && b.provenance.describes_now() {
         return Ok(());
@@ -125,7 +121,7 @@ const SAME_MOMENT_GAP_SECS: i64 = 15 * 60;
 /// thousand people the second walk alone is about twenty minutes at the
 /// documented pace — so comparing finishing times against a fifteen-minute
 /// bound refused precisely the pair that was most obviously one moment, and
-/// went on refusing it every time that pair was read back with `--cache`.
+/// went on refusing it every time that pair was read back with `--offline`.
 ///
 /// It is not a license, either. A walk that genuinely took an hour, crossed
 /// against a snapshot from two hours later, still has an hour of gap and is
@@ -145,6 +141,7 @@ fn gap_between(a: &ListOutcome, b: &ListOutcome) -> i64 {
 mod tests {
     use super::*;
     use crate::exit::ExitCode;
+    use snob_core::{Epoch, Pk};
 
     /// The drift two stored lists may have between them, written out.
     ///
@@ -163,13 +160,17 @@ mod tests {
     }
 
     /// A stored row, which is what the outcomes under test are built from.
+    ///
+    /// The two moments arrive as plain seconds and become [`Epoch`] here, at
+    /// the edge, so every assertion below reads as the number of seconds
+    /// between two walks rather than as a constructor repeated forty times.
     fn stored(started_at: i64, taken_at: i64) -> snapshots::Snapshot {
         snapshots::Snapshot {
             id: 1,
-            account_pk: 1,
+            account_pk: Pk::new(1),
             kind: ListKind::Followers,
-            started_at,
-            taken_at: Some(taken_at),
+            started_at: Epoch::new(started_at),
+            taken_at: Some(Epoch::new(taken_at)),
             member_count: 0,
             declared_count: None,
             next_cursor: None,
@@ -196,7 +197,7 @@ mod tests {
     }
 
     /// The regression this type exists for. Two of the three storage paths used
-    /// to look identical to a verified one, so `snob unfollowers --cache`
+    /// to look identical to a verified one, so `snob unfollowers --offline`
     /// crossed a followers list from June against a following list from August
     /// and called the difference unfollowers.
     #[test]
@@ -229,7 +230,7 @@ mod tests {
     /// `taken_at` is when a walk **finished**. Walking six thousand accounts
     /// takes about twenty minutes at the documented pace, so the two lists of
     /// one perfectly good `snob unfollowers` run finish far more than fifteen
-    /// minutes apart — and reading that same pair back with `--cache`, where
+    /// minutes apart — and reading that same pair back with `--offline`, where
     /// neither side carries evidence, was refused as "different moments". The
     /// answer was correct and the tool would not show it, ever again.
     #[test]

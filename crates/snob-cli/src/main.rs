@@ -1,11 +1,12 @@
+use anyhow::Context;
 use clap::Parser;
 use snob_cli::cli::{Cli, Command};
 use snob_cli::commands;
 use snob_cli::commands::sets::SetOp;
 use snob_cli::exit::ExitCode;
 use snob_core::model::ListKind;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 /// Two workers, always two, whatever the machine has.
 ///
@@ -33,13 +34,115 @@ async fn main() -> std::process::ExitCode {
     init_tracing(cli.verbose);
     restore_terminal_on_panic();
 
+    let wording = wording_for(&cli);
     match run(cli).await {
         Ok(code) => code.into(),
         Err(e) => {
-            snob_cli::report::print_error(&e);
-            exit_code_for(&e).into()
+            snob_cli::report::print_error(&e, wording);
+            snob_cli::exit::exit_code_for(&e).into()
         }
     }
+}
+
+/// Whether a failure is told in JSON: when the answer was going to be.
+///
+/// The same decision the command makes about its result, made once more
+/// here for its failure -- `--format json`, `--json`, an extension that
+/// means JSON, or standard output not being a terminal, which is what turns
+/// a list into JSON on its own. A program reading one stream should not
+/// have to read the other in English.
+fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
+    use snob_cli::cli::{Format, WatchCommand};
+    use snob_cli::output::effective_format;
+    use snob_cli::report::Wording;
+
+    let json = match &cli.command {
+        Command::Followers(args)
+        | Command::Following(args)
+        | Command::Unfollowers(args)
+        | Command::Fans(args)
+        | Command::Friends(args) => matches!(
+            effective_format(args.output.format, args.output.path.as_deref()),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Scan(args) => matches!(
+            effective_format(args.output.format, args.output.path.as_deref()),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Stories(args) => matches!(
+            effective_format(args.list.format.map(Format::from), None),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Highlights(args) => matches!(
+            effective_format(args.list.format.map(Format::from), None),
+            Format::Json | Format::Ndjson
+        ),
+        Command::Profile(args) => matches!(
+            effective_format(args.format.map(Format::from), args.output.as_deref()),
+            Format::Json
+        ),
+        Command::Whoami(args) => args.output.json,
+        Command::Watch(args) => match &args.command {
+            None => args.run.output.json,
+            Some(WatchCommand::Once(once)) => once.output.json,
+            Some(WatchCommand::Check(check)) => check.output.json,
+            Some(WatchCommand::Status(status)) => status.output.json,
+            Some(WatchCommand::Diff(diff)) => diff.output.json,
+            Some(WatchCommand::Setup(_)) => false,
+        },
+        Command::Login(_)
+        | Command::Logout(_)
+        | Command::Purge(_)
+        | Command::Pfp(_)
+        | Command::Follow(_)
+        | Command::Unfollow(_) => false,
+    };
+    if json { Wording::Json } else { Wording::Prose }
+}
+
+/// Whether a file really holds PEM certificates.
+///
+/// **Emptiness is the case that matters**, and it is why this is not a bare
+/// `is_err()`. `from_pem_bundle` scans for BEGIN/END blocks and answers `Ok`
+/// with an empty list when there are none, so a text file, a DER file or a
+/// mistyped path that happened to exist was accepted in silence — and
+/// `tls_certs_only` would then be handed Mozilla's roots and nothing of the
+/// user's, which is the one outcome `--tls-extra-root` exists to prevent. It
+/// fails at the handshake, hours later, against Instagram and nowhere else.
+fn holds_a_certificate(pem: &[u8]) -> anyhow::Result<()> {
+    match snob_ig::http::reqwest::Certificate::from_pem_bundle(pem) {
+        Ok(found) if !found.is_empty() => Ok(()),
+        Ok(_) => anyhow::bail!("it holds no PEM certificates"),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+fn trust_from(cli: &Cli) -> anyhow::Result<snob_ig::http::Trust> {
+    if !cli.strict_roots {
+        return Ok(snob_ig::http::Trust::Platform);
+    }
+    if !snob_ig::http::CAN_NARROW {
+        anyhow::bail!(
+            "--strict-roots does nothing on this build, so it is refused rather than \
+             ignored.\n\
+             This is the Windows on ARM64 binary, which uses the operating system's TLS \
+             stack; that stack has no way to be told \"these roots and no others\"."
+        );
+    }
+
+    let mut extra = Vec::new();
+    for path in &cli.tls_extra_root {
+        // Read and checked here rather than at the first request, so a typo in
+        // a path is an error before anything has been walked -- and so the
+        // failure names the file rather than arriving as a handshake error
+        // hours later.
+        let pem =
+            std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+        holds_a_certificate(&pem)
+            .with_context(|| format!("{} is not usable as an extra root", path.display()))?;
+        extra.push(pem);
+    }
+    Ok(snob_ig::http::Trust::Narrow { extra })
 }
 
 /// Where this run keeps its files, whether the keyring is off, and — for a
@@ -71,6 +174,21 @@ async fn main() -> std::process::ExitCode {
 /// namespace of its own, so every one of those operations lands on entries
 /// nothing outside the sandbox can see.
 fn wiring(cli: &Cli) -> anyhow::Result<(AppPaths, bool, Option<String>)> {
+    // Before any client exists, which is what `use_trust` requires: a run
+    // cannot change what it trusts halfway through. A second answer is an
+    // error and not a shrug: `http.rs` says a security option that silently
+    // does nothing is worse than one that is not offered, and `let _ =` on
+    // this line was exactly that -- nine lines under the redirect flag, whose
+    // identical set-once shape is handled with a `?`. The same value twice
+    // is accepted, because the tests below call this more than once in one
+    // process and a repeat of the same answer changes nothing.
+    let trust = trust_from(cli)?;
+    if let Err(already) = snob_ig::http::use_trust(trust.clone())
+        && already != trust
+    {
+        anyhow::bail!("the trust store was already decided for this run");
+    }
+
     #[cfg(feature = "testing")]
     if let Some(root) = &cli.sandbox_root {
         if let Some(base) = cli.ig_base_url.clone() {
@@ -111,31 +229,6 @@ fn sandbox_keyring_namespace(root: &std::path::Path) -> String {
     format!("snob-ig-sandbox-{hash:016x}")
 }
 
-/// Looks for an Instagram error in the cause chain so the exit code is one the
-/// v2 service can interpret without reading text.
-fn exit_code_for(error: &anyhow::Error) -> ExitCode {
-    // An error that already knows its code wins: it was set by whoever refused
-    // the result, which is more specific than anything reconstructed from an
-    // Instagram error further down.
-    if let Some(code) = ExitCode::from_chain(error) {
-        return code;
-    }
-
-    error
-        .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<snob_ig::error::IgError>()
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<snob_ig::login::LoginError>()
-                        .and_then(|e| e.as_instagram())
-                })
-                .map(ExitCode::from_ig_error)
-        })
-        .unwrap_or(ExitCode::Error)
-}
-
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let (paths, no_keyring, keyring_namespace) = wiring(&cli)?;
     let store = SecretStore::new(paths.clone(), no_keyring);
@@ -157,6 +250,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Following(args) => {
             commands::lists::run(args, store, &paths, ListKind::Following).await
         }
+        Command::Profile(args) => commands::profile::run(args, store, &paths).await,
         Command::Scan(args) => commands::scan::run(args, store, &paths).await,
         Command::Unfollowers(args) => {
             commands::sets::run(args, store, &paths, SetOp::Unfollowers).await
@@ -164,6 +258,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Fans(args) => commands::sets::run(args, store, &paths, SetOp::Fans).await,
         Command::Friends(args) => commands::sets::run(args, store, &paths, SetOp::Friends).await,
         Command::Pfp(args) => commands::pfp::run(args, store, &paths).await,
+        Command::Stories(args) => commands::stories::run(args, store, &paths).await,
+        Command::Highlights(args) => commands::highlights::run(args, store, &paths).await,
+        Command::Follow(args) => {
+            commands::follow::run(args, commands::follow::Verb::Follow, store, &paths).await
+        }
+        Command::Unfollow(args) => {
+            commands::follow::run(args, commands::follow::Verb::Unfollow, store, &paths).await
+        }
         Command::Watch(args) => commands::watch::run(args, store, &paths).await,
     }
 }
@@ -171,7 +273,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// Gives the cursor back if the process dies with a menu on screen.
 ///
 /// The release profile is `panic = "abort"`, so nothing runs on the way out —
-/// and `dialoguer` hides the cursor while a prompt is up. A panic during the
+/// and `ui::menu` hides the cursor and takes the terminal raw while a menu
+/// is up, as the story browser does. A panic during the
 /// login menu therefore left the user with an invisible cursor for the rest of
 /// their shell session, which reads as the terminal being broken rather than
 /// as this program having failed.
@@ -187,20 +290,82 @@ fn restore_terminal_on_panic() {
     }));
 }
 
+/// What is logged, and at which level.
+///
+/// `--verbose` turns on `debug` for this workspace's crates and nothing else;
+/// without it, `SNOB_LOG` is read as a list of `target=level` directives --
+/// `snob_ig=debug,warn` -- and `warn` is the answer when it is unset or does not
+/// parse. A directive that does not parse is said so, once, rather than
+/// silently read as `warn`: somebody who set the variable is debugging and is
+/// the one person who needs to know it was ignored.
+///
+/// `Targets` rather than `EnvFilter`, which is the obvious type and was the
+/// one here: `EnvFilter` understands span and field matchers, and to do so it
+/// links a regular-expression engine. Nothing here logs a span. The manifest
+/// says what that cost.
+fn log_filter(verbose: bool, spec: Option<&str>) -> tracing_subscriber::filter::Targets {
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+
+    if verbose {
+        return Targets::new()
+            .with_target("snob", Level::DEBUG)
+            .with_target("snob_ig", Level::DEBUG)
+            .with_target("snob_core", Level::DEBUG)
+            .with_target("snob_store", Level::DEBUG)
+            .with_target("snob_cli", Level::DEBUG);
+    }
+    let quiet = || Targets::new().with_default(Level::WARN);
+    match spec {
+        Some(spec) => spec.parse::<Targets>().unwrap_or_else(|e| {
+            eprintln!("warning: SNOB_LOG was ignored: {e}");
+            quiet()
+        }),
+        None => quiet(),
+    }
+}
+
 fn init_tracing(verbose: bool) {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
-    let filter = if verbose {
-        EnvFilter::new("snob=debug,snob_ig=debug,snob_core=debug,snob_cli=debug")
-    } else {
-        EnvFilter::try_from_env("SNOB_LOG").unwrap_or_else(|_| EnvFilter::new("warn"))
-    };
-
+    let spec = std::env::var("SNOB_LOG").ok();
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .without_time()
+        .finish()
+        .with(log_filter(verbose, spec.as_deref()))
         .init();
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::log_filter;
+    use tracing::Level;
+
+    /// The two settings a person reaches for, and the one they mistype.
+    #[test]
+    fn the_filter_reads_what_was_asked_for() {
+        let verbose = log_filter(true, None);
+        assert!(verbose.would_enable("snob_ig::client", &Level::DEBUG));
+        assert!(!verbose.would_enable("hyper_util::client", &Level::DEBUG));
+        assert!(!verbose.would_enable("snob_ig::client", &Level::TRACE));
+
+        let quiet = log_filter(false, None);
+        assert!(quiet.would_enable("snob_ig::client", &Level::WARN));
+        assert!(!quiet.would_enable("snob_ig::client", &Level::INFO));
+
+        let chosen = log_filter(false, Some("snob_store=debug,warn"));
+        assert!(chosen.would_enable("snob_store::secrets", &Level::DEBUG));
+        assert!(!chosen.would_enable("snob_ig::client", &Level::DEBUG));
+        assert!(chosen.would_enable("snob_ig::client", &Level::WARN));
+
+        // A spec that does not parse falls back to the quiet default rather
+        // than to nothing at all, so a typo does not also silence warnings.
+        let typo = log_filter(false, Some("snob_ig=loud"));
+        assert!(typo.would_enable("snob_ig::client", &Level::WARN));
+        assert!(!typo.would_enable("snob_ig::client", &Level::INFO));
+    }
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -251,5 +416,44 @@ mod tests {
         let cli = Cli::try_parse_from(["snob", "whoami"]).expect("it parses");
         let (_, _, namespace) = wiring(&cli).expect("discovery works on a test machine");
         assert_eq!(namespace, None);
+    }
+    /// A file that holds no certificate is refused, and that is the case a bare
+    /// error check misses.
+    ///
+    /// `from_pem_bundle` looks for BEGIN/END blocks and answers `Ok` with an
+    /// empty list when it finds none, so plain text, a DER file, or a path that
+    /// happened to exist all passed. The narrowing would then hand
+    /// `tls_certs_only` Mozilla's roots and none of the user's -- the one
+    /// outcome the flag exists to prevent -- and it would fail at the handshake
+    /// against Instagram, hours later, and nowhere else.
+    ///
+    /// Checked against a real certificate rather than only against rejections,
+    /// because a predicate that refuses everything also passes the first half.
+    #[test]
+    fn an_extra_root_has_to_be_a_certificate() {
+        assert!(
+            holds_a_certificate(
+                b"not a certificate
+"
+            )
+            .is_err()
+        );
+        assert!(holds_a_certificate(b"").is_err());
+        assert!(
+            holds_a_certificate(
+                b"-----BEGIN CERTIFICATE-----
+not base64
+-----END CERTIFICATE-----
+"
+            )
+            .is_err(),
+            "a block that is not a certificate is not one"
+        );
+
+        // One of Mozilla's own, so the accepting half is exercised too.
+        let real = snob_ig::http::reqwest::Certificate::from_der(
+            &webpki_root_certs::TLS_SERVER_ROOT_CERTS[0],
+        );
+        assert!(real.is_ok(), "the bundled roots are certificates");
     }
 }

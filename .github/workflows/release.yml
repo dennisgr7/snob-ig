@@ -22,6 +22,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Inside the checkout on purpose, and it is what makes the build independent
+  # of where it ran. Absolute paths reach the binary from two places -- the
+  # sources being compiled and the registry the dependencies were unpacked into
+  # -- and the second is normally in the home directory, which differs per
+  # runner and per operating system. Moved under the workspace, one
+  # `--remap-path-prefix` covers both. Nothing is cached here anyway; the `build`
+  # job deliberately has no cache, for the reason written at that step.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
 
 # Read-only unless a job asks for more, and two of them do: `publish` creates
 # the release and `packaging` pushes the manifests. Without this the rest
@@ -110,14 +118,50 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          targets: ${{ matrix.target }}
+      # **`rustup`, not the action's `targets:` input.** The action is pinned by
+      # SHA onto its `stable` branch, where `toolchain` is a required input
+      # defaulting to the literal `stable` -- so `targets:` installed the
+      # standard library into whatever stable is today, while every cargo
+      # invocation used the 1.97.1 that `rust-toolchain.toml` pins. On the host
+      # target nothing notices, because its standard library is already there;
+      # on a cross target the build fails with "can't find crate for `core`",
+      # which reads like a broken runner and is not.
+      #
+      # Run from the checkout, `rustup` honours the override file, so the target
+      # lands on the toolchain that will compile it. Emptying the input instead
+      # does not work on this pin -- the action refuses with "'toolchain' is a
+      # required input" -- and naming 1.97.1 here would put the pin in six
+      # places, which is the drift that caused this.
+      - name: The target, on the toolchain this repository pins
+        run: rustup target add ${{ matrix.target }}
       # **No build cache here, deliberately**, though CI has one. An Actions
       # cache has no authenticated separation between refs and every run holds
       # a token that can write to it, so a cache is an input to the shipped
       # binary that no reviewed diff covers -- which is the primitive used
       # against Angular's release infrastructure. CI can have one because
       # nothing it produces is published.
+
+      # Two builds of one tag have to produce the same bytes, and an absolute
+      # path baked into the binary is the difference that is easiest to miss.
+      #
+      # **Not `RUSTFLAGS`.** That variable *replaces* `.cargo/config.toml`
+      # rather than adding to it, so exporting it here would silently drop
+      # `+crt-static` and `/Brepro` and both Windows binaries would go back to
+      # needing the Visual C++ redistributable -- with nothing failing until
+      # somebody's machine could not launch it. A second config file is the
+      # shape that works: cargo reads `$CARGO_HOME/config.toml` as well as the
+      # repository's and **joins** the `rustflags` arrays.
+      #
+      # A TOML literal string, single-quoted, because the Windows path is full
+      # of backslashes and a basic string would eat them.
+      - name: Make the build independent of where it ran
+        shell: bash
+        run: |
+          mkdir -p "$CARGO_HOME"
+          cat >> "$CARGO_HOME/config.toml" <<'EOF'
+          [target.'cfg(all())']
+          rustflags = ['--remap-path-prefix=${{ github.workspace }}=/snob']
+          EOF
 
       # rusqlite compiles SQLite from C, which a musl target cannot do without
       # a musl C compiler.
@@ -138,21 +182,54 @@ jobs:
       #
       # Both hold a directory rather than loose files, so unpacking in the
       # wrong place leaves one folder to delete instead of four files to find.
+      # The binaries are reproducible; the archives were not, and an archive
+      # nobody can rebuild byte for byte makes the binary inside it unverifiable
+      # too. Both formats embed a modification time, so both are given one: the
+      # committer date of the tagged commit, which is derived from the tag like
+      # everything else in this workflow rather than being a wall clock.
+      #
+      # The `.deb` needs nothing -- `cargo-deb` is already reproducible.
       - name: Package
         shell: bash
+        # Through `env`, never interpolated into the script. `check` proves
+        # the value is the literal in Cargo.toml at an ancestor of main, so
+        # this is not exploitable today -- but that is a content check
+        # guarding a shell-injection shape, and the workflow already does it
+        # the right way for `$GITHUB_REF_NAME`.
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
-          name="snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          name="snob-v$VERSION-$TARGET"
+          # The tag's own commit date. `%ct` is seconds since the epoch, which
+          # is what every tool below wants.
+          epoch=$(git log -1 --format=%ct)
           mkdir -p "staging/$name"
           cp README.md LICENSE CHANGELOG.md "staging/$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/snob.exe" "staging/$name/"
             # Compress-Archive rather than 7z: it ships with PowerShell, and
             # the Windows on ARM image cannot be assumed to carry 7-Zip.
+            #
+            # It stores each entry's LastWriteTime, and there is no flag for
+            # that, so the times are set on the files first. A zip's DOS
+            # timestamp has two-second resolution, so the value is rounded down
+            # to an even second here rather than left for the format to round
+            # unpredictably.
+            even=$(( epoch - epoch % 2 ))
             (cd staging && powershell -NoProfile -Command \
-              "Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
+              "\$stamp = [DateTimeOffset]::FromUnixTimeSeconds($even).UtcDateTime; \
+               Get-ChildItem -Recurse '$name' | ForEach-Object { \$_.LastWriteTimeUtc = \$stamp }; \
+               Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
           else
             cp "target/${{ matrix.target }}/release/snob" "staging/$name/"
-            tar -C staging -czf "$name.tar.gz" "$name"
+            # --sort=name so the order does not depend on the filesystem,
+            # --mtime so it does not depend on when this ran, and --owner/--group
+            # so it does not depend on who the runner is. gzip -n because gzip
+            # writes its own timestamp into the header as well, which is the one
+            # everybody forgets.
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+              -C staging -cf - "$name" | gzip -n > "$name.tar.gz"
           fi
 
       # A .deb as well on Linux, so Debian and Ubuntu get an install that their
@@ -160,6 +237,9 @@ jobs:
       # and tested rather than compiling a second, unverified one.
       - name: Debian package
         if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           # Pinned. The comment below says this is the line the release runs,
           # and that is only true if both resolve the same tool: unpinned, CI
@@ -167,8 +247,8 @@ jobs:
           # with a different one on Wednesday.
           cargo install cargo-deb@3.7.0 --locked
           cargo deb --no-build --no-strip -p snob-cli \
-            --target ${{ matrix.target }} \
-            --output "snob-v${{ needs.check.outputs.version }}-${{ matrix.target }}.deb"
+            --target "$TARGET" \
+            --output "snob-v$VERSION-$TARGET.deb"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -224,8 +304,10 @@ jobs:
           subject-checksums: artifacts/SHA256SUMS
 
       - name: Release notes
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          version="${{ needs.check.outputs.version }}"
+          version="$VERSION"
           # The changelog entry for this version, up to the next heading.
           awk -v h="## ${version} " '
             index($0, h) == 1 { flag = 1; next }
@@ -271,6 +353,8 @@ jobs:
           ref: main
 
       - name: Render
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           curl -fsSL -o /tmp/SHA256SUMS \
             "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
@@ -279,7 +363,7 @@ jobs:
           # by default, so an edit from there can quietly drop it again -- and
           # this job is the last one in a release, where the failure is most
           # expensive to discover.
-          bash packaging/render.sh "${{ needs.check.outputs.version }}" /tmp/SHA256SUMS
+          bash packaging/render.sh "$VERSION" /tmp/SHA256SUMS
 
       - name: Commit
         run: |

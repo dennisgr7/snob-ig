@@ -7,13 +7,15 @@
 
 use std::sync::Arc;
 
+use snob_core::Pk;
+use snob_core::budget::{RateBudget, UnlimitedRateBudget};
 use snob_core::model::ListKind;
-use snob_core::paths::AppPaths;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
-use snob_core::store::rate_budget::{RateBudget, SqliteRateBudget, UnlimitedRateBudget};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::paths::AppPaths;
+use snob_store::store::Store;
+use snob_store::store::rate_budget::SqliteRateBudget;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,30 +25,7 @@ use snob_cli::engine::Provenance;
 use snob_cli::engine::watch::{self, Skipped, TickReport, Watched};
 
 mod common;
-use common::{SID, UA};
-
-fn open_db(root: &std::path::Path) -> Store {
-    Store::open_at(&root.join("test.db")).unwrap()
-}
-
-fn app_with(server: &MockServer, db: Store, budget: Arc<dyn RateBudget>) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::new(budget))
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: 42,
-            username: Some("me".into()),
-        },
-    )
-}
-
-fn app(server: &MockServer, db: Store) -> App {
-    app_with(server, db, Arc::new(UnlimitedRateBudget))
-}
+use common::{SID, UA, app, app_with, open_db, requests};
 
 /// A profile answering with these two counters.
 async fn mount_profile(server: &MockServer, followers: u64, following: u64) {
@@ -74,10 +53,6 @@ async fn mount_list(server: &MockServer, kind: &str, pks: &[u64]) {
         )
         .mount(server)
         .await;
-}
-
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
 }
 
 /// A whole run: look, then record having reported it.
@@ -183,7 +158,7 @@ async fn a_capture_nobody_reported_is_not_a_baseline() {
     // what makes this what a hand-run of the list commands leaves behind.
     let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
 
-    let before = baseline_of(&app, 42);
+    let before = baseline_of(&app, Pk::new(42));
     assert_eq!(
         before.verdict,
         Verdict::Warned,
@@ -197,7 +172,7 @@ async fn a_capture_nobody_reported_is_not_a_baseline() {
     // One run of the monitor, and now there is one.
     watch::commit(&mut app, &tick, None).unwrap();
 
-    let after = baseline_of(&app, 42);
+    let after = baseline_of(&app, Pk::new(42));
     assert_eq!(after.verdict, Verdict::Ok, "{:?}", after.problem);
     assert!(after.problem.is_none());
 }
@@ -321,7 +296,7 @@ async fn a_refused_run_does_not_move_the_monitor_on() {
     // The arrival was reported by the run that could see, and the refused run
     // in between neither repeated it nor swallowed it.
     let db = Store::open(&paths).unwrap();
-    let mark = snob_core::store::watch::mark(db.conn(), 42, ListKind::Followers)
+    let mark = snob_store::store::watch::mark(db.conn(), Pk::new(42), ListKind::Followers)
         .unwrap()
         .expect("the run that could see left a receipt");
     assert!(mark.snapshot_id.is_some());
@@ -360,15 +335,15 @@ async fn a_run_that_could_not_look_is_still_recorded_as_having_run() {
     drop(app);
 
     let db = Store::open(&paths).unwrap();
-    let runs = snob_core::store::watch::last_runs(db.conn()).unwrap();
+    let runs = snob_store::store::watch::last_runs(db.conn()).unwrap();
     let last = runs
         .iter()
-        .find(|run| run.account_pk == 42)
+        .find(|run| run.account_pk == Pk::new(42))
         .expect("a run that concluded nothing still ran");
 
     assert_eq!(
-        last.outcome.as_deref(),
-        Some("rate_limited"),
+        last.outcome,
+        Some(snob_core::watch::RunOutcome::RateLimited.into()),
         "it has to say why it could not look, not merely that it was quiet"
     );
     assert_eq!(last.changes, 0);
@@ -426,7 +401,7 @@ async fn a_second_watched_account_is_walked_as_itself() {
 
     assert_eq!(
         seen,
-        vec![42, 99],
+        vec![Pk::new(42), Pk::new(99)],
         "the second account was handed the first one's target"
     );
 
@@ -441,6 +416,45 @@ async fn a_second_watched_account_is_walked_as_itself() {
         asked.iter().any(|u| u.contains("/friendships/99/")),
         "the second account's lists were never requested: {asked:?}"
     );
+}
+
+/// A cooldown on an account nothing is stored about yet refuses both lists
+/// before either has said whose they are -- and the report that came out of
+/// that was the **viewer's**: `account.pk` 42 on the wire, and a
+/// `rate_limited` row written against the viewer in `watch_runs`, displacing
+/// that account's own newest row in `status`. A tick that learned nothing
+/// about a named account has nothing to report under that name, and says so.
+#[tokio::test]
+async fn a_tick_that_could_not_look_at_a_stranger_is_not_reported_as_the_viewer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::rooted_at(tmp.path());
+    let _schema = Store::open(&paths).unwrap();
+    let budget = Arc::new(SqliteRateBudget::open(&paths).unwrap());
+    let server = MockServer::start().await;
+
+    budget
+        .start_cooldown("rate_limit", std::time::Duration::from_secs(3600))
+        .unwrap();
+    let mut app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
+
+    let outcome = watch::tick(
+        &mut app,
+        &Watched::consented("stranger".into(), watch::Consent),
+    )
+    .await;
+
+    let error = match outcome {
+        Ok(tick) => panic!(
+            "a report was made under account {}, which is nobody this run looked at",
+            tick.report.account_pk
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        error.to_string().contains("stranger"),
+        "the refusal names the account: {error:#}"
+    );
+    assert_eq!(requests(&server).await, 0, "a cooldown spends nothing");
 }
 
 /// Your own account needs nobody's permission; somebody else's does, and a
@@ -468,12 +482,13 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
     let tmp = tempfile::tempdir().unwrap();
     let app = app(&server, open_db(tmp.path()));
 
-    let now = snob_core::store::now();
-    let long_ago = now - snob_core::store::deliveries::MAX_AGE_SECS - 1;
-    snob_core::store::users::upsert(
+    let now = snob_core::clock::now();
+    let long_ago = now
+        - std::time::Duration::from_secs(snob_store::store::deliveries::MAX_AGE_SECS as u64 + 1);
+    snob_store::store::users::upsert(
         app.db().conn(),
         &snob_core::model::User {
-            pk: 42,
+            pk: Pk::new(42),
             username: "me".into(),
             full_name: None,
             is_private: None,
@@ -482,13 +497,19 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
         },
     )
     .unwrap();
-    snob_core::store::accounts::upsert(app.db().conn(), 42, true).unwrap();
-    let id =
-        snob_core::store::deliveries::enqueue(app.db().conn(), "run-1", 42, "{}", long_ago, None)
-            .unwrap();
+    snob_store::store::accounts::upsert(app.db().conn(), Pk::new(42), true).unwrap();
+    let id = snob_store::store::deliveries::enqueue(
+        app.db().conn(),
+        "run-1",
+        Pk::new(42),
+        "{}",
+        long_ago,
+        None,
+    )
+    .unwrap();
 
     assert!(
-        snob_core::store::deliveries::due(app.db().conn(), now, 10, "https://receiver.example")
+        snob_store::store::deliveries::due(app.db().conn(), now, 10, "https://receiver.example")
             .unwrap()
             .is_empty(),
         "an over-age report is not due, so nothing can expire it by failing"
@@ -497,11 +518,11 @@ async fn a_report_too_old_to_be_news_settles_without_a_comparison() {
     watch::settle(app.db(), now);
 
     assert_eq!(
-        snob_core::store::deliveries::state(app.db().conn(), id).unwrap(),
+        snob_store::store::deliveries::state(app.db().conn(), id).unwrap(),
         Some("expired".to_string())
     );
     assert_eq!(
-        snob_core::store::deliveries::pending(app.db().conn()).unwrap(),
+        snob_store::store::deliveries::pending(app.db().conn()).unwrap(),
         0,
         "status must not go on saying a report is owed"
     );
@@ -643,10 +664,10 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
         // A rename filed between runs, of somebody who is only in `following`.
         // Filing it through the store is what an ordinary `snob followers` by
         // hand does.
-        snob_core::store::users::upsert(
+        snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -703,7 +724,7 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
             1,
             "a rename in a list that was refused is owed, not lost: {renamed:?}"
         );
-        assert_eq!(renamed[0].pk, 2);
+        assert_eq!(renamed[0].pk, Pk::new(2));
         assert_eq!(renamed[0].from, "two");
         assert_eq!(renamed[0].to, "two_renamed");
     }
@@ -722,7 +743,7 @@ async fn a_refused_list_holds_the_rename_cursor_where_it_is() {
 /// still stop the run rather than become "one list was skipped".
 #[tokio::test]
 async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
-    use snob_core::store::rate_budget::RateBudgetError;
+    use snob_core::budget::RateBudgetError;
 
     /// Free until the run has spent a couple of requests, then standing — the
     /// shape of another process writing a cooldown while this one is between
@@ -734,12 +755,20 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(std::time::Duration::ZERO)
         }
-        fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-            let spent = self.0.load(std::sync::atomic::Ordering::Relaxed);
-            Ok((spent >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+        fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+            self.reserve()
         }
-        fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {
-            Ok(0)
+        fn cooldown(&self) -> Result<Option<snob_core::EpochMs>, RateBudgetError> {
+            let spent = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            Ok((spent >= 2)
+                .then(|| snob_core::clock::now_ms() + std::time::Duration::from_millis(7_200_000)))
+        }
+        fn start_cooldown(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<snob_core::EpochMs, RateBudgetError> {
+            Ok(snob_core::EpochMs::new(0))
         }
     }
 
@@ -760,9 +789,13 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
         let mut app = app(&server, open_db(tmp.path()));
         run(&mut app, &Watched::own()).await;
         assert!(
-            snob_core::store::snapshots::latest_complete(app.db().conn(), 42, ListKind::Following)
-                .unwrap()
-                .is_none(),
+            snob_store::store::snapshots::latest_complete(
+                app.db().conn(),
+                Pk::new(42),
+                ListKind::Following
+            )
+            .unwrap()
+            .is_none(),
             "the fixture depends on following having nothing stored"
         );
     }
@@ -819,10 +852,10 @@ async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
         run(&mut app, &Watched::own()).await;
 
         // A rename of somebody in the list that will be readable.
-        snob_core::store::users::upsert(
+        snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 1,
+                pk: Pk::new(1),
                 username: "one_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -851,7 +884,7 @@ async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
         let tick = run(&mut app, &Watched::own()).await;
         let renamed = tick.report.changes().renamed;
         assert_eq!(renamed.len(), 1, "announced once: {renamed:?}");
-        assert_eq!(renamed[0].pk, 1);
+        assert_eq!(renamed[0].pk, Pk::new(1));
     }
 
     // Run three: both counters match what is stored, so both lists are verified
@@ -904,10 +937,10 @@ async fn a_rename_seen_by_a_walk_that_stopped_short_is_not_stepped_over() {
         );
 
         // Somebody the walled walk saw renames.
-        snob_core::store::users::upsert(
+        snob_store::store::users::upsert(
             app.db().conn(),
             &snob_core::model::User {
-                pk: 2,
+                pk: Pk::new(2),
                 username: "two_renamed".into(),
                 full_name: None,
                 is_private: None,
@@ -970,13 +1003,13 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
     // somebody in it changed their name.
     {
         let db = open_db(tmp.path());
-        snob_core::store::users::ensure(db.conn(), 42).unwrap();
-        snob_core::store::accounts::upsert(db.conn(), 42, true).unwrap();
+        snob_store::store::users::ensure(db.conn(), Pk::new(42)).unwrap();
+        snob_store::store::accounts::upsert(db.conn(), Pk::new(42), true).unwrap();
         for name in ["before", "after"] {
-            snob_core::store::users::upsert(
+            snob_store::store::users::upsert(
                 db.conn(),
                 &snob_core::model::User {
-                    pk: 1,
+                    pk: Pk::new(1),
                     username: name.into(),
                     full_name: None,
                     is_private: None,
@@ -987,7 +1020,7 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
             .unwrap();
         }
         assert_eq!(
-            snob_core::store::watch::history_head(db.conn()).unwrap(),
+            snob_store::store::watch::history_head(db.conn()).unwrap(),
             1,
             "there is a rename on record before the monitor ever runs"
         );
@@ -1014,6 +1047,22 @@ async fn a_baseline_run_seeds_the_rename_cursor() {
         "run two announced history from before the monitor: {:?}",
         second.report.changes().renamed
     );
+}
+
+/// A check line that says a standing cooldown is why nothing was asked.
+///
+/// Two shapes, because a cooldown reaches a line two ways: nothing was asked
+/// about this at all, or an account that also has no recorded consent, whose
+/// line is the consent sentence with the cooldown as a clause after it.
+/// Matched on the reason rather than searched for a word, because the reason is
+/// what `engine::check` answers with -- the sentence is
+/// `commands::watch::say`'s and is not reachable from here.
+fn blames_the_cooldown(checked: &snob_cli::engine::check::Checked) -> bool {
+    use snob_cli::engine::check::Problem;
+    matches!(
+        checked.problem,
+        Some(Problem::InCooldown { .. }) | Some(Problem::NoRecordedConsent { in_cooldown: true })
+    )
 }
 
 /// `snob watch check` spends nothing while the account is in cooldown.
@@ -1044,7 +1093,7 @@ async fn watch_check_spends_nothing_during_a_cooldown() {
         .unwrap();
 
     let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+    let secrets = snob_store::secrets::SecretStore::new(paths.clone(), false)
         .with_service(&format!("snob-ig-test-check-{}", std::process::id()));
 
     let mut report = CheckReport::default();
@@ -1061,10 +1110,7 @@ async fn watch_check_spends_nothing_during_a_cooldown() {
         "a cooldown lifts on its own, so it is not a failure"
     );
     assert!(
-        report
-            .checked
-            .iter()
-            .all(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown"))),
+        report.checked.iter().all(blames_the_cooldown),
         "and every line has to say why it was not checked: {:?}",
         report.checked
     );
@@ -1102,7 +1148,7 @@ async fn check_stops_asking_once_an_account_earns_a_cooldown() {
         .await;
 
     let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+    let secrets = snob_store::secrets::SecretStore::new(paths.clone(), false)
         .with_service(&format!("snob-ig-test-throttle-{}", std::process::id()));
 
     let watched = [
@@ -1130,7 +1176,7 @@ async fn check_stops_asking_once_an_account_earns_a_cooldown() {
         report
             .checked
             .iter()
-            .filter(|c| c.problem.as_deref().is_some_and(|p| p.contains("cooldown")))
+            .filter(|c| blames_the_cooldown(c))
             .count()
             >= 2,
         "and the ones that were not asked about say why: {:?}",
@@ -1158,7 +1204,7 @@ async fn a_cooldown_does_not_downgrade_a_missing_consent() {
 
     let server = MockServer::start().await;
     let app = app_with(&server, Store::open(&paths).unwrap(), budget.clone());
-    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+    let secrets = snob_store::secrets::SecretStore::new(paths.clone(), false)
         .with_service(&format!("snob-ig-test-consent-{}", std::process::id()));
 
     let mut report = CheckReport::default();
@@ -1222,11 +1268,11 @@ async fn a_session_with_no_stored_username_is_resolved_rather_than_waved_through
         client,
         Store::open(&paths).unwrap(),
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: None,
         },
     );
-    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+    let secrets = snob_store::secrets::SecretStore::new(paths.clone(), false)
         .with_service(&format!("snob-ig-test-noname-{}", std::process::id()));
 
     let mut report = CheckReport::default();
@@ -1247,7 +1293,7 @@ async fn a_session_with_no_stored_username_is_resolved_rather_than_waved_through
         .expect("the account is checked");
     assert_eq!(
         account,
-        (Some(42), Some(7), Some(3)),
+        (Some(Pk::new(42)), Some(7), Some(3)),
         "the account line has to carry what was really checked: {:?}",
         report.checked
     );
@@ -1288,7 +1334,7 @@ async fn checking_twice_spends_twice() {
     mount_profile(&server, 2, 2).await;
 
     let app = app(&server, Store::open(&paths).unwrap());
-    let secrets = snob_core::secrets::SecretStore::new(paths.clone(), false)
+    let secrets = snob_store::secrets::SecretStore::new(paths.clone(), false)
         .with_service(&format!("snob-ig-test-cost-{}", std::process::id()));
     let watched = [Watched::own()];
 

@@ -6,13 +6,13 @@
 //! which costs nothing and is therefore the only one allowed when the network
 //! is off.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use snob_core::Pk;
-use snob_core::model::{ListKind, printable};
-use snob_core::store::{accounts, users};
+use snob_core::model::ListKind;
+use snob_store::store::{accounts, users};
 
 use crate::app::App;
-use crate::cli::ListArgs;
+use crate::engine::ListQuery;
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -27,7 +27,7 @@ pub struct Target {
     ///
     /// It used to be a `String` holding `pk.to_string()` in that case, with a
     /// comment saying it was only a label. It was not: `engine::decide` writes
-    /// it straight into `users.username`, so `--cache` clobbered a correct
+    /// it straight into `users.username`, so `--offline` clobbered a correct
     /// stored name with the number, filed a rename that never happened, and
     /// then told the user their own account had no stored list — because
     /// `find_pk_by_username` no longer matched the real one.
@@ -69,8 +69,8 @@ pub fn clean(typed: &str) -> &str {
 /// The typed name when there is one, the viewer's own label otherwise. It goes
 /// through `printable` because it is drawn on a terminal and `clean` only
 /// strips the at sign.
-pub fn label(app: &App, args: &ListArgs) -> String {
-    match args.target.as_deref() {
+pub fn label(app: &App, typed: Option<&str>) -> String {
+    match typed {
         Some(raw) => format!("@{}", snob_core::model::printable(clean(raw))),
         None => app.viewer().label(),
     }
@@ -81,7 +81,7 @@ pub fn label(app: &App, args: &ListArgs) -> String {
 /// A private account the viewer does not follow is refused **here**, before a
 /// single page is walked: Instagram serves those lists to followers only, so
 /// walking would buy nothing but empty pages.
-pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
+pub async fn resolve(app: &mut App, args: &ListQuery) -> Result<Target> {
     let Some(typed) = args.target.as_deref() else {
         let viewer = app.viewer().clone();
         let resolved = match viewer.username {
@@ -118,20 +118,32 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
     // never turn into a refusal: with `None` the walk runs and fails, or does
     // not, on its own terms.
     if !is_self && profile.is_private == Some(true) && profile.followed_by_viewer == Some(false) {
-        // Filtered: it came off Instagram, not out of anybody's keyboard, and
-        // this sentence is written to a terminal. `pfp.rs` does the same with
-        // the same field in the same shape of refusal.
-        if profile.requested_by_viewer == Some(true) {
-            bail!(
-                "@{} is private and your follow request has not been accepted yet, \
-                 so its lists cannot be read",
-                printable(&profile.username)
-            );
-        }
-        bail!(
-            "@{} is a private account you do not follow, so its lists cannot be read",
-            printable(&profile.username)
-        );
+        // Which of the two refusals it is, and nothing about how either reads.
+        // The name is filtered inside `report`, where it came off Instagram
+        // rather than out of anybody's keyboard; `pfp.rs` refuses in the same
+        // shape on the same field.
+        return Err(crate::report::refuse_private(
+            &profile.username,
+            profile.requested_by_viewer == Some(true),
+        ));
+    }
+
+    // The profile endpoint answers 400 for certain business accounts, and the
+    // client falls back to search to get an id at all. Search has no counters,
+    // so this run has none — and that is worth a sentence rather than a silent
+    // `None`, because two things people expect quietly stop happening.
+    //
+    // `pager::verify_completion` compares a finished walk against the declared
+    // size and skips the check entirely when there is nothing to compare with,
+    // so the truncation wall — the one that catches Instagram serving 39 of
+    // 21631 followers — cannot be detected on this account. And the counters
+    // are what `--offline` weighs freshness against, so every run re-walks.
+    //
+    // Said here rather than in the client because this is where a *walk* is
+    // being set up; `pfp` reaches the same fallback and loses nothing by it.
+    if !profile.counters_are_knowable() {
+        app.progress()
+            .warn(&crate::report::counters_unknowable(&profile.username));
     }
 
     Ok(Target {
@@ -139,6 +151,13 @@ pub async fn resolve(app: &mut App, args: &ListArgs) -> Result<Target> {
         pk: profile.id,
         // The same answer that named the account also counted it. Asking again
         // would be the identical request to the identical endpoint.
+        //
+        // `Some` with two `None`s inside it, never `None`: the outer one means
+        // "nobody has asked", which would send `freshness::poll` off to ask
+        // again and spend a request on the endpoint that just refused. The
+        // inner ones mean "asked, and this route cannot say", which is the
+        // truth. Neither is zero, and zero is the reading that would make every
+        // short walk look complete.
         counters: Some(Counters {
             followers: profile.follower_count(),
             following: profile.following_count(),

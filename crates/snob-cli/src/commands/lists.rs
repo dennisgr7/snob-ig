@@ -5,12 +5,12 @@
 //! cooldown — happens there.
 
 use anyhow::Result;
-use snob_core::model::{ListKind, StopReason, User};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_core::model::{ListKind, User};
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::cli::ListArgs;
-use crate::commands::common::{self, Session};
+use crate::commands::common;
 use crate::engine::{self, ListOutcome, ResultSource};
 use crate::exit::ExitCode;
 use crate::report;
@@ -22,47 +22,52 @@ pub async fn run(
     paths: &AppPaths,
     kind: ListKind,
 ) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
+    }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
-    let Session::Open(mut app) = common::open(&args, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // Named before the engine runs, so the bar says what it is about during
     // consent, resolution and the counter poll rather than only once pages
     // start arriving.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let result = common::walk_named(&mut app, &args, kind, &subject, |_| Ok(())).await;
     app.progress().finish();
     let (found, outcome) = result?;
 
-    let total = found.len();
-    let mut found = filter.apply(found);
-    let kept = found.len();
-    if let Some(cap) = args.limit {
-        found.truncate(cap);
-    }
+    let common::Narrowed { shown, kept, total } = common::narrow(found, &filter, args.limit);
 
-    destination.write(&found)?;
-    print_summary(&found, kept, total, &outcome, kind);
-    Ok(exit_code(&outcome))
-}
-
-/// A plain list is the one place a partial answer is still worth having: every
-/// account in it really is in the list, only some are missing. So it prints,
-/// says so, and reports what stopped it.
-///
-/// A stored list needs no arm of its own. `ListOutcome::cached` is the only way
-/// to a provenance other than `Walked` and it records `Completed`, so anything
-/// out of storage arrives at the first arm anyway — and an arm that reads as
-/// policy while deciding nothing is one a later change would edit to no effect.
-fn exit_code(outcome: &ListOutcome) -> ExitCode {
-    match outcome.reason {
-        // A cap was asked for by the user, so it is not a failure.
-        StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
-        _ => outcome.exit_code(),
+    // The browser instead of the listing — the default at a terminal, the
+    // decision made above. An empty result is not browsed: there is nothing
+    // to move over, and the summary line already says the count.
+    let browsed = if browses && !shown.is_empty() {
+        let shelf = ui::people::Shelf::flat(format!("{kind} of {subject}"), &shown);
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        destination.write(&shown)?;
     }
+    print_summary(&shown, kept, total, &outcome, kind);
+    // A plain list is the one place a partial answer is still worth having:
+    // every account in it really is in the list, only some are missing. So it
+    // prints, says so, and exits with what stopped it. Leaving the browser
+    // with Ctrl+C outranks that: it is the freshest thing the user said.
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => outcome.exit_code_for_a_printed_result(),
+    })
 }
 
 /// The singular of a list's name. `Display` gives the plural, and for
@@ -84,11 +89,7 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
                 " - list stored on {}",
                 report::stored_on(outcome.taken_at)
             ));
-            if outcome.requests > 0 {
-                line.push_str(&format!(" - {}", report::requests(outcome.requests)));
-            } else {
-                line.push_str(" - without touching the network");
-            }
+            line.push_str(&report::spent(outcome.requests));
         }
         ResultSource::Fetched => {
             line.push_str(&format!(" - {}", report::requests(outcome.requests)));
@@ -111,6 +112,8 @@ fn print_summary(found: &[User], kept: usize, total: usize, outcome: &ListOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snob_core::Pk;
+    use snob_core::model::StopReason;
 
     fn outcome(source: ResultSource, reason: StopReason) -> ListOutcome {
         ListOutcome {
@@ -120,9 +123,9 @@ mod tests {
             },
             reason,
             requests: 1,
-            started_at: 0,
-            taken_at: 0,
-            account_pk: 1,
+            started_at: snob_core::Epoch::default(),
+            taken_at: snob_core::Epoch::default(),
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,
@@ -134,6 +137,7 @@ mod tests {
     /// happened, so a script can tell "wait" from "log in again".
     #[test]
     fn the_exit_code_reports_what_stopped_the_walk() {
+        let exit_code = ListOutcome::exit_code_for_a_printed_result;
         for reason in [StopReason::Completed, StopReason::PageLimit] {
             assert_eq!(
                 exit_code(&outcome(ResultSource::Fetched, reason)),

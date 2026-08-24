@@ -1,8 +1,9 @@
 //! `snob scan`: the whole-account summary.
 //!
 //! Walks both lists and prints the five counts. Unlike the set commands it
-//! returns no account list, so `--limit` has nothing to trim, the machine
-//! formats emit a counts object, and the row formats come out one row wide.
+//! returns no account list, so it takes no `--limit` — `cli::ScanArgs` is the
+//! list options without it — the machine formats emit a counts object, and the
+//! row formats come out one row wide.
 //!
 //! On somebody else's account it opens with the people you both know, which is
 //! the line you actually read first — and it costs nothing, because the answer
@@ -11,17 +12,19 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use snob_core::Pk;
 use snob_core::filters::Filter;
 use snob_core::model::{ListKind, User, printable};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_core::sets;
+use snob_core::{Epoch, Pk};
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
-use crate::cli::{Format, ListArgs};
-use crate::commands::common::{self, Destination, Session};
+use crate::cli::{Format, ScanArgs};
+use crate::commands::common::{self, Destination};
 use crate::engine::{self, ListOutcome, ResultSource, people};
 use crate::exit::ExitCode;
 use crate::output::Rendered;
+#[cfg(feature = "xlsx")]
 use crate::output::xlsx::Cell;
 use crate::report;
 use crate::{output, ui};
@@ -74,22 +77,26 @@ struct Summary<'a> {
     /// When the capture behind `followed_by` was taken. Carried beside it so
     /// this answer dates itself the way every other stored figure in the same
     /// object does.
-    followed_by_at: Option<i64>,
+    followed_by_at: Option<Epoch>,
     followers: &'a ListOutcome,
     following: &'a ListOutcome,
 }
 
-pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
-    let filter = common::filter_from(&args)?;
-    let destination = common::destination(&args)?;
-
-    if args.limit.is_some() {
-        ui::warn("--limit has no effect on scan: it prints counts, not accounts");
+pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    let filter = common::filter_from(&args.filter)?;
+    let destination = common::destination(&args.output)?;
+    if args.browse.interactive {
+        ui::people::check_drawable()?;
     }
+    // Decided before anything is spent, like the destination: what was said
+    // first, detection only for a run that asked for nothing. The matrix is
+    // `BrowseArgs::browses`.
+    let browses = args.browse.browses(
+        args.output.format.is_some() || args.output.path.is_some(),
+        ui::a_human_would_watch_the_listing_scroll_by(),
+    );
 
-    let Session::Open(mut app) = common::open(&args, &secrets, paths)? else {
-        return Ok(ExitCode::NoSession);
-    };
+    let mut app = common::open(&args.walk, &secrets, paths)?;
 
     // The label of the account being summarized, worked out up front so the
     // hints can name it.
@@ -100,7 +107,7 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // Followers first, mirroring the order `unfollowers` consumes the cache
     // in, and so an incomplete list is found out before the second walk is
     // spent.
-    let subject = engine::target::label(&app, &args);
+    let subject = engine::target::label(&app, args.target.as_deref());
     let (followers, followers_outcome) =
         common::walk_named(&mut app, &args, ListKind::Followers, &subject, |outcome| {
             check_complete(ListKind::Followers, outcome)
@@ -133,8 +140,8 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     // covers only the two lists that were walked — so without the bound the
     // opening line could name accounts unfollowed months ago while reading
     // exactly like one worked out this minute.
-    let max_age = i64::try_from(args.max_age.as_secs()).unwrap_or(i64::MAX);
-    let now = snob_core::store::now();
+    let max_age = i64::try_from(args.walk.max_age.as_secs()).unwrap_or(i64::MAX);
+    let now = snob_core::clock::now();
     let stale = found.as_ref().is_some_and(|f| !f.is_current(max_age, now));
     let followed_by = found.filter(|_| !stale);
 
@@ -160,7 +167,46 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
         following: &following_outcome,
     };
 
-    render_to(&summary, &destination)?;
+    // The browser instead of the document — the default at a terminal, the
+    // decision made above. A scan browses as a tray of the five
+    // lists the summary counts, crossings first because they are what the
+    // command exists to answer; Enter walks into one and shows the accounts
+    // the counts stand for. The sets are cut by the same filter as the
+    // counts, so a tray row and its summary line never disagree.
+    let browsed = if browses {
+        let crossings = [
+            (
+                "unfollowers",
+                filter.apply(sets::difference(&following, &followers)),
+            ),
+            (
+                "fans",
+                filter.apply(sets::difference(&followers, &following)),
+            ),
+            (
+                "friends",
+                filter.apply(sets::intersection(&followers, &following)),
+            ),
+            ("followers", filter.apply(followers.clone())),
+            ("following", filter.apply(following.clone())),
+        ];
+        let shelf = ui::people::Shelf {
+            title: format!("scan of @{target}"),
+            sets: crossings
+                .iter()
+                .map(|(label, people)| ui::people::Set {
+                    label: (*label).to_string(),
+                    people,
+                })
+                .collect(),
+        };
+        Some(ui::people::browse(&shelf)?)
+    } else {
+        None
+    };
+    if browsed.is_none() {
+        render_to(&summary, &destination)?;
+    }
 
     let mut line = format!(
         "account summary of @{target} - {}",
@@ -171,12 +217,12 @@ pub async fn run(args: ListArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     }
     ui::info(&line);
 
-    Ok(ExitCode::Ok)
+    Ok(match browsed {
+        Some(ExitCode::Interrupted) => ExitCode::Interrupted,
+        _ => ExitCode::Ok,
+    })
 }
 
-/// Both lists have to be complete. The set commands only need the crossed-
-/// against list whole; here every one of the five counts leans on both lists,
-/// so a single missing account would bend the summary from partial to wrong.
 /// How this summary names the account it is about.
 ///
 /// Filtered on both paths, for the reason `target::label` gives about the one
@@ -199,6 +245,9 @@ fn summary_target(typed: Option<&str>, viewer: &crate::app::Viewer) -> String {
     }
 }
 
+/// Both lists have to be complete. The set commands only need the crossed-
+/// against list whole; here every one of the five counts leans on both lists,
+/// so a single missing account would bend the summary from partial to wrong.
 fn check_complete(kind: ListKind, outcome: &ListOutcome) -> Result<()> {
     if outcome.is_complete() {
         return Ok(());
@@ -258,6 +307,11 @@ fn render_to(summary: &Summary<'_>, destination: &Destination) -> Result<()> {
 }
 
 fn render(summary: &Summary<'_>, format: Format, hints: bool) -> Result<Rendered> {
+    #[cfg(not(feature = "xlsx"))]
+    if format == Format::Xlsx {
+        anyhow::bail!("this build of snob was made without the \"xlsx\" format");
+    }
+    #[cfg(feature = "xlsx")]
     if format == Format::Xlsx {
         return Ok(Rendered::Bytes(output::xlsx::single_row_workbook(
             &ROW_HEADER,
@@ -379,8 +433,6 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
     // minutes ago from one of last month. `lists::print_summary` says it for a
     // single list; this is the same sentence for a crossing.
     //
-    // The older of the two dates, because a scan is only as recent as its
-    // staler half.
     if summary.followers.source() == ResultSource::Cached
         || summary.following.source() == ResultSource::Cached
     {
@@ -388,7 +440,7 @@ fn text_table(summary: &Summary<'_>, hints: bool) -> String {
         rows.push(format!(
             "{:<14}{}",
             "Stored on:",
-            report::stored_on(summary.followers.taken_at.min(summary.following.taken_at))
+            report::stored_on_the_older_of(summary.followers.taken_at, summary.following.taken_at)
         ));
     }
 
@@ -455,6 +507,7 @@ fn row_fields(summary: &Summary<'_>) -> Vec<String> {
     fields
 }
 
+#[cfg(feature = "xlsx")]
 fn row_cells(summary: &Summary<'_>) -> Vec<Cell> {
     let mut cells = vec![
         Cell::Text(summary.target.to_string()),
@@ -527,7 +580,7 @@ mod tests {
     #[test]
     fn the_heading_is_filtered_whoever_the_name_came_from() {
         let viewer = crate::app::Viewer {
-            pk: 7,
+            pk: Pk::new(7),
             username: Some("me\u{1b}[2K".into()),
         };
 
@@ -536,7 +589,7 @@ mod tests {
 
         // No name learned yet, so the id stands in for one.
         let nameless = crate::app::Viewer {
-            pk: 7,
+            pk: Pk::new(7),
             username: None,
         };
         assert_eq!(summary_target(None, &nameless), "7");
@@ -544,7 +597,7 @@ mod tests {
 
     fn user(pk: u64, name: &str) -> User {
         User {
-            pk,
+            pk: Pk::new(pk),
             username: name.into(),
             full_name: None,
             is_private: None,
@@ -583,9 +636,9 @@ mod tests {
             provenance: engine::Provenance::Walked,
             reason: StopReason::Completed,
             requests: 3,
-            started_at: 1_722_699_000,
-            taken_at: 1_722_700_000,
-            account_pk: 1,
+            started_at: Epoch::new(1_722_699_000),
+            taken_at: Epoch::new(1_722_700_000),
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,
@@ -804,10 +857,16 @@ mod tests {
         assert!(md.contains("| Unfollowers | 32 |"), "{md}");
         assert!(md.contains("| Friends | 104 |"), "{md}");
 
+        #[cfg(feature = "xlsx")]
         match render(&summary(counts(), false, &outcomes), Format::Xlsx, false).unwrap() {
             Rendered::Bytes(bytes) => assert_eq!(&bytes[..4], b"PK\x03\x04"),
             Rendered::Text(_) => panic!("a workbook is not text"),
         }
+        #[cfg(not(feature = "xlsx"))]
+        assert!(
+            render(&summary(counts(), false, &outcomes), Format::Xlsx, false).is_err(),
+            "a build without the format has to say so rather than hand back text"
+        );
     }
 
     /// The counts a person reads are the ones a script reads. If the summary
@@ -862,7 +921,7 @@ mod tests {
         let outcomes = (outcome(), outcome());
         let known = vec![user(1, "ana"), user(2, "luis")];
         let dated = Summary {
-            followed_by_at: Some(1_720_360_320),
+            followed_by_at: Some(Epoch::new(1_720_360_320)),
             ..with_people(&outcomes, &known)
         };
 
@@ -870,7 +929,7 @@ mod tests {
         assert!(
             text.starts_with(&format!(
                 "Followed by @ana and @luis, as of {}\n",
-                report::stored_on(1_720_360_320)
+                report::stored_on(Epoch::new(1_720_360_320))
             )),
             "{text}"
         );

@@ -9,9 +9,9 @@
 //! That detail rules out the console-snippet shortcut and is the reason the two
 //! ways are the ones they are.
 
-use snob_core::Pk;
 use snob_core::secret::Secret;
 use snob_core::session::{Session, SessionError, SessionOrigin};
+use snob_core::{EpochMs, Pk};
 use thiserror::Error;
 
 use crate::client::IgClient;
@@ -75,7 +75,7 @@ pub enum ValidationOutcome {
     /// Nothing was asked because the account is in cooldown. Storing an
     /// unchecked session beats spending the one request the cooldown exists to
     /// prevent — and a fresh session is the usual reason someone is here.
-    Skipped { until_ms: i64 },
+    Skipped { until_ms: EpochMs },
 }
 
 /// Builds a session from what the user pasted.
@@ -142,6 +142,14 @@ pub async fn validate(
         Ok(()) => {
             session.mark_validated();
         }
+        // The pacer re-reads the cooldown table before every request, so one
+        // written by another process between the pre-check above and this
+        // request arrives here as `InCooldown`. It is the same fact the
+        // pre-check answers `Skipped` for, and it must not cost the person
+        // the session they just produced.
+        Err(crate::error::IgError::InCooldown { until_ms }) => {
+            return Ok(ValidationOutcome::Skipped { until_ms });
+        }
         Err(e) if e.invalidates_session() => return Err(e.into()),
         Err(e) if e.is_login_tolerable() => {
             tracing::warn!(error = %e, "could not confirm the session");
@@ -151,9 +159,17 @@ pub async fn validate(
     }
 
     // The username is cosmetic: failing to get it does not invalidate anything.
+    // A push-back on it is not cosmetic, though. `classify_and_record` has
+    // just written a cooldown, so the next command will refuse for half an
+    // hour -- and at `debug` the person had been told their login succeeded
+    // and nothing else. The session is still good; the warning is about what
+    // Instagram said on the way.
     if session.username.is_none() {
         match client.resolve_username(session.ds_user_id).await {
             Ok(name) => session.username = name,
+            Err(e) if e.is_push_back() => {
+                tracing::warn!(error = %e, "the session works, but Instagram pushed back on the follow-up request; the account is in cooldown");
+            }
             Err(e) => tracing::debug!(error = %e, "could not resolve the username"),
         }
     }
@@ -171,7 +187,7 @@ mod tests {
     fn a_pasted_session_remembers_where_it_came_from() {
         let s = session_from_paste("42%3AAbCd%3A20", UA).unwrap();
         assert_eq!(s.origin, SessionOrigin::Paste);
-        assert_eq!(s.ds_user_id, 42);
+        assert_eq!(s.ds_user_id, Pk::new(42));
         assert!(s.validated_at.is_none());
     }
 
@@ -189,7 +205,7 @@ mod tests {
     fn a_browser_session_carries_every_cookie_it_was_given() {
         let s = session_from_cookies(&cookies(), UA).unwrap();
         assert_eq!(s.origin, SessionOrigin::Browser);
-        assert_eq!(s.ds_user_id, 42);
+        assert_eq!(s.ds_user_id, Pk::new(42));
         assert_eq!(s.csrftoken.as_ref().map(Secret::expose), Some("tok"));
         assert_eq!(
             s.cookie_header().as_str(),
@@ -219,7 +235,10 @@ mod tests {
             sessionid: "42%3AAbCd%3A20".into(),
             ..BrowserCookies::default()
         };
-        assert_eq!(session_from_cookies(&bare, UA).unwrap().ds_user_id, 42);
+        assert_eq!(
+            session_from_cookies(&bare, UA).unwrap().ds_user_id,
+            Pk::new(42)
+        );
     }
 
     #[test]

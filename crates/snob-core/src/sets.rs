@@ -28,10 +28,13 @@ pub fn intersection(a: &[User], b: &[User]) -> Vec<User> {
 mod tests {
     use super::*;
 
-    fn users(pks: &[Pk]) -> Vec<User> {
+    /// Plain numbers in, ids out: the arithmetic under test is about which
+    /// accounts are in which list, and spelling `Pk::new` sixteen times says
+    /// nothing about it.
+    fn users(pks: &[u64]) -> Vec<User> {
         pks.iter()
             .map(|&pk| User {
-                pk,
+                pk: Pk::new(pk),
                 username: format!("u{pk}"),
                 full_name: None,
                 is_private: None,
@@ -41,8 +44,8 @@ mod tests {
             .collect()
     }
 
-    fn pks(us: &[User]) -> Vec<Pk> {
-        us.iter().map(|u| u.pk).collect()
+    fn pks(us: &[User]) -> Vec<u64> {
+        us.iter().map(|u| u.pk.get()).collect()
     }
 
     #[test]

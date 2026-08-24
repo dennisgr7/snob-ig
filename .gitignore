@@ -18,6 +18,11 @@ exports/
 # Agent and editor scratch
 .claude/
 
+# What tools/capture/record.js writes: a browser profile holding a live
+# session while it runs, and a log that still carries real usernames after
+# the secrets are redacted. Neither is ever committed.
+/tools/capture/out/
+
 # Output the tool itself produces, if it lands in the repo root.
 #
 # All six extensions `output.rs` can write, not four. `.json` was the one

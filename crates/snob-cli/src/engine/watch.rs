@@ -13,15 +13,14 @@
 //! Both return data and the interval it covers. What any of it looks like is
 //! [`crate::commands::watch`]'s question.
 
-use anyhow::{Result, bail};
-use snob_core::Pk;
+use anyhow::Result;
 use snob_core::model::{ListKind, StopReason};
-use snob_core::store::{accounts, snapshots, users, watch as store};
 use snob_core::watch::{Basis, Changes, ListDiff, Rename};
+use snob_core::{Epoch, Pk};
+use snob_store::store::{accounts, snapshots, users, watch as store};
 
 use crate::app::App;
-use crate::cli::ListArgs;
-use crate::engine::{self, ListOutcome, Provenance, target};
+use crate::engine::{self, ListOutcome, ListQuery, Provenance, target};
 use crate::exit::ExitCode;
 
 /// What one list has to report.
@@ -35,9 +34,9 @@ pub struct ListReport {
     /// The receipt's moment, not the marked capture's `taken_at`. Those come
     /// apart the moment somebody types `snob followers` between two runs, and
     /// this is the one that says what has actually been said out loud.
-    pub since: Option<i64>,
+    pub since: Option<Epoch>,
     /// When the newest capture was taken.
-    pub until: i64,
+    pub until: Epoch,
     pub diff: ListDiff,
     /// How many accounts the newest capture holds, so a report can say "three
     /// left, of a hundred and forty" without the caller counting again.
@@ -73,6 +72,23 @@ pub struct WatchReport {
 }
 
 impl WatchReport {
+    /// Whether the tick found anything, without cloning the diffs.
+    ///
+    /// [`WatchReport::changes`] clones both lists' diffs and every rename to
+    /// answer, and two of its five callers only wanted this bool or the
+    /// count -- on the monitor's path, where no deliberate wait amortizes a
+    /// copy of every arrival and departure.
+    pub fn has_changes(&self) -> bool {
+        self.change_count() > 0
+    }
+
+    /// How many individual changes, counted the way `Changes::len` counts --
+    /// both lists plus the renames -- without building a `Changes`.
+    pub fn change_count(&self) -> usize {
+        let of = |kind| self.report(kind).map_or(0, |r| r.diff.len());
+        of(ListKind::Followers) + of(ListKind::Following) + self.renamed.len()
+    }
+
     /// The changes, in the shape the payload and the printer both want.
     pub fn changes(&self) -> Changes {
         Changes {
@@ -186,17 +202,10 @@ impl Watched {
     /// record. `refresh` stays off because the counter poll is what decides
     /// whether to walk, and `cache` stays off because a promise not to look is
     /// not a monitor.
-    fn list_args(&self) -> ListArgs {
-        ListArgs {
+    fn list_args(&self) -> ListQuery {
+        ListQuery {
             target: self.target.clone(),
             yes: self.consent.is_some(),
-            hide: vec![],
-            only: vec![],
-            no_verified: false,
-            exclude_list: None,
-            format: None,
-            output: None,
-            limit: None,
             refresh: false,
             cache: false,
             // A stored capture whose counter has not moved is still current, so
@@ -205,7 +214,6 @@ impl Watched {
             max_age: std::time::Duration::from_secs(6 * 3600),
             no_resume: false,
             max_pages: None,
-            no_progress: true,
         }
     }
 }
@@ -227,7 +235,7 @@ pub struct TickList {
 pub enum Skipped {
     /// Nothing in this run established that the list still describes the
     /// account. That is the three storage paths where no request was spent
-    /// finding out: a cooldown, a failed poll, and `--cache`.
+    /// finding out: a cooldown, a failed poll, and `--offline`.
     NobodyLooked(Provenance),
     /// The walk did not finish, so accounts are missing from it — and every one
     /// of them would be reported as somebody who left.
@@ -259,7 +267,7 @@ pub struct TickReport {
     /// comparison could not build a report for, and asking the store again
     /// afterwards would find both and mark them anyway.
     committable: Vec<(ListKind, i64)>,
-    at: i64,
+    at: Epoch,
     /// How far along the rename history this report has covered, when it read a
     /// window at all. `None` means the cursor must not move.
     rename_cursor: Option<i64>,
@@ -314,10 +322,10 @@ pub fn commit(
         &store::Run {
             account_pk: pk,
             started_at: at,
-            finished_at: Some(snob_core::store::now()),
+            finished_at: Some(snob_core::clock::now()),
             requests: tick.requests,
-            outcome: Some(tick.outcome().as_str().to_string()),
-            changes: tick.report.changes().len() as u32,
+            outcome: Some(tick.outcome().into()),
+            changes: tick.report.change_count() as u32,
         },
     );
     if let Err(e) = record {
@@ -353,7 +361,7 @@ pub fn commit(
 /// moment anybody can be told. Everything else it did stays in a trace. It
 /// returns the count rather than printing it for the reason the module header
 /// gives -- `engine` says what happened and `commands` decides how it reads.
-pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
+pub fn settle(db: &snob_store::store::Store, at: Epoch) -> usize {
     match store::prune(db.conn(), at) {
         Ok(swept) => {
             if swept.captures > 0 {
@@ -389,22 +397,25 @@ pub fn settle(db: &snob_core::store::Store, at: i64) -> usize {
 /// monitor there is nobody it would mean anything to: `snob followers` did not
 /// queue it and cannot say anything useful about it, and the monitor's own
 /// settle reports it the next time it runs.
-pub fn settle_daily(db: &snob_core::store::Store) {
+pub fn settle_daily(db: &snob_store::store::Store) {
     const KEY: &str = "settled_at";
     const A_DAY: i64 = 24 * 3_600;
 
-    let now = snob_core::store::now();
-    let last = snob_core::store::meta_get(db.conn(), KEY)
+    let now = snob_core::clock::now();
+    let last = snob_store::store::meta_get(db.conn(), KEY)
         .ok()
         .flatten()
+        // The one row this is kept in is TEXT, so the moment is parsed back
+        // out of it here, at the boundary, and nothing further in handles a
+        // number.
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
+        .map_or(Epoch::default(), Epoch::new);
     if now - last < A_DAY {
         return;
     }
 
     let _ = settle(db, now);
-    if let Err(e) = snob_core::store::meta_set(db.conn(), KEY, &now.to_string()) {
+    if let Err(e) = snob_store::store::meta_set(db.conn(), KEY, &now.to_string()) {
         // Not worth failing an ordinary command over. The worst case is that
         // the sweep runs again on the next one.
         tracing::debug!(error = %e, "when retention last ran could not be recorded");
@@ -433,8 +444,8 @@ pub fn settle_daily(db: &snob_core::store::Store) {
 /// Best-effort, like the rest of settling. A database that cannot be opened is
 /// the run's own problem a moment later, and it is not worth turning a refusal
 /// about a webhook into a different failure.
-pub fn settle_without_a_session(paths: &snob_core::paths::AppPaths, at: i64) -> usize {
-    match snob_core::store::Store::open(paths) {
+pub fn settle_without_a_session(paths: &snob_store::paths::AppPaths, at: Epoch) -> usize {
+    match snob_store::store::Store::open(paths) {
         Ok(db) => settle(&db, at),
         Err(e) => {
             tracing::warn!(error = %e, "the database could not be opened to settle it");
@@ -451,7 +462,7 @@ impl TickReport {
     /// module can decide that — a caller that could set `committable` could
     /// retire the mark of a list the run refused.
     #[doc(hidden)]
-    pub fn for_test(report: WatchReport, requests: u32, at: i64) -> Self {
+    pub fn for_test(report: WatchReport, requests: u32, at: Epoch) -> Self {
         Self {
             report,
             requests,
@@ -463,14 +474,14 @@ impl TickReport {
         }
     }
 
-    /// When this run concluded, in epoch seconds.
+    /// When this run concluded.
     ///
     /// Read once, inside [`tick`], just before the comparison, and handed out
     /// rather than read again: this is the moment `commit_report` files the
     /// mark at, and a body or a stream line that asked the clock a second time
     /// would put a different moment on the same event. The field stays
     /// private, so only a real tick can decide it.
-    pub fn at(&self) -> i64 {
+    pub fn at(&self) -> Epoch {
         self.at
     }
 
@@ -494,23 +505,32 @@ impl TickReport {
         if self.looked() {
             return ExitCode::Ok;
         }
-        // Every list was refused. The most specific reason wins: a cooldown is
-        // something that lifts, and saying so is more use than "error".
-        self.lists
-            .iter()
-            .find_map(|list| match list.skipped {
-                Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
-                // What Instagram said beats what the store had to record, which
-                // is the rule `ListOutcome::stopped_by` exists for and the one
-                // `exit::from_stop_reason` names in its own doc: whichever of
-                // the two a command happens to read must not change the answer.
-                Some(Skipped::Incomplete(reason, said)) => {
-                    Some(said.unwrap_or_else(|| ExitCode::from_stop_reason(reason)))
-                }
-                _ => None,
-            })
-            .unwrap_or(ExitCode::Error)
+        refused_outcome(&self.lists)
     }
+}
+
+/// The most specific reason every list on a run was refused. A cooldown is
+/// something that lifts, and saying so is more use than "error".
+///
+/// Shared between [`TickReport::outcome`] and the refusal `tick` raises when
+/// it has no stored account to report against, so the two cannot drift:
+/// `snob watch once someone` during a cooldown exits the same way whether or
+/// not that account had ever been walked before.
+fn refused_outcome(lists: &[TickList]) -> ExitCode {
+    lists
+        .iter()
+        .find_map(|list| match list.skipped {
+            Some(Skipped::NobodyLooked(Provenance::Cooldown)) => Some(ExitCode::RateLimited),
+            // What Instagram said beats what the store had to record, which
+            // is the rule `ListOutcome::stopped_by` exists for and the one
+            // `exit::from_stop_reason` names in its own doc: whichever of
+            // the two a command happens to read must not change the answer.
+            Some(Skipped::Incomplete(reason, said)) => {
+                Some(said.unwrap_or_else(|| ExitCode::from_stop_reason(reason)))
+            }
+            _ => None,
+        })
+        .unwrap_or(ExitCode::Error)
 }
 
 /// Goes and looks, then reports what changed since the last time it did.
@@ -532,7 +552,16 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
     // Whose account this turned out to be, taken from the engine's answer
     // rather than from the viewer: on a third party they are different, and the
     // id the engine reports is the one that cannot be wrong about it.
-    let mut pk = app.viewer().pk;
+    //
+    // `None` until a list answers, and not the viewer's id as a stand-in. The
+    // two arms below that `continue` learn nothing about the account, and
+    // when both lists took one of them -- a cooldown on a freshly added
+    // account with no capture, or a Ctrl+C before the first page -- the
+    // comparison, the report's `account.pk` and the `watch_runs` row all
+    // went out under the viewer's id, displacing that account's own newest
+    // row in `status`. What is stored about the name is the fallback, and
+    // when nothing is, the run says so instead of guessing.
+    let mut pk: Option<Pk> = None;
 
     for kind in [ListKind::Followers, ListKind::Following] {
         // A canceled walk comes back `Ok`, so without this the loop went
@@ -585,7 +614,7 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
             }
             Err(e) => return Err(e),
         };
-        pk = outcome.account_pk;
+        pk = Some(outcome.account_pk);
 
         let skipped = refusal(&outcome);
         if skipped.is_none() {
@@ -594,11 +623,26 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         lists.push(TickList { kind, skipped });
     }
 
+    let pk = match (pk, watched.name()) {
+        (Some(pk), _) => pk,
+        (None, None) => app.viewer().pk,
+        (None, Some(name)) => {
+            let name = target::clean(name);
+            // The refusal carries the code `outcome()` would have produced,
+            // not a bare error: a first tick during a cooldown used to exit 1
+            // where the same tick on a walked account exits 5, and the `--json`
+            // stream said `"error"` about a state that lifts on its own.
+            accounts::find_pk_by_username(app.db().conn(), name)?.ok_or_else(|| {
+                crate::report::refuse_nothing_looked_at(name, refused_outcome(&lists))
+            })?
+        }
+    };
+
     // Read before the comparison, and both handed back, so that whatever
     // commits this report writes the same two numbers the renames were read
     // against. Read again at commit time, a rename filed in between would be
     // marked as reported without having been.
-    let at = snob_core::store::now();
+    let at = snob_core::clock::now();
     let head = store::history_head(app.db().conn())?;
 
     // Nothing is written here. The marks and the cursor move in `commit`,
@@ -670,7 +714,7 @@ pub fn record_from_store(app: &mut App, typed: Option<&str>) -> Result<WatchRepo
         db,
         pk,
         &compared.marks,
-        snob_core::store::now(),
+        snob_core::clock::now(),
         compared.rename_cursor,
         &compared.renames_sent,
         None,
@@ -980,9 +1024,10 @@ fn list_report(app: &App, pk: Pk, kind: ListKind, snapshot_id: i64) -> Result<Op
 
 /// Which account this is about, from storage alone.
 ///
-/// Deliberately not `target::from_store`: that one refuses with a sentence
-/// about `--cache`, which is a flag this command does not have. What the user
-/// has to do here is walk the account once, and the refusal says so.
+/// Deliberately not `target::from_store`: that one refuses with
+/// `report::refuse_nothing_stored`, a sentence about `--offline`, which is a flag
+/// this command does not have. `report::refuse_never_walked` is the one that
+/// belongs here, and it carries the difference between the two.
 fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
     let Some(typed) = typed else {
         let viewer = app.viewer();
@@ -991,12 +1036,7 @@ fn resolve(app: &App, typed: Option<&str>) -> Result<(Pk, Option<String>)> {
 
     let name = target::clean(typed);
     let Some(pk) = accounts::find_pk_by_username(app.db().conn(), name)? else {
-        bail!(
-            "nothing is stored about @{}. Run \"snob followers {}\" once and the monitor \
-             will have something to compare against from then on.",
-            snob_core::model::printable(name),
-            snob_core::model::printable(name),
-        );
+        return Err(crate::report::refuse_never_walked(name));
     };
 
     Ok((pk, users::name(app.db().conn(), pk)?))
@@ -1011,9 +1051,9 @@ mod tests {
             provenance,
             reason,
             requests: 0,
-            started_at: 1_000,
-            taken_at: 1_100,
-            account_pk: 42,
+            started_at: Epoch::new(1_000),
+            taken_at: Epoch::new(1_100),
+            account_pk: Pk::new(42),
             snapshot_id: 7,
             stopped_by: None,
             resumable: false,
@@ -1068,7 +1108,7 @@ mod tests {
     #[test]
     fn a_run_whose_lists_all_came_back_short_does_not_exit_zero() {
         let report = WatchReport {
-            account_pk: 42,
+            account_pk: Pk::new(42),
             username: None,
             is_self: true,
             followers: None,
@@ -1086,7 +1126,7 @@ mod tests {
                 )),
             }],
             committable: Vec::new(),
-            at: 0,
+            at: Epoch::default(),
             rename_cursor: None,
             renames_sent: Vec::new(),
         };
@@ -1113,7 +1153,7 @@ mod tests {
     fn a_challenge_keeps_its_own_code_through_a_tick() {
         let short = |said| TickReport {
             report: WatchReport {
-                account_pk: 42,
+                account_pk: Pk::new(42),
                 username: None,
                 is_self: true,
                 followers: None,
@@ -1126,7 +1166,7 @@ mod tests {
                 skipped: Some(Skipped::Incomplete(StopReason::SessionInvalid, said)),
             }],
             committable: Vec::new(),
-            at: 0,
+            at: Epoch::default(),
             rename_cursor: None,
             renames_sent: Vec::new(),
         };

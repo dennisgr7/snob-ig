@@ -9,25 +9,22 @@
 //! client is built only because an `App` needs one; if any of this ever reached
 //! for it, the mock server it points at has nothing mounted and would say so.
 
+use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::{Store, accounts, snapshots, users};
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
-use url::Url;
+use snob_store::store::{Store, accounts, snapshots, users};
 use wiremock::MockServer;
 
-use snob_cli::app::{App, Viewer};
+use snob_cli::app::App;
 use snob_cli::engine::watch;
 
 mod common;
-use common::{SID, UA};
+use common::app;
 
-const ME: u64 = 42;
+const ME: Pk = Pk::new(42);
 
 fn user(pk: u64, name: &str) -> User {
     User {
-        pk,
+        pk: Pk::new(pk),
         username: name.into(),
         full_name: None,
         is_private: None,
@@ -42,21 +39,6 @@ fn users(names: &[(u64, &str)]) -> Vec<User> {
 
 /// An app over this database. The server has nothing mounted, so any request
 /// would fail loudly rather than quietly succeeding.
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::unlimited())
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: ME,
-            username: Some("me".into()),
-        },
-    )
-}
-
 /// Stores a finished walk of `kind` holding `members`, the way a real one does.
 fn walked(db: &mut Store, kind: ListKind, members: &[User]) -> i64 {
     users::ensure(db.conn(), ME).unwrap();
@@ -555,7 +537,7 @@ async fn an_unknown_account_is_refused_with_something_to_do_about_it() {
 /// closed, and every list it covered has a receipt from the same commit.
 #[tokio::test]
 async fn the_rename_cursor_moves_only_over_lists_a_mark_was_written_for() {
-    use snob_core::store::watch as watch_store;
+    use snob_store::store::watch as watch_store;
 
     let server = MockServer::start().await;
     let mut db = Store::in_memory().unwrap();

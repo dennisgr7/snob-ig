@@ -17,13 +17,12 @@ pub mod walk;
 pub mod watch;
 
 use anyhow::Result;
-use snob_core::Pk;
 use snob_core::model::{ListKind, StopReason, User};
-use snob_core::store::{accounts, snapshots, users};
+use snob_core::{Epoch, Pk};
+use snob_store::store::{accounts, snapshots, users};
 
-use crate::app::{App, ConsentInAdvance};
-use crate::cli::ListArgs;
-use crate::exit::{ExitCode, ExitError};
+use crate::app::App;
+use crate::exit::ExitCode;
 use crate::ui;
 
 /// Where a returned list came from.
@@ -39,7 +38,7 @@ pub enum ResultSource {
 /// them may be crossed against each other.
 ///
 /// This used to be a `bool` called `from_cooldown`, and two of the three paths
-/// that serve from storage set it to `false` — so `snob unfollowers --cache`
+/// that serve from storage set it to `false` — so `snob unfollowers --offline`
 /// crossed a followers list stored in June against a following list stored in
 /// August and reported the difference as unfollowers, with nothing on screen
 /// saying either list came out of storage.
@@ -59,7 +58,7 @@ pub enum Provenance {
     Cooldown,
     /// Stored, served because the counter poll failed. No evidence either way.
     PollFailed,
-    /// Stored, served because `--cache` said not to look.
+    /// Stored, served because `--offline` said not to look.
     CacheFlag,
 }
 
@@ -96,10 +95,10 @@ pub struct ListOutcome {
     /// twenty minutes, and every question about whether two lists describe one
     /// moment is really about the time between the two walks rather than
     /// between the two moments they happened to finish at.
-    pub started_at: i64,
+    pub started_at: Epoch,
     /// When it finished. The date shown to a person, and the one the store
     /// orders by.
-    pub taken_at: i64,
+    pub taken_at: Epoch,
     /// Whose list this is.
     ///
     /// The caller asked with a name and gets back an id, which is the only
@@ -195,9 +194,62 @@ impl ListOutcome {
             .unwrap_or_else(|| ExitCode::from_stop_reason(self.reason))
     }
 
+    /// The code for a result that **was printed** out of this list, short or
+    /// not.
+    ///
+    /// A cap the user asked for is not a failure, so `PageLimit` sits with
+    /// `Completed`; everything else keeps the code that says what stopped the
+    /// walk, so a script can tell "wait" from "log in again". It was written
+    /// out in `lists` and again in `sets`, and the two disagreed once: `snob
+    /// unfollowers --max-pages 2` exited 1 while `snob following --max-pages
+    /// 2` exited 0 for the identical stop reason. One function, two callers.
+    ///
+    /// A stored list needs no arm of its own. `ListOutcome::cached` is the
+    /// only way to a provenance other than `Walked` and it records
+    /// `Completed`, so anything out of storage arrives at the first arm.
+    pub fn exit_code_for_a_printed_result(&self) -> ExitCode {
+        match self.reason {
+            StopReason::Completed | StopReason::PageLimit => ExitCode::Ok,
+            _ => self.exit_code(),
+        }
+    }
+
     /// Whether this is the list of the account the run acts as.
     pub fn is_own(&self, viewer: &crate::app::Viewer) -> bool {
         self.account_pk == viewer.pk
+    }
+}
+
+/// What a list is asked for: which account, and how the answer may be got.
+///
+/// The engine used to take `cli::ListArgs`, the clap struct, and so was
+/// parameterized by the command-line parser: eight of its fifteen fields
+/// are presentation -- the format, the output path, the filters, the cap --
+/// which the engine never reads and whose presence said it might. The cost
+/// showed in the monitor, which had to fabricate the whole struct with eleven
+/// dummy values to ask for a list. These are the seven the engine reads, and
+/// `commands::common` is where a `ListArgs` becomes one.
+#[derive(Debug, Clone, Default)]
+pub struct ListQuery {
+    /// The account, as typed. `None` is the session's own.
+    pub target: Option<String>,
+    /// Consent given in advance, for a list that is somebody else's.
+    pub yes: bool,
+    /// Walk even when storage could answer.
+    pub refresh: bool,
+    /// Answer out of storage and spend nothing.
+    pub cache: bool,
+    /// How old a stored list may be and still be served.
+    pub max_age: std::time::Duration,
+    /// Start over rather than continue an interrupted walk.
+    pub no_resume: bool,
+    /// Stop after this many pages.
+    pub max_pages: Option<u32>,
+}
+
+impl From<&ListQuery> for ListQuery {
+    fn from(query: &ListQuery) -> Self {
+        query.clone()
     }
 }
 
@@ -207,7 +259,7 @@ impl ListOutcome {
 /// request being spent that did not have to be:
 ///
 /// 1. In cooldown nothing may be spent, so only storage can answer.
-/// 2. With `--cache` the network is off, resolution included — and with it the
+/// 2. With `--offline` the network is off, resolution included — and with it the
 ///    consent question, which is about enumerating somebody rather than about
 ///    reading what was already enumerated.
 /// 3. Otherwise, someone else's account needs consent before it is enumerated,
@@ -218,9 +270,10 @@ impl ListOutcome {
 /// 7. Otherwise, walk.
 pub async fn list(
     app: &mut App,
-    args: &ListArgs,
+    query: impl Into<ListQuery>,
     kind: ListKind,
 ) -> Result<(Vec<User>, ListOutcome)> {
+    let args = &query.into();
     // Measured rather than added up along the way. Every request goes through
     // the pacer, including the ones a retry makes and the ones spent before
     // the walk begins, so asking it afterwards is the only count that cannot
@@ -233,21 +286,21 @@ pub async fn list(
 
 async fn decide(
     app: &mut App,
-    args: &ListArgs,
+    args: &ListQuery,
     kind: ListKind,
 ) -> Result<(Vec<User>, ListOutcome)> {
     if let Some(until_ms) = app.client().pacer().cooldown()? {
         return cooldown::serve(app, args, kind, until_ms);
     }
 
-    // **`--cache` is not asked about**, because there is nothing to agree to:
+    // **`--offline` is not asked about**, because there is nothing to agree to:
     // consent governs enumerating somebody else's lists, and this reads a list
     // that was already walked — with permission — off this machine's own disk.
     // Nothing is resolved over the network either, so the rule that consent
     // comes before resolution is not in play.
     //
     // Asking anyway cost more than a redundant prompt. `ui::can_be_asked` is
-    // false without a terminal, so `snob unfollowers someone --cache` from cron
+    // false without a terminal, so `snob unfollowers someone --offline` from cron
     // or down a pipe exited 130 with "there is no terminal to ask at" over an
     // answer that costs nothing and touches nobody. Interactively it warned
     // about "a heavier request" that was never going to be made.
@@ -317,15 +370,15 @@ async fn decide(
     }
     accounts::upsert(app.db().conn(), target.pk, target.is_self)?;
 
-    let stored = snob_core::store::snapshots::latest_complete(app.db().conn(), target.pk, kind)?;
+    let stored = snob_store::store::snapshots::latest_complete(app.db().conn(), target.pk, kind)?;
 
     if args.cache {
         let Some(snapshot) = stored else {
             return Err(crate::report::refuse_nothing_stored(kind));
         };
         return Ok((
-            snob_core::store::snapshots::members(app.db().conn(), snapshot.id)?,
-            // `--cache` is a promise not to spend a request, so nothing here
+            snob_store::store::snapshots::members(app.db().conn(), snapshot.id)?,
+            // `--offline` is a promise not to spend a request, so nothing here
             // checked whether the stored list is still true. That is exactly
             // what makes it unsafe to cross against another one.
             ListOutcome::cached(&snapshot, Provenance::CacheFlag),
@@ -345,7 +398,7 @@ async fn decide(
 /// than the one Instagram spells. That costs nothing when it is wrong, and the
 /// only account it can wrongly ask about is your own, which needs you to have
 /// typed your own name.
-async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
+async fn ask_consent(app: &mut App, args: &ListQuery) -> Result<()> {
     ask_consent_with(app, args, ui::can_be_asked()).await
 }
 
@@ -358,9 +411,10 @@ async fn ask_consent(app: &mut App, args: &ListArgs) -> Result<()> {
 #[doc(hidden)]
 pub async fn ask_consent_with(
     app: &mut App,
-    args: &ListArgs,
+    query: impl Into<ListQuery>,
     someone_is_there: bool,
 ) -> Result<()> {
+    let args = &query.into();
     let Some(typed) = args.target.as_deref() else {
         return Ok(()); // your own account, nothing to agree to
     };
@@ -387,9 +441,10 @@ pub async fn ask_consent_with(
 
     // How an account is named on screen is `target::label`'s question, and it is
     // the same question here: `args.target` is `Some` at this point, so `label`
-    // returns exactly the at sign and the filtered name these three sentences
-    // want. Repeating the rule was how one of them ended up unfiltered.
-    let shown = target::label(app, args);
+    // returns exactly the at sign and the filtered name the sentences in
+    // `report` want. Repeating the rule was how one of them ended up
+    // unfiltered.
+    let shown = target::label(app, args.target.as_deref());
 
     // Being unable to ask and being told no are two different events, and they
     // were reported as one. `confirm` answers with its default the moment
@@ -406,40 +461,23 @@ pub async fn ask_consent_with(
     // standard error, and the gate did not follow it.
     if !someone_is_there {
         // Which way to answer in advance is the *caller's* fact, not this
-        // function's. Both commands that reach here take an answer beforehand
-        // and they do not take it the same way, and one sentence named `-y` for
-        // both — so `snob watch once someone` refused with advice that then
-        // failed to parse, because `watch once` deliberately has no `-y`.
-        let in_advance = match app.consent_in_advance() {
-            ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
-            ConsentInAdvance::WatchConfig => format!(
-                "Run \"snob watch setup\" to answer it once, or ask about {shown} \
-                 while you are here."
-            ),
-        };
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!(
-                "reading {shown}'s lists needs confirmation, and there is no terminal to \
-                 ask at. {in_advance}"
-            ),
-        )
-        .into());
+        // function's, and it is the one thing this hands over: the sentence
+        // itself is `report`'s, like every other sentence the tool prints.
+        return Err(crate::report::refuse_unconsented(
+            &shown,
+            app.consent_in_advance(),
+        ));
     }
 
-    app.warn(
-        "reading somebody else's lists is a heavier request than reading your own, \
-         and Instagram is readier to refuse it",
-    );
-    if !ui::confirm_off_thread(app.progress(), format!("Continue with {shown}?"), false).await? {
-        // No mention of -y here. They have just said no, and answering that
-        // with "pass the flag that skips the question" is telling them to do
-        // it anyway.
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            format!("nothing was done: {shown} was not confirmed"),
-        )
-        .into());
+    app.warn(crate::report::READING_SOMEBODY_ELSES_LIST);
+    if !ui::confirm_off_thread(
+        app.progress(),
+        crate::report::ask_to_continue(&shown),
+        false,
+    )
+    .await?
+    {
+        return Err(crate::report::refuse_declined(&shown));
     }
     // Asked and answered. A crossing wants two lists and a summary four, and
     // asking again about the same account reads as not having listened.
@@ -455,10 +493,10 @@ mod tests {
     fn a_cached_outcome_is_complete_by_construction() {
         let snapshot = snapshots::Snapshot {
             id: 1,
-            account_pk: 7,
+            account_pk: Pk::new(7),
             kind: ListKind::Followers,
-            started_at: 0,
-            taken_at: Some(0),
+            started_at: Epoch::default(),
+            taken_at: Some(Epoch::default()),
             member_count: 0,
             declared_count: None,
             next_cursor: None,
@@ -468,6 +506,6 @@ mod tests {
         assert_eq!(outcome.source(), ResultSource::Cached);
         // Both ends of the interval come off the row, so they cannot disagree
         // with the members read from the same one.
-        assert_eq!(outcome.account_pk, 7);
+        assert_eq!(outcome.account_pk, Pk::new(7));
     }
 }

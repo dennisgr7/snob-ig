@@ -1,5 +1,246 @@
 # Changelog
 
+## 0.5.0 — 2026-08-24
+
+- **Ctrl+C reaches a download in flight.** Inside every browser the keyboard
+  now stays live while a story, a highlight or a picture is being fetched:
+  Ctrl+C stops the request where it stands and leaves saying so, `q` stops it
+  and leaves cleanly. A stalled fetch used to hold the whole terminal until
+  its own timeout, because raw mode swallows the signal and the key loop was
+  not running.
+
+- **A pre-release review closed four holes before they shipped.** The scratch
+  directory under the shared temporary folder is created and swept without
+  ever following a link somebody else planted at its predictable name, and
+  `snob purge` removes such a link as the link itself; `snob watch check`
+  redacts a Slack or Discord webhook address the way `status` already did,
+  in the terminal and in `--json`; a profile's `external_url` is filtered
+  like every other server-supplied field before it reaches a terminal or a
+  markdown file; and the setup wizard refuses an `Authorization` header in
+  the free-form header question — the keyring prompt one question later is
+  where that value belongs, not `watch.toml` in the clear.
+
+- **Smaller fixes from the same review.** The account browser no longer
+  rebuilds every row several times a second while idle; `snob stories -i`
+  and `snob highlights -i` refuse a terminal that cannot draw before
+  spending their two requests, like every other command; two runs saving the
+  same story into one directory can no longer publish each other's
+  truncated bytes; a monitor's first tick during a cooldown exits 5 and
+  says `rate_limited` in `--json` instead of a bare error; an unfollow no
+  longer refuses on a relationship field Instagram merely left out; a
+  cooldown landing mid-login skips validation instead of discarding the
+  fresh session; a failed screen write can no longer leave the shell in raw
+  mode; and the `Saved ...` receipts survive a draw error instead of
+  vanishing with the alternate screen.
+
+- **The browsers take the whole screen.** Every interactive view — the story,
+  highlight, picture and account browsers, and the profile card — now opens on
+  the terminal's alternate screen, drawn with `ratatui`: a rounded frame with
+  the view's name on it, a scrollbar when the list does not fit, the hints on
+  the bottom edge, and in the account lists a real cursor at the end of the
+  `/` filter as you type. The keys are exactly the ones the browsers already
+  had. Leaving puts your terminal back the way it was, and what you saved
+  while inside is said again where the prompt returns — `Saved
+  ./someone-3.jpg` survives in your scrollback even though the frame does
+  not. The wizard menus (`snob login`, `snob watch setup`) stay in the flow
+  of their questions, redrawn with the same renderer in place. A pipe,
+  `--format`, `-o` and `--no-interactive` print exactly as before.
+
+- **Every list is a real table, and the question looks you in the eye.** The
+  account lists put the username, the full name and the badges in columns
+  that line up on every row; stories and highlights get named columns —
+  `kind`, `posted`, `left`, `taken` — because a date and a countdown do not
+  explain themselves. The profile card is a centered column with air in it:
+  the handle and the badges on the frame, the person's name and bio inside,
+  the counters as three tiles with the number under its label, and the
+  highlights as chips without the brackets. The walk-this-list question is
+  no longer a line hidden on the bottom edge: it opens as a small framed
+  window in the middle of the screen, over a dimmed card, with `y`, `n` and
+  Esc spelled out — and no default, so Enter cannot start a three-hundred
+  page walk by accident. The actions submenu opens the same way, over the
+  card instead of replacing it. Failures now say so in red; receipts stay
+  yellow.
+
+- **`snob profile` opens as a card on a terminal.** The account's page with
+  one cursor over it: Up/Down move between rows, Left/Right along the
+  horizontal ones, Enter opens what is under the cursor. "Actions on this
+  account" is a submenu — the profile picture (Enter looks at it, D saves
+  it) and a scan; the stories open below the bio; "followed by N you follow"
+  walks the mutual list at the click rather than at the fetch, so opening a
+  profile costs about three requests; followers and following open from the
+  stored list when it still answers, and otherwise ask first, with the size
+  named — on somebody else's account that question is the consent question.
+  The highlights are a horizontal strip that behaves like the highlights
+  browser: Enter walks in, D saves a whole one. A pipe, `--format`, `-o`
+  and `--no-interactive` print the document exactly as before.
+
+- **`snob pfp` shows the picture before you keep it.** On a terminal it
+  opens a one-row viewer — Enter hands the full-size picture to the system
+  viewer, D saves it here, q leaves. `-o`, `--no-interactive` and a
+  redirected stdout download exactly as before.
+
+- **The lists open as a browser on a terminal.** `snob unfollowers` — and
+  the same on `fans`, `friends`, `followers`, `following` and `scan` — moves
+  through the result with the arrow keys when standard input, output and
+  error are all a terminal and nothing asked for the printed form: Enter
+  opens the account's profile in your browser, `/` narrows the list as you
+  type, Esc clears the filter, `q` leaves. `scan` starts at a tray of the
+  five lists with their counts and Enter walks into one. A pipe, a redirect,
+  `--format` and `-o` print exactly as before, `--no-interactive` prints on
+  a terminal too, and `-i` forces the browser — the same rule the media
+  browsers settled.
+
+- **A crossing's finished walk keeps its progress bar.** The followers bar
+  used to be reset and reused for the following list, so a glance away and
+  back showed a nearly-full bar sitting at zero. Each walk draws its own bar
+  now; a finished one freezes into a line — the name, the bar, the count and
+  how long it took — and the next walk draws below it. The rest between
+  pages is dimmed and counts down in place, and the page number is gone from
+  the bar: pages are how the API paginates, not how anybody counts their
+  followers.
+
+- **The browsers are now the default on a terminal.** `snob stories` and
+  `snob highlights` open their arrow-key browser when standard input, output
+  and error are all a terminal and nothing else was asked for; a pipe, a
+  redirect, `--format`, `--download` or `-o` all print or save exactly as
+  before. `--no-interactive` is the new explicit spelling for the printed
+  listing on a terminal, and `-i` still forces the browser where detection
+  would not have opened one.
+
+- **`snob highlights`**: the highlights an account keeps on its profile, as a
+  command of its own beside `stories`. `snob highlights someone` numbers the
+  tray with each one's title, size and dates; `snob highlights someone 2`
+  lists what the second holds; `--download`, `-o`, `--format` and `-i` act on
+  that listing exactly as they do on `stories`, and without the number
+  `--download` saves whole highlights — `-d 2` the second, `-d all` the whole
+  profile. Files land as `someone-2-3.jpg`, the tray's number then the
+  item's, streamed and deduplicated the way stories are. `-i` browses the
+  tray like folders: Enter or Right walks in, Left or Backspace walks back
+  out, D saves an item or a whole highlight depending on where it is pressed.
+  Like a story, none of it marks anything as seen, and the test that reads
+  the source to prove that already covered the highlight spelling. A private
+  account you do not follow is told apart from an account with no highlights,
+  and the tray is not even asked for.
+
+- `--sign-with` now trims surrounding whitespace before checking its
+  32-character floor, the same way `snob watch setup` always did. A key that
+  was only long enough by counting invisible padding is refused at both doors
+  now; a key that never carried whitespace at its edges is unchanged.
+
+**snob follows, unfollows, and shows you stories.** The first release that
+changes anything on Instagram at all, and the rule it replaces is worth reading
+before the features: `snob` used to write nothing, deliberately, because a read
+tool asks a service for what it already shows you while a write tool acts on
+your behalf. That rule was lifted for two verbs and no others, and what took its
+place is a regime rather than permission.
+
+- **`snob follow` and `snob unfollow`**, one account per command. Both ask
+  before they send; `-y` answers in advance. Both come out of a request budget
+  of their own — one action every fifteen minutes, at most three in a row —
+  which is separate from the one reads come out of, so an exhausted write budget
+  never holds up a walk and a walk never spends a write. **There is no bulk
+  mode and no flag that makes one.** What strains a service is the burst rather
+  than the daily total, and the follow-then-unfollow churn that automating a
+  list makes easy is a growth-hacking trick rather than housekeeping, and
+  outside what this tool is for.
+- A write needs a session with a CSRF token. `snob login --browser` already
+  captured one; a session created by pasting a sessionid does not have one, and
+  the two commands now **refuse before spending anything** rather than finding
+  out from a 403 that would read as an expired session.
+  `snob login --paste --csrftoken <token>` is the way to add one on a machine
+  with no browser to launch.
+- **`snob profile`** is an account the way its page shows it, for three or
+  four requests: the counters and the post count, the bio, whether you follow
+  each other, the "followed by a, b and 30 others" line with the whole list
+  under it, the highlights with their sizes and dates, and whether anything is
+  up right now. It walks no list and stores nothing; `snob scan` is still the
+  crossing. A private account you do not follow is not asked for the reels it
+  would not serve, and the summary says they are not visible rather than that
+  there are none. `--format json` and `--format md` as well as the table.
+- **The list commands' options are three groups rather than one struct**, and
+  a flag a command would ignore is now refused by the parser: `snob scan
+  --limit` used to be accepted with a warning, `--cache` with `--max-pages` or
+  `--no-resume` walked nothing and said nothing, and `snob stories --format json
+  -d 2` printed no JSON. `--no-verified` still works and is out of the help:
+  `--hide verified` is the general form.
+- **`snob stories`** lists what an account has up: what each story is, when it
+  went up and how long it has left. `--download 2` saves one by the number the
+  listing printed, `--all` saves all of them, and `--interactive` is a list you
+  move through with the arrow keys — Enter hands the story to the system viewer,
+  `D` keeps a copy. It is built on what was already in the binary rather than on
+  a terminal-UI framework, so it costs nothing to carry.
+- **Nothing tells anybody you looked at their story.** Instagram registers a
+  view through a separate request, snob does not make it, and a test reads the
+  source of all three crates on every build so that adding one is a failing
+  build rather than a code review somebody has to catch.
+- A write follows no redirect. Instagram redirecting a POST would mean doing the
+  thing twice, and the HTTP client replays the method and the body on a 307.
+- **`snob stories --download` and `--all` can save a file.** They could not: the
+  name the command invents carries a hyphen, the name check did not allow one,
+  and every download fetched the bytes and then refused its own name. `--all -o
+  somewhere` also put the files next to the directory rather than in it, a
+  failed write stopped the loop at story one, and a Ctrl+C exited 1 instead of
+  130. The interactive `D` key no longer writes over a file it did not name.
+- **A write is never sent twice.** A 5xx, a redirect, or a 200 the client could
+  not read on `follow` or `unfollow` used to trigger the `doc_id` rediscovery and
+  a second mutation — a follow sent twice on one confirmation. Only an answer
+  that says the first did not happen earns a second attempt now.
+- **A failure is told in JSON when the answer was going to be.** With `--format
+  json`, `--json`, or standard output down a pipe, an error on standard error is
+  one object: `{"error": {"code", "exit", "message", "causes", "hint", "url",
+  "cooldown_until"}}`, where `code` is the same token the exit status names.
+  "No session stored" went round the printer entirely in five commands; it is an
+  error with a hint like every other refusal.
+- **The reader leaving is not an error.** `snob watch status | head -1` used to
+  end in a panic the moment `head` had read its line; every line of prose on
+  standard output now survives a closed pipe, as the lists always did.
+- **Every printed moment is in your zone.** "stored on", "until" and "last ran"
+  were UTC with no label while the schedule runs on local time, so a monitor on
+  `--at 09:00` in Madrid reported having last run at 07:00.
+- **A tick the monitor could not look at is reported under the account it was
+  for**, or refused by name — not under the session's own account, which is what
+  a cooldown on a freshly added account used to write into `watch_runs`.
+- **Security.** The interactive story browser built its scratch file's name
+  from the username Instagram sent and wrote it with `fs::write`; a crafted
+  reply chose where the bytes landed. It goes through the same name check and
+  create-only open as every other write. The scratch directory under `/tmp` is
+  made fresh under a private parent rather than adopted, so a planted link is
+  refused. `snob watch status` printed a `user:pass@` webhook address on its
+  second line after hiding it on the first. A login canceled or failed after
+  the form was submitted left the browser profile — and the session in it — on
+  disk. Slack and Discord webhook addresses are shown without their path, which
+  is their credential. `--csrftoken` and `--sign-with` can come from
+  `SNOB_CSRFTOKEN` and `SNOB_SIGNING_KEY` instead of the command line, which
+  `ps` shows to every local user. The install scripts verify the Sigstore build
+  provenance the release has signed all along, when `gh` is installed.
+- **Lighter.** The log filter no longer links a regular-expression engine:
+  327,680 bytes off the Windows binary, 4.4%. `SNOB_LOG` still reads
+  `target=level` lists. Two duplicate crates left the tree.
+- **Building from source can leave the `.xlsx` export out**: `cargo build
+  --no-default-features` is 656 KB and six crates lighter. The released binary
+  is unchanged, and a build without the feature refuses `--format xlsx` before
+  a walk is paid for, naming the formats it has.
+- **`bash tools/ci/run.sh`** runs the Linux CI job — musl, a real keyring behind
+  a session bus — in a container on the development machine, in under a minute
+  once warm. The musl target is the machine's own: `aarch64-unknown-linux-musl`
+  on an ARM64 host, where asking for x86_64 failed in every C build script and
+  where that shipped target's suite had never run at all.
+- **`snob check` answers at once about a calendar that never fires.** The
+  search walked four years of minutes before saying so — a second and a half
+  of CPU for `0 0 31 2 *` — and `snob watch` walked them again on every wake.
+  It steps over whole days the calendar does not name now; what a named day
+  means is unchanged, and a sweep against the old walk says so.
+- On Windows, a planted **directory link** under the stories scratch name is
+  now replaced rather than refused: removing one takes `RemoveDirectory`, and
+  `DeleteFile` answered "access denied" wherever the link could be made at all
+  — Developer Mode, or the Administrator a CI runner is.
+- Smaller: `@ alice` in an `--exclude-list` now matches; `watch diff --json`
+  carries `schema` like its siblings; `snob stories -o out.xlsx` is refused
+  rather than written as text under that name; a push-back on the login's
+  follow-up request is said out loud instead of logged at debug; a control
+  character pasted into `snob watch setup` no longer makes `watch.toml`
+  unreadable; "24 is not a hour" reads as it should.
+
 ## 0.2.0 — 2026-08-21
 
 **`snob watch` says what has changed since the last time it looked.** The

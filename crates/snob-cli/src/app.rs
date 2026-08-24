@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use snob_core::Pk;
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
-use snob_core::store::Store;
-use snob_core::store::rate_budget::SqliteRateBudget;
 use snob_ig::client::IgClient;
 use snob_ig::pace::{CancelToken, Pacer};
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
+use snob_store::store::Store;
+use snob_store::store::rate_budget::SqliteRateBudget;
 
 use crate::engine::target;
 use crate::interrupt;
@@ -114,6 +114,26 @@ pub fn pacer(
         .announcing(announce))
 }
 
+/// [`pacer`] with the announcement the single-request commands want: one line
+/// on standard error, because there is nothing for a bar to count.
+///
+/// `login` and `whoami` are the two commands AGENTS.md lists as building their
+/// client directly, and they are also the two that want exactly this
+/// presentation -- which each of them wired by hand, identically, doc-comment
+/// included. The bar-or-line distinction `pacer`'s doc defends is untouched:
+/// this is one of the two presentations, named.
+pub fn pacer_saying_a_line(paths: &AppPaths) -> Result<Pacer> {
+    pacer(
+        paths,
+        Arc::new(|waited: std::time::Duration| {
+            crate::ui::info(&format!(
+                "The request budget is rationing; waiting {}.",
+                snob_core::duration::format(waited)
+            ));
+        }),
+    )
+}
+
 /// How a run could have been given consent before it started.
 ///
 /// The refusal printed when nobody is at a terminal names the way *this*
@@ -135,7 +155,9 @@ pub enum ConsentInAdvance {
 }
 
 pub struct App {
-    client: IgClient,
+    /// Shared, for the one place that fans work out across tasks: the story
+    /// downloads. Everywhere else reads it through [`App::client`] as before.
+    client: Arc<IgClient>,
     db: Store,
     progress: Progress,
     consent_in_advance: ConsentInAdvance,
@@ -226,7 +248,7 @@ impl App {
         })?;
 
         Ok(Some(Self {
-            client: IgClient::new(session, pacer)?,
+            client: Arc::new(IgClient::new(session, pacer)?),
             db,
             progress,
             cancel,
@@ -252,7 +274,7 @@ impl App {
     pub fn for_test(client: IgClient, db: Store, viewer: Viewer) -> Self {
         let cancel = client.pacer().cancel_token().clone();
         Self {
-            client,
+            client: Arc::new(client),
             db,
             progress: Progress::new(false),
             cancel,
@@ -265,6 +287,16 @@ impl App {
 
     pub fn client(&self) -> &IgClient {
         &self.client
+    }
+
+    /// The client, to be held by a task.
+    ///
+    /// `JoinSet` wants `'static`, and `IgClient` is deliberately not `Clone`
+    /// -- it owns the pacer and the cancel token, and two of it would be two
+    /// budgets. One `Arc` is what lets several story downloads share the one
+    /// client and its one CDN connection pool; nothing else needs this.
+    pub fn client_shared(&self) -> Arc<IgClient> {
+        Arc::clone(&self.client)
     }
 
     /// The three pieces a walk needs at once: it reads through the client and
@@ -414,6 +446,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{Viewer, target_label};
+    use snob_core::Pk;
 
     /// The three copies of this rule all called `printable`, and none of them
     /// had anything watching that they did.
@@ -442,7 +475,7 @@ mod tests {
     #[test]
     fn a_viewer_label_does_not_carry_what_a_terminal_would_obey() {
         let viewer = Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some(format!("me{esc}[2K{esc}[A", esc = '\x1b')),
         };
 
@@ -455,7 +488,7 @@ mod tests {
     #[test]
     fn an_unnamed_viewer_is_still_nameable() {
         let viewer = Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: None,
         };
 

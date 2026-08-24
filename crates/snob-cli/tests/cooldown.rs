@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use snob_core::Pk;
+use snob_core::budget::{RateBudget, RateBudgetError, UnlimitedRateBudget};
 use snob_core::model::ListKind;
-use snob_core::paths::AppPaths;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
-use snob_core::store::rate_budget::{
-    RateBudget, RateBudgetError, SqliteRateBudget, UnlimitedRateBudget,
-};
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::paths::AppPaths;
+use snob_store::store::Store;
+use snob_store::store::rate_budget::SqliteRateBudget;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -27,7 +27,7 @@ use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 use snob_cli::exit::ExitCode;
 
 mod common;
-use common::{SID, UA, args};
+use common::{SID, UA, args, requests};
 
 /// A budget over a database that exists.
 ///
@@ -55,7 +55,7 @@ async fn mount_profile(server: &MockServer, user: &str) {
         .await;
 }
 
-async fn mount_list(server: &MockServer, pk: u64, how_many: u64) {
+async fn mount_list(server: &MockServer, pk: Pk, how_many: u64) {
     let users: Vec<String> = (0..how_many)
         .map(|i| format!(r#"{{"pk":{i},"username":"u{i}"}}"#))
         .collect();
@@ -84,7 +84,7 @@ async fn execute_with(
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -92,10 +92,6 @@ async fn execute_with(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 /// Reports no cooldown for a fixed number of calls, then an active one: the
 /// shape of a cooldown another process sets while a run is underway.
 struct LateCooldown {
@@ -117,13 +113,22 @@ impl RateBudget for LateCooldown {
         Ok(std::time::Duration::ZERO)
     }
 
-    fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-        let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok((seen >= self.calls_before).then(|| snob_core::store::now_ms() + 3_600_000))
+    fn reserve_write(&self) -> Result<std::time::Duration, RateBudgetError> {
+        self.reserve()
     }
 
-    fn start_cooldown(&self, _: &str, _: std::time::Duration) -> Result<i64, RateBudgetError> {
-        Ok(0)
+    fn cooldown(&self) -> Result<Option<snob_core::EpochMs>, RateBudgetError> {
+        let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((seen >= self.calls_before)
+            .then(|| snob_core::clock::now_ms() + std::time::Duration::from_millis(3_600_000)))
+    }
+
+    fn start_cooldown(
+        &self,
+        _: &str,
+        _: std::time::Duration,
+    ) -> Result<snob_core::EpochMs, RateBudgetError> {
+        Ok(snob_core::EpochMs::new(0))
     }
 }
 
@@ -145,7 +150,7 @@ async fn during_a_cooldown_the_stored_list_is_served_without_requests() {
         r#"{"id":"42","username":"me","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
     )
     .await;
-    mount_list(&server, 42, 30).await;
+    mount_list(&server, Pk::new(42), 30).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -186,7 +191,7 @@ async fn an_old_snapshot_is_still_served_during_the_cooldown() {
         r#"{"id":"42","username":"me","edge_followed_by":{"count":30},"edge_follow":{"count":10}}"#,
     )
     .await;
-    mount_list(&server, 42, 30).await;
+    mount_list(&server, Pk::new(42), 30).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -242,7 +247,7 @@ async fn refresh_is_refused_while_the_cooldown_lasts() {
     start_cooldown(&budget);
 
     let mut args = args();
-    args.refresh = true;
+    args.walk.refresh = true;
     let error = execute_with(&server, reopen(tmp.path()), budget.clone(), &args)
         .await
         .unwrap_err();
@@ -260,7 +265,7 @@ async fn a_named_target_is_resolved_locally_and_case_insensitively() {
         r#"{"id":99,"username":"ghost","edge_followed_by":{"count":5},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&seed, 99, 5).await;
+    mount_list(&seed, Pk::new(99), 5).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -343,8 +348,17 @@ async fn a_cooldown_landing_after_the_poll_still_exits_throttled() {
     let tmp = tempfile::tempdir().unwrap();
     let _schema = Store::open(&AppPaths::rooted_at(tmp.path())).unwrap();
 
-    // Visible only at the third look: entry check, pre-poll check, walker.
-    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(2));
+    // Visible only at the fourth look: entry check, pre-poll check, **the
+    // pacer's own**, walker.
+    //
+    // The third of those is the backstop in `Pacer::clear`, which reads the
+    // cooldown before every request rather than trusting the caller to have
+    // asked. It moved this ordinal by one and nothing else: with `after(2)` the
+    // pacer saw the cooldown first and the poll never went out, which is a
+    // better outcome and a different test. This one is about the walk stopping
+    // after a request that had already left, so the fixture has to let that
+    // request leave.
+    let budget: Arc<dyn RateBudget> = Arc::new(LateCooldown::after(3));
     let error = execute_with(&server, reopen(tmp.path()), budget.clone(), &args())
         .await
         .unwrap_err();
@@ -367,7 +381,7 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
         r#"{"id":99,"username":"ghost","edge_followed_by":{"count":5},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&seed, 99, 5).await;
+    mount_list(&seed, Pk::new(99), 5).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let budget = budget_at(tmp.path());
@@ -388,7 +402,7 @@ async fn cache_during_a_cooldown_skips_the_resolve_request() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@ghost".into());
-    cached.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute_with(&empty, reopen(tmp.path()), budget.clone(), &cached)
         .await
         .unwrap();

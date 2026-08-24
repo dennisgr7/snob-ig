@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::Pk;
 use crate::secret::Secret;
+use crate::{Epoch, Pk};
 
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
@@ -112,7 +112,7 @@ pub struct Session {
     /// When the installed browser's version was last compared against the
     /// User-Agent. Absent means never.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_agent_checked_at: Option<i64>,
+    pub user_agent_checked_at: Option<Epoch>,
     /// Which browser the User-Agent describes, when one was picked.
     ///
     /// A machine with Chrome and Edge on it has two answers, and the session
@@ -122,9 +122,9 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<String>,
     pub origin: SessionOrigin,
-    pub created_at: i64,
+    pub created_at: Epoch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validated_at: Option<i64>,
+    pub validated_at: Option<Epoch>,
 }
 
 impl Session {
@@ -153,7 +153,7 @@ impl Session {
             user_agent_checked_at: None,
             browser: None,
             origin,
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: crate::clock::now(),
             validated_at: None,
         })
     }
@@ -215,11 +215,12 @@ impl Session {
     }
 
     pub fn mark_validated(&mut self) {
-        self.validated_at = Some(chrono::Utc::now().timestamp());
+        self.validated_at = Some(crate::clock::now());
     }
 
     /// Reduced version for when the store cannot take the full record. Keeps
     /// only what the session cannot work without.
+    #[must_use]
     pub fn minimal(&self) -> Self {
         Self {
             username: None,
@@ -295,6 +296,8 @@ mod tests {
 
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
     const SID: &str = "71234567890%3AAbCdEfGhIjKl%3A20%3AAYc123";
+    /// The account every `sessionid` in this module begins with.
+    const PK: Pk = Pk::new(71234567890);
 
     fn session() -> Session {
         Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap()
@@ -302,13 +305,13 @@ mod tests {
 
     #[test]
     fn the_account_id_is_taken_from_the_sessionid() {
-        assert_eq!(session().ds_user_id, 71234567890);
+        assert_eq!(session().ds_user_id, PK);
     }
 
     #[test]
     fn an_unescaped_colon_is_accepted() {
         let s = Session::from_sessionid("71234567890:AbCd:20", UA, SessionOrigin::Paste).unwrap();
-        assert_eq!(s.ds_user_id, 71234567890);
+        assert_eq!(s.ds_user_id, PK);
     }
 
     #[test]
@@ -321,7 +324,7 @@ mod tests {
         ] {
             let s = Session::from_sessionid(input, UA, SessionOrigin::Paste)
                 .unwrap_or_else(|e| panic!("\"{input}\" should be accepted, but failed: {e}"));
-            assert_eq!(s.ds_user_id, 71234567890);
+            assert_eq!(s.ds_user_id, PK);
             assert_eq!(s.sessionid.expose(), "71234567890%3AAbCd%3A20");
         }
     }
@@ -413,7 +416,7 @@ mod tests {
         let s = Session::from_sessionid(whole_row, UA, SessionOrigin::Paste).unwrap();
 
         assert_eq!(s.sessionid.expose(), "71234567890%3AAbCd%3A20");
-        assert_eq!(s.ds_user_id, 71234567890);
+        assert_eq!(s.ds_user_id, PK);
         assert!(!s.cookie_header().contains("csrftoken=abc123"));
     }
 
@@ -450,9 +453,9 @@ mod tests {
         s.mid = Some("y".repeat(28));
         s.ig_did = Some("Z".repeat(36));
         s.user_agent_pinned = true;
-        s.user_agent_checked_at = Some(1_722_700_000);
+        s.user_agent_checked_at = Some(Epoch::new(1_722_700_000));
         s.browser = Some("Chrome".into());
-        s.validated_at = Some(1_722_700_000);
+        s.validated_at = Some(Epoch::new(1_722_700_000));
         let json = serde_json::to_string(&s).unwrap();
         assert!(
             keyring_bytes(&json) < MAX_KEYRING_SECRET_BYTES,

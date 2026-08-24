@@ -3,48 +3,23 @@
 //! It is what decides how many requests each invocation costs, so it is checked
 //! by counting what reaches the mock server rather than by looking at output.
 
+use snob_core::Pk;
 use snob_core::model::ListKind;
-use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
-use snob_ig::client::IgClient;
-use snob_ig::pace::Pacer;
-use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use snob_cli::app::{App, Viewer};
 use snob_cli::cli::ListArgs;
 use snob_cli::engine::cooldown::check_same_moment;
 use snob_cli::engine::{self, ListOutcome, Provenance, ResultSource};
 
 mod common;
-use common::{SID, UA, args};
+use common::{app, args, open_db, requests};
 
 /// An app pointed at the mock server, over a database that outlives it.
 ///
 /// A fresh one per invocation on purpose: that is what a second run of the
 /// command really is, and it is the only way the stored snapshot gets to prove
 /// it survives the process.
-fn app(server: &MockServer, db: Store) -> App {
-    let session = Session::from_sessionid(SID, UA, SessionOrigin::Paste).unwrap();
-    let client = IgClient::new(session, Pacer::unlimited())
-        .unwrap()
-        .with_base_url(Url::parse(&server.uri()).unwrap());
-
-    App::for_test(
-        client,
-        db,
-        Viewer {
-            pk: 42,
-            username: Some("me".into()),
-        },
-    )
-}
-
-fn open_db(root: &std::path::Path) -> Store {
-    Store::open_at(&root.join("test.db")).unwrap()
-}
-
 /// A profile with whatever follower count is asked for.
 async fn mount_profile(server: &MockServer, followers: u64) {
     Mock::given(method("GET"))
@@ -97,10 +72,6 @@ async fn execute(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 #[tokio::test]
 async fn the_first_run_walks_the_list_and_later_ones_reuse() {
     let server = MockServer::start().await;
@@ -140,7 +111,7 @@ async fn with_cache_the_network_is_not_touched() {
     let before = requests(&server).await;
 
     let mut args = args();
-    args.cache = true;
+    args.walk.offline = true;
     let (found, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(found.len(), 30);
@@ -149,7 +120,7 @@ async fn with_cache_the_network_is_not_touched() {
     assert_eq!(
         requests(&server).await,
         before,
-        "--cache must not ask for anything"
+        "--offline must not ask for anything"
     );
 }
 
@@ -171,7 +142,7 @@ async fn a_cached_crossing_asks_about_the_account_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.yes = true;
+    args.walk.consent.yes = true;
 
     // Populate both lists, in runs of their own.
     execute(&server, tmp.path(), &args).await.unwrap();
@@ -215,7 +186,7 @@ async fn a_walk_invalidates_the_counters_it_was_started_with() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
     args.target = Some("someone".into());
-    args.yes = true;
+    args.walk.consent.yes = true;
 
     let mut app = app(&server, open_db(tmp.path()));
     // Nothing stored, so this one walks.
@@ -260,7 +231,7 @@ async fn a_cached_pair_carries_no_evidence_and_cannot_be_crossed() {
     execute(&server, tmp.path(), &args()).await.unwrap();
 
     let mut args = args();
-    args.cache = true;
+    args.walk.offline = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(
@@ -292,7 +263,7 @@ async fn refresh_walks_again_even_with_no_changes() {
     execute(&server, tmp.path(), &args()).await.unwrap();
 
     let mut args = args();
-    args.refresh = true;
+    args.walk.refresh = true;
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert_eq!(outcome.source(), ResultSource::Fetched);
@@ -325,7 +296,7 @@ async fn refresh_walks_again_when_the_counter_poll_fails() {
     mount_list(&server, 30).await;
 
     let mut refreshing = args();
-    refreshing.refresh = true;
+    refreshing.walk.refresh = true;
     let (found, outcome) = execute(&server, tmp.path(), &refreshing).await.unwrap();
 
     assert_eq!(
@@ -378,7 +349,7 @@ async fn with_nothing_stored_cache_fails_instead_of_lying() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = args();
-    args.cache = true;
+    args.walk.offline = true;
 
     assert!(execute(&server, tmp.path(), &args).await.is_err());
 }
@@ -419,7 +390,7 @@ async fn cache_with_a_named_target_stays_off_the_network() {
     let empty = MockServer::start().await;
     let mut cached = args();
     cached.target = Some("@Ghost".into());
-    cached.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute(&empty, tmp.path(), &cached).await.unwrap();
 
     assert_eq!(found.len(), 2);
@@ -433,12 +404,12 @@ async fn cache_with_an_unknown_target_fails_without_the_network() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.cache = true;
+    args.walk.offline = true;
     args.target = Some("@nobody".into());
     let error = execute(&server, tmp.path(), &args).await.unwrap_err();
 
     assert!(
-        error.to_string().contains("--cache says not to look"),
+        error.to_string().contains("--offline says not to look"),
         "{error}"
     );
     assert_eq!(
@@ -467,16 +438,16 @@ async fn the_page_cap_leaves_the_list_marked_incomplete() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.max_pages = Some(1);
+    args.walk.max_pages = Some(1);
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert!(!outcome.is_complete());
 
     // And it is not available to compare against.
     assert!(
-        snob_core::store::snapshots::latest_complete(
+        snob_store::store::snapshots::latest_complete(
             open_db(tmp.path()).conn(),
-            42,
+            Pk::new(42),
             ListKind::Followers
         )
         .unwrap()
@@ -512,7 +483,7 @@ async fn an_interrupted_walk_is_left_unclaimed_for_the_next_run() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut args = args();
-    args.max_pages = Some(1);
+    args.walk.max_pages = Some(1);
     let (_, outcome) = execute(&server, tmp.path(), &args).await.unwrap();
 
     assert!(
@@ -600,7 +571,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     let tmp = tempfile::tempdir().unwrap();
     execute(&server, tmp.path(), &args()).await.unwrap();
     let mut following_args = args();
-    following_args.cache = false;
+    following_args.walk.offline = false;
     {
         let mut app = app(&server, open_db(tmp.path()));
         engine::list(&mut app, &following_args, ListKind::Following)
@@ -628,7 +599,7 @@ async fn a_pair_walked_in_one_run_can_be_crossed_from_the_cache_afterwards() {
     }
 
     let mut cached = args();
-    cached.cache = true;
+    cached.walk.offline = true;
     let (_, followers) = execute(&server, tmp.path(), &cached).await.unwrap();
     let following = {
         let mut app = app(&server, open_db(tmp.path()));
@@ -686,7 +657,7 @@ async fn an_interrupted_walk_continues_from_the_cursor_it_stored() {
 
     // A walk stopped after one page, with a cursor saved.
     let mut capped = args();
-    capped.max_pages = Some(1);
+    capped.walk.max_pages = Some(1);
     execute(&server, tmp.path(), &capped).await.unwrap();
 
     let partial: i64 = open_db(tmp.path())
@@ -758,12 +729,12 @@ async fn no_resume_walks_the_list_again_from_the_first_page() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut capped = args();
-    capped.max_pages = Some(1);
+    capped.walk.max_pages = Some(1);
     execute(&server, tmp.path(), &capped).await.unwrap();
     let after_the_first = requests(&server).await;
 
     let mut fresh = args();
-    fresh.no_resume = true;
+    fresh.walk.no_resume = true;
     execute(&server, tmp.path(), &fresh).await.unwrap();
 
     let resumes: i64 = open_db(tmp.path())

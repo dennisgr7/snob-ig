@@ -5,19 +5,22 @@
 //! read as two different pieces of advice about the same situation.
 
 use snob_core::model::{ListKind, StopReason, User, printable};
+use snob_core::{Epoch, EpochMs};
+use snob_ig::pager::Warning;
 
+use crate::app::ConsentInAdvance;
 use crate::engine::Provenance;
 
 use crate::exit::{ExitCode, ExitError};
 
 /// What a machine with no `watch.toml` is told, by both things that look.
 ///
-/// `engine::check::without_a_session` decides it for `snob watch check` and
-/// `watch_setup::health` decides it for `snob watch status`, and the two spelled
-/// it out separately, character for character. It is the advice a newly
-/// installed tool gives, so it is the sentence somebody edits — and an edit to
-/// one copy leaves two probes a person runs one after the other saying different
-/// things about the same machine, each with a test asserting it is right.
+/// `snob watch check` reaches it through `commands::watch::say::problem_line`
+/// and `watch::status::health` reads it directly, and the two spelled it out
+/// separately, character for character. It is the advice a newly installed tool
+/// gives, so it is the sentence somebody edits — and an edit to one copy leaves
+/// two probes a person runs one after the other saying different things about
+/// the same machine, each with a test asserting it is right.
 pub const NOTHING_CONFIGURED: &str =
     "nothing is configured, so a bare \"snob watch\" has no schedule to run on";
 
@@ -30,17 +33,24 @@ pub const NOTHING_CONFIGURED: &str =
 /// wording.
 ///
 /// What it deliberately does not do is say what to do about it.
-/// `commands::watch::refuse_unattended` is the sentence that names
+/// `commands::watch::scheduled::refuse_unattended` is the sentence that names
 /// `snob watch setup`, and that is the refusal itself rather than a report about
 /// one.
 ///
-/// A `const` and not a typed reason on `Checked`. The wording being decided
-/// inside `engine` is the architecture rule, and moving it out is the right
-/// shape — but `Checked::problem` is a pass-through for whatever the schedule
-/// parser, Instagram or the user's own server said, so a typed reason needs a
-/// free-string variant anyway and every consumer still handles one. That trade
-/// is worth revisiting the day `problem` stops carrying foreign text; it is not
-/// worth nine sentences and a byte-identity promise across two renderers today.
+/// A `const` here rather than a sentence inside `engine::check`, which is where
+/// both of these lines used to be written. `Checked::problem` is
+/// [`crate::engine::check::Problem`] now — a variant per decided reason,
+/// rendered by `commands::watch::say::problem_line` — so this is what that
+/// renderer and `watch::status::health` share.
+///
+/// What held the typed reason up was `Problem::Foreign`: some of those lines
+/// carry text this program did not write, so a typed reason needs a free-string
+/// variant whatever else it has, and the trade looked like nine sentences and a
+/// byte-identity promise across two renderers for one variant less. It is one
+/// variant among twelve now rather than a reason for the other eleven to be
+/// strings, and the two renderers are the point rather than the price: the
+/// terminal report and `check --json` agreed by copying a string and agree by
+/// construction instead.
 pub const NO_RECORDED_CONSENT: &str =
     "no recorded consent, so an unattended run will refuse to read it";
 
@@ -61,8 +71,72 @@ pub const NO_RECORDED_CONSENT: &str =
 /// decides on stdout's color state, so the labels lose their color when only
 /// stdout is redirected, and write escape codes into the file when only stderr
 /// is.
-pub fn print_error(error: &anyhow::Error) {
-    eprint!("{}", rendered(error));
+pub fn print_error(error: &anyhow::Error, wording: Wording) {
+    match wording {
+        Wording::Prose => eprint!("{}", rendered(error)),
+        Wording::Json => eprintln!("{}", error_json(error)),
+    }
+}
+
+/// How a failure is told: to a person, or to a program.
+///
+/// A run whose result was going to be JSON had its failure written as
+/// English prose, so a script reading `snob followers --format json` got a
+/// stable exit code and nothing else it could parse -- not the hint, not the
+/// challenge address a code 4 carries. `whoami --json` already answered in
+/// JSON on failure; this makes every command do the same, and makes the
+/// decision `main`'s, from the format the command was going to answer in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wording {
+    Prose,
+    Json,
+}
+
+/// The failure as one JSON object, for a caller that asked for JSON.
+///
+/// One shape for every command: `code` is the same token the exit status
+/// names, so a reader that only has the stream and a reader that only has
+/// `$?` are told the same thing; `message` and `causes` are the chain the
+/// prose prints, in the same order; `hint` is the advice the prose sets
+/// apart; `url` is the address a challenge has to be cleared at. Filtered
+/// line by line like the prose, and for the same reason -- a name is
+/// filtered before anything draws it, and a JSON consumer may well print it.
+pub fn error_json(error: &anyhow::Error) -> serde_json::Value {
+    let code = crate::exit::exit_code_for(error);
+    let mut chain = error
+        .chain()
+        .map(|cause| filtered(&cause.to_string(), "\n"));
+    let message = chain.next().unwrap_or_default();
+    let causes: Vec<String> = chain.collect();
+    let instagram = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>());
+    // The same fallback `rendered` applies, so the two shapes cannot disagree
+    // about whether there was any advice — which is the whole reason this
+    // function exists rather than a second rendering.
+    let hint = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<ExitError>())
+        .and_then(ExitError::hint)
+        .or_else(|| instagram.and_then(advice_for))
+        .map(|hint| filtered(hint, "\n"));
+    let url = instagram.and_then(|e| e.challenge_url());
+    let lifts = instagram.and_then(|e| match e {
+        snob_ig::error::IgError::InCooldown { until_ms } => Some(until_ms.to_epoch()),
+        _ => None,
+    });
+
+    serde_json::json!({
+        "error": {
+            "code": code.as_str(),
+            "exit": code as u8,
+            "message": message,
+            "causes": causes,
+            "hint": hint,
+            "url": url,
+            "cooldown_until": lifts,
+        }
+    })
 }
 
 /// The block `print_error` writes, built rather than printed.
@@ -89,13 +163,45 @@ fn rendered(error: &anyhow::Error) -> String {
         out.push_str(&format!("  {caused} {}\n", indented(&cause.to_string())));
     }
 
+    // The command's own advice first, and Instagram's client's only when the
+    // command had none. `IgError`'s two pieces of advice used to be part of its
+    // message, so they arrived whatever else was in the chain; putting them on
+    // the hint means deciding which one line the reader gets, and a command
+    // that has written advice for this exact situation knows more than a
+    // variant does. The two cannot in fact meet — `ExitError` carries no
+    // source, so nothing of Instagram's is ever underneath one — but the order
+    // is written down rather than left to that, and `error_json` reads it the
+    // same way so the two shapes cannot come to disagree.
     if let Some(hint) = error
         .chain()
         .find_map(|c| c.downcast_ref::<ExitError>())
         .and_then(ExitError::hint)
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>())
+                .and_then(advice_for)
+        })
     {
         let label = console::style("hint:").cyan().bold().for_stderr();
         out.push_str(&format!("{label}  {}\n", indented(hint)));
+    }
+
+    // The backstop in `Pacer::clear` answers with the epoch and no wording,
+    // because when a cooldown lifts is a date and `snob-ig` has no business
+    // formatting one. Said here so the last resort tells a person the same thing
+    // the eight gates in front of it tell them; every path anybody really
+    // reaches names the date itself, so this fires only when one of them was
+    // forgotten — which is exactly when the person reading needs it most.
+    if let Some(snob_ig::error::IgError::InCooldown { until_ms }) = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<snob_ig::error::IgError>())
+    {
+        let label = console::style("hint:").cyan().bold().for_stderr();
+        out.push_str(&format!(
+            "{label}  {}\n",
+            indented(&format!("it lifts {}", cooldown_ends_at(*until_ms)))
+        ));
     }
 
     out
@@ -134,28 +240,61 @@ fn filtered(text: &str, join: &str) -> String {
         .join(join)
 }
 
-/// "03/08 at 14:12", from a timestamp in epoch seconds. UTC, like every other
-/// timestamp the tool prints.
-pub fn stored_on(taken_at: i64) -> String {
+/// The requests half of a summary line: what was spent, or the promise that
+/// nothing was.
+///
+/// Two commands wrote the `if` themselves — the single lists and the
+/// crossings — and "without touching the network" is exactly the kind of
+/// sentence this module exists to keep from drifting into two ways of
+/// describing one situation.
+pub fn spent(n: u32) -> String {
+    if n > 0 {
+        format!(" - {}", requests(n))
+    } else {
+        " - without touching the network".to_string()
+    }
+}
+
+/// The date a crossing's summary names: the older of the two captures,
+/// because a crossing is only as recent as its staler half.
+///
+/// `check_same_moment` is what stops the two being far apart at all, so this
+/// is completeness rather than a correction. The rule was written out twice,
+/// comment and all, in `sets` and `scan`.
+pub fn stored_on_the_older_of(a: snob_core::Epoch, b: snob_core::Epoch) -> String {
+    stored_on(a.min(b))
+}
+
+/// "Aug 3 at 14:12", in the local zone like every other moment the tool prints.
+pub fn stored_on(taken_at: Epoch) -> String {
     format_epoch(taken_at, "earlier")
 }
 
-/// "04/08 at 16:30", from a cooldown end in epoch milliseconds.
-pub fn cooldown_ends_at(until_ms: i64) -> String {
-    format_epoch(cooldown_ends_at_secs(until_ms), "later")
+/// "Aug 3, 2024", for a moment that may be years old.
+///
+/// [`stored_on`] carries no year because everything it dates — a capture, a
+/// story, a cooldown — is at most days away and the hour is the informative
+/// part. A highlight is the opposite: kept for years on purpose, so "Aug 3"
+/// alone would read as this year and be wrong most of the time, and the
+/// hour of a moment years back says nothing worth a column.
+pub fn dated(at: Epoch) -> String {
+    chrono::DateTime::from_timestamp(at.get(), 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%b %-d, %Y")
+                .to_string()
+        })
+        .unwrap_or_else(|| "sometime".to_string())
 }
 
-/// A cooldown end in the unit every timestamp this tool reports uses.
+/// "04/08 at 16:30", from a cooldown end.
 ///
-/// `Pacer::cooldown` answers in milliseconds while `created_at` and
-/// `validated_at` next to it in `whoami`'s object are in seconds, so something
-/// has to convert — and both the printed date above and that JSON field are the
-/// same cooldown, which is why they may not do their own arithmetic.
-///
-/// `div_euclid` rather than `/`, so a moment before the epoch floors instead of
-/// rounding towards zero into the wrong second.
-pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
-    until_ms.div_euclid(1000)
+/// The conversion to seconds is [`EpochMs::to_epoch`] and is not written here.
+/// It used to be — `cooldown_ends_at_secs`, in this file — and the printed date
+/// and `whoami`'s JSON field are the same cooldown, so the arithmetic belongs
+/// with the type rather than one crate out from it.
+pub fn cooldown_ends_at(until_ms: EpochMs) -> String {
+    format_epoch(until_ms.to_epoch(), "later")
 }
 
 /// A moment, for a person to read.
@@ -169,9 +308,24 @@ pub fn cooldown_ends_at_secs(until_ms: i64) -> i64 {
 /// month removes the ambiguity for everybody instead of moving it from one half
 /// of the readership to the other; `%-d` rather than `%d` because "Aug 3" is
 /// how the date is said.
-fn format_epoch(seconds: i64, unknown: &str) -> String {
-    chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|t| t.format("%b %-d at %H:%M").to_string())
+///
+/// **In the local zone**, because everything else the person reads is. The
+/// schedule is evaluated in `chrono::Local`, the README says "times are
+/// your local ones", and a cooldown "until 15:46" is read against the clock
+/// on the wall -- while this printed UTC with no label, so a monitor on
+/// `--at 09:00` in Madrid reported having "last run on Aug 22 at 07:00",
+/// and a cooldown ending at four looked like it ended at two. The zone is
+/// taken at the call, so the test can pin the arithmetic with a fixed one.
+fn format_epoch(at: Epoch, unknown: &str) -> String {
+    format_epoch_in(at, unknown, &chrono::Local)
+}
+
+fn format_epoch_in<Z: chrono::TimeZone>(at: Epoch, unknown: &str, zone: &Z) -> String
+where
+    Z::Offset: std::fmt::Display,
+{
+    chrono::DateTime::from_timestamp(at.get(), 0)
+        .map(|t| t.with_timezone(zone).format("%b %-d at %H:%M").to_string())
         .unwrap_or_else(|| unknown.to_string())
 }
 
@@ -218,17 +372,17 @@ pub fn refuse_incomplete(
 ///
 /// - A **cooldown** is waited out, so "run it again later" is true and the
 ///   throttling code is right.
-/// - **`--cache`** is the user's own doing, and dropping it is the fix.
+/// - **`--offline`** is the user's own doing, and dropping it is the fix.
 /// - A **failed poll** is neither. Nobody asked for storage — the request to
 ///   check went out and did not come back — so advising them to drop a flag
 ///   they never typed sends them looking for something that is not there. This
-///   arm used to fall in with `--cache` because the only question asked was
+///   arm used to fall in with `--offline` because the only question asked was
 ///   whether either side was a cooldown.
 pub fn refuse_different_moments(
     a: Provenance,
     b: Provenance,
-    a_at: i64,
-    b_at: i64,
+    a_at: Epoch,
+    b_at: Epoch,
 ) -> anyhow::Error {
     // Each arm asks the same question of the same pair, so each one asks it the
     // same way. The cooldown arm used to go through a method of its own while its
@@ -243,7 +397,7 @@ pub fn refuse_different_moments(
     } else if either(Provenance::CacheFlag) {
         (
             ExitCode::Error,
-            "Run it again without --cache, so both lists are checked against the account.",
+            "Run it again without --offline, so both lists are checked against the account.",
         )
     } else {
         (
@@ -280,7 +434,7 @@ pub enum Blocked<'a> {
 }
 
 /// The account is in cooldown and storage cannot answer either.
-pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error {
+pub fn refuse_in_cooldown(until_ms: EpochMs, blocked: Blocked<'_>) -> anyhow::Error {
     let when = cooldown_ends_at(until_ms);
     let detail = match blocked {
         Blocked::RefreshWanted => {
@@ -306,7 +460,7 @@ pub fn refuse_in_cooldown(until_ms: i64, blocked: Blocked<'_>) -> anyhow::Error 
 }
 
 /// A cooldown that landed between the check and the walk.
-pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
+pub fn refuse_cooldown_mid_walk(until_ms: EpochMs) -> anyhow::Error {
     ExitError::new(
         ExitCode::RateLimited,
         format!(
@@ -315,6 +469,196 @@ pub fn refuse_cooldown_mid_walk(until_ms: i64) -> anyhow::Error {
         ),
     )
     .into()
+}
+
+/// What somebody is agreeing to when they let a run read a stranger's lists.
+///
+/// Three facts about the request rather than about the account, which is why
+/// there is one of these rather than one per target.
+pub const READING_SOMEBODY_ELSES_LIST: &str = "this reads a list that belongs to somebody else, and lands their followers \
+     in your local database. It is also a heavier request than reading your own, \
+     and Instagram is readier to refuse it";
+
+/// The consent question, with the account named the way the warning above
+/// named it.
+pub fn ask_to_continue(shown: &str) -> String {
+    format!("Continue with {shown}?")
+}
+
+/// Being unable to ask and being told no are two different events, and this is
+/// the first one, shaped the same way everywhere a question finds no terminal:
+/// what was not done, why nothing could be asked, and how to answer in
+/// advance. Exit 130, which is what the README's table and `--help` both
+/// promise for a confirmation that was not given.
+///
+/// The advice rides in the message rather than on a hint, and that is
+/// load-bearing: [`rendered`] returns early for this exit code, so a hint set
+/// on an interrupted error is advice nobody is ever shown — which is exactly
+/// what happened to `follow`'s for as long as it carried one. Three commands
+/// wrote this sentence themselves, each a little differently, before it lived
+/// here; the scheduled monitor keeps its own variant, because "a scheduled run
+/// has nobody to ask" is a different fact from "there is no terminal".
+pub fn refuse_unattended(refused: String, in_advance: String) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!("{refused}, and there is no terminal to ask at. {in_advance}"),
+    )
+    .into()
+}
+
+/// Nobody is there to be asked, so nothing is enumerated.
+///
+/// Which way to answer in advance is the **caller's** fact rather than this
+/// sentence's, and it arrives as [`ConsentInAdvance`]. Both commands that reach
+/// here take an answer beforehand and they do not take it the same way, and one
+/// sentence named `-y` for both — so `snob watch once someone` refused with
+/// advice that then failed to parse, because `watch once` deliberately has no
+/// `-y`.
+///
+/// `shown` is `target::label`'s answer, so it is already the at sign and the
+/// filtered name.
+pub fn refuse_unconsented(shown: &str, in_advance: ConsentInAdvance) -> anyhow::Error {
+    let in_advance = match in_advance {
+        ConsentInAdvance::Flag => "Pass -y to confirm in advance.".to_string(),
+        ConsentInAdvance::WatchConfig => format!(
+            "Run \"snob watch setup\" to answer it once, or ask about {shown} \
+             while you are here."
+        ),
+    };
+    refuse_unattended(
+        format!("reading {shown}'s lists needs confirmation"),
+        in_advance,
+    )
+}
+
+/// They were asked, and they said no.
+///
+/// No mention of `-y` here, and that is the whole difference from
+/// [`refuse_unconsented`]: they have just said no, and answering that with
+/// "pass the flag that skips the question" is telling them to do it anyway.
+pub fn refuse_declined(shown: &str) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Interrupted,
+        format!("nothing was done: {shown} was not confirmed"),
+    )
+    .into()
+}
+
+/// Serving a stored list because nothing may be spent.
+///
+/// The list is named because a crossing serves two of them, and two identical
+/// warnings in a row read like the same one printed twice.
+pub fn serving_stored_in_cooldown(until_ms: EpochMs, kind: ListKind, taken_at: Epoch) -> String {
+    format!(
+        "the account is in cooldown until {}; serving the {kind} list stored on {}",
+        cooldown_ends_at(until_ms),
+        stored_on(taken_at)
+    )
+}
+
+/// The counter poll failed and there is a stored list to fall back on.
+///
+/// Walking the whole list right when Instagram is already having trouble is the
+/// worst possible reaction, so the warning says what was served rather than
+/// what was refused.
+pub fn poll_failed_serving_stored(error: &anyhow::Error) -> String {
+    format!(
+        "could not check for changes ({}); using the stored list",
+        what_went_wrong(error)
+    )
+}
+
+/// The counter poll failed and nothing is stored, so the walk goes ahead
+/// without a number to check it against.
+pub fn poll_failed(error: &anyhow::Error) -> String {
+    format!("could not read the profile ({})", what_went_wrong(error))
+}
+
+/// A failure as one clause inside a sentence.
+///
+/// Interpolating the error would print [`snob_ig::error::IgError`]'s diagnosis
+/// and drop the advice that used to be part of the same message, on the two
+/// warnings a dead session reaches most often. Only the head of the chain is
+/// asked, because that is the one whose text is about to be printed.
+fn what_went_wrong(error: &anyhow::Error) -> String {
+    match error
+        .chain()
+        .next()
+        .and_then(|head| head.downcast_ref::<snob_ig::error::IgError>())
+    {
+        Some(instagram) => what_instagram_said(instagram),
+        None => error.to_string(),
+    }
+}
+
+/// A private account nobody here can read the lists of.
+///
+/// Two answers rather than one, because a pending follow request is a different
+/// situation from never having asked: the first is waiting on somebody else and
+/// the second is waiting on the reader.
+///
+/// Filtered here rather than at the call site: the name came off Instagram and
+/// this sentence is written to a terminal.
+pub fn refuse_private(username: &str, requested: bool) -> anyhow::Error {
+    if requested {
+        return anyhow::anyhow!(
+            "@{} is private and your follow request has not been accepted yet, \
+             so its lists cannot be read",
+            printable(username)
+        );
+    }
+    anyhow::anyhow!(
+        "@{} is a private account you do not follow, so its lists cannot be read",
+        printable(username)
+    )
+}
+
+/// The account whose profile Instagram will not serve, and what that costs the
+/// run.
+///
+/// Two things people expect quietly stop happening — the truncation wall cannot
+/// be detected without a declared size, and `--offline` has nothing to weigh
+/// freshness against — so both are said out loud rather than left to be
+/// discovered.
+pub fn counters_unknowable(username: &str) -> String {
+    format!(
+        "Instagram would not serve the profile of @{}, so its id came from search \
+         instead. That route carries no follower or following counts, so this run \
+         cannot tell a truncated list from a complete one, and cannot judge whether \
+         a cached list is still current.",
+        printable(username)
+    )
+}
+
+/// A run that concluded nothing about an account nothing is stored for.
+///
+/// It is the tick's own refusal rather than a report, so it names no command:
+/// there was nothing wrong with what the user asked for, and the next run may
+/// well answer it.
+pub fn refuse_nothing_looked_at(name: &str, code: ExitCode) -> anyhow::Error {
+    ExitError::new(
+        code,
+        format!(
+            "nothing could be looked at for @{} this time, and nothing is stored \
+             about that account yet to report against",
+            printable(name)
+        ),
+    )
+    .into()
+}
+
+/// A name the monitor was pointed at and has never walked.
+///
+/// Deliberately not [`refuse_nothing_stored`], which talks about `--offline` — a
+/// flag the commands that reach this do not have. What the user has to do here
+/// is walk the account once, and the sentence says so.
+pub fn refuse_never_walked(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "nothing is stored about @{}. Run \"snob followers {}\" once and the monitor \
+         will have something to compare against from then on.",
+        printable(name),
+        printable(name),
+    )
 }
 
 /// "@someone followers" — what a run is walking, said the same way by every
@@ -419,7 +763,86 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
     }
 }
 
-/// Nothing stored to answer with, and `--cache` said not to look.
+/// What to do about something Instagram's client reported, when there is
+/// anything to do about it.
+///
+/// Two of `IgError`'s messages used to end in advice — "run \"snob login\"
+/// again", and the two ways to get a CSRF token — which named subcommands of a
+/// binary `snob-ig` does not know it is part of, from a crate that has no
+/// terminal and no exit codes. The diagnosis stays in the variant, because only
+/// the client knows what happened; the advice lives here, where the rest of the
+/// tool's advice lives, and reaches the reader as the `hint:` line that every
+/// other refusal already puts it on.
+///
+/// `&'static str` and not a sentence built per call: none of this depends on
+/// what was being asked for. Where a cooldown lifts is the counter-example, and
+/// it is a date rather than advice — [`rendered`] adds that one separately.
+pub fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
+    use snob_ig::error::IgError;
+    match error {
+        IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::NoCsrfToken => Some(
+            "run \"snob login --browser\", or pass the token with \
+             \"snob login --paste --csrftoken\"",
+        ),
+        _ => None,
+    }
+}
+
+/// One line: what Instagram's client said, and what to do about it.
+///
+/// The `hint:` line is what a **reported failure** gets, and the two places
+/// that print an `IgError` are not that: `engine::walk` warns about what
+/// stopped a walk while the walk's own refusal is still to come, and
+/// `engine::check` puts the answer in a column of its own. Both used to print
+/// the message whole, advice included, so this rejoins the two halves exactly
+/// where they were joined before.
+pub fn what_instagram_said(error: &snob_ig::error::IgError) -> String {
+    match advice_for(error) {
+        Some(advice) => format!("{error}; {advice}"),
+        None => error.to_string(),
+    }
+}
+
+/// What the walker noticed, in the words the person watching it reads.
+///
+/// These six sentences were authored inside `snob_ig::pager` and printed
+/// unmodified by `progress.rs`, which put the wording of the walk's most
+/// alarming lines in the HTTP crate — the one part of the tool that has no
+/// terminal, no format and no business having an opinion about either. The
+/// pager reports the condition now; the words are decided here, beside every
+/// other sentence the tool prints.
+///
+/// Two of them carry numbers, which is why this returns a `String` rather than
+/// a `&'static str`: what makes a shortfall worth reading is how big it is.
+pub fn pager_warning(warning: Warning) -> String {
+    match warning {
+        Warning::SameCursorTwice => {
+            "Instagram returned the same cursor twice; stopping so the request is not repeated"
+                .to_string()
+        }
+        Warning::TwoEmptyPages => "Instagram returned two empty pages in a row".to_string(),
+        Warning::GoingInCircles => {
+            "several pages in a row with no new accounts; the list is going in circles".to_string()
+        }
+        Warning::EmptyAndNoCounter => {
+            "the list came back empty and the profile counter could not be read, so there is \
+             no way to tell an empty list from one Instagram did not serve; treating it as \
+             incomplete rather than risking the comparison"
+                .to_string()
+        }
+        Warning::StoppedShort { walked, declared } => format!(
+            "Instagram stopped serving pages at {walked} of the {declared} accounts it declared; \
+             the list is incomplete and cannot be compared against"
+        ),
+        Warning::ShortOfDeclared { walked, declared } => format!(
+            "walked {walked} accounts while Instagram declared {declared}; \
+             the difference is usually deleted accounts"
+        ),
+    }
+}
+
+/// Nothing stored to answer with, and `--offline` said not to look.
 ///
 /// Two situations reach this: the account has never been seen at all, and the
 /// account is known but this list of it has never been walked. They get the
@@ -434,9 +857,9 @@ pub fn why_incomplete(reason: StopReason) -> Option<&'static str> {
 pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
     ExitError::new(
         ExitCode::Error,
-        format!("no {kind} list is stored, and --cache says not to look for one"),
+        format!("no {kind} list is stored, and --offline says not to look for one"),
     )
-    .with_hint(format!("run \"snob {kind}\" once, or drop --cache"))
+    .with_hint(format!("run \"snob {kind}\" once, or drop --offline"))
     .into()
 }
 
@@ -537,6 +960,7 @@ pub fn jitter_sentence(jitter: std::time::Duration) -> Option<String> {
 mod tests {
     use super::*;
     use crate::engine::ListOutcome;
+    use snob_core::Pk;
 
     /// Every string this module draws goes through the name filter, and the
     /// paragraph breaks it lays out survive it.
@@ -567,7 +991,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, name)| User {
-                pk: i as u64 + 1,
+                pk: Pk::new(i as u64 + 1),
                 username: (*name).into(),
                 full_name: None,
                 is_private: None,
@@ -673,7 +1097,7 @@ mod tests {
     #[test]
     fn a_cooldown_refusal_cannot_be_made_to_erase_the_line_above_it() {
         let name = "gh\u{1b}[2K\u{1b}[A";
-        let error = refuse_in_cooldown(1_000, Blocked::AccountUnknown(name));
+        let error = refuse_in_cooldown(EpochMs::new(1_000), Blocked::AccountUnknown(name));
         let message = error.to_string();
 
         assert!(
@@ -693,9 +1117,9 @@ mod tests {
             provenance: Provenance::Walked,
             reason,
             requests: 1,
-            started_at: 0,
-            taken_at: 0,
-            account_pk: 1,
+            started_at: Epoch::default(),
+            taken_at: Epoch::default(),
+            account_pk: Pk::new(1),
             snapshot_id: 1,
             stopped_by,
             resumable: false,
@@ -706,12 +1130,61 @@ mod tests {
     /// the alternative is a message with a hole in the middle of it.
     #[test]
     fn a_date_out_of_range_still_reads_as_something() {
-        assert_eq!(stored_on(i64::MAX), "earlier");
-        assert_eq!(cooldown_ends_at(i64::MAX), "later");
-        assert_eq!(stored_on(1_722_700_000), "Aug 3 at 15:46");
-        // Milliseconds, and a negative one must not round towards zero into a
-        // different second than it belongs to.
-        assert_eq!(cooldown_ends_at(1_722_700_000_000), "Aug 3 at 15:46");
+        assert_eq!(stored_on(Epoch::new(i64::MAX)), "earlier");
+        assert_eq!(cooldown_ends_at(EpochMs::new(i64::MAX)), "later");
+        assert_eq!(
+            format_epoch_in(Epoch::new(1_722_700_000), "earlier", &chrono::Utc),
+            "Aug 3 at 15:46"
+        );
+        // The same moment in milliseconds reads as the same second, which is
+        // what `EpochMs::to_epoch` is for.
+        assert_eq!(
+            format_epoch_in(
+                EpochMs::new(1_722_700_000_000).to_epoch(),
+                "later",
+                &chrono::Utc
+            ),
+            "Aug 3 at 15:46"
+        );
+    }
+
+    /// What is printed is the wall clock, not UTC with no label.
+    #[test]
+    fn a_moment_is_printed_in_the_zone_the_reader_is_in() {
+        let madrid_in_august = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(
+            format_epoch_in(Epoch::new(1_722_700_000), "earlier", &madrid_in_august),
+            "Aug 3 at 17:46"
+        );
+    }
+
+    /// A failure told to a program carries what the prose carries: the code
+    /// the exit status names, the message, the advice set apart, and the
+    /// address a challenge is cleared at -- filtered, since the consumer may
+    /// print it.
+    #[test]
+    fn a_failure_in_json_carries_the_code_the_hint_and_the_address() {
+        let hostile = "gh\u{1b}[2K";
+        let error: anyhow::Error = anyhow::Error::new(snob_ig::error::IgError::Challenge {
+            url: Some("https://www.instagram.com/challenge/".into()),
+        })
+        .context(format!("could not read @{hostile}'s followers list"));
+        let json = error_json(&error);
+        let error = &json["error"];
+
+        assert_eq!(error["code"], "challenge");
+        assert_eq!(error["exit"], 4);
+        assert_eq!(error["message"], "could not read @gh[2K's followers list");
+        assert_eq!(error["url"], "https://www.instagram.com/challenge/");
+        assert_eq!(error["causes"].as_array().map(Vec::len), Some(1));
+
+        let advised: anyhow::Error = ExitError::new(ExitCode::NoSession, "no session")
+            .with_hint("run \"snob login\"")
+            .into();
+        let json = error_json(&advised);
+        assert_eq!(json["error"]["code"], "no_session");
+        assert_eq!(json["error"]["hint"], "run \"snob login\"");
+        assert!(json["error"]["url"].is_null());
     }
 
     /// The refusal has to name the mistake the caller would otherwise have
@@ -805,17 +1278,26 @@ mod tests {
     /// cooldown they are not in is worse than saying nothing.
     #[test]
     fn different_moments_are_explained_by_why_nobody_checked() {
-        let throttled = refuse_different_moments(Provenance::Cooldown, Provenance::Cooldown, 0, 1);
+        let throttled = refuse_different_moments(
+            Provenance::Cooldown,
+            Provenance::Cooldown,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         assert!(hint_of(&throttled).unwrap().contains("cooldown lifts"));
         assert_eq!(
             ExitCode::from_chain(&throttled),
             Some(ExitCode::RateLimited)
         );
 
-        let asked_for =
-            refuse_different_moments(Provenance::CacheFlag, Provenance::CacheFlag, 0, 1);
+        let asked_for = refuse_different_moments(
+            Provenance::CacheFlag,
+            Provenance::CacheFlag,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         let hint = hint_of(&asked_for).unwrap();
-        assert!(hint.contains("--cache"), "{hint}");
+        assert!(hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(ExitCode::from_chain(&asked_for), Some(ExitCode::Error));
 
@@ -823,10 +1305,14 @@ mod tests {
         // request to check went out and did not come back — so it used to be
         // told to drop a flag it never passed, which sends somebody looking for
         // something that is not in their command line.
-        let nobody_could_check =
-            refuse_different_moments(Provenance::PollFailed, Provenance::PollFailed, 0, 1);
+        let nobody_could_check = refuse_different_moments(
+            Provenance::PollFailed,
+            Provenance::PollFailed,
+            Epoch::new(0),
+            Epoch::new(1),
+        );
         let hint = hint_of(&nobody_could_check).unwrap();
-        assert!(!hint.contains("--cache"), "{hint}");
+        assert!(!hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(
             ExitCode::from_chain(&nobody_could_check),
@@ -850,7 +1336,7 @@ mod tests {
             (Blocked::NothingStored(ListKind::Followers), "followers"),
         ];
         for (blocked, expected) in cases {
-            let error = refuse_in_cooldown(1_722_700_000_000, blocked);
+            let error = refuse_in_cooldown(EpochMs::new(1_722_700_000_000), blocked);
             let text = error.to_string();
             assert!(text.contains(expected), "{text}");
             assert!(text.contains("in cooldown until"), "{text}");
@@ -989,6 +1475,115 @@ third",
 
         let stopped_short = try_again_advice(StopReason::Truncated, true);
         assert!(stopped_short.contains("continues from where it stopped"));
+    }
+
+    /// Advice that names a `snob` subcommand belongs to the binary, not to its
+    /// HTTP client — and it still has to reach the person reading.
+    ///
+    /// It used to be the tail of two `IgError` messages, so it arrived wherever
+    /// the message did. Moved to the hint, the thing to check is that every
+    /// path it took before still carries it: the labeled failure, the JSON
+    /// shape, and the two places that print an `IgError` as one line.
+    #[test]
+    fn the_advice_an_ig_error_carried_still_reaches_the_reader() {
+        use snob_ig::error::IgError;
+
+        for (error, advice) in [
+            (IgError::SessionExpired, "run \"snob login\" again"),
+            (
+                IgError::NoCsrfToken,
+                "run \"snob login --browser\", or pass the token with \
+                 \"snob login --paste --csrftoken\"",
+            ),
+        ] {
+            // One line, exactly as the message used to read.
+            assert_eq!(
+                what_instagram_said(&error),
+                format!("{error}; {advice}"),
+                "the two halves have to rejoin where they were joined before"
+            );
+
+            let said = error.to_string();
+            let error: anyhow::Error = anyhow::Error::new(error);
+            let out = rendered(&error);
+            assert!(out.contains(&said), "{out}");
+            assert!(out.contains("hint:"), "{out}");
+            assert!(out.contains(advice), "{out}");
+
+            let json = error_json(&error);
+            assert_eq!(json["error"]["hint"], advice);
+            assert_eq!(json["error"]["message"], said);
+        }
+
+        // Everything else has nothing to advise, and an invented hint would be
+        // worse than none.
+        assert_eq!(advice_for(&IgError::TooManyRedirects), None);
+        assert_eq!(
+            what_instagram_said(&IgError::TooManyRedirects),
+            IgError::TooManyRedirects.to_string()
+        );
+    }
+
+    /// One hint, whoever wrote it. A reader is being told what to do, and two
+    /// answers to that is worse than either of them alone.
+    #[test]
+    fn a_failure_carries_one_piece_of_advice() {
+        let from_the_client: anyhow::Error =
+            anyhow::Error::new(snob_ig::error::IgError::SessionExpired);
+        assert_eq!(rendered(&from_the_client).matches("hint:").count(), 1);
+
+        // A command's own advice is the one that shows, and the client's is
+        // not consulted. They cannot in fact meet — an `ExitError` carries no
+        // source, so nothing of Instagram's is ever underneath one — but the
+        // order is written down rather than left to that.
+        let from_the_command: anyhow::Error =
+            ExitError::new(ExitCode::NoSession, "no session is stored")
+                .with_hint("run \"snob login\"")
+                .into();
+        let out = rendered(&from_the_command);
+        assert_eq!(out.matches("hint:").count(), 1, "{out}");
+        assert!(out.contains("run \"snob login\"\n"), "{out}");
+    }
+
+    /// The pager reports a condition and this is where it becomes a sentence,
+    /// so this is where the sentence is asserted on.
+    ///
+    /// `pager.rs` used to write these itself and its own tests read them back
+    /// with `contains`. They match on the variant now, which is the right test
+    /// over there and leaves the words untested unless something checks them
+    /// here.
+    #[test]
+    fn every_warning_the_walk_raises_says_something() {
+        assert!(
+            pager_warning(Warning::EmptyAndNoCounter).contains("came back empty"),
+            "{}",
+            pager_warning(Warning::EmptyAndNoCounter)
+        );
+        for warning in [
+            Warning::SameCursorTwice,
+            Warning::TwoEmptyPages,
+            Warning::GoingInCircles,
+            Warning::EmptyAndNoCounter,
+        ] {
+            assert!(!pager_warning(warning).is_empty(), "{warning:?}");
+        }
+
+        // The two that carry numbers name both of them: a shortfall with only
+        // one of its halves shown says nothing about how big it is.
+        let short = pager_warning(Warning::StoppedShort {
+            walked: 39,
+            declared: 21_631,
+        });
+        assert!(short.contains("39") && short.contains("21631"), "{short}");
+
+        let deleted = pager_warning(Warning::ShortOfDeclared {
+            walked: 80,
+            declared: 100,
+        });
+        assert!(
+            deleted.contains("80") && deleted.contains("100"),
+            "{deleted}"
+        );
     }
 
     /// Only a full walk has nothing to explain. Every other ending owes the

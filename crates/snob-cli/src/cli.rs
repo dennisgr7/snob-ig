@@ -13,9 +13,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     long_about = "Instagram from the terminal.\n\n\
                   Walks your followers and your following, crosses them, and answers who \
                   does not follow you back, who you never followed back, and who you and \
-                  somebody else both know.\n\n\
-                  It only ever reads. snob never follows, unfollows, blocks or removes \
-                  anyone.",
+                  somebody else both know. It also shows and downloads the stories an \
+                  account has up and the highlights it keeps.\n\n\
+                  It changes exactly two things and asks first about both: \"follow\" and \
+                  \"unfollow\", one account at a time. It never blocks, never removes a \
+                  follower, and never tells anybody you looked at their story.",
     after_help = EXAMPLES
 )]
 pub struct Cli {
@@ -30,6 +32,40 @@ pub struct Cli {
     /// Show diagnostic traces
     #[arg(long, global = true, display_order = 901)]
     pub verbose: bool,
+
+    /// Check Instagram's certificate against Mozilla's roots only
+    ///
+    /// Off by default, and that default is deliberate rather than lazy.
+    /// reqwest 0.13 made the platform verifier the default, so snob honors
+    /// whatever roots an administrator has installed — which is what makes it
+    /// work on a managed machine, and is also how a laptop carrying a
+    /// TLS-inspecting root lets that middlebox read the session in transit.
+    /// This ends the second at the cost of the first, which is a trade only the
+    /// person running it can make.
+    ///
+    /// It refuses on Windows for ARM64, where the TLS backend is schannel and
+    /// has no way to express "these roots and no others". A security flag that
+    /// silently does nothing is worse than one that is not offered.
+    ///
+    /// **Never applied to the webhook.** A private CA in front of somebody's
+    /// own receiver is legitimate, and `snob_ig::http::plain` has no argument
+    /// for this — the same shape that stops the session reaching a webhook.
+    #[arg(long, global = true, display_order = 904)]
+    pub strict_roots: bool,
+
+    /// Also trust the certificates in this PEM file
+    ///
+    /// The way back out of `--strict-roots`, and it requires it: on the
+    /// platform store there is nothing to add to, because whatever an
+    /// administrator installed is already trusted. Repeatable.
+    #[arg(
+        long,
+        global = true,
+        display_order = 905,
+        requires = "strict_roots",
+        value_name = "PEM"
+    )]
+    pub tls_extra_root: Vec<PathBuf>,
 
     /// Keep every file this run reads or writes under this directory
     ///
@@ -91,12 +127,32 @@ pub struct Cli {
 /// Thirty-two characters is the shortest that is not a guessing target. It is
 /// counted in characters rather than bytes because the person typing it is
 /// counting characters.
-fn signing_secret(value: &str) -> Result<String, String> {
+///
+/// **The one floor, wherever a key arrives.** `--sign-with` applies it as a
+/// value parser and `watch setup` applies it to what was typed at the prompt;
+/// the wizard had its own copy of the count, and the two had already
+/// diverged -- the wizard trimmed before counting, the flag did not, so a
+/// 30-character key padded with spaces passed one door and was refused at the
+/// other. Trimming is now part of the rule: the prompt's non-terminal path
+/// reads a whole line, newline included, and a key that differs from itself
+/// by invisible whitespace is a support case.
+pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
     const FLOOR: usize = 32;
+    let value = value.trim();
     let length = value.chars().count();
     if length < FLOOR {
         return Err(format!(
-            "a signing secret has to be at least {FLOOR} characters and this one is              {length}. A short one can be guessed offline by anybody who has been sent              one signed report. Generate one instead --              \"openssl rand -hex 32\", or \"python -c \\\"import secrets;              print(secrets.token_hex(32))\\\"\"."
+            concat!(
+                "a signing secret has to be at least {FLOOR} characters and this one is ",
+                "{length}. A short one can be guessed offline by anybody who has been ",
+                "sent one signed report. Generate one instead -- ",
+                "\"openssl rand -hex 32\", or ",
+                "\"python -c \\\"import secrets; print(secrets.token_hex(32))\\\"\"." // Named rather than captured: a `format!` cannot reach an identifier
+                                                                                      // through a `concat!`, and `concat!` is what keeps `cargo fmt` from
+                                                                                      // rejoining these lines and leaving the indentation inside the string.
+            ),
+            FLOOR = FLOOR,
+            length = length
         ));
     }
     Ok(value.to_string())
@@ -113,8 +169,13 @@ const EXAMPLES: &str = "\
 Examples:
   snob login                          store your session, once
   snob unfollowers                    who does not follow you back
+  snob profile someone                their page: counts, bio, who you both know
   snob scan someone                   the full picture of another account
   snob pfp someone -o picture.jpg     their profile picture, at full size
+  snob stories someone                browse what they have up; a listing in a pipe
+  snob highlights someone             browse the highlights its profile keeps
+  snob highlights someone 2 -d all    save everything in the second one
+  snob unfollow someone               the one thing snob changes, after asking
   snob unfollowers --format csv -o unfollowers.csv
 
 A username may be written with or without a leading @. If you write the @, quote
@@ -129,7 +190,16 @@ Exit codes:
   4   Instagram wants the account verified -- open the address it prints
   5   Instagram is throttling, or the account is in cooldown -- wait
   130 stopped by you: Ctrl+C, or a confirmation not given -- including with
-      no terminal to ask at, where -y confirms in advance";
+      no terminal to ask at, where -y confirms in advance
+
+Environment:
+  NO_COLOR          no styling, whatever the terminal supports
+  CLICOLOR_FORCE    styling even where stdout is not a terminal
+  FORCE_HYPERLINK   OSC 8 hyperlinks even where they were not detected
+  SNOB_LOG          what --verbose shows, as target=level pairs
+  SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
+                    the two secrets a command line would otherwise carry;
+                    see \"snob login --help\" and \"snob watch --help\"";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -153,8 +223,18 @@ pub enum Command {
     )]
     Purge(PurgeArgs),
 
+    /// An account as its page shows it: counts, bio, who you both know, highlights
+    #[command(
+        after_help = "What you would see opening the profile, for three or four requests: the \
+                      counters, the bio, whether you follow each other, the accounts you follow \
+                      that follow them, the highlights and whether anything is up right now. It \
+                      walks no list and stores nothing. \"snob scan\" is the crossing, and \
+                      costs both lists."
+    )]
+    Profile(ProfileArgs),
+
     /// Summary of the whole account: followers, following, and how they cross
-    Scan(ListArgs),
+    Scan(ScanArgs),
 
     /// Accounts you follow that do not follow you back
     Unfollowers(ListArgs),
@@ -177,7 +257,46 @@ pub enum Command {
     /// Download a profile picture in high resolution
     Pfp(PfpArgs),
 
+    /// Show the stories an account has up, and download them
+    #[command(
+        after_help = "Listing and downloading a story does not tell the account you looked. \
+                      snob has no way of doing that and a test keeps it that way."
+    )]
+    Stories(StoriesArgs),
+
+    /// Show the highlights an account keeps on its profile, and download them
+    #[command(
+        after_help = "\"snob highlights someone\" numbers the tray; \"snob highlights someone 2\" \
+                      lists what the second one holds, and takes -d, -o and -i exactly as \
+                      \"stories\" does. Without the number, -d takes whole highlights: \
+                      \"-d 2\" saves everything in the second, \"-d all\" the whole profile. \
+                      Listing and downloading a highlight does not tell the account you \
+                      looked. snob has no way of doing that and a test keeps it that way."
+    )]
+    Highlights(HighlightsArgs),
+
+    /// Follow an account
+    #[command(
+        after_help = "One account per run, on purpose: what Instagram acts on is a burst of \
+                      follows rather than the day's total. Needs a session with a CSRF token, \
+                      which \"snob login --browser\" captures."
+    )]
+    Follow(FollowArgs),
+
+    /// Unfollow an account
+    #[command(
+        after_help = "One account per run, on purpose: what Instagram acts on is a burst of \
+                      unfollows rather than the day's total. Needs a session with a CSRF token, \
+                      which \"snob login --browser\" captures."
+    )]
+    Unfollow(FollowArgs),
+
     /// Track an account over time and report what changed
+    #[command(
+        after_help = "With no subcommand it stays up and runs on a schedule; the subcommands                       are the things a person does by hand. \"--json\" here emits one JSON                       object per run, one per line -- what the list commands would call                       ndjson, spelled --json because each object is the state of one run.
+
+                      An account named like a subcommand -- \"status\", \"once\", \"diff\",                       \"check\", \"setup\" -- is read as the subcommand; write it \"@status\"                       to watch the account."
+    )]
     Watch(WatchArgs),
     // `import dyi` is written and tested but not wired up here on purpose: the
     // reader works, and what is unfinished is the question of what an import
@@ -201,6 +320,24 @@ pub struct LoginArgs {
     #[arg(long, value_name = "STRING")]
     pub user_agent: Option<String>,
 
+    /// The csrftoken cookie, alongside the pasted sessionid
+    ///
+    /// Only "follow" and "unfollow" need it; everything else reads, and reads
+    /// do not. "--browser" picks it up on its own, so this is for the machine
+    /// with no browser to launch — the headless case this tool supports on
+    /// purpose — where the two cookies have to be copied by hand.
+    ///
+    /// A value typed here lands in the shell history and in "ps"; the
+    /// SNOB_CSRFTOKEN environment variable is read instead when it is set.
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        requires = "paste",
+        env = "SNOB_CSRFTOKEN",
+        hide_env_values = true
+    )]
+    pub csrftoken: Option<String>,
+
     /// Keep the browser profile "--browser" creates, so a later login skips
     /// the Instagram form
     ///
@@ -219,9 +356,8 @@ pub struct WhoamiArgs {
     #[arg(long)]
     pub offline: bool,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -233,20 +369,156 @@ pub struct LogoutArgs {
 
 #[derive(Args, Debug)]
 pub struct PurgeArgs {
-    /// Delete without asking. Needed when there is no terminal to ask at.
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    #[command(flatten)]
+    pub consent: ConsentArgs,
 
     /// List what would be deleted and delete nothing
     #[arg(long, conflicts_with = "yes")]
     pub dry_run: bool,
 }
 
+/// The options every command that prints a list of accounts takes.
+///
+/// Composed from three groups rather than written as one struct, and the
+/// reason is `scan`: it walks the same two lists with the same filter and
+/// writes to the same destinations, but it prints counts, so `--limit` had
+/// nothing to trim and was accepted with a warning. One flat struct meant
+/// every command took every flag whether it meant anything or not, and the
+/// warning was the cheapest way to say so. A command now takes the groups it
+/// acts on — [`ScanArgs`] is this without the cap — and a flag it would ignore
+/// is one clap refuses.
+///
+/// The order of the fields is the order of the help, so a reader meets the
+/// target, then what to show, then where, then how the walk is made.
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
     pub target: Option<String>,
 
+    #[command(flatten)]
+    pub filter: FilterArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+
+    /// Trim the output to the first N accounts. Saves no requests: --max-pages
+    /// is what does that.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    #[command(flatten)]
+    pub browse: BrowseArgs,
+
+    #[command(flatten)]
+    pub walk: WalkArgs,
+}
+
+/// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five
+/// counts has no rows to cut.
+#[derive(Args, Debug)]
+pub struct ScanArgs {
+    /// Account to summarize. Defaults to your own.
+    pub target: Option<String>,
+
+    #[command(flatten)]
+    pub filter: FilterArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+
+    #[command(flatten)]
+    pub browse: BrowseArgs,
+
+    #[command(flatten)]
+    pub walk: WalkArgs,
+}
+
+/// The list commands' way into the account browser. One definition, like
+/// [`ConsentArgs`], so the flags and their conflicts cannot drift between the
+/// six commands that take them.
+///
+/// **The browser is the default at a human terminal**, the same rule the
+/// media browsers keep and for the same reason the owner gave when lifting
+/// the old opt-in there: the browsers are what a person at a terminal wants
+/// first. The first cut of this group took the other view — the listing *is*
+/// the answer, so never detect — and the owner reversed it on 2026-08-24
+/// after using both. What that view protected is still protected, by the
+/// same detection the media commands use: a pipe, a redirect and a script
+/// are exactly the runs `attending` refuses, so scrollback, the terminal's
+/// own search and `snob unfollowers | wc -l` all still read the printed
+/// form. [`BrowseArgs::browses`] is [`MediaActionArgs::browses`] minus the
+/// verbs lists do not have, and the matrix is a test the same way.
+///
+/// One conflict is stricter than the media group's: `-i` is refused beside
+/// `--format` and `-o` rather than out-ranking them, because a list browser
+/// downloads nothing — there is no later step for a format or a destination
+/// to apply to, so accepting either would be accepting-and-ignoring it.
+/// `--no-interactive` conflicts with `-i` alone: beside `--format` or `-o`
+/// it is redundant rather than ignored — each of those already prints — and
+/// a script that says it defensively should not break.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct BrowseArgs {
+    /// Move through the result with the arrow keys: Enter opens the
+    /// account's profile, "/" filters as you type. The default on a
+    /// terminal; this forces it, and fails where no terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with_all = ["format", "path"])]
+    pub interactive: bool,
+
+    /// Print the result and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+}
+
+impl BrowseArgs {
+    /// Whether this run takes the terminal over.
+    ///
+    /// The order is the contract, and it is [`MediaActionArgs::browses`]'s:
+    /// what was *said* wins over what is detected — `-i` first, then anything
+    /// that already asks for the printed or written form — and only a run
+    /// that asked for nothing at all falls to detection. `attending` is
+    /// [`crate::ui::a_human_would_watch_the_listing_scroll_by`]: all three
+    /// streams a terminal, because the browser reads keys, draws on standard
+    /// error and *withholds* the result from standard output.
+    ///
+    /// A pure function of its inputs so the whole matrix is testable without
+    /// a terminal; the caller supplies the one detected bit.
+    pub fn browses(&self, printed_form_asked: bool, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            printed_form_asked,
+            attending,
+        )
+    }
+}
+
+/// The one rule every browse group applies: what was *said* wins over what
+/// is detected — `-i` first, then anything that already asked for the
+/// printed or written form — and only a run that asked for nothing at all
+/// falls to detection.
+///
+/// One function rather than four copies of the ordering, because the
+/// ordering is the contract and four copies of a contract drift. The groups
+/// stay separate structs — their conflicts differ, and clap conflicts are
+/// declared per command — but the decision they feed is this one.
+fn browse_decision(
+    interactive: bool,
+    no_interactive: bool,
+    printed_form_asked: bool,
+    attending: bool,
+) -> bool {
+    if interactive {
+        return true;
+    }
+    if no_interactive || printed_form_asked {
+        return false;
+    }
+    attending
+}
+
+/// Which accounts a list keeps.
+#[derive(Args, Debug, Clone, Default)]
+pub struct FilterArgs {
     /// Hide accounts with any of these attributes
     #[arg(long, value_delimiter = ',', value_name = "ATTR")]
     pub hide: Vec<Attr>,
@@ -261,53 +533,122 @@ pub struct ListArgs {
     pub only: Vec<Attr>,
 
     /// Shorthand for --hide verified
-    #[arg(long)]
+    // Hidden rather than removed: it is the spelling the first release
+    // documented, so a script written against it still runs. It is kept out of
+    // the help because `--hide` is the general form and a second way to say
+    // one thing is the beginning of one per attribute.
+    #[arg(long, hide = true)]
     pub no_verified: bool,
 
     /// File of usernames to exclude from the result, one per line
     #[arg(long, value_name = "FILE")]
     pub exclude_list: Option<PathBuf>,
+}
 
+/// Where a list goes and in what shape.
+#[derive(Args, Debug, Clone, Default)]
+pub struct OutputArgs {
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
     #[arg(long, value_enum)]
     pub format: Option<Format>,
 
     /// Write the result to a file instead of standard output
-    #[arg(short = 'o', long, value_name = "FILE")]
-    pub output: Option<PathBuf>,
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    pub path: Option<PathBuf>,
+}
 
-    /// Trim the output to the first N accounts. Saves no requests: --max-pages
-    /// is what does that.
-    #[arg(long, value_name = "N")]
-    pub limit: Option<usize>,
+/// The one question a command asks, answered in advance.
+///
+/// One definition for the one convention: each command asks at most one thing
+/// — consent to enumerate somebody else's lists, confirmation of a write,
+/// confirmation of a purge — and `-y` is always the answer to that one thing.
+/// It used to be spelled out three times, each with its own sentence, and
+/// nothing tied them together. What the question *is* stays with the command
+/// that asks it, in its `after_help` and in the question itself.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct ConsentArgs {
+    /// Answer yes in advance to the one question this command asks.
+    /// Needed when there is no terminal to ask at.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
 
+/// Whether the progress bar draws. One definition, like [`ConsentArgs`]:
+/// the bar already hides itself when standard error is not a terminal, so
+/// this flag is only for the terminal that has one and does not want it.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct ProgressArgs {
+    /// Do not draw the progress bar
+    #[arg(long)]
+    pub no_progress: bool,
+}
+
+/// The status-object switch, for commands that report the state of things.
+///
+/// `--json` is for a status object; `--format` is for a document. One
+/// definition holds the first half of that convention the way the narrowed
+/// format enums hold the second.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct StatusOutputArgs {
+    /// Return the data as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// How a walk is made: whether to make one at all, how far, and whether
+/// anybody has to be asked first.
+///
+/// `--offline` answers out of storage and spends nothing, so the two flags
+/// that shape a walk conflict with it rather than being accepted and ignored.
+#[derive(Args, Debug, Clone)]
+pub struct WalkArgs {
     /// Walk the list again even if there is a recent snapshot
-    #[arg(long, conflicts_with = "cache")]
+    #[arg(long, conflicts_with = "offline")]
     pub refresh: bool,
 
-    /// Use the last stored snapshot without touching the network
-    #[arg(long, conflicts_with = "refresh")]
-    pub cache: bool,
+    /// Answer from the last stored snapshot without touching the network
+    // `--cache` was the name until August 2026; kept as a hidden alias so a
+    // script written against it still runs, the same way `mutuals` and
+    // `--no-verified` are kept. `--offline` is the spelling that generalizes:
+    // `whoami` already used it, and the two used to be two names for the one
+    // intention a script has — spend no network.
+    #[arg(long, alias = "cache", conflicts_with = "refresh")]
+    pub offline: bool,
 
     /// Maximum age of a reusable snapshot (30m, 6h, 2d)
     #[arg(long, value_name = "DURATION", default_value = "6h", value_parser = duration)]
     pub max_age: std::time::Duration,
 
     /// Start from scratch instead of continuing an interrupted walk
-    #[arg(long)]
+    #[arg(long, conflicts_with = "offline")]
     pub no_resume: bool,
 
     /// Stop the walk after N pages, saving requests
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", conflicts_with = "offline")]
     pub max_pages: Option<u32>,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
 
-    /// Do not ask before enumerating someone else's account
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    #[command(flatten)]
+    pub consent: ConsentArgs,
+}
+
+/// What no flags mean. Written by hand because a derived `Default` would put
+/// `--max-age` at zero seconds, and a test building arguments with
+/// `..Default::default()` would then find every snapshot stale.
+impl Default for WalkArgs {
+    fn default() -> Self {
+        Self {
+            refresh: false,
+            offline: false,
+            max_age: std::time::Duration::from_secs(6 * 3600),
+            no_resume: false,
+            max_pages: None,
+            progress: ProgressArgs::default(),
+            consent: ConsentArgs::default(),
+        }
+    }
 }
 
 /// Parses durations written like `30m`, `6h`, `2d`, `2w`.
@@ -371,13 +712,14 @@ pub struct WatchRunArgs {
     #[command(flatten)]
     pub delivery: WebhookArgs,
 
-    /// Emit one JSON object per run, on standard output
-    #[arg(long)]
-    pub json: bool,
+    // A doc comment here would not reach the help -- clap renders the
+    // flattened group's own docs -- so the "one object per run, one per line"
+    // sentence lives in the Watch command's after_help, where it shows.
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
 }
 
 /// Where a report goes, shared by the scheduled run and `once`.
@@ -401,7 +743,19 @@ pub struct WebhookArgs {
     /// is deliberate: a report is queued before it is delivered, so refusing a
     /// weak key at send time would strand one that had already been made.
     /// Here, nothing has been queued yet.
-    #[arg(long, value_name = "SECRET", value_parser = signing_secret)]
+    ///
+    /// A value typed here lands in the shell history and in "ps", where on
+    /// Linux every local user can read it for as long as the run lasts; the
+    /// SNOB_SIGNING_KEY environment variable is read instead when it is set,
+    /// which is also the shape a systemd unit wants. "snob watch setup" puts
+    /// the key in the keyring, and then neither is needed.
+    #[arg(
+        long,
+        value_name = "SECRET",
+        value_parser = signing_secret,
+        env = "SNOB_SIGNING_KEY",
+        hide_env_values = true
+    )]
     pub sign_with: Option<String>,
 
     /// Send a report even when nothing changed, so something watching for
@@ -474,9 +828,8 @@ pub enum WatchCommand {
 
 #[derive(Args, Debug, Default)]
 pub struct WatchCheckArgs {
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
     /// Do not post anything to the webhook
     #[arg(long)]
@@ -492,9 +845,8 @@ pub struct WatchSetupArgs {
 
 #[derive(Args, Debug)]
 pub struct WatchStatusArgs {
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -502,9 +854,8 @@ pub struct WatchDiffArgs {
     /// Account to report on. Defaults to your own.
     pub target: Option<String>,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -521,13 +872,51 @@ pub struct WatchOnceArgs {
     // which is the only thing an unattended run accepts.
     pub target: Option<String>,
 
-    /// Return the data as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 
-    /// Do not draw the progress bar
-    #[arg(long)]
-    pub no_progress: bool,
+    #[command(flatten)]
+    pub progress: ProgressArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ProfileArgs {
+    /// Account to show. Defaults to your own.
+    pub target: Option<String>,
+
+    /// Output format. Defaults to a table on a terminal and JSON in a pipe.
+    #[arg(long, value_enum)]
+    pub format: Option<ProfileFormat>,
+
+    /// Write the result to a file instead of standard output
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    // Not [`BrowseArgs`], deliberately: that group's conflicts name the ids
+    // `format` and `path`, and this command's `-o` field is `output` — clap
+    // refuses unknown ids, and `Cli::command().debug_assert()` holds it.
+    // The rule itself is shared through [`browse_decision`].
+    /// Browse the profile with the arrow keys: Enter opens what is under the
+    /// cursor. The default on a terminal; this forces it, and fails where no
+    /// terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with_all = ["format", "output"])]
+    pub interactive: bool,
+
+    /// Print the profile and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+}
+
+impl ProfileArgs {
+    /// Whether this run takes the terminal over. See [`browse_decision`].
+    pub fn browses(&self, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            self.format.is_some() || self.output.is_some(),
+            attending,
+        )
+    }
 }
 
 #[derive(Args, Debug)]
@@ -538,16 +927,207 @@ pub struct PfpArgs {
     /// Destination file
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+
+    /// Look at the picture before deciding: Enter opens it in the system
+    /// viewer, D saves it here. The default on a terminal; this forces it,
+    /// and fails where no terminal can be drawn
+    #[arg(short = 'i', long, conflicts_with = "output")]
+    pub interactive: bool,
+
+    /// Download the picture and exit, even on a terminal
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
 }
 
-/// Not reachable from the CLI yet; see the note in [`Command`].
-#[derive(Subcommand, Debug)]
-pub enum ImportCommand {
-    /// Import Instagram's "Download your information" archive
-    Dyi {
-        /// Path to the downloaded archive
-        path: PathBuf,
-    },
+impl PfpArgs {
+    /// Whether this run takes the terminal over. See [`browse_decision`].
+    pub fn browses(&self, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            self.output.is_some(),
+            attending,
+        )
+    }
+}
+
+/// What `-d/--download` selects, decided at the parser so a typo is exit 2
+/// and nothing was fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadSelection {
+    /// Every story in the tray.
+    All,
+    /// The numbered ones, in the order they were asked for: `3`, `1,3`, `2-4`.
+    These(Vec<usize>),
+}
+
+/// Parses `all`, one number, or a comma-separated run of numbers and ranges.
+///
+/// The listing is one-based, so zero is refused by name rather than
+/// underflowing later. The count is capped well past any real tray, so
+/// `-d 1-999999999` is a parse error instead of an allocation.
+fn download_selection(text: &str) -> Result<DownloadSelection, String> {
+    const MOST: usize = 200;
+    if text.eq_ignore_ascii_case("all") {
+        return Ok(DownloadSelection::All);
+    }
+    let mut numbers: Vec<usize> = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        let (from, to) = match part.split_once('-') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => (part, part),
+        };
+        let complaint =
+            || format!("\"{part}\" is not a number from the listing, a range like 2-4, or \"all\"");
+        let from: usize = from.parse().map_err(|_| complaint())?;
+        let to: usize = to.parse().map_err(|_| complaint())?;
+        if from == 0 {
+            return Err("the listing starts at 1".to_string());
+        }
+        if from > to {
+            return Err(format!("\"{part}\" runs backwards"));
+        }
+        for n in from..=to {
+            if numbers.len() >= MOST {
+                return Err(format!(
+                    "that is more than {MOST}; \"all\" is the way to ask for everything listed"
+                ));
+            }
+            if !numbers.contains(&n) {
+                numbers.push(n);
+            }
+        }
+    }
+    Ok(DownloadSelection::These(numbers))
+}
+
+/// What a media command does with its tray: download some of it, or take the
+/// terminal over and browse it.
+///
+/// One definition, written for `stories` and for the `highlights` command
+/// AGENTS.md already shapes ("`-d`, `--all`, `-o`, `-i` on that exactly as
+/// `stories` has them") — so the second command takes this group instead of
+/// copying four flags and their conflicts.
+#[derive(Args, Debug)]
+pub struct MediaActionArgs {
+    /// Download from the listing: a number, a set (1,3 or 2-4), or "all"
+    #[arg(
+        short = 'd',
+        long,
+        value_name = "N|all",
+        value_parser = download_selection,
+        conflicts_with = "interactive"
+    )]
+    pub download: Option<DownloadSelection>,
+
+    /// What "-d all" was spelled before -d took it; hidden, kept so a script
+    /// written against the first release still runs
+    #[arg(long, hide = true, conflicts_with_all = ["download", "interactive"])]
+    pub all: bool,
+
+    /// Move through the listing with the arrow keys. The default on a
+    /// terminal; this forces it, and fails where no terminal can be taken
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+
+    /// Print the listing and exit, even on a terminal
+    // Long-only, like every flag since the short space was closed. It
+    // conflicts with `-i` alone: beside `-d`, `-o` or `--format` it is
+    // redundant rather than ignored -- each of those already prints -- and a
+    // script that says `--no-interactive` defensively should not break the
+    // day a download is added to it.
+    #[arg(long, conflicts_with = "interactive")]
+    pub no_interactive: bool,
+
+    /// Where a download goes. A directory when several are saved, a file when
+    /// one is.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+impl MediaActionArgs {
+    /// `--all` folded into the selection, so a command reads one field.
+    pub fn selection(&self) -> Option<DownloadSelection> {
+        if self.all {
+            return Some(DownloadSelection::All);
+        }
+        self.download.clone()
+    }
+
+    /// Whether this run takes the terminal over.
+    ///
+    /// The order is the contract. What was *said* wins over what is detected:
+    /// `-i` first, then anything that already asks for the printed or
+    /// downloaded form — `--no-interactive`, a selection, a destination, a
+    /// format. Only a run that asked for nothing at all falls to detection,
+    /// and `attending` is [`crate::ui::a_human_would_watch_the_listing_scroll_by`]:
+    /// all three streams a terminal, because the browser reads keys, draws on
+    /// standard error and *withholds* the listing from standard output.
+    ///
+    /// A pure function of its inputs so the whole matrix is testable without
+    /// a terminal; the caller supplies the one detected bit.
+    pub fn browses(&self, format_given: bool, attending: bool) -> bool {
+        browse_decision(
+            self.interactive,
+            self.no_interactive,
+            // A selection or a destination asks for the downloaded form the
+            // way a format asks for the printed one.
+            self.selection().is_some() || self.output.is_some() || format_given,
+            attending,
+        )
+    }
+}
+
+/// The listing's format, apart from the actions so the conflicts can say it:
+/// a download writes a file and the browser draws a screen, so `--format json
+/// -d 3` used to be accepted and then ignored, which reads as a format that
+/// did not work.
+#[derive(Args, Debug)]
+pub struct MediaListArgs {
+    /// Output format. Defaults to a table on a terminal and JSON in a pipe.
+    #[arg(long, value_enum, conflicts_with_all = ["download", "all", "interactive"])]
+    pub format: Option<StoryFormat>,
+}
+
+#[derive(Args, Debug)]
+pub struct StoriesArgs {
+    /// Account whose stories to show. Defaults to your own.
+    pub target: Option<String>,
+
+    #[command(flatten)]
+    pub action: MediaActionArgs,
+
+    #[command(flatten)]
+    pub list: MediaListArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct HighlightsArgs {
+    /// Account whose highlights to show. Defaults to your own — but the first
+    /// bare word is always read as an account, so picking a highlight of your
+    /// own takes your username in front of the number.
+    pub target: Option<String>,
+
+    /// A highlight's number from the tray listing: what -d and -i then act on
+    /// is what that highlight holds
+    #[arg(value_name = "HIGHLIGHT", value_parser = clap::value_parser!(u64).range(1..))]
+    pub highlight: Option<u64>,
+
+    #[command(flatten)]
+    pub action: MediaActionArgs,
+
+    #[command(flatten)]
+    pub list: MediaListArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FollowArgs {
+    /// The one account to follow or unfollow
+    pub target: String,
+
+    #[command(flatten)]
+    pub consent: ConsentArgs,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,6 +1145,42 @@ pub enum Format {
     Csv,
     Xlsx,
     Md,
+}
+
+/// The formats a story listing actually has.
+///
+/// A narrower enum rather than [`Format`] with three values quietly ignored.
+/// `--format xlsx` on a list of five stories would have been accepted, printed
+/// a table, and left the user believing they had a spreadsheet somewhere. The
+/// three that are missing are the ones that exist to hand a **list of accounts**
+/// to something else — a column of usernames — and a story has no username in
+/// it. Adding them would mean deciding what a spreadsheet of five expiring
+/// links is for, and nobody has asked.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryFormat {
+    Table,
+    Json,
+    Ndjson,
+}
+
+/// The formats a profile has: a card to read, an object to parse, a
+/// document to keep. The row formats are for a list of accounts, and a
+/// profile is not one — the same reasoning as [`StoryFormat`].
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileFormat {
+    Table,
+    Json,
+    Md,
+}
+
+impl From<StoryFormat> for Format {
+    fn from(story: StoryFormat) -> Self {
+        match story {
+            StoryFormat::Table => Self::Table,
+            StoryFormat::Json => Self::Json,
+            StoryFormat::Ndjson => Self::Ndjson,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -691,8 +1307,464 @@ mod tests {
     }
 
     #[test]
-    fn cache_and_refresh_are_mutually_exclusive() {
-        let result = Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]);
+    fn offline_and_refresh_are_mutually_exclusive() {
+        let result = Cli::try_parse_from(["snob", "followers", "--offline", "--refresh"]);
         assert!(result.is_err());
+    }
+
+    /// `-i` on a list command withholds the printed listing, so it is refused
+    /// beside anything that names the printed or written form — accepted and
+    /// ignored is the shape the format enums exist to refuse. It composes
+    /// with everything that narrows the *result*: the browser shows what the
+    /// listing would have shown.
+    #[test]
+    fn the_list_browser_conflicts_with_the_printed_forms_and_composes_with_the_rest() {
+        for command in ["unfollowers", "fans", "friends", "followers", "following"] {
+            assert!(
+                Cli::try_parse_from(["snob", command, "-i"]).is_ok(),
+                "{command} takes -i"
+            );
+            for said_a_form in [vec!["--format", "json"], vec!["-o", "list.csv"]] {
+                let mut line = vec!["snob", command, "-i"];
+                line.extend(said_a_form.iter());
+                assert!(
+                    Cli::try_parse_from(&line).is_err(),
+                    "{command} -i beside {said_a_form:?} would be accepted and ignored"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["snob", "unfollowers", "-i", "--limit", "5", "--offline"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["snob", "scan", "-i"]).is_ok(),
+            "scan browses its five lists as a tray"
+        );
+        assert!(Cli::try_parse_from(["snob", "scan", "-i", "--format", "json"]).is_err());
+
+        // The two spellings contradict each other and clap says so; beside
+        // the flags that already print, --no-interactive is redundant and
+        // allowed, so a defensive script survives.
+        assert!(Cli::try_parse_from(["snob", "unfollowers", "--no-interactive", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "snob",
+                "unfollowers",
+                "--no-interactive",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "scan", "--no-interactive"]).is_ok());
+    }
+
+    /// The list commands' half of the take-over matrix, the same shape as
+    /// the media one below: what was said beats what was detected, and only
+    /// a run that asked for nothing at all listens to the detection bit.
+    #[test]
+    fn the_list_browser_is_the_default_only_when_nothing_else_was_asked_for() {
+        let browse = |line: &[&str]| {
+            let Command::Unfollowers(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("unfollowers");
+            };
+            let printed = args.output.format.is_some() || args.output.path.is_some();
+            (args.browse, printed)
+        };
+
+        // Nothing asked for: the detection bit decides.
+        let (bare, printed) = browse(&["snob", "unfollowers"]);
+        assert!(bare.browses(printed, true));
+        assert!(!bare.browses(printed, false), "a pipe never gets a browser");
+
+        // Forced on: a terminal that cannot browse is an error, not a print.
+        let (forced, printed) = browse(&["snob", "unfollowers", "-i"]);
+        assert!(forced.browses(printed, false));
+
+        // Every explicit route to the printed form wins over an attending
+        // terminal. (`-i` beside these is a clap conflict, tested above.)
+        for line in [
+            &["snob", "unfollowers", "--no-interactive"][..],
+            &["snob", "unfollowers", "--format", "json"][..],
+            &["snob", "unfollowers", "-o", "list.csv"][..],
+        ] {
+            let (static_asked, printed) = browse(line);
+            assert!(
+                !static_asked.browses(printed, true),
+                "{line:?} must not open the browser"
+            );
+        }
+    }
+
+    /// `profile` and `pfp` carry their own browse pair — their `-o`/`--format`
+    /// ids differ from the lists', so [`BrowseArgs`] cannot be flattened in —
+    /// but the decision they feed is the shared one, and this is its matrix.
+    #[test]
+    fn profile_and_pfp_follow_the_same_browse_rule() {
+        // Said beats detected, and only a bare run listens to detection.
+        assert!(
+            browse_decision(true, false, false, false),
+            "-i wins outright"
+        );
+        assert!(!browse_decision(false, true, false, true));
+        assert!(!browse_decision(false, false, true, true));
+        assert!(browse_decision(false, false, false, true));
+        assert!(!browse_decision(false, false, false, false));
+
+        let profile = |line: &[&str]| {
+            let Command::Profile(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("profile");
+            };
+            args
+        };
+        assert!(profile(&["snob", "profile"]).browses(true));
+        assert!(!profile(&["snob", "profile"]).browses(false));
+        assert!(profile(&["snob", "profile", "-i"]).browses(false));
+        assert!(!profile(&["snob", "profile", "--no-interactive"]).browses(true));
+        assert!(!profile(&["snob", "profile", "--format", "json"]).browses(true));
+        assert!(!profile(&["snob", "profile", "-o", "out.md"]).browses(true));
+
+        let pfp = |line: &[&str]| {
+            let Command::Pfp(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("pfp");
+            };
+            args
+        };
+        assert!(pfp(&["snob", "pfp", "x"]).browses(true));
+        assert!(!pfp(&["snob", "pfp", "x"]).browses(false));
+        assert!(pfp(&["snob", "pfp", "x", "-i"]).browses(false));
+        assert!(!pfp(&["snob", "pfp", "x", "--no-interactive"]).browses(true));
+        assert!(!pfp(&["snob", "pfp", "x", "-o", "face.jpg"]).browses(true));
+
+        // The conflicts: -i beside a printed or written form is refused, the
+        // two spellings contradict each other, and --no-interactive beside a
+        // form that already prints stays redundant-and-allowed.
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "--format", "json"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "-o", "out.md"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "profile", "-i", "--no-interactive"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "profile", "--no-interactive", "--format", "json"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "pfp", "x", "-i", "-o", "f.jpg"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "pfp", "x", "-i", "--no-interactive"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "pfp", "x", "--no-interactive", "-o", "f.jpg"]).is_ok()
+        );
+    }
+
+    /// `--cache` was the spelling until August 2026; a script written against
+    /// it still runs, and the conflicts follow the alias to the same argument.
+    #[test]
+    fn the_old_cache_spelling_still_parses_and_is_not_advertised() {
+        let cli = Cli::try_parse_from(["snob", "followers", "--cache"]).unwrap();
+        let Command::Followers(args) = cli.command else {
+            panic!("followers");
+        };
+        assert!(args.walk.offline);
+        assert!(Cli::try_parse_from(["snob", "followers", "--cache", "--refresh"]).is_err());
+
+        let help = Cli::command()
+            .find_subcommand("followers")
+            .expect("followers is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--cache"), "{help}");
+        assert!(help.contains("--offline"), "{help}");
+    }
+
+    /// `--offline` makes no walk, so a flag that shapes one is refused rather
+    /// than accepted and ignored.
+    #[test]
+    fn a_flag_that_shapes_a_walk_is_refused_with_offline() {
+        for flag in [["--max-pages", "2"], ["--no-resume", ""]] {
+            let mut line = vec!["snob", "followers", "--offline", flag[0]];
+            if !flag[1].is_empty() {
+                line.push(flag[1]);
+            }
+            assert!(
+                Cli::try_parse_from(&line).is_err(),
+                "{} was accepted alongside --offline",
+                flag[0]
+            );
+        }
+    }
+
+    /// `scan` prints counts, so it has no rows for `--limit` to cut and does
+    /// not take it. It used to, with a warning, because it shared the list
+    /// commands' struct.
+    #[test]
+    fn scan_takes_the_list_options_but_not_the_cap() {
+        assert!(Cli::try_parse_from(["snob", "scan", "--limit", "5"]).is_err());
+        let cli = Cli::try_parse_from([
+            "snob",
+            "scan",
+            "someone",
+            "--hide",
+            "verified",
+            "--format",
+            "json",
+            "--offline",
+            "-y",
+        ])
+        .unwrap();
+        let Command::Scan(args) = cli.command else {
+            panic!("scan");
+        };
+        assert_eq!(args.target.as_deref(), Some("someone"));
+        assert_eq!(args.filter.hide, vec![Attr::Verified]);
+        assert_eq!(args.output.format, Some(Format::Json));
+        assert!(args.walk.offline && args.walk.consent.yes);
+    }
+
+    /// The environment variables the program answers to are announced in one
+    /// place, under the examples, where exit codes already live.
+    ///
+    /// Four of them used to be documented nowhere at all: three belong to the
+    /// crates behind the styling (`console`, `supports-hyperlinks`) and one to
+    /// `main::init_tracing`, so no flag's help ever mentioned them. This pins
+    /// the list. `SNOB_IGNORE_COOLDOWN` is deliberately absent -- its own
+    /// doc-comment in `rate_budget` says why it is not advertised -- and the
+    /// assertion holds that down too.
+    #[test]
+    fn the_environment_variables_are_announced_together() {
+        for name in [
+            "NO_COLOR",
+            "CLICOLOR_FORCE",
+            "FORCE_HYPERLINK",
+            "SNOB_LOG",
+            "SNOB_CSRFTOKEN",
+            "SNOB_SIGNING_KEY",
+        ] {
+            assert!(EXAMPLES.contains(name), "{name} is read but not announced");
+        }
+        assert!(
+            !EXAMPLES.contains("SNOB_IGNORE_COOLDOWN"),
+            "the escape hatch is deliberately not advertised"
+        );
+    }
+
+    /// Hidden from the help, still accepted: the first release documented it.
+    #[test]
+    fn no_verified_still_parses_and_is_not_advertised() {
+        let cli = Cli::try_parse_from(["snob", "unfollowers", "--no-verified"]).unwrap();
+        let Command::Unfollowers(args) = cli.command else {
+            panic!("unfollowers");
+        };
+        assert!(args.filter.no_verified);
+
+        let help = Cli::command()
+            .find_subcommand("unfollowers")
+            .expect("unfollowers is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--no-verified"), "{help}");
+        assert!(help.contains("--hide"), "{help}");
+    }
+
+    /// A story listing's format has nothing to say about a download or the
+    /// browser, and was accepted and ignored next to both.
+    #[test]
+    fn a_story_format_only_goes_with_the_listing() {
+        for extra in [["-d", "1"], ["--all", ""], ["-i", ""]] {
+            let mut line = vec!["snob", "stories", "someone", "--format", "json", extra[0]];
+            if !extra[1].is_empty() {
+                line.push(extra[1]);
+            }
+            assert!(
+                Cli::try_parse_from(&line).is_err(),
+                "--format was accepted alongside {}",
+                extra[0]
+            );
+        }
+        assert!(Cli::try_parse_from(["snob", "stories", "someone", "--format", "json"]).is_ok());
+    }
+
+    /// `-d` takes the listing's numbers in every shape the help promises, and
+    /// refuses the shapes that would only fail later, at the parser -- exit 2,
+    /// nothing fetched.
+    #[test]
+    fn a_download_selection_parses_numbers_ranges_and_all() {
+        use DownloadSelection::{All, These};
+
+        let selected = |line: &[&str]| {
+            let cli = Cli::try_parse_from(line).unwrap();
+            let Command::Stories(args) = cli.command else {
+                panic!("stories");
+            };
+            args.action.selection()
+        };
+
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "3"]),
+            Some(These(vec![3]))
+        );
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "1,3"]),
+            Some(These(vec![1, 3]))
+        );
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "2-4"]),
+            Some(These(vec![2, 3, 4]))
+        );
+        // A duplicate is asked for once: 2-4 already brought 3.
+        assert_eq!(
+            selected(&["snob", "stories", "x", "-d", "2-4,3,1"]),
+            Some(These(vec![2, 3, 4, 1]))
+        );
+        assert_eq!(selected(&["snob", "stories", "x", "-d", "all"]), Some(All));
+        // The first release's spelling still works, hidden, and folds into
+        // the same selection.
+        assert_eq!(selected(&["snob", "stories", "x", "--all"]), Some(All));
+        assert_eq!(selected(&["snob", "stories", "x"]), None);
+
+        for bad in ["0", "3-1", "one", "1,,2", "1-999999999"] {
+            assert!(
+                Cli::try_parse_from(["snob", "stories", "x", "-d", bad]).is_err(),
+                "{bad} should have been refused at the parser"
+            );
+        }
+        // The two spellings of "everything" cannot be combined with each
+        // other or with the browser.
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "-d", "all", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "-d", "1", "-i"]).is_err());
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "--all", "-i"]).is_err());
+
+        // Hidden means hidden: the help teaches -d, not --all.
+        let help = Cli::command()
+            .find_subcommand("stories")
+            .expect("stories is a subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--all"), "{help}");
+        assert!(help.contains("--download"), "{help}");
+    }
+
+    /// The whole matrix of "does this run take the terminal over".
+    ///
+    /// What was said beats what was detected, in every combination: `-i`
+    /// wins outright, every static flag refuses, and only a run that asked
+    /// for nothing at all listens to the detection bit.
+    #[test]
+    fn the_browser_is_the_default_only_when_nothing_else_was_asked_for() {
+        let action = |line: &[&str]| {
+            let Command::Stories(args) = Cli::try_parse_from(line).unwrap().command else {
+                panic!("stories");
+            };
+            (args.action, args.list.format.is_some())
+        };
+
+        // Nothing asked for: the detection bit decides.
+        let (bare, fmt) = action(&["snob", "stories", "x"]);
+        assert!(bare.browses(fmt, true));
+        assert!(!bare.browses(fmt, false), "a pipe never gets a browser");
+
+        // Forced on: a terminal that cannot browse is an error, not a print,
+        // so the answer stays true whatever was detected.
+        let (forced, fmt) = action(&["snob", "stories", "x", "-i"]);
+        assert!(forced.browses(fmt, false));
+
+        // Every explicit route to the static forms wins over an attending
+        // terminal.
+        for line in [
+            &["snob", "stories", "x", "--no-interactive"][..],
+            &["snob", "stories", "x", "-d", "2"][..],
+            &["snob", "stories", "x", "--all"][..],
+            &["snob", "stories", "x", "--format", "json"][..],
+            &["snob", "stories", "x", "-o", "somewhere"][..],
+        ] {
+            let (static_asked, fmt) = action(line);
+            assert!(
+                !static_asked.browses(fmt, true),
+                "{line:?} must not open the browser"
+            );
+        }
+
+        // The two spellings contradict each other and clap says so; beside
+        // the flags that already print, --no-interactive is redundant and
+        // allowed, so a defensive script survives growing a download.
+        assert!(Cli::try_parse_from(["snob", "stories", "x", "--no-interactive", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "stories", "x", "--no-interactive", "-d", "1"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["snob", "highlights", "x", "2", "--no-interactive"]).is_ok());
+    }
+
+    /// The `highlights` positionals: an account, then a number naming one
+    /// entry of its tray. The number and the selection flags compose the way
+    /// AGENTS.md settled -- `-d`, `-o`, `-i` on the items exactly as
+    /// `stories` has them, and without the number `-d` takes whole entries.
+    #[test]
+    fn highlights_takes_an_account_and_then_a_number() {
+        let cli = Cli::try_parse_from(["snob", "highlights", "someone"]).expect("tray listing");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.target.as_deref(), Some("someone"));
+        assert_eq!(args.highlight, None);
+
+        let cli =
+            Cli::try_parse_from(["snob", "highlights", "someone", "2", "-d", "3"]).expect("item");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.highlight, Some(2));
+        assert_eq!(
+            args.action.selection(),
+            Some(DownloadSelection::These(vec![3]))
+        );
+
+        // No account at all is the viewer's own tray.
+        let cli = Cli::try_parse_from(["snob", "highlights"]).expect("own tray");
+        let Command::Highlights(args) = cli.command else {
+            panic!("highlights");
+        };
+        assert_eq!(args.target, None);
+
+        // The listing starts at 1, and the parser is where zero stops.
+        assert!(Cli::try_parse_from(["snob", "highlights", "someone", "0"]).is_err());
+
+        // The same conflicts as stories: one action per run.
+        assert!(Cli::try_parse_from(["snob", "highlights", "x", "2", "-d", "1", "-i"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "highlights", "x", "--format", "json", "-d", "1"])
+                .is_err()
+        );
+    }
+
+    /// `--tls-extra-root` only means something alongside `--strict-roots`.
+    ///
+    /// On the platform store there is nothing to add to: whatever an
+    /// administrator installed is already trusted, so a lone `--tls-extra-root`
+    /// would be a flag that reads a file and changes nothing. Enforced by clap
+    /// rather than described, the same way `--ig-base-url` is paired with
+    /// `--sandbox-root`.
+    #[test]
+    fn an_extra_root_needs_the_narrowing_it_widens() {
+        let alone = Cli::try_parse_from(["snob", "--tls-extra-root", "ca.pem", "whoami"]);
+        assert!(alone.is_err(), "it was accepted on its own");
+
+        let paired = Cli::try_parse_from([
+            "snob",
+            "--strict-roots",
+            "--tls-extra-root",
+            "ca.pem",
+            "whoami",
+        ])
+        .expect("together they are the way out of the narrowing");
+        assert!(paired.strict_roots);
+        assert_eq!(paired.tls_extra_root.len(), 1);
+
+        // And narrowing on its own is the ordinary case.
+        let narrow = Cli::try_parse_from(["snob", "--strict-roots", "whoami"]).unwrap();
+        assert!(narrow.strict_roots);
+        assert!(narrow.tls_extra_root.is_empty());
+
+        // Off unless asked, which is the default the audit settled on.
+        let plain = Cli::try_parse_from(["snob", "whoami"]).unwrap();
+        assert!(!plain.strict_roots);
     }
 }

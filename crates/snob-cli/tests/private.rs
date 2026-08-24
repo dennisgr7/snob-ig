@@ -3,11 +3,12 @@
 //! Checked end to end because what matters is *when* it happens: before any
 //! walk, so no request is spent on lists Instagram would never serve.
 
+use snob_core::Pk;
 use snob_core::model::ListKind;
 use snob_core::session::{Session, SessionOrigin};
-use snob_core::store::Store;
 use snob_ig::client::IgClient;
 use snob_ig::pace::Pacer;
+use snob_store::store::Store;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17,7 +18,7 @@ use snob_cli::cli::ListArgs;
 use snob_cli::engine::{self, ListOutcome};
 
 mod common;
-use common::{SID, UA};
+use common::{SID, UA, requests};
 
 /// The account every test here asks about.
 fn args() -> ListArgs {
@@ -35,7 +36,7 @@ async fn mount_profile(server: &MockServer, user: &str) {
         .await;
 }
 
-async fn mount_list(server: &MockServer, pk: u64) {
+async fn mount_list(server: &MockServer, pk: Pk) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/friendships/{pk}/followers/")))
         .respond_with(
@@ -59,7 +60,7 @@ async fn execute_with(
         client,
         db,
         Viewer {
-            pk: 42,
+            pk: Pk::new(42),
             username: Some("me".into()),
         },
     );
@@ -75,10 +76,6 @@ async fn execute(
 }
 
 /// How many requests the server has received so far.
-async fn requests(server: &MockServer) -> usize {
-    server.received_requests().await.unwrap().len()
-}
-
 #[tokio::test]
 async fn a_private_account_you_do_not_follow_fails_before_any_walk() {
     let server = MockServer::start().await;
@@ -127,7 +124,7 @@ async fn an_unknown_relationship_does_not_block() {
             "edge_followed_by":{"count":1},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&server, 99).await;
+    mount_list(&server, Pk::new(99)).await;
 
     let (found, _) = execute(&server).await.unwrap();
     assert_eq!(found.len(), 1);
@@ -142,7 +139,7 @@ async fn a_private_account_you_follow_is_walked() {
             "edge_followed_by":{"count":1},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&server, 99).await;
+    mount_list(&server, Pk::new(99)).await;
 
     let (found, _) = execute(&server).await.unwrap();
     assert_eq!(found.len(), 1);
@@ -162,7 +159,7 @@ async fn with_cache_the_stored_snapshot_is_still_served() {
         r#"{"id":99,"username":"ghost","edge_followed_by":{"count":1},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&public, 99).await;
+    mount_list(&public, Pk::new(99)).await;
     execute_with(&public, db(), &args()).await.unwrap();
 
     // Now the account is private and unfollowed, and only stored data is
@@ -174,7 +171,7 @@ async fn with_cache_the_stored_snapshot_is_still_served() {
     )
     .await;
     let mut cached = args();
-    cached.cache = true;
+    cached.walk.offline = true;
     let (found, outcome) = execute_with(&private, db(), &cached).await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(outcome.requests, 0);
@@ -190,7 +187,7 @@ async fn your_own_account_is_never_blocked() {
             "edge_followed_by":{"count":1},"edge_follow":{"count":1}}"#,
     )
     .await;
-    mount_list(&server, 42).await;
+    mount_list(&server, Pk::new(42)).await;
 
     let (found, _) = execute(&server).await.unwrap();
     assert_eq!(found.len(), 1);

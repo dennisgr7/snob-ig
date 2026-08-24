@@ -8,8 +8,8 @@
 use std::error::Error;
 use std::time::Duration;
 
-use snob_core::Pk;
 use snob_core::model::StopReason;
+use snob_core::{EpochMs, Pk};
 
 use crate::client::{Direction, IgClient};
 use crate::error::{IgError, Reaction};
@@ -72,12 +72,45 @@ pub enum Event {
         after: Duration,
         error: String,
     },
-    Warning(String),
+    Warning(Warning),
     Finished {
         pages: u32,
         users: usize,
         reason: StopReason,
     },
+}
+
+/// Something the walk noticed and the caller ought to say out loud.
+///
+/// A variant per condition rather than a sentence, because the sentence is not
+/// this crate's to write: `snob-ig` reports what it saw and `snob-cli`'s
+/// `report::pager_warning` decides the words. Six English sentences used to be
+/// authored here and printed unmodified by the progress bar, which put the
+/// wording of the walk's most alarming lines inside the HTTP client.
+///
+/// Five of the six end the walk as [`StopReason::Truncated`]; they are separate
+/// variants because what a reader has to understand differs by guard, and
+/// because a caller may want to recognize one of them without reading a
+/// sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warning {
+    /// The cursor came back the same as the one just sent, so following it
+    /// would ask for the page that has already been served.
+    SameCursorTwice,
+    /// Two pages in a row carried nobody.
+    TwoEmptyPages,
+    /// [`MAX_PAGES_WITHOUT_NEW`] pages in a row carried only accounts that had
+    /// already been walked.
+    GoingInCircles,
+    /// One empty page, and no counter to tell an account with no followers
+    /// from an account Instagram would not serve.
+    EmptyAndNoCounter,
+    /// The walk ended cleanly far short of what the profile declared, and
+    /// [`truncated`] read that as Instagram having stopped serving pages.
+    StoppedShort { walked: usize, declared: usize },
+    /// The same shortfall, read the other way: a counter that includes
+    /// accounts which no longer appear in the list.
+    ShortOfDeclared { walked: usize, declared: usize },
 }
 
 /// What to walk.
@@ -119,7 +152,12 @@ impl WalkSummary {
 #[derive(Debug, thiserror::Error)]
 pub enum WalkError {
     #[error("the account is in cooldown for another {}", minutes(.remaining_ms))]
-    Cooldown { until_ms: i64, remaining_ms: i64 },
+    Cooldown {
+        until_ms: EpochMs,
+        /// How long is left of it, in milliseconds. A length of time rather than
+        /// a moment, which is why it stays a number.
+        remaining_ms: i64,
+    },
     #[error(transparent)]
     Budget(IgError),
     #[error("could not save the page: {0}")]
@@ -161,11 +199,13 @@ impl<'a> ListWalker<'a> {
         }
     }
 
+    #[must_use]
     pub fn with_pace(mut self, pace: Pace) -> Self {
         self.pace = pace;
         self
     }
 
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
         self
@@ -186,7 +226,7 @@ impl<'a> ListWalker<'a> {
         S: FnMut(&FriendshipsPage, u32) -> Result<usize, Box<dyn Error + Send + Sync>>,
         O: FnMut(Event),
     {
-        self.check_cooldown()?;
+        self.check_cooldown().await?;
 
         observe(Event::Started {
             estimated: request.estimated,
@@ -204,27 +244,36 @@ impl<'a> ListWalker<'a> {
             //
             // `check_cooldown` above answers for the moment the walk started,
             // and this loop is the longest unbroken run of requests the tool
-            // produces. Nothing else re-reads the table on the way through:
-            // `Pacer::clear_to_send` consults the cancel token and the budget,
-            // and `SqliteRateBudget::reserve` touches `rate_budget` alone. So a
-            // cooldown another process writes while this walk is in flight is
-            // invisible to it — `snob whoami` in a second terminal drawing a
-            // 429 stops *that* process and leaves this one paging into a door
-            // Instagram has just closed. The database is shared per user, which
-            // is what makes that an ordinary Tuesday rather than a corner case.
+            // produces. A cooldown another process writes while this walk is in
+            // flight was invisible to it — `snob whoami` in a second terminal
+            // drawing a 429 stops *that* process and leaves this one paging into
+            // a door Instagram has just closed. The database is shared per user,
+            // which is what makes that an ordinary Tuesday rather than a corner
+            // case.
             //
             // It does not self-limit either, unless the push-back happens to
             // cover `/api/v1/friendships/` as well: an endpoint-specific
             // throttle leaves this walk answering normally to the end.
             //
+            // **`Pacer::clear` now reads the table too**, so this is no longer
+            // the only thing standing between a walk and a cooldown it did not
+            // open. It is still worth its place, and the reason is the next
+            // paragraph: the two stop the walk by different routes and only one
+            // of them is this one.
+            //
             // `break` rather than `Err`, so the partial keeps its cursor and
             // stays resumable — `verify_completion` passes a non-`Completed`
-            // reason through untouched. One local SQLite read against a wait of
-            // at least 1.5 s per page.
+            // reason through untouched. The backstop answers `Err`, which lands
+            // in `stop_reason_for` and also breaks with `RateLimit` carrying
+            // `state.cursor`, so nothing is lost either way; what this buys is
+            // catching the cooldown *between* pages, before the next request has
+            // been reserved at all. One local SQLite read against a wait of at
+            // least 1.5 s per page.
             if self
                 .client
                 .pacer()
-                .cooldown()
+                .cooldown_off_thread()
+                .await
                 .map_err(WalkError::Budget)?
                 .is_some()
             {
@@ -305,10 +354,15 @@ impl<'a> ListWalker<'a> {
         })
     }
 
-    fn check_cooldown(&self) -> Result<(), WalkError> {
-        let until = self.client.pacer().cooldown().map_err(WalkError::Budget)?;
+    async fn check_cooldown(&self) -> Result<(), WalkError> {
+        let until = self
+            .client
+            .pacer()
+            .cooldown_off_thread()
+            .await
+            .map_err(WalkError::Budget)?;
         if let Some(until_ms) = until {
-            let remaining_ms = until_ms - snob_core::store::now_ms();
+            let remaining_ms = until_ms - snob_core::clock::now_ms();
             return Err(WalkError::Cooldown {
                 until_ms,
                 remaining_ms,
@@ -382,6 +436,17 @@ impl<'a> ListWalker<'a> {
                 // client rather than through the token, and it is still the
                 // user stopping rather than anything going wrong.
                 IgError::Canceled => StopReason::Canceled,
+                // The backstop in `Pacer::clear` refusing, which is throttling
+                // and not a network failure however it arrives. Its reaction is
+                // `Abort` — retrying a wait measured in hours is the one thing
+                // that must not happen — so without this arm it fell to the line
+                // below and the walk reported `Network`. That is the same defect
+                // twice over: the mid-walk check a few hundred lines up breaks
+                // with `RateLimit` for the identical condition, and
+                // `ExitCode::from_stop_reason` turns `Network` into a plain
+                // failure while `from_ig_error` says `RateLimited` — and those
+                // two are documented to agree.
+                IgError::InCooldown { .. } => StopReason::RateLimit,
                 _ => StopReason::Network,
             },
         };
@@ -471,19 +536,14 @@ impl WalkState {
         if self.last_cursor.as_deref() == Some(next.as_str())
             || self.cursor.as_deref() == Some(next.as_str())
         {
-            observe(Event::Warning(
-                "Instagram returned the same cursor twice; stopping so the request is not repeated"
-                    .into(),
-            ));
+            observe(Event::Warning(Warning::SameCursorTwice));
             return Some(StopReason::Truncated);
         }
 
         if received == 0 {
             self.empty_in_a_row += 1;
             if self.empty_in_a_row >= 2 {
-                observe(Event::Warning(
-                    "Instagram returned two empty pages in a row".into(),
-                ));
+                observe(Event::Warning(Warning::TwoEmptyPages));
                 return Some(StopReason::Truncated);
             }
         } else {
@@ -493,10 +553,7 @@ impl WalkState {
         if added == 0 {
             self.barren_in_a_row += 1;
             if self.barren_in_a_row >= MAX_PAGES_WITHOUT_NEW {
-                observe(Event::Warning(
-                    "several pages in a row with no new accounts; the list is going in circles"
-                        .into(),
-                ));
+                observe(Event::Warning(Warning::GoingInCircles));
                 return Some(StopReason::Truncated);
             }
         } else {
@@ -534,12 +591,7 @@ impl WalkState {
         // follow an unfollower. A real empty account loses nothing by being
         // asked again, so this refuses.
         if request.estimated.is_none() && self.users == 0 {
-            observe(Event::Warning(
-                "the list came back empty and the profile counter could not be read, so there is \
-                 no way to tell an empty list from one Instagram did not serve; treating it as \
-                 incomplete rather than risking the comparison"
-                    .into(),
-            ));
+            observe(Event::Warning(Warning::EmptyAndNoCounter));
             return StopReason::Truncated;
         }
 
@@ -561,19 +613,17 @@ impl WalkState {
         }
 
         if truncated(self.users, estimated) {
-            observe(Event::Warning(format!(
-                "Instagram stopped serving pages at {} of the {estimated} accounts it declared; \
-                 the list is incomplete and cannot be compared against",
-                self.users
-            )));
+            observe(Event::Warning(Warning::StoppedShort {
+                walked: self.users,
+                declared: estimated,
+            }));
             return StopReason::Truncated;
         }
 
-        observe(Event::Warning(format!(
-            "walked {} accounts while Instagram declared {estimated}; \
-             the difference is usually deleted accounts",
-            self.users
-        )));
+        observe(Event::Warning(Warning::ShortOfDeclared {
+            walked: self.users,
+            declared: estimated,
+        }));
         reason
     }
 }
@@ -617,7 +667,7 @@ mod tests {
     #[test]
     fn the_cooldown_display_pluralizes_the_minutes() {
         let one = WalkError::Cooldown {
-            until_ms: 0,
+            until_ms: EpochMs::new(0),
             remaining_ms: 30_000,
         };
         assert_eq!(
@@ -626,7 +676,7 @@ mod tests {
         );
 
         let four = WalkError::Cooldown {
-            until_ms: 0,
+            until_ms: EpochMs::new(0),
             remaining_ms: 240_000,
         };
         assert_eq!(
@@ -685,7 +735,7 @@ mod tests {
 
     fn request<'a>() -> ListRequest<'a> {
         ListRequest {
-            pk: 42,
+            pk: Pk::new(42),
             username: "someone",
             direction: Direction::Followers,
             from: None,
@@ -717,12 +767,12 @@ mod tests {
     async fn walk(
         server: &MockServer,
         request: ListRequest<'_>,
-    ) -> (WalkSummary, Vec<Event>, Vec<u64>) {
+    ) -> (WalkSummary, Vec<Event>, Vec<Pk>) {
         let client = client(server);
         let walker = ListWalker::new(&client);
 
         let mut events = Vec::new();
-        let mut seen: Vec<u64> = Vec::new();
+        let mut seen: Vec<Pk> = Vec::new();
 
         let summary = walker
             .walk(
@@ -764,7 +814,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::Warning(w) if w.contains("came back empty"))),
+                .any(|e| matches!(e, Event::Warning(Warning::EmptyAndNoCounter))),
             "{events:?}"
         );
     }
@@ -1172,18 +1222,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_cooldown_prevents_starting() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         struct InCooldown;
         impl RateBudget for InCooldown {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 Ok(Duration::ZERO)
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-                Ok(Some(snob_core::store::now_ms() + 3_600_000))
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
+                Ok(Some(
+                    snob_core::clock::now_ms() + Duration::from_millis(3_600_000),
+                ))
+            }
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 
@@ -1217,22 +1272,36 @@ mod tests {
     /// `MAX_PAGES_WITHOUT_NEW` would end the walk on its own and prove nothing.
     #[tokio::test]
     async fn a_cooldown_written_mid_walk_stops_the_walk() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         /// Answers `None` until the walk is under way, then `Some` — the shape
         /// of another process writing the row while this one pages.
+        ///
+        /// **Three asks, not two, and the third one is the pacer's.** The walk
+        /// consults the table at the entry check and once per iteration, and
+        /// since the backstop went into `Pacer::clear` it is consulted again
+        /// before every request. At two the cooldown became visible during the
+        /// first page's reservation, so the walk stopped with nothing read and
+        /// no cursor — which is the backstop working, and a different test from
+        /// this one. `pace.rs` covers that. This one is about the check between
+        /// pages, where the walk `break`s instead of erroring and the partial
+        /// stays resumable, so the fixture has to let a page through first.
         #[derive(Default)]
-        struct CooldownAfterTwo(std::sync::atomic::AtomicUsize);
-        impl RateBudget for CooldownAfterTwo {
+        struct CooldownAfterThree(std::sync::atomic::AtomicUsize);
+        impl RateBudget for CooldownAfterThree {
             fn reserve(&self) -> Result<Duration, RateBudgetError> {
                 Ok(Duration::ZERO)
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
-                let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok((asked >= 2).then(|| snob_core::store::now_ms() + 7_200_000))
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
+                let asked = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok((asked >= 3)
+                    .then(|| snob_core::clock::now_ms() + Duration::from_millis(7_200_000)))
+            }
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 
@@ -1246,7 +1315,7 @@ mod tests {
 
         let client = client_with(
             &server,
-            Pacer::new(std::sync::Arc::new(CooldownAfterTwo::default())),
+            Pacer::new(std::sync::Arc::new(CooldownAfterThree::default())),
         );
         let walker = ListWalker::new(&client);
         let summary = walker
@@ -1273,7 +1342,7 @@ mod tests {
     /// page without the walker having to remember to.
     #[tokio::test]
     async fn every_page_is_charged_to_the_budget() {
-        use snob_core::store::rate_budget::{RateBudget, RateBudgetError};
+        use snob_core::budget::{RateBudget, RateBudgetError};
 
         #[derive(Default)]
         struct Counting(std::sync::atomic::AtomicUsize);
@@ -1282,11 +1351,14 @@ mod tests {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(Duration::ZERO)
             }
-            fn cooldown(&self) -> Result<Option<i64>, RateBudgetError> {
+            fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
+                self.reserve()
+            }
+            fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
                 Ok(None)
             }
-            fn start_cooldown(&self, _: &str, _: Duration) -> Result<i64, RateBudgetError> {
-                Ok(0)
+            fn start_cooldown(&self, _: &str, _: Duration) -> Result<EpochMs, RateBudgetError> {
+                Ok(EpochMs::new(0))
             }
         }
 
@@ -1327,6 +1399,6 @@ mod tests {
 
         let (summary, _, seen) = walk(&server, request()).await;
         assert_eq!(summary.users, 3);
-        assert_eq!(seen, vec![1, 2, 3]);
+        assert_eq!(seen, vec![Pk::new(1), Pk::new(2), Pk::new(3)]);
     }
 }

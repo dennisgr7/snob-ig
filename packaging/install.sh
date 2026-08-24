@@ -70,6 +70,26 @@ verify() {
   [ "$expected" = "$actual" ] || die "checksum mismatch for $archive"
 }
 
+# The checksum says the file is the one the release page lists. It does not
+# say who built it: SHA256SUMS is fetched from the same page as the archive,
+# so whoever can replace one can replace both. The release workflow signs
+# build provenance through Sigstore for exactly that question, and this is
+# where somebody finally asks it. `gh` is the only client that reads those
+# attestations, so without it the step is skipped and said so -- a check that
+# silently did not run is the one outcome worse than no check.
+attest() {
+  archive="$1"
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "note: gh is not installed, so the build provenance was not verified"
+    echo "      (the checksum was). Install GitHub CLI to have it checked."
+    return 0
+  fi
+  gh attestation verify "$archive" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" >/dev/null \
+    || die "$archive does not carry a valid build provenance from $REPO's release workflow"
+  echo "Build provenance verified"
+}
+
 main() {
   t=$(target)
 
@@ -94,6 +114,7 @@ main() {
   download "$base/SHA256SUMS" "$work/SHA256SUMS"
 
   (cd "$work" && verify "$name.tar.gz" SHA256SUMS)
+  attest "$work/$name.tar.gz"
   tar -xzf "$work/$name.tar.gz" -C "$work"
 
   mkdir -p "$INSTALL_DIR"

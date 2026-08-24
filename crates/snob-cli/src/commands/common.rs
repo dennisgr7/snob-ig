@@ -10,40 +10,93 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use snob_core::filters::{Attribute, Filter, parse_username_list};
 use snob_core::model::{ListKind, User};
-use snob_core::paths::AppPaths;
-use snob_core::secrets::SecretStore;
+use snob_store::paths::AppPaths;
+use snob_store::secrets::SecretStore;
 
 use crate::app::App;
-use crate::cli::{Attr, Format, ListArgs};
+use crate::cli::{Attr, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs};
 use crate::engine::{self, ListOutcome};
+use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
-use crate::ui;
 
-/// What opening a session produced.
+/// The three forms either media listing has, and the refusal for the others —
+/// so `-o out.xlsx` cannot fall through to a table with a spreadsheet's name
+/// on it. One copy for `stories` and both levels of `highlights`: the guard
+/// began inline in `stories`, was parameterized in `highlights`, and the two
+/// had already started spelling the same refusal from two homes.
+pub fn checked_format(
+    format: Option<crate::cli::StoryFormat>,
+    destination: Option<&std::path::Path>,
+    what: &str,
+) -> Result<Format> {
+    let format = output::effective_format(format.map(Into::into), destination);
+    if matches!(format, Format::Csv | Format::Xlsx | Format::Md) {
+        anyhow::bail!(
+            "{what} has no {} form; it can be a table, json or ndjson",
+            format!("{format:?}").to_ascii_lowercase()
+        );
+    }
+    output::check_destination(format, destination)?;
+    Ok(format)
+}
+
+/// The header row of a media table, bold when color is on. Shared for the
+/// same reason as [`checked_format`]: three listings, one way to draw it.
+pub fn header_cells(names: &[&str], presentation: Presentation) -> Vec<comfy_table::Cell> {
+    names
+        .iter()
+        .map(|name| {
+            let cell = comfy_table::Cell::new(name);
+            if presentation.color {
+                cell.add_attribute(comfy_table::Attribute::Bold)
+            } else {
+                cell
+            }
+        })
+        .collect()
+}
+
+/// What opening a session produced, for the one caller that has something
+/// to do without one.
 ///
-/// An enum rather than an `Option` because the empty case is not "nothing
-/// happened": it has already told the user what to do, and the caller's only
-/// job is to return the matching code.
+/// `snob watch check` reports a missing session as one finding among
+/// several rather than stopping at it. Everything else wants [`app`], which
+/// turns the empty case into the refusal every command gives.
 pub enum Session {
     Open(Box<App>),
     Missing,
 }
 
-/// Opens the app, or explains that there is no session and says so once.
-///
-/// Every command printed this same line and returned this same code. Having one
-/// copy is what stops them drifting into three different ways of saying it.
-pub fn open(args: &ListArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Session> {
+/// Opens the app for a list command, or refuses because there is no session.
+pub fn open(walk: &WalkArgs, secrets: &SecretStore, paths: &AppPaths) -> Result<Box<App>> {
     // No bar when the answer comes out of storage: there is nothing to watch.
-    open_with_progress(!args.no_progress && !args.cache, secrets, paths)
+    app(secrets, paths, !walk.progress.no_progress && !walk.offline)
 }
 
-/// The same, for a command whose arguments are not [`ListArgs`].
+/// Opens the app, or refuses because there is no session.
 ///
-/// Split out rather than copied so that the one sentence about there being no
-/// session, and the code that goes with it, stay in one place — which is the
-/// whole reason [`open`] exists.
+/// Every command printed the same line and returned the same code, by hand,
+/// and what that cost was not drift but shape: a refusal printed as a line
+/// and returned as `Ok` went round `report::print_error`, so a caller that
+/// had asked for JSON got English on standard error for the one failure it
+/// is likeliest to meet. It is an error now, with the code and the hint
+/// every other refusal carries, and the printer decides how to say it.
+pub fn app(secrets: &SecretStore, paths: &AppPaths, with_progress: bool) -> Result<Box<App>> {
+    match open_with_progress(with_progress, secrets, paths)? {
+        Session::Open(app) => Ok(app),
+        Session::Missing => Err(no_session()),
+    }
+}
+
+/// The refusal every command gives when there is no session.
+pub fn no_session() -> anyhow::Error {
+    ExitError::new(ExitCode::NoSession, "no session is stored")
+        .with_hint("run \"snob login\"")
+        .into()
+}
+
+/// Opens the app, and says whether there was a session to open it with.
 pub fn open_with_progress(
     with_progress: bool,
     secrets: &SecretStore,
@@ -51,11 +104,84 @@ pub fn open_with_progress(
 ) -> Result<Session> {
     match App::open(secrets, paths, with_progress)? {
         Some(app) => Ok(Session::Open(Box::new(app))),
-        None => {
-            ui::no_session();
-            Ok(Session::Missing)
-        }
+        None => Ok(Session::Missing),
     }
+}
+
+/// The part of the command line the engine is asked with.
+///
+/// Here and not in `engine`, so the engine knows nothing about clap: this is
+/// the one place the parser's structs are read for what the engine needs.
+/// Two commands carry a walk, and both become the same query.
+fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
+    engine::ListQuery {
+        target: target.clone(),
+        yes: walk.consent.yes,
+        refresh: walk.refresh,
+        cache: walk.offline,
+        max_age: walk.max_age,
+        no_resume: walk.no_resume,
+        max_pages: walk.max_pages,
+    }
+}
+
+impl From<&ListArgs> for engine::ListQuery {
+    fn from(args: &ListArgs) -> Self {
+        query(&args.target, &args.walk)
+    }
+}
+
+impl From<&ScanArgs> for engine::ListQuery {
+    fn from(args: &ScanArgs) -> Self {
+        query(&args.target, &args.walk)
+    }
+}
+
+/// What is left of a list after the filter and the cap, and how many there
+/// were at each step -- the three numbers the summary line is built from.
+///
+/// Four lines, written twice, in the two commands that print a list. The
+/// numbers have to be taken in this order -- total before the filter, kept
+/// after it, shown after the cap -- and two copies of an order are two
+/// places to get it wrong.
+pub struct Narrowed {
+    pub shown: Vec<User>,
+    /// After the filter, before the cap.
+    pub kept: usize,
+    /// Before the filter.
+    pub total: usize,
+}
+
+pub fn narrow(users: Vec<User>, filter: &Filter, limit: Option<usize>) -> Narrowed {
+    let total = users.len();
+    let mut shown = filter.apply(users);
+    let kept = shown.len();
+    if let Some(cap) = limit {
+        shown.truncate(cap);
+    }
+    Narrowed { shown, kept, total }
+}
+
+/// Refuses a command outright while the account is in cooldown.
+///
+/// For the commands that have nothing stored to serve instead -- a picture,
+/// a story, a write. The list commands do not come here: `engine::cooldown`
+/// answers them out of storage, which a refusal cannot. The gate is still
+/// explicit at each call site, before anything is asked of a person and
+/// before anything is spent; what is shared is the sentence, which three
+/// commands had written out in two spellings.
+pub fn refuse_during_cooldown(app: &App, doing: &str) -> Result<()> {
+    if let Some(until_ms) = app.client().pacer().cooldown()? {
+        return Err(ExitError::new(
+            ExitCode::RateLimited,
+            format!(
+                "the account is in cooldown until {}, so {doing}",
+                report::cooldown_ends_at(until_ms)
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Where the result goes and what shape it takes.
@@ -93,8 +219,8 @@ impl Destination {
 }
 
 /// Settles the destination and refuses up front what would only fail later.
-pub fn destination(args: &ListArgs) -> Result<Destination> {
-    let path = args.output.clone();
+pub fn destination(args: &OutputArgs) -> Result<Destination> {
+    let path = args.path.clone();
     let format = output::effective_format(args.format, path.as_deref());
     output::check_destination(format, path.as_deref())?;
 
@@ -106,7 +232,7 @@ pub fn destination(args: &ListArgs) -> Result<Destination> {
 }
 
 /// Builds the filter from the arguments.
-pub fn filter_from(args: &ListArgs) -> Result<Filter> {
+pub fn filter_from(args: &FilterArgs) -> Result<Filter> {
     let mut hide: Vec<Attribute> = args.hide.iter().copied().map(attribute).collect();
     if args.no_verified && !hide.contains(&Attribute::Verified) {
         hide.push(Attribute::Verified);
@@ -157,7 +283,7 @@ fn attribute(a: Attr) -> Attribute {
 /// blank line. The caller ends it when the run is over.
 pub async fn walk_named(
     app: &mut App,
-    args: &ListArgs,
+    args: impl Into<engine::ListQuery>,
     kind: ListKind,
     subject: &str,
     check: impl FnOnce(&ListOutcome) -> Result<()>,
@@ -181,24 +307,8 @@ pub async fn walk_named(
 mod tests {
     use super::*;
 
-    fn args() -> ListArgs {
-        ListArgs {
-            target: None,
-            hide: vec![],
-            only: vec![],
-            no_verified: false,
-            exclude_list: None,
-            format: None,
-            output: None,
-            limit: None,
-            refresh: false,
-            cache: false,
-            max_age: std::time::Duration::from_secs(6 * 3600),
-            no_resume: false,
-            max_pages: None,
-            no_progress: true,
-            yes: true,
-        }
+    fn args() -> FilterArgs {
+        FilterArgs::default()
     }
 
     #[test]
@@ -245,14 +355,18 @@ mod tests {
     /// be settled before the first request rather than after the walk.
     #[test]
     fn the_destination_is_settled_from_the_arguments() {
-        let mut a = args();
-        a.output = Some(PathBuf::from("result.csv"));
-        assert_eq!(destination(&a).unwrap().format(), Format::Csv);
+        let to_file = OutputArgs {
+            format: None,
+            path: Some(PathBuf::from("result.csv")),
+        };
+        assert_eq!(destination(&to_file).unwrap().format(), Format::Csv);
 
         // A spreadsheet on standard output is refused here, before anything is
         // spent finding out.
-        let mut binary = args();
-        binary.format = Some(Format::Xlsx);
+        let binary = OutputArgs {
+            format: Some(Format::Xlsx),
+            path: None,
+        };
         assert!(destination(&binary).is_err());
     }
 }

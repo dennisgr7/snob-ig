@@ -12,7 +12,21 @@
 //! The split is by question rather than by layer: [`super`] decides what a
 //! report says, this decides where it goes and what travels with it.
 
-use super::*;
+use anyhow::{Context, Result, bail};
+use snob_core::secret::Secret;
+use snob_core::watch::Changes;
+use snob_core::{Epoch, Pk};
+use snob_store::config::{WatchConfig, WebhookConfig};
+use snob_store::secrets::{Kind, SecretStore, Stored};
+use snob_store::store::{deliveries, watch::Queued};
+use url::Url;
+
+use crate::cli::WebhookArgs;
+use crate::engine::watch::TickReport;
+use crate::ui;
+use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
+
+use super::wire::payload;
 
 /// Where reports go, once the arguments have been checked.
 pub(super) struct Delivery {
@@ -333,7 +347,7 @@ pub(super) async fn deliver(
     // the signal and "quiet" has to be told from "stopped".
     let body = match delivery.and_then(|d| event_for(&changes, d.heartbeat)) {
         Some(event) => {
-            let run_id = run_id(snob_core::store::now(), tick.report.account_pk);
+            let run_id = run_id(snob_core::clock::now(), tick.report.account_pk);
             // Serialized once, here, and stored as the string that goes on the
             // wire. `serde_json` may render one value two ways, and the
             // signature covers bytes — so a retry that rendered it again could
@@ -398,7 +412,7 @@ async fn send_one(
     body: &str,
     attempt: i64,
 ) {
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     let outcome = delivery
         .client
         .post(body, event_of(body), run_id, attempt)
@@ -474,9 +488,9 @@ async fn send_one(
 
 /// The far end's answer, whatever shape the attempt came back in.
 /// "in 4m", for a moment in the near future.
-fn describe_when(at: i64, now: i64) -> String {
-    match at.checked_sub(now) {
-        Some(seconds) if seconds > 0 => format!(
+fn describe_when(at: Epoch, now: Epoch) -> String {
+    match at - now {
+        seconds if seconds > 0 => format!(
             "in {}",
             snob_core::duration::format(std::time::Duration::from_secs(seconds as u64))
         ),
@@ -546,7 +560,7 @@ fn event_of(body: &str) -> &str {
 /// which is `exit(130)`. Nothing is gained by finishing: the rows stay pending
 /// and the next run drains them, which is the whole point of the queue.
 pub(super) async fn drain(app: &crate::app::App, delivery: &Delivery) {
-    let now = snob_core::store::now();
+    let now = snob_core::clock::now();
     let owed = match deliveries::due(app.db().conn(), now, DRAIN_LIMIT, &delivery.destination) {
         Ok(owed) => owed,
         Err(e) => {
@@ -593,14 +607,21 @@ const DRAIN_LIMIT: usize = 10;
 /// `now` is an argument rather than read inside, which is this project's shape
 /// for anything with arithmetic in it -- and here it is also what lets the
 /// uniqueness be tested without building a whole tick.
-pub(super) fn run_id(now: i64, account_pk: Pk) -> String {
-    format!("{}-{:08x}", now, fastrand::u32(..) ^ (account_pk as u32))
+pub(super) fn run_id(now: Epoch, account_pk: Pk) -> String {
+    format!(
+        "{}-{:08x}",
+        now,
+        fastrand::u32(..) ^ (account_pk.get() as u32)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::watch::tests::fixtures::{app_posting_to, list, report_with, user};
+    use crate::cli::WatchRunArgs;
+    use crate::commands::watch::fixtures::{app_posting_to, list, report_with, user};
+    use crate::commands::watch::run::run_one;
+    use snob_core::watch::{Basis, ListDiff};
 
     /// Two workflows on one host are two addresses.
     ///
@@ -648,10 +669,10 @@ mod tests {
                     after: 2,
                 },
                 ListDiff {
-                    gained: vec![user(7, "newcomer")],
+                    gained: vec![user(Pk::new(7), "newcomer")],
                     lost: vec![],
                 },
-                Some(1_000),
+                Some(Epoch::new(1_000)),
             )),
             vec![],
         )
@@ -679,13 +700,16 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1_000 {
             assert!(
-                seen.insert(run_id(1_700, 42)),
+                seen.insert(run_id(Epoch::new(1_700), Pk::new(42))),
                 "the same second and the same account produced one id twice"
             );
         }
         // And two accounts in one second, which is one run of a monitor
         // watching more than one.
-        assert_ne!(run_id(1_700, 42), run_id(1_700, 43));
+        assert_ne!(
+            run_id(Epoch::new(1_700), Pk::new(42)),
+            run_id(Epoch::new(1_700), Pk::new(43))
+        );
     }
 
     async fn accepting(server: &wiremock::MockServer) {
@@ -696,12 +720,12 @@ mod tests {
             .await;
     }
 
-    fn owe(app: &crate::app::App, delivery: &Delivery, how_many: usize, at: i64) {
+    fn owe(app: &crate::app::App, delivery: &Delivery, how_many: usize, at: Epoch) {
         for n in 0..how_many {
             deliveries::enqueue(
                 app.db().conn(),
                 &format!("run-{n}"),
-                42,
+                Pk::new(42),
                 r#"{"schema":1,"event":"watch.changes"}"#,
                 at,
                 Some(&delivery.destination),
@@ -721,7 +745,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
-        let now = snob_core::store::now();
+        let now = snob_core::clock::now();
         owe(&app, &delivery, 2, now);
 
         drain(&app, &delivery).await;
@@ -740,7 +764,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
-        let now = snob_core::store::now();
+        let now = snob_core::clock::now();
         // A literal count and a literal ceiling, not `DRAIN_LIMIT + 5` and
         // `DRAIN_LIMIT`: a test written in terms of the constant it is checking
         // passes whatever that constant becomes, which is exactly how this
@@ -792,9 +816,9 @@ mod tests {
         let id = deliveries::enqueue(
             app.db().conn(),
             "run-1",
-            42,
+            Pk::new(42),
             "{}",
-            snob_core::store::now(),
+            snob_core::clock::now(),
             Some(&delivery.destination),
         )
         .unwrap();
@@ -834,7 +858,7 @@ mod tests {
         accepting(&server).await;
         let (app, delivery) = app_posting_to(&server);
         let owed = 5;
-        owe(&app, &delivery, owed, snob_core::store::now());
+        owe(&app, &delivery, owed, snob_core::clock::now());
 
         app.cancel().cancel();
         drain(&app, &delivery).await;
@@ -869,10 +893,10 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         accepting(&server).await;
         let (mut app, delivery) = app_posting_to(&server);
-        owe(&app, &delivery, 1, snob_core::store::now());
+        owe(&app, &delivery, 1, snob_core::clock::now());
 
         let args = WatchRunArgs {
-            no_progress: true,
+            progress: crate::cli::ProgressArgs { no_progress: true },
             ..WatchRunArgs::default()
         };
         run_one(&args, &mut app, &[], Some(&delivery))

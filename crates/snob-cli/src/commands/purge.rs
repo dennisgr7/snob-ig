@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use snob_core::paths::{self, AppPaths};
-use snob_core::secrets::{Kind, SecretStore};
+use snob_store::paths::{self, AppPaths};
+use snob_store::secrets::{Kind, SecretStore};
 
 use crate::cli::PurgeArgs;
 use crate::exit::{ExitCode, ExitError};
@@ -162,7 +162,11 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
     }
 
     for dir in &plan.directories {
-        if let Err(e) = std::fs::remove_dir_all(dir) {
+        // `remove_tree`, not `remove_dir_all`: the scratch root sits at a
+        // predictable name in the shared temporary directory, and a link
+        // planted there is removed as a link instead of being reported as our
+        // failure to clean up.
+        if let Err(e) = paths::remove_tree(dir) {
             failures.push(Failure {
                 what: dir.display().to_string(),
                 why: e.to_string(),
@@ -223,18 +227,18 @@ pub fn run_with(
     let plan = survey(&store, app_paths);
 
     if plan.is_empty() {
-        println!("There is nothing of snob's stored on this computer.");
+        crate::ui::say!("There is nothing of snob's stored on this computer.");
         report_the_binary();
         return Ok(ExitCode::Ok);
     }
 
-    println!("This will delete, from this computer:");
+    crate::ui::say!("This will delete, from this computer:");
     for line in plan.lines() {
-        println!("  {line}");
+        crate::ui::say!("  {line}");
     }
 
     if args.dry_run {
-        println!("\nNothing was deleted (--dry-run).");
+        crate::ui::say!("\nNothing was deleted (--dry-run).");
         return Ok(ExitCode::Ok);
     }
 
@@ -252,34 +256,26 @@ pub fn run_with(
     // The same predicate `confirm` gates on, deliberately: two questions about
     // whether anybody is there, asked differently, is how one of them starts
     // answering for a person who is sitting right in front of it.
-    if !args.yes && !someone_is_there {
-        // `Interrupted`, which is what the README's table and `--help` both
-        // promise for "a confirmation that was not given — including with no
-        // terminal to ask at". This returned the generic failure, so a script
-        // branching on 130 to re-run with `--yes` never fired and one branching
-        // on 1 warned about a half-finished delete that had not started.
-        //
-        // The advice goes in the message rather than the hint: `print_error`
-        // returns early for this code, so a hint would be dropped. That early
-        // return is also why the duplicate `ui::info` is gone — the sentence is
-        // printed once, by the printer.
-        return Err(ExitError::new(
-            ExitCode::Interrupted,
-            "nothing was deleted: there is no terminal to confirm at.\n\
-             To delete it unattended, run \"snob purge --yes\".",
-        )
-        .into());
+    if !args.consent.yes && !someone_is_there {
+        // The shared refusal, which is where the exit code and the "advice in
+        // the message, never on a hint" rule now live — this used to build the
+        // sentence by hand, and so did `follow` and the consent gate, each a
+        // little differently.
+        return Err(crate::report::refuse_unattended(
+            "nothing was deleted: it needs confirmation".to_string(),
+            "To delete it unattended, run \"snob purge --yes\".".to_string(),
+        ));
     }
 
-    if !args.yes && !ui::confirm("\nDelete all of it?", false)? {
-        println!("Nothing was deleted.");
+    if !args.consent.yes && !ui::confirm("\nDelete all of it?", false)? {
+        crate::ui::say!("Nothing was deleted.");
         return Ok(ExitCode::Ok);
     }
 
     let failures = execute(&plan, &store);
 
     if failures.is_empty() {
-        println!("Done.");
+        crate::ui::say!("Done.");
         // Said rather than implied. Removing a file unlinks it; on any modern
         // filesystem the bytes may survive in a journal, a shadow copy, a
         // snapshot, or — on flash — in a block the drive has not yet erased.
