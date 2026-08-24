@@ -1281,7 +1281,7 @@ fn card_footer_line(here: CardRow, note: &str, colors: bool) -> Line<'static> {
 }
 
 /// What the modal needs to say no twice and yes once, for measuring.
-const ANSWER_WORDS: &str = "y  walk it now    n  leave it    esc = no";
+const ANSWER_WORDS: &str = "y  walk it now    n  leave it    esc = no"; // layout-allow: the gaps are the columns being measured
 const MODAL_MIN_W: u16 = 46;
 const MODAL_MAX_W: u16 = 72;
 
