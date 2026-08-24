@@ -1,18 +1,18 @@
 {
-    "version": "0.2.0",
+    "version": "0.5.0",
     "description": "Instagram from the terminal: who does not follow you back",
     "homepage": "https://github.com/dennisgr7/snob-ig",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.2.0/snob-v0.2.0-x86_64-pc-windows-msvc.zip",
-            "hash": "e8db71d3a34ffbd51f12ad723947a6c38fbc946746ad35e97caff53645794e53",
-            "extract_dir": "snob-v0.2.0-x86_64-pc-windows-msvc"
+            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.5.0/snob-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "hash": "6d77cd313d9af6d30c2615798179cc3d0f2dbd0e9ab976c812c7b5831095d3ba",
+            "extract_dir": "snob-v0.5.0-x86_64-pc-windows-msvc"
         },
         "arm64": {
-            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.2.0/snob-v0.2.0-aarch64-pc-windows-msvc.zip",
-            "hash": "b3323fbdce03bae7cc7ee01c52ca772cefa2b1baf8415edfaef8d592d7331d2c",
-            "extract_dir": "snob-v0.2.0-aarch64-pc-windows-msvc"
+            "url": "https://github.com/dennisgr7/snob-ig/releases/download/v0.5.0/snob-v0.5.0-aarch64-pc-windows-msvc.zip",
+            "hash": "4938d7cf8ff4b0781435e62b056aa6fdb9f157ee23140882ed7d8e100ae6b01b",
+            "extract_dir": "snob-v0.5.0-aarch64-pc-windows-msvc"
         }
     },
     "bin": "snob.exe",
