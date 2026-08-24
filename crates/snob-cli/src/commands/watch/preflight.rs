@@ -86,10 +86,19 @@ pub(super) async fn preflight(
         }),
     }
 
+    // The address as `check` may print it, with any path secret cut off.
+    // `Delivery::destination` is the exact URL on purpose -- it is the outbox
+    // key -- so the redaction happens here, where the report is built: every
+    // line and every `--json` object downstream renders what this hands over,
+    // and a Slack or Discord address printed whole is the secret printed whole.
+    let shown = delivery
+        .as_ref()
+        .map(|d| (shown_destination(&d.destination), d.signed));
+
     if let Some(line) = not_posted(
-        delivery
+        shown
             .as_ref()
-            .map(|d| (d.destination.as_str(), d.signed)),
+            .map(|(destination, signed)| (destination.as_str(), *signed)),
         args.no_webhook,
     ) {
         // Not posted is not the same as nowhere to post, and with no line at
@@ -101,7 +110,7 @@ pub(super) async fn preflight(
         report.checked.push(
             check::webhook_of(
                 &delivery.client,
-                delivery.destination.clone(),
+                shown_destination(&delivery.destination),
                 delivery.signed,
                 &id,
                 &body,
@@ -111,6 +120,18 @@ pub(super) async fn preflight(
     }
 
     Ok(report)
+}
+
+/// [`crate::watch::webhook::shown`], asked of the outbox's exact address.
+///
+/// The parse cannot really fail -- the destination began as `Url::as_str` --
+/// but an address that somehow does not parse is shown as it came rather than
+/// dropped, because which address was meant is the content of the line.
+fn shown_destination(destination: &str) -> String {
+    url::Url::parse(destination).map_or_else(
+        |_| destination.to_string(),
+        |url| crate::watch::webhook::shown(&url),
+    )
 }
 
 /// The webhook line for a run that is deliberately not posting one.

@@ -592,6 +592,17 @@ fn ask_webhook() -> Result<WebhookAnswers> {
                     printable(line)
                 );
             };
+            // Everything typed here is written into `watch.toml` in the clear
+            // -- that is the file's contract, "no secret is in it" -- and the
+            // very next question exists to put an Authorization value in the
+            // keyring instead. Accepted here, it would sit readable on disk
+            // and silently shadow the stored one at every send.
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                bail!(
+                    "an Authorization header is a secret and is not written into watch.toml. \
+                     Answer the next question instead: it stores the value in the system keyring."
+                );
+            }
             typed.push((name.trim().to_string(), value.trim().to_string()));
         }
     }

@@ -317,8 +317,19 @@ fn runtime_dir() -> PathBuf {
 /// Every failure is ignored on purpose. This is housekeeping, and a run that
 /// cannot tidy up after an earlier one still has a story to show.
 pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(root) else {
+    // Never walk through a link at the root. `read_dir` follows one, and the
+    // root sits at a predictable name in a directory anybody can write to, so
+    // "the root" could be a link into somebody's home with everything in it
+    // older than the cutoff. A link is left alone here; creating the scratch
+    // afterwards removes it as a link, the same as at the leaf.
+    let Ok(found) = std::fs::symlink_metadata(root) else {
         return; // nothing has ever run, which is the common case
+    };
+    if !found.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
     };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
@@ -408,6 +419,43 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
     restrict_to_this_account(dir)
 }
 
+/// Creates and restricts a directory at a name somebody else can predict,
+/// keeping a real directory that is already there and never following a link.
+///
+/// For the scratch **root** under the world-writable temporary directory --
+/// the parent every [`create_fresh_private_dir`] leaf sits in, and the
+/// directory [`sweep_old_scratch`] walks with `remove_dir_all`.
+/// [`create_private_dir`] cannot be trusted with that name: `create_dir_all`
+/// answers `Ok` over a planted link, and [`restrict_to_this_account`] then
+/// lands the `0700` on **whatever the link points at** -- so whoever planted
+/// it chooses which directory of this account's the age sweep then deletes
+/// out of. A link or a stray file found at the name is removed as itself --
+/// the same recipe as at the leaf -- while a real directory is kept, because
+/// it holds other runs' scratch. A real directory that belongs to somebody
+/// else fails in `restrict_to_this_account`, which is the refusal wanted.
+pub fn create_private_root(dir: &Path) -> Result<(), PathError> {
+    let create = |source| PathError::Create {
+        path: dir.to_path_buf(),
+        source,
+    };
+    if let Err(e) = std::fs::create_dir(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(create(e));
+        }
+        // `symlink_metadata` does not follow, so a link is seen as a link.
+        let found = std::fs::symlink_metadata(dir).map_err(create)?;
+        if !found.is_dir() {
+            if is_link_to_a_directory(&found) {
+                std::fs::remove_dir(dir).map_err(create)?;
+            } else {
+                std::fs::remove_file(dir).map_err(create)?;
+            }
+            std::fs::create_dir(dir).map_err(create)?;
+        }
+    }
+    restrict_to_this_account(dir)
+}
+
 /// Creates a private directory that **did not exist a moment ago**, under a
 /// parent that is made private first.
 ///
@@ -422,10 +470,11 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
 /// needs the parent to be creatable by anybody -- which `/tmp` is, and which
 /// the parent was, because only the leaf was ever restricted.
 ///
-/// Two things close it. The parent is created and restricted first, so on a
-/// run that is the first to use it nobody else can put an entry inside; and
-/// the leaf is created with `create_dir`, which fails rather than adopts when
-/// something is already there. What is already there is removed if it is
+/// Two things close it. The parent is created and restricted first — with
+/// [`create_private_root`], which refuses to follow a link planted at *its*
+/// predictable name too — so on a run that is the first to use it nobody else
+/// can put an entry inside; and the leaf is created with `create_dir`, which
+/// fails rather than adopts when something is already there. What is already there is removed if it is
 /// something this tool could have left -- an earlier run's directory under a
 /// reused process id, which Windows hands out again freely -- and the creation
 /// is tried once more. A link is removed as a link, never followed:
@@ -436,7 +485,7 @@ pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
         source,
     };
     if let Some(parent) = dir.parent() {
-        create_private_dir(parent)?;
+        create_private_root(parent)?;
     }
     if let Err(e) = std::fs::create_dir(dir) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -467,6 +516,24 @@ pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
 /// Only Windows tells the two kinds of link apart, and only there does it
 /// matter: a directory link is a directory to the call that removes it. On
 /// Unix every link is a file and `remove_file` takes it.
+/// Removes a directory tree, or a link found at the name as the link itself.
+///
+/// For `snob purge`, whose list includes the scratch root in the shared
+/// temporary directory. `remove_dir_all` already refuses a link at the top --
+/// it opens without following -- which is safe, but it reports somebody
+/// else's planted link as our failure to clean up. Taking the link as a link
+/// leaves what it points at alone and still leaves nothing of snob's behind.
+pub fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    let found = std::fs::symlink_metadata(dir)?;
+    if found.is_dir() {
+        std::fs::remove_dir_all(dir)
+    } else if is_link_to_a_directory(&found) {
+        std::fs::remove_dir(dir)
+    } else {
+        std::fs::remove_file(dir)
+    }
+}
+
 fn is_link_to_a_directory(found: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {

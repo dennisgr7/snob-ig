@@ -367,7 +367,13 @@ pub async fn fetch(
                 )
             })
             .filter(|s| !s.trim().is_empty()),
-        external_url: info.external_url.clone().filter(|s| !s.is_empty()),
+        // Filtered like every sibling field: a URL is server-supplied text,
+        // and a control character in it reaches the terminal all the same.
+        external_url: info
+            .external_url
+            .as_deref()
+            .map(printable)
+            .filter(|s| !s.is_empty()),
         is_private,
         is_verified: info.is_verified.unwrap_or(false),
         category: info
@@ -767,7 +773,16 @@ fn as_markdown(profile: &Profile) -> String {
         s.push('\n');
     }
     if let Some(url) = &profile.external_url {
-        s.push_str(&format!("<{url}>\n\n"));
+        // An autolink ends at the first `>` and breaks on a space, so a link
+        // whose text carries either would spill the rest into the document as
+        // markdown of the server's choosing. Percent-encoded rather than
+        // escaped: `md::escape` is for labels, and a backslash inside `<…>`
+        // is part of the address.
+        let safe = url
+            .replace('<', "%3C")
+            .replace('>', "%3E")
+            .replace(' ', "%20");
+        s.push_str(&format!("<{safe}>\n\n"));
     }
 
     s.push_str("| Followers | Following | Posts |\n|---:|---:|---:|\n");

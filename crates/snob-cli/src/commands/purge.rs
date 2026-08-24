@@ -162,7 +162,11 @@ pub fn execute(plan: &Plan, store: &SecretStore) -> Vec<Failure> {
     }
 
     for dir in &plan.directories {
-        if let Err(e) = std::fs::remove_dir_all(dir) {
+        // `remove_tree`, not `remove_dir_all`: the scratch root sits at a
+        // predictable name in the shared temporary directory, and a link
+        // planted there is removed as a link instead of being reported as our
+        // failure to clean up.
+        if let Err(e) = paths::remove_tree(dir) {
             failures.push(Failure {
                 what: dir.display().to_string(),
                 why: e.to_string(),
