@@ -420,6 +420,7 @@ pub async fn browse(
                                     app.client().pacer().cancel_token(),
                                     keep_folder(
                                         app.client(),
+                                        &mut tui,
                                         &media.tray,
                                         state.hl_col,
                                         &mut media.folders,

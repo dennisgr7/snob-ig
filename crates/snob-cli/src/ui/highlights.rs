@@ -40,7 +40,7 @@ use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui::browser::input::{Action, Next, TICK, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::tui;
+use crate::ui::tui::{self, Tui};
 
 /// Where the browser is, and what the arrow keys therefore move.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,7 +226,14 @@ pub async fn browse(
                     Level::Tray => {
                         let (folder_note, stopped) = watching_cancel_keys(
                             client.pacer().cancel_token(),
-                            keep_folder(client, tray, selected, &mut folders, &mut receipts),
+                            keep_folder(
+                                client,
+                                &mut tui,
+                                tray,
+                                selected,
+                                &mut folders,
+                                &mut receipts,
+                            ),
                         )
                         .await;
                         note = folder_note;
@@ -329,11 +336,14 @@ pub(crate) async fn walk_in(
 ///
 /// One at a time rather than through `download_many`, which reports each
 /// file on standard error as it lands — lines that would tear the frame this
-/// browser is holding. The note line is the browser's one place to speak, and
-/// it gets the tally; when anything was saved, the tally also joins the
-/// receipts, because the alternate screen takes the note away on exit.
+/// browser is holding. Between items this draws its own frame with the
+/// running tally, because a folder of forty items is minutes, and a screen
+/// frozen on its last frame reads as a hang. The note line gets the final
+/// tally; when anything was saved, the tally also joins the receipts,
+/// because the alternate screen takes the note away on exit.
 pub(crate) async fn keep_folder(
     client: &IgClient,
+    tui: &mut Tui,
     tray: &Tray,
     index: usize,
     folders: &mut [Folder],
@@ -349,13 +359,27 @@ pub(crate) async fn keep_folder(
     let total = items.len();
     let mut kept = 0usize;
     let mut failed = 0usize;
+    let mut stopped = false;
     for number in 1..=total {
+        // The watcher wrapping this call cancels the pacer token on q and
+        // Ctrl+C; read here, it turns "every remaining item fails fast" into
+        // an honest early stop that keeps what already landed.
+        if client.pacer().cancel_token().is_canceled() {
+            stopped = true;
+            break;
+        }
+        draw_saving(tui, &tray.username, index, number, total);
         match save_story(client, &stem, items, number, std::path::Path::new(".")).await {
             Ok(Saved::Now(_) | Saved::Already(_)) => kept += 1,
             Err(_) => failed += 1,
         }
     }
-    let note = if failed == 0 {
+    let note = if stopped {
+        format!(
+            "Stopped after {kept} of {total} from highlight {}",
+            index + 1
+        )
+    } else if failed == 0 {
         format!("Saved {kept} of highlight {} here", index + 1)
     } else {
         format!(
@@ -367,6 +391,33 @@ pub(crate) async fn keep_folder(
         receipts.push(note.clone());
     }
     note
+}
+
+/// One frame between downloads: the chrome with the count moving on the
+/// bottom edge.
+///
+/// Drawn by the loop itself rather than by the view, because the view's own
+/// frame reads the folders the loop holds mutably. A draw failure is
+/// ignored on purpose — the save is the job, the frame is the report — and
+/// the caller's next ordinary frame repaints whatever this left behind.
+fn draw_saving(tui: &mut Tui, username: &str, index: usize, number: usize, total: usize) {
+    let colors = tui::colors_enabled();
+    let _ = tui.terminal.draw(|frame| {
+        let area = frame.area();
+        let block = tui::view_block(
+            format!("Highlights · @{}", printable(username)),
+            colors,
+            tui::list_padding(area),
+        )
+        .title_bottom(tui::outcome_line(
+            format!(
+                "Saving {number} of {total} from highlight {} · q stops",
+                index + 1
+            ),
+            colors,
+        ));
+        frame.render_widget(block, area);
+    });
 }
 
 /// The note for a folder with nothing to show.
