@@ -120,6 +120,34 @@ impl WatchReport {
     }
 }
 
+/// How old a stored capture may be and still be served, when the counter polled
+/// this run says it has not moved.
+///
+/// **It has to be longer than the time between two runs, or it never serves
+/// anything.** It was six hours, the same as `--max-age`'s default and the same
+/// as the interval the setup wizard offers as its example — and the next run
+/// is due one interval after the previous one *finished*, plus a jitter that
+/// only ever moves it later. So on `every = "6h"` every capture was at least
+/// six hours old when the next run looked at it, the counter poll was spent to
+/// no purpose, and both lists were walked in full four times a day whether
+/// anything had changed or not. The same held for every longer interval.
+/// Measured against a fake server in September 2026: a capture 5h50m old with
+/// its counters unchanged cost one request; the same capture at 6h05m cost 64.
+///
+/// Walking less is the one lever the public record agrees on. Meta's own paper
+/// on its anti-scraping response system (arXiv 2502.17693, February 2025)
+/// weighs a request by how many accounts it returns, and that is what a list
+/// page is made of. A monitor that re-walks unchanged lists on a timer is the
+/// most expensive shape this tool has.
+///
+/// What the age still buys is catching the change a counter cannot see — one
+/// arrival and one departure between two runs. A day bounds how long that can
+/// go unnoticed while leaving the counter to decide on every other run; a
+/// counter that moves still walks at once. Not derived from the schedule,
+/// because `watch once` is also driven by cron and systemd timers, and there
+/// the interval is something this program never sees.
+const REUSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// An account this monitor watches.
 ///
 /// The consent is a field rather than a flag the caller passes, because it is
@@ -211,7 +239,7 @@ impl Watched {
             // A stored capture whose counter has not moved is still current, so
             // reusing it is right and costs nothing. It reads as `Unchanged`
             // against the mark, which is exactly the answer.
-            max_age: std::time::Duration::from_secs(6 * 3600),
+            max_age: REUSE_WINDOW,
             no_resume: false,
             max_pages: None,
         }
@@ -1058,6 +1086,39 @@ mod tests {
             stopped_by: None,
             resumable: false,
         }
+    }
+
+    /// A capture with an unchanged counter is served on the schedule people
+    /// actually write.
+    ///
+    /// The window used to equal the interval the setup wizard offers as its
+    /// example, and the next run is due an interval after the previous one
+    /// plus a jitter that only adds — so the capture was always just too old,
+    /// and every run walked both lists in full. Written against the schedule
+    /// itself, so a longer jitter or a shorter window fails here rather than
+    /// in somebody's account.
+    #[test]
+    fn an_unchanged_capture_outlives_the_gap_to_the_next_run() {
+        assert_eq!(REUSE_WINDOW, std::time::Duration::from_secs(24 * 3600));
+        assert_eq!(
+            watched_own_max_age(),
+            REUSE_WINDOW,
+            "the tick is what reads it"
+        );
+
+        let every = std::time::Duration::from_secs(6 * 3600);
+        let schedule = snob_core::watch::schedule::Schedule::every(every).unwrap();
+        // The longest the next run can be pushed, plus a walk of a list of a
+        // few thousand at the documented pace, between the capture and it.
+        let worst_gap = every + schedule.jitter() + std::time::Duration::from_secs(30 * 60);
+        assert!(
+            REUSE_WINDOW > worst_gap,
+            "a capture taken on one run has to still be servable on the next: {worst_gap:?}"
+        );
+    }
+
+    fn watched_own_max_age() -> std::time::Duration {
+        Watched::own().list_args().max_age
     }
 
     /// A walk that came back short is refused, and refused as *incomplete*
