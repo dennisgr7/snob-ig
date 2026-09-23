@@ -1,6 +1,6 @@
 //! Request pacing and cancellation.
 //!
-//! The numbers in [`Pace`] are copied from InstagramUnfollowers, which has
+//! The numbers in [`Pace`] are copied from InstagramUnfollowers, which had
 //! years of real use without incident, and have only been changed to make
 //! *fewer* requests. **They are not changed without a documented reason** —
 //! each one carries below what it is for, and that is what stops a number being
@@ -22,6 +22,28 @@
 //!   in the same response. This walks both lists, so for a symmetric account it
 //!   spends roughly twice the requests for the same answer. What offsets that is
 //!   a budget that persists across runs, which the reference also does not have.
+//!
+//! **And the provenance itself stopped holding in September 2026.** The
+//! reference moved off GraphQL — its query hash began answering a correct
+//! total with no accounts in it — onto this very endpoint,
+//! `/api/v1/friendships/{pk}/{kind}/?count=50`, keeping the cadence above. It
+//! runs inside the person's own browser, so its requests carry the real TLS
+//! handshake, the real cookies and the real address. Within days its tracker
+//! filled with the reports this project exists to avoid: logged out for
+//! "automated activity" at about 1,600 of 2,600 followers (issue #333, 11
+//! September), logged out or asked to change the email "every second or third
+//! time" (#340, 15 September), no settings that still work past 2,000
+//! followers (#342, 19 September). This tool's own users have since reported
+//! the same warning, in the app and on the web.
+//!
+//! So what these numbers can claim is narrower than the paragraph above says.
+//! The cadence has a record on this endpoint now, the record is short, and it
+//! is bad from a client that looks better on the wire than this one does.
+//! What the public record agrees on instead is volume: Meta's paper on the
+//! system that issues these warnings (arXiv 2502.17693, February 2025) weighs
+//! each request by the number of accounts it returns, and a list page is
+//! nothing but accounts. The pace below decides how fast a walk goes; how many
+//! walks there are, and how long they are, is what the account is judged on.
 //!
 //! **And there is a third limit, which is the honest one: nothing behind these
 //! numbers is a published rate.** An audit in August 2026 went looking for one
