@@ -62,6 +62,7 @@ pub struct BrowserCookies {
     pub csrftoken: Option<Secret>,
     pub mid: Option<String>,
     pub ig_did: Option<String>,
+    pub datr: Option<String>,
 }
 
 /// Result of validating a freshly obtained session.
@@ -116,6 +117,7 @@ pub fn session_from_cookies(
     session.csrftoken = cookies.csrftoken.clone();
     session.mid = cookies.mid.clone();
     session.ig_did = cookies.ig_did.clone();
+    session.datr = cookies.datr.clone();
     Ok(session)
 }
 
@@ -198,6 +200,7 @@ mod tests {
             csrftoken: Some("tok".into()),
             mid: Some("mid".into()),
             ig_did: Some("did".into()),
+            datr: Some("dt".into()),
         }
     }
 
@@ -209,7 +212,7 @@ mod tests {
         assert_eq!(s.csrftoken.as_ref().map(Secret::expose), Some("tok"));
         assert_eq!(
             s.cookie_header().as_str(),
-            "sessionid=42%3AAbCd%3A20; ds_user_id=42; csrftoken=tok; mid=mid; ig_did=did"
+            "sessionid=42%3AAbCd%3A20; ds_user_id=42; csrftoken=tok; mid=mid; ig_did=did; datr=dt"
         );
     }
 

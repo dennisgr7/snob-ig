@@ -477,6 +477,7 @@ fn collect(cookies: &[Value]) -> Option<BrowserCookies> {
             "csrftoken" => found.csrftoken = Some(value.into()),
             "mid" => found.mid = Some(value.to_string()),
             "ig_did" => found.ig_did = Some(value.to_string()),
+            "datr" => found.datr = Some(value.to_string()),
             _ => {}
         }
     }
@@ -602,6 +603,7 @@ mod tests {
             cookie("csrftoken", "tok", ".instagram.com"),
             cookie("mid", "m", "instagram.com"),
             cookie("ig_did", "d", ".instagram.com"),
+            cookie("datr", "dt", ".instagram.com"),
         ];
 
         let found = collect(&cookies).unwrap();
@@ -615,6 +617,10 @@ mod tests {
             Some("tok")
         );
         assert_eq!(found.ig_did.as_deref(), Some("d"));
+        // The device cookie the login was made on. Left behind, every request
+        // after the login came from a browser Instagram had never seen, on a
+        // session it had just handed to one it had.
+        assert_eq!(found.datr.as_deref(), Some("dt"));
     }
 
     /// Everything but `sessionid` is there from the moment the login page

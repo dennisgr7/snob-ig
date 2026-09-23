@@ -101,6 +101,11 @@ pub struct Session {
     pub mid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ig_did: Option<String>,
+    /// Meta's browser cookie, set on the first page load and carried by every
+    /// request the browser makes after that — the login included. Absent from
+    /// a session stored before it was captured, and from a paste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datr: Option<String>,
     pub user_agent: String,
     /// The user gave this User-Agent explicitly, so nothing may rewrite it.
     ///
@@ -148,6 +153,7 @@ impl Session {
             csrftoken: None,
             mid: None,
             ig_did: None,
+            datr: None,
             user_agent,
             user_agent_pinned: false,
             user_agent_checked_at: None,
@@ -191,6 +197,7 @@ impl Session {
             ("csrftoken", self.csrftoken.as_ref().map(Secret::expose)),
             ("mid", self.mid.as_deref()),
             ("ig_did", self.ig_did.as_deref()),
+            ("datr", self.datr.as_deref()),
         ];
         for (name, value) in optional {
             if let Some(value) = value.filter(|v| !v.is_empty()) {
@@ -227,6 +234,7 @@ impl Session {
             csrftoken: None,
             mid: None,
             ig_did: None,
+            datr: None,
             ..self.clone()
         }
     }
@@ -381,6 +389,7 @@ mod tests {
         s.csrftoken = Some(Secret::new(""));
         s.mid = Some(String::new());
         s.ig_did = Some(String::new());
+        s.datr = Some(String::new());
 
         let header = s.cookie_header();
         for pair in header.split("; ") {
