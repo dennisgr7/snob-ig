@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **The monitor stops re-walking lists that have not changed.** A stored
+  capture whose counter had not moved was served only while it was under six
+  hours old — and the next run is due an interval after the previous one
+  plus a jitter that only adds, so on `every = "6h"` or anything longer every
+  capture was always just too old, and every run walked both lists in full.
+  It is now served for a day. Against a fake server, a capture six hours and
+  five minutes old with unchanged counters went from 64 requests to one; an
+  idle account on the six-hour schedule goes from four full walks a day to
+  one. A counter that moves still walks at once.
+
+- **The login keeps Meta's browser cookie.** `datr` is set on the first page
+  load and travels with every request the browser makes after that; the
+  login captured `mid` and `ig_did` beside the session and left this one
+  behind, so every request after a browser login came without it. A session
+  stored before this change is unaffected until the next `snob login`.
+
 ## 0.5.0 — 2026-08-24
 
 - **Ctrl+C reaches a download in flight.** Inside every browser the keyboard
