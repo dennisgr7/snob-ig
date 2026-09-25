@@ -271,6 +271,20 @@ A username can be written with or without a leading `@`. If you write it on
 PowerShell, quote it — `"@someone"` — because an unquoted `@` is swallowed by
 the shell before snob ever sees it.
 
+### Without talking to Instagram at all
+
+```bash
+snob import dyi instagram-export.zip
+```
+
+Instagram will hand you your own followers and following lists: in Accounts
+Center, "Download your information", ask for "Followers and following" in JSON.
+`snob import dyi` reads that archive and prints who does not follow you back,
+who you do not follow back and who follows both ways — with no session, no
+request and nothing stored. It describes the moment Instagram built the export
+rather than this one, and it is the only way to the answer that carries no risk
+to the account at all.
+
 ## Watching over time
 
 ```bash

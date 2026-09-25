@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`snob import dyi` is in.** It reads the archive Instagram itself hands
+  over under "Download your information" and prints the same four answers
+  the live commands give, with no session and no request. It was written and
+  tested long ago and held back over what an import should be allowed to do;
+  it ships as a reader and nothing more — crossed with nothing, stored
+  nowhere — because it is the one route to the answer that sends Instagram
+  nothing at all.
+
 - **Lists are read slowly, and only so much a day.** A walk reads a page every
   one to two minutes, with a ten-to-twenty-minute break every twenty pages
   (somebody else's lists half as slow again), and every list page is charged
