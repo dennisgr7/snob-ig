@@ -254,18 +254,35 @@ impl IgClient {
             query.push(("max_id", c));
         }
         let segment = direction.segment();
-        self.get(
-            &format!("/api/v1/friendships/{pk}/{segment}/"),
-            &query,
-            // In a browser this call only ever comes from the modal that opens
-            // over the account's own page.
-            &if username.is_empty() {
-                String::new()
-            } else {
-                format!("{}/{segment}/", snob_core::model::in_a_path(username))
-            },
-        )
-        .await
+        let page: FriendshipsPage = self
+            .get(
+                &format!("/api/v1/friendships/{pk}/{segment}/"),
+                &query,
+                // In a browser this call only ever comes from the modal that
+                // opens over the account's own page.
+                &if username.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/{segment}/", snob_core::model::in_a_path(username))
+                },
+            )
+            .await?;
+        self.count_accounts(&page).await;
+        Ok(page)
+    }
+
+    /// Charges the day's accounts for what a list page carried.
+    ///
+    /// Here, beside the two endpoints that return lists, so that every caller
+    /// pays and none has to remember to — the same shape as the request budget
+    /// inside `get`. A failure to record it is logged rather than raised: the
+    /// page was already paid for and already read, and losing it over a
+    /// bookkeeping write would only mean asking for it again.
+    async fn count_accounts(&self, page: &FriendshipsPage) {
+        let accounts = u32::try_from(page.users.len()).unwrap_or(u32::MAX);
+        if let Err(e) = self.pacer.spend_accounts(accounts).await {
+            tracing::warn!(error = %e, "could not record the accounts a page carried");
+        }
     }
 
     /// A page, as HTML, exactly as a browser navigating to it would get it.
@@ -315,21 +332,24 @@ impl IgClient {
         if let Some(c) = cursor {
             query.push(("max_id", c));
         }
-        self.get(
-            &format!("/api/v1/friendships/{pk}/mutual_followers/"),
-            &query,
-            // In a browser this is the "mutual" tab of the followers dialog,
-            // which has an address of its own.
-            &if username.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "{}/followers/mutualOnly",
-                    snob_core::model::in_a_path(username)
-                )
-            },
-        )
-        .await
+        let page: FriendshipsPage = self
+            .get(
+                &format!("/api/v1/friendships/{pk}/mutual_followers/"),
+                &query,
+                // In a browser this is the "mutual" tab of the followers
+                // dialog, which has an address of its own.
+                &if username.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "{}/followers/mutualOnly",
+                        snob_core::model::in_a_path(username)
+                    )
+                },
+            )
+            .await?;
+        self.count_accounts(&page).await;
+        Ok(page)
     }
 
     /// The highlights under an account's bio. One request.

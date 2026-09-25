@@ -181,6 +181,22 @@ fn log_in(root: &Path, instagram: &MockServer) {
     );
 }
 
+/// Moves every capture in the sandbox a day and an hour into the past.
+///
+/// The monitor walks a list at most once a day however its counter moves, so
+/// a test about what the second run's walk finds has to let the day go by.
+fn a_day_passes(root: &Path) {
+    snob_store::store::Store::open_at(&root.join("data").join("snob.db"))
+        .expect("the sandbox has a database once something has run")
+        .conn()
+        .execute(
+            "UPDATE snapshots SET started_at = started_at - 90000,
+                                  taken_at = taken_at - 90000",
+            [],
+        )
+        .expect("the captures can be moved");
+}
+
 /// A `watch.toml` in the sandbox, written the way a hand-edit would.
 fn configure(root: &Path, body: &str) {
     let dir = root.join("config");
@@ -312,7 +328,8 @@ async fn a_change_reaches_the_receiver_signed_and_only_once() {
         "the first run lays a baseline and has nothing to report"
     );
 
-    // Somebody left.
+    // Somebody left, a day later.
+    a_day_passes(tmp.path());
     let second = fake_instagram(2, 2).await;
     let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -367,6 +384,7 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
     );
 
     snob(tmp.path(), Some(&first), &["watch", "once"]);
+    a_day_passes(tmp.path());
     let second = fake_instagram(2, 2).await;
     let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
     assert!(

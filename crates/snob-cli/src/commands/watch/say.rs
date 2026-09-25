@@ -32,6 +32,9 @@ pub(super) fn refusal_line(kind: ListKind, skipped: Skipped) -> String {
             match provenance {
                 Provenance::Cooldown => " (the account is in cooldown)",
                 Provenance::PollFailed => " (the check failed)",
+                Provenance::WalkedRecently => {
+                    " (it changed, but it was walked less than a day ago; a later run walks it)"
+                }
                 _ => "",
             }
         ),

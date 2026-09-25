@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Lists are read slowly, and only so much a day.** A walk reads a page every
+  one to two minutes, with a ten-to-twenty-minute break every twenty pages
+  (somebody else's lists half as slow again), and every list page is charged
+  to a daily budget of 2,000 accounts — 1,000 for a week after Instagram
+  pushes back. The old cadence, about a page every four seconds, is the one
+  InstagramUnfollowers' users began getting logged out for automated activity
+  at in September 2026. When the rest of a list will not fit in the day, the
+  run says so first and asks: pause when the day runs out and continue on its
+  own when it makes room, or finish today. `--spread` and `--same-day` answer
+  in advance; with nobody to ask, and always in the monitor, it pauses. An
+  interrupted walk can now be resumed for a day and a half rather than
+  fifteen minutes, and a walk asleep on the budget keeps its claim on the
+  capture.
+
+- **The monitor walks each list at most once a day.** A counter that moved
+  within a day of the last walk is reported by the next walk, not by an
+  immediate one.
+
 - **The monitor stops re-walking lists that have not changed.** A stored
   capture whose counter had not moved was served only while it was under six
   hours old — and the next run is due an interval after the previous one

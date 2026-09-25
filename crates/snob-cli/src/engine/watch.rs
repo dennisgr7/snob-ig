@@ -242,6 +242,12 @@ impl Watched {
             max_age: REUSE_WINDOW,
             no_resume: false,
             max_pages: None,
+            // Nobody is there to ask, and a monitor is the last thing that
+            // should go past the day's ceiling on its own say-so.
+            over_budget: Some(snob_ig::pager::OverBudget::Pause),
+            // One walk a day per list at most. A moved counter between two
+            // walks is reported by the next one, a day late at worst.
+            walk_at_most_every: Some(REUSE_WINDOW),
         }
     }
 }

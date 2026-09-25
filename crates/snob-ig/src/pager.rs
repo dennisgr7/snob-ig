@@ -113,6 +113,25 @@ pub enum Warning {
     ShortOfDeclared { walked: usize, declared: usize },
 }
 
+/// What a walk does when the day's accounts run out before the list does.
+///
+/// A choice rather than a rule because both answers cost something the person
+/// running it is better placed to weigh: pausing spreads a large list over two
+/// days and a list read over two days describes a longer stretch of time;
+/// carrying on reads more accounts in one day than the ceiling in
+/// `budget::accounts_per_day` was set at, which is what the account is judged
+/// on. Pausing is the default because it is the one that cannot make things
+/// worse with Instagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverBudget {
+    /// Stop before the page that would go over, and say how long until the
+    /// day has room. The caller decides whether to sleep and continue.
+    #[default]
+    Pause,
+    /// Read on. The pace still applies; the daily ceiling does not.
+    Continue,
+}
+
 /// What to walk.
 #[derive(Debug, Clone)]
 pub struct ListRequest<'a> {
@@ -129,6 +148,8 @@ pub struct ListRequest<'a> {
     pub max_pages: Option<u32>,
     /// How many were already stored, when resuming.
     pub already_stored: usize,
+    /// What to do when the day's accounts run out mid-walk.
+    pub over_budget: OverBudget,
 }
 
 /// How the walk ended.
@@ -141,6 +162,10 @@ pub struct WalkSummary {
     pub pending_cursor: Option<String>,
     /// The error that cut the walk short, if any.
     pub error: Option<IgError>,
+    /// Set when the walk stopped because the day's accounts ran out: how long
+    /// until there is room for the next page. The reason is then `PageLimit`,
+    /// the cursor is kept, and continuing is the caller's decision.
+    pub paused_for: Option<Duration>,
 }
 
 impl WalkSummary {
@@ -169,6 +194,18 @@ fn minutes(remaining_ms: &i64) -> String {
     match (remaining_ms / 60_000).max(1) {
         1 => "1 minute".to_string(),
         n => format!("{n} minutes"),
+    }
+}
+
+/// How many accounts the next page will carry, to ask the day's budget
+/// whether it has room for them.
+///
+/// The followers list answers about twenty-five a page whatever is asked for,
+/// and the following list honors what is asked (see [`Pace::per_page`]).
+fn expected_on_a_page(direction: Direction, pace: &Pace) -> u32 {
+    match direction {
+        Direction::Followers => pace.per_page.min(25),
+        Direction::Following => pace.per_page,
     }
 }
 
@@ -284,6 +321,23 @@ impl<'a> ListWalker<'a> {
                 break end;
             }
 
+            // The day's accounts, asked before the page rather than found out
+            // after it: a page that would go over is not asked for. Against a
+            // test server there is no day to spend, for the same reason there
+            // are no waits.
+            if self.sleeps && request.over_budget == OverBudget::Pause {
+                let wait = self
+                    .client
+                    .pacer()
+                    .accounts_wait(expected_on_a_page(request.direction, &self.pace))
+                    .await
+                    .map_err(WalkError::Budget)?;
+                if !wait.is_zero() {
+                    state.paused_for = Some(wait);
+                    break StopReason::PageLimit;
+                }
+            }
+
             // The budget's own wait is not paid here. It happens inside the
             // client, after this one, so an exhausted budget makes the walk
             // slower than the two numbers suggest — the safe direction, and
@@ -351,6 +405,7 @@ impl<'a> ListWalker<'a> {
                 state.cursor.clone()
             },
             error: state.error,
+            paused_for: state.paused_for,
         })
     }
 
@@ -483,6 +538,8 @@ struct WalkState {
     empty_in_a_row: u32,
     barren_in_a_row: u32,
     error: Option<IgError>,
+    /// See [`WalkSummary::paused_for`].
+    paused_for: Option<Duration>,
 }
 
 impl WalkState {
@@ -495,6 +552,7 @@ impl WalkState {
             empty_in_a_row: 0,
             barren_in_a_row: 0,
             error: None,
+            paused_for: None,
         }
     }
 
@@ -742,6 +800,7 @@ mod tests {
             estimated: None,
             max_pages: None,
             already_stored: 0,
+            over_budget: OverBudget::Pause,
         }
     }
 
@@ -855,15 +914,15 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
-    /// Pins the pacing policy down: the long pause lands after the seventh and
-    /// fourteenth page and nowhere else, every wait is inside its documented
+    /// Pins the pacing policy down: the long pause lands after the twentieth
+    /// and fortieth page and nowhere else, every wait is inside its documented
     /// range, and none is paid after the last page.
     #[tokio::test]
     async fn the_cadence_is_the_documented_one() {
-        let mut responses: Vec<ResponseTemplate> = (0..15)
+        let mut responses: Vec<ResponseTemplate> = (0..45)
             .map(|i| ok(body(i * 50, 50, Some(&format!("c{i}")))))
             .collect();
-        responses.push(ok(body(750, 10, None)));
+        responses.push(ok(body(2_250, 10, None)));
         let server = server(responses).await;
 
         let client = client(&server);
@@ -890,13 +949,13 @@ mod tests {
             .filter(|(_, (k, _))| *k == WaitKind::Long)
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(long.len(), 2, "the long pause must land twice in 16 pages");
+        assert_eq!(long.len(), 2, "the long pause must land twice in 46 pages");
 
         for (kind, ms) in &waits {
             let range = match kind {
-                WaitKind::Micro => (500, 2_000),
-                WaitKind::Cycle => (1_000, 1_300),
-                WaitKind::Long => (5_000, 15_000),
+                WaitKind::Micro => (1_000, 4_000),
+                WaitKind::Cycle => (55_000, 110_000),
+                WaitKind::Long => (600_000, 1_200_000),
             };
             assert!(
                 (range.0..=range.1).contains(ms),
@@ -905,7 +964,7 @@ mod tests {
         }
 
         // Nothing is waited after the last page: the final entry is the micro
-        // pause of request number sixteen.
+        // pause of request number forty-six.
         assert_eq!(
             waits.last().map(|(k, _)| *k),
             Some(WaitKind::Micro),
@@ -1336,6 +1395,125 @@ mod tests {
             summary.pending_cursor.is_some(),
             "stopping is not the same as throwing the partial away"
         );
+    }
+
+    /// A budget that holds a fixed number of accounts for the day and counts
+    /// what it is charged.
+    struct Day {
+        left: std::sync::atomic::AtomicU32,
+    }
+
+    impl snob_core::budget::RateBudget for Day {
+        fn reserve(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::ZERO)
+        }
+        fn reserve_write(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::ZERO)
+        }
+        fn cooldown(&self) -> Result<Option<EpochMs>, snob_core::budget::RateBudgetError> {
+            Ok(None)
+        }
+        fn start_cooldown(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<EpochMs, snob_core::budget::RateBudgetError> {
+            Ok(EpochMs::new(0))
+        }
+        fn accounts_wait(&self, n: u32) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            let left = self.left.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(if n <= left {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(3_600)
+            })
+        }
+        fn spend_accounts(&self, n: u32) -> Result<(), snob_core::budget::RateBudgetError> {
+            let left = self.left.load(std::sync::atomic::Ordering::Relaxed);
+            self.left
+                .store(left.saturating_sub(n), std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn zero_pace() -> Pace {
+        Pace {
+            micro_pause_ms: (0, 0),
+            cycle_wait_ms: (0, 0),
+            long_pause_ms: (0, 0),
+            ..Pace::default()
+        }
+    }
+
+    /// The page that would go past the day is not asked for: the walk stops
+    /// before it, keeps its cursor, and says how long until there is room.
+    #[tokio::test]
+    async fn the_page_that_would_go_past_the_day_is_not_asked_for() {
+        let server = server(vec![
+            ok(body(0, 25, Some("c1"))),
+            ok(body(25, 25, Some("c2"))),
+            ok(body(50, 25, None)),
+        ])
+        .await;
+        let budget = std::sync::Arc::new(Day {
+            left: std::sync::atomic::AtomicU32::new(60),
+        });
+        let client = client_with(&server, Pacer::new(budget.clone()));
+        let mut walker = ListWalker::new(&client).with_pace(zero_pace());
+        walker.sleeps = true;
+
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::PageLimit);
+        assert_eq!(
+            summary.pages, 2,
+            "sixty accounts fit two pages of twenty-five"
+        );
+        assert_eq!(summary.pending_cursor.as_deref(), Some("c2"));
+        assert_eq!(summary.paused_for, Some(Duration::from_secs(3_600)));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "the third page was never requested"
+        );
+        assert_eq!(
+            budget.left.load(std::sync::atomic::Ordering::Relaxed),
+            10,
+            "what the two pages carried was charged"
+        );
+    }
+
+    /// Choosing to finish today reads past the day, and still charges it.
+    #[tokio::test]
+    async fn finishing_today_reads_past_the_day() {
+        let server = server(vec![
+            ok(body(0, 25, Some("c1"))),
+            ok(body(25, 25, Some("c2"))),
+            ok(body(50, 25, None)),
+        ])
+        .await;
+        let budget = std::sync::Arc::new(Day {
+            left: std::sync::atomic::AtomicU32::new(30),
+        });
+        let client = client_with(&server, Pacer::new(budget.clone()));
+        let mut walker = ListWalker::new(&client).with_pace(zero_pace());
+        walker.sleeps = true;
+
+        let request = ListRequest {
+            over_budget: OverBudget::Continue,
+            ..request()
+        };
+        let summary = walker
+            .walk(request, |p, _| Ok(p.users.len()), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Completed);
+        assert_eq!(summary.paused_for, None);
+        assert_eq!(budget.left.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// The point of moving the budget into the client: a walk pays for every

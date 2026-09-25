@@ -692,6 +692,10 @@ fn list_query(typed: Option<&str>) -> engine::ListQuery {
         max_age: MAX_AGE,
         no_resume: false,
         max_pages: None,
+        // Asked from inside a drawn screen, where a question cannot be put:
+        // the safe answer, which never goes past the day's ceiling.
+        over_budget: Some(snob_ig::pager::OverBudget::Pause),
+        walk_at_most_every: None,
     }
 }
 

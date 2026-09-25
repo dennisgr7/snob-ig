@@ -627,6 +627,16 @@ pub struct WalkArgs {
     #[arg(long, value_name = "N", conflicts_with = "offline")]
     pub max_pages: Option<u32>,
 
+    /// If the list does not fit in today's account budget, pause when it runs
+    /// out and continue on its own when the day makes room
+    #[arg(long, conflicts_with_all = ["offline", "same_day"])]
+    pub spread: bool,
+
+    /// If the list does not fit in today's account budget, finish it today
+    /// anyway (riskier for the account)
+    #[arg(long, conflicts_with = "offline")]
+    pub same_day: bool,
+
     #[command(flatten)]
     pub progress: ProgressArgs,
 
@@ -645,6 +655,8 @@ impl Default for WalkArgs {
             max_age: std::time::Duration::from_secs(6 * 3600),
             no_resume: false,
             max_pages: None,
+            spread: false,
+            same_day: false,
             progress: ProgressArgs::default(),
             consent: ConsentArgs::default(),
         }

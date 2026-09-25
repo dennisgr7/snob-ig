@@ -479,6 +479,38 @@ pub const READING_SOMEBODY_ELSES_LIST: &str = "this reads a list that belongs to
      in your local database. It is also a heavier request than reading your own, \
      and Instagram is readier to refuse it";
 
+/// The rest of a list is more than the day's accounts can cover.
+pub fn over_the_day(needed: u64, left: u64) -> String {
+    format!(
+        "the rest of this list is about {needed} accounts and today's budget has {left} left. \
+         Reading more than that in a day is the pattern Instagram answers with an \
+         automated-activity warning"
+    )
+}
+
+/// The choice, asked with pausing as the default because it is the one that
+/// cannot make things worse with Instagram.
+pub const ASK_FINISH_TODAY: &str = "Finish it today anyway? (No pauses when the budget runs out \
+     and continues on its own when the day makes room)";
+
+/// Said when nobody was there to ask.
+pub const PAUSING_WITHOUT_ASKING: &str = "it will pause when the budget runs out and continue on \
+     its own; --same-day finishes it today instead";
+
+/// The walk stopped for the day's accounts and is waiting to go on.
+pub fn paused_for_the_day(wait: std::time::Duration) -> String {
+    let minutes = wait.as_secs().div_ceil(60);
+    let when = if minutes < 120 {
+        format!("{minutes} minutes")
+    } else {
+        format!("about {} hours", minutes.div_ceil(60))
+    };
+    format!(
+        "today's account budget is spent; waiting {when} to continue from where it stopped. \
+         Ctrl+C stops here, and the next run picks up from the same page"
+    )
+}
+
 /// The consent question, with the account named the way the warning above
 /// named it.
 pub fn ask_to_continue(shown: &str) -> String {

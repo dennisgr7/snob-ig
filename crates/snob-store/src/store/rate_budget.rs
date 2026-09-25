@@ -39,6 +39,11 @@ use crate::paths::AppPaths;
 const PACE_BUCKET: &str = "pace";
 const DAILY_BUCKET: &str = "daily";
 const WRITE_BUCKET: &str = "writes";
+/// Accounts read off lists, rather than requests. Same table, same algorithm,
+/// a different unit: one emission is one account.
+const ACCOUNTS_BUCKET: &str = "accounts";
+/// A day, the window the accounts ceiling is stated over.
+const DAY_MS: i64 = 86_400_000;
 /// The only value of `cooldowns.scope`. A cooldown covers the whole session.
 const SESSION_SCOPE: &str = "session";
 
@@ -307,6 +312,43 @@ impl SqliteRateBudget {
             pace_wait.max(daily_wait).max(write_wait).max(0) as u64,
         ))
     }
+
+    /// What one account costs in the accounts bucket today, from the ceiling
+    /// in force. Halved ceiling, doubled cost: the bucket's stored instant is
+    /// a time, so a lower ceiling makes what was already spent weigh more.
+    fn account_emission(conn: &Connection, now: EpochMs) -> Result<i64, RateBudgetError> {
+        let last_push_back: Option<EpochMs> = conn
+            .query_row(
+                "SELECT set_at_ms FROM cooldowns WHERE scope = ?1",
+                params![SESSION_SCOPE],
+                |row| Ok(EpochMs::new(row.get(0)?)),
+            )
+            .optional()
+            .map_err(budget_err)?;
+        let per_day = snob_core::budget::accounts_per_day(last_push_back, now);
+        Ok(DAY_MS / i64::from(per_day.max(1)))
+    }
+
+    /// The accounts bucket's theoretical instant, read without moving it.
+    fn accounts_tat(conn: &Connection, now: EpochMs) -> Result<EpochMs, RateBudgetError> {
+        let row: Option<(EpochMs, EpochMs)> = conn
+            .query_row(
+                "SELECT tat_ms, updated_at_ms FROM rate_budget WHERE bucket = ?1",
+                params![ACCOUNTS_BUCKET],
+                |row| Ok((EpochMs::new(row.get(0)?), EpochMs::new(row.get(1)?))),
+            )
+            .optional()
+            .map_err(budget_err)?;
+        Ok(match row {
+            Some((_, updated))
+                if now + Duration::from_millis(CLOCK_SKEW_TOLERANCE_MS as u64) < updated =>
+            {
+                now
+            }
+            Some((tat, _)) => tat.max(now),
+            None => now,
+        })
+    }
 }
 
 impl RateBudget for SqliteRateBudget {
@@ -316,6 +358,55 @@ impl RateBudget for SqliteRateBudget {
 
     fn reserve_write(&self) -> Result<Duration, RateBudgetError> {
         self.reserve_buckets(true)
+    }
+
+    /// GCRA asked about `accounts` emissions at once, without committing: a
+    /// day of burst, so the first two thousand of a day go at the walker's own
+    /// pace and the rest wait for the day to make room.
+    fn accounts_wait(&self, accounts: u32) -> Result<Duration, RateBudgetError> {
+        let now = now_ms();
+        let conn = self.conn();
+        let emission = Self::account_emission(&conn, now)?;
+        let tat = Self::accounts_tat(&conn, now)?;
+        let after = tat + Duration::from_millis((emission * i64::from(accounts)) as u64);
+        let wait = (after - Duration::from_millis(DAY_MS as u64)) - now;
+        Ok(Duration::from_millis(wait.max(0) as u64))
+    }
+
+    /// Charged after the page arrived, for what it actually carried — asking
+    /// for fifty and being served twenty-five is twenty-five accounts.
+    fn spend_accounts(&self, accounts: u32) -> Result<(), RateBudgetError> {
+        if accounts == 0 {
+            return Ok(());
+        }
+        let now = now_ms();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(budget_err)?;
+        let emission = Self::account_emission(&tx, now)?;
+        let tat = Self::accounts_tat(&tx, now)?
+            + Duration::from_millis((emission * i64::from(accounts)) as u64);
+        tx.execute(
+            "INSERT INTO rate_budget (bucket, tat_ms, emission_ms, burst_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(bucket) DO UPDATE SET
+                 tat_ms = excluded.tat_ms,
+                 emission_ms = excluded.emission_ms,
+                 burst_ms = excluded.burst_ms,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![ACCOUNTS_BUCKET, tat.get(), emission, DAY_MS, now.get()],
+        )
+        .map_err(budget_err)?;
+        tx.commit().map_err(budget_err)
+    }
+
+    fn accounts_left(&self) -> Result<u32, RateBudgetError> {
+        let now = now_ms();
+        let conn = self.conn();
+        let emission = Self::account_emission(&conn, now)?;
+        let used = Self::accounts_tat(&conn, now)? - now;
+        Ok(((DAY_MS - used).max(0) / emission.max(1)) as u32)
     }
 
     fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
@@ -701,6 +792,53 @@ mod tests {
         }
         let until = b.cooldown().unwrap().unwrap();
         assert!(until - now_ms() <= MAX_COOLDOWN_MS);
+    }
+
+    /// A day's accounts go through without waiting, and the next ones wait for
+    /// the day to make room.
+    #[test]
+    fn the_account_budget_holds_a_day_and_then_rations() {
+        let (_tmp, b) = temp_budget();
+        assert_eq!(b.accounts_left().unwrap(), 2_000);
+        assert_eq!(b.accounts_wait(25).unwrap(), Duration::ZERO);
+
+        for _ in 0..79 {
+            b.spend_accounts(25).unwrap();
+        }
+        assert_eq!(b.accounts_left().unwrap(), 25);
+        assert_eq!(b.accounts_wait(25).unwrap(), Duration::ZERO);
+        b.spend_accounts(25).unwrap();
+
+        assert_eq!(b.accounts_left().unwrap(), 0);
+        let wait = b.accounts_wait(25).unwrap();
+        // Twenty-five accounts at 43.2 seconds each, less the few
+        // milliseconds the test itself took.
+        assert!(
+            wait > Duration::from_secs(1_070) && wait <= Duration::from_secs(1_080),
+            "{wait:?}"
+        );
+    }
+
+    /// Asking does not spend: the ration is only moved by what was read.
+    #[test]
+    fn asking_about_accounts_spends_none() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..10 {
+            b.accounts_wait(2_000).unwrap();
+        }
+        assert_eq!(b.accounts_left().unwrap(), 2_000);
+    }
+
+    /// A push-back halves the day, and what was already read weighs double.
+    #[test]
+    fn a_push_back_halves_what_is_left() {
+        let (_tmp, b) = temp_budget();
+        b.spend_accounts(500).unwrap();
+        assert_eq!(b.accounts_left().unwrap(), 1_500);
+
+        b.start_cooldown("feedback_required", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(b.accounts_left().unwrap(), 750);
     }
 
     /// Proves the budget really is shared between connections, which is what

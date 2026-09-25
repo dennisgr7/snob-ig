@@ -492,10 +492,18 @@ to:
   churn that automating a list makes easy is a growth-hacking trick, not
   housekeeping, and not what this is for. Writing your own loop around it is
   your business; shipping you the loop is not something snob will do.
-- **Requests are paced**, with the timings borrowed from
-  [InstagramUnfollowers][iu], which has years of real use behind it, and only
-  ever adjusted downwards. Nothing in snob can send a request without paying for
-  it first.
+- **Lists are read slowly, and only so much a day.** A page every one to two
+  minutes, a long break every five hundred or so accounts, and a ceiling of
+  2,000 accounts a day across every list read — 1,000 for a week after
+  Instagram has pushed back. What Instagram judges an account on is how many
+  accounts it reads, not how politely it asks: the timings this used to borrow
+  from [InstagramUnfollowers][iu] started getting that project's users logged
+  out for automated activity in September 2026. A list that does not fit in
+  what is left of the day is flagged before the walk starts: by default the
+  walk pauses when the day runs out and continues on its own when it makes
+  room (`--spread`), and `--same-day` finishes it anyway. A scan of a thousand
+  followers now takes most of an hour. Nothing in snob can send a request
+  without paying for it first.
 - **The first refusal stops the run.** A 429, a `feedback_required` or a
   challenge ends it immediately and puts the account in cooldown. There is no
   retry loop: when a service says no, the answer is to stop asking, and pushing

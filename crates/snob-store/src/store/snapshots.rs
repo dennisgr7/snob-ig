@@ -19,7 +19,17 @@ use snob_core::{Epoch, Pk};
 /// Past the window it is not resumed: stitching two separate moments together
 /// produces a list that reflects no single instant, and comparing it against
 /// another invents arrivals and departures that never happened.
-pub const RESUME_WINDOW_SECS: i64 = 15 * 60;
+///
+/// **A day and a half, and it was fifteen minutes.** Fifteen minutes was right
+/// for a walk that read a page every four seconds. Walks now read a page every
+/// one to two minutes and stop for the day when the day's accounts are spent
+/// (`pace.rs`, `budget::accounts_per_day`), so a list of a thousand takes most
+/// of an hour and a large one spans two days by design. At fifteen minutes
+/// every one of those would have been unresumable, and every interruption
+/// would have paid again for the pages already read — which is the one thing
+/// the slower pace exists to stop. A day and a half covers a walk paused
+/// overnight and the run that picks it up the next day.
+pub const RESUME_WINDOW_SECS: i64 = 36 * 3600;
 
 /// How long a claim on a walk outlives the last page it saved.
 ///
@@ -40,14 +50,16 @@ pub const RESUME_WINDOW_SECS: i64 = 15 * 60;
 /// interrupted walk of every list started again from page one, at the full cost
 /// of the requests it had already paid for.
 ///
-/// Five minutes rather than something tighter because the pacer can legitimately
-/// be quiet for a while: `Pace::third_party` waits up to thirty seconds between
-/// pages, and the request budget can ration on top of that. And rather than
+/// Forty-five minutes rather than something tighter because the walker is
+/// quiet for long stretches on purpose: `Pace::third_party` waits up to three
+/// minutes between pages and takes a break of up to half an hour every ten.
+/// A walk paused for the day's accounts is quiet for hours, and refreshes the
+/// claim itself with [`keep_claim`] while it waits. And rather than
 /// something looser because losing a claim is no longer a way to corrupt a
 /// capture: `save_page` refuses to write into a snapshot this process does not
 /// hold, so a walk whose claim was taken stops instead of interleaving with the
 /// walk that took it.
-pub const CLAIM_TTL_SECS: i64 = 5 * 60;
+pub const CLAIM_TTL_SECS: i64 = 45 * 60;
 
 /// The ordering above, enforced where it cannot be argued with: a build in which
 /// a killed walk can never be adopted does not compile.
@@ -333,6 +345,23 @@ pub fn mark_resumed(conn: &Connection, id: i64) -> Result<(), StoreError> {
         params![id],
     )?;
     Ok(())
+}
+
+/// Tells other processes the walk holding `id` is still here, while it waits
+/// rather than saves.
+///
+/// A walk paused for the day's accounts saves nothing for hours, and without
+/// this its claim would go stale after [`CLAIM_TTL_SECS`] and another process
+/// could adopt a walk whose owner is only asleep. Only the owner may refresh:
+/// `false` means the claim is somebody else's now, and the sleeper should stop
+/// rather than wake up to a row it no longer holds.
+pub fn keep_claim(store: &Store, id: i64) -> Result<bool, StoreError> {
+    let held = store.conn().execute(
+        "UPDATE snapshots SET claimed_at = ?3
+         WHERE id = ?1 AND claimed_by = ?2 AND complete = 0",
+        params![id, this_process(), now().get()],
+    )?;
+    Ok(held > 0)
 }
 
 /// Saves a whole page in a single transaction: the users, their membership in
@@ -767,8 +796,8 @@ mod tests {
 
     #[test]
     fn the_two_windows_are_the_documented_ones() {
-        assert_eq!(RESUME_WINDOW_SECS, 15 * 60);
-        assert_eq!(CLAIM_TTL_SECS, 5 * 60);
+        assert_eq!(RESUME_WINDOW_SECS, 36 * 3600);
+        assert_eq!(CLAIM_TTL_SECS, 45 * 60);
     }
 
     fn base() -> Store {
@@ -792,6 +821,23 @@ mod tests {
                 params![id, at.get()],
             )
             .unwrap();
+    }
+
+    /// A walk asleep on the day's accounts keeps its claim, and only its own.
+    #[test]
+    fn a_sleeping_walk_keeps_its_claim_and_nobody_elses() {
+        let mut db = base();
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        assert!(keep_claim(&db, id).unwrap(), "the walk's own claim");
+
+        claimed_by_somebody_else(&db, id, now());
+        assert!(
+            !keep_claim(&db, id).unwrap(),
+            "a claim another process took is not refreshed from here"
+        );
     }
 
     /// A walk somebody else is in the middle of is not adopted.
