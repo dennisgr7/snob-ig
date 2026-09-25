@@ -298,10 +298,17 @@ pub enum Command {
                       An account named like a subcommand -- \"status\", \"once\", \"diff\",                       \"check\", \"setup\" -- is read as the subcommand; write it \"@status\"                       to watch the account."
     )]
     Watch(WatchArgs),
-    // `import dyi` is written and tested but not wired up here on purpose: the
-    // reader works, and what is unfinished is the question of what an import
-    // should be able to do once it is in. Leaving it out of the CLI keeps the
-    // published surface to what has been settled. See `commands::import`.
+
+    /// Read Instagram's own data export, with no session and no request
+    #[command(
+        subcommand,
+        after_help = "The one way to answer who does not follow you back without anything \
+                      talking to Instagram on your behalf: request \"Followers and following\" \
+                      in JSON from Accounts Center, \"Download your information\", and point \
+                      this at the archive. It reads, prints and stores nothing; what it shows \
+                      describes the moment Instagram built the export."
+    )]
+    Import(crate::commands::import::ImportCommand),
 }
 
 #[derive(Args, Debug)]
@@ -627,6 +634,12 @@ pub struct WalkArgs {
     #[arg(long, value_name = "N", conflicts_with = "offline")]
     pub max_pages: Option<u32>,
 
+    /// If the list does not fit in today's account budget, finish it today
+    /// anyway instead of pausing until the day makes room (riskier for the
+    /// account)
+    #[arg(long, conflicts_with = "offline")]
+    pub same_day: bool,
+
     #[command(flatten)]
     pub progress: ProgressArgs,
 
@@ -645,6 +658,7 @@ impl Default for WalkArgs {
             max_age: std::time::Duration::from_secs(6 * 3600),
             no_resume: false,
             max_pages: None,
+            same_day: false,
             progress: ProgressArgs::default(),
             consent: ConsentArgs::default(),
         }

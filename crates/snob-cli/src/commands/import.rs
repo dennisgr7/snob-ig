@@ -1,13 +1,13 @@
 //! `snob import dyi`: reads the archive Instagram hands over under "Download
 //! your information" and works out the same relationships the live commands do.
 //!
-//! **Not reachable from the CLI.** The reader below works and is covered by
-//! tests, but the command is deliberately not registered in `cli.rs`: what is
-//! unsettled is not the parsing, it is what an import should be able to do once
-//! it is in — whether it can be crossed against a live list, how it should be
-//! exported, and whether it belongs in the store at all. Shipping the subcommand
-//! would answer those questions by accident. Re-registering it is two lines,
-//! once they have answers.
+//! **Registered in September 2026, as a reader and nothing more.** It was held
+//! back while three questions stayed open — whether an import can be crossed
+//! against a live list, how it is exported, whether it belongs in the store —
+//! and it ships answering all three the conservative way: it is crossed with
+//! nothing, printed as it always was, and stored nowhere. What changed is that
+//! the live commands started drawing Instagram's automated-activity warning,
+//! and this is the one route to the same answer that sends Instagram nothing.
 //!
 //! It costs nothing and risks nothing: no session, no network, no request. That
 //! is the whole point — it is the answer for anyone who would rather not have a
@@ -43,11 +43,7 @@ use crate::ui;
 /// archive able to ask for gigabytes.
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Not reachable from the CLI yet; see the note on [`crate::cli::Command`].
-///
-/// Defined here rather than in `cli.rs` on purpose: until it is wired up,
-/// `cli.rs` describes only what exists, and the enum lives next to the one
-/// function that takes it.
+/// `snob import`'s subcommands. Next to the one function that takes them.
 #[derive(Subcommand, Debug)]
 pub enum ImportCommand {
     /// Import Instagram's "Download your information" archive

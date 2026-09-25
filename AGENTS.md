@@ -363,9 +363,9 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 
 ## Open, not yet taken
 
-- **`commands::import`** reads Instagram's data export and is tested, but is
-  not registered in `cli.rs` — what an import may do once it is in (crossed
-  against a live list? stored?) is the unsettled half.
+- **`snob import dyi`** is registered as a reader and nothing more: it is
+  crossed with nothing, stores nothing and sends nothing. Whether an import
+  may be crossed against a live list or stored is still the unsettled half.
 - Two endpoints worth a command someday, both GETs about the viewer's own
   account: `friendships/pending/` (follow requests awaiting an answer) and
   `archive/reel/day_shells/` (the story archive).

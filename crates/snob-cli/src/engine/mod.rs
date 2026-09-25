@@ -60,6 +60,11 @@ pub enum Provenance {
     PollFailed,
     /// Stored, served because `--offline` said not to look.
     CacheFlag,
+    /// Stored, served because the counter moved but the list was walked less
+    /// than [`ListQuery::walk_at_most_every`] ago. The change is real and is
+    /// left for a later walk to read: a monitor re-walking a list every time a
+    /// counter ticks is the volume Instagram judges an account on.
+    WalkedRecently,
 }
 
 impl Provenance {
@@ -245,6 +250,13 @@ pub struct ListQuery {
     pub no_resume: bool,
     /// Stop after this many pages.
     pub max_pages: Option<u32>,
+    /// What a walk does when the day's accounts run out before the list
+    /// does. `None` pauses, and says so first when the list will not fit;
+    /// `Some` is a caller that already knows and wants nothing said.
+    pub over_budget: Option<snob_ig::pager::OverBudget>,
+    /// The shortest gap between two walks of one list, whatever the counter
+    /// says. `None` walks whenever the stored list no longer answers.
+    pub walk_at_most_every: Option<std::time::Duration>,
 }
 
 impl From<&ListQuery> for ListQuery {

@@ -82,6 +82,9 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Format::Json
         ),
         Command::Whoami(args) => args.output.json,
+        // It takes no format flag and answers in JSON down a pipe, the way
+        // `commands::import::run` decides it.
+        Command::Import(_) => matches!(effective_format(None, None), Format::Json | Format::Ndjson),
         Command::Watch(args) => match &args.command {
             None => args.run.output.json,
             Some(WatchCommand::Once(once)) => once.output.json,
@@ -267,6 +270,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             commands::follow::run(args, commands::follow::Verb::Unfollow, store, &paths).await
         }
         Command::Watch(args) => commands::watch::run(args, store, &paths).await,
+        Command::Import(command) => commands::import::run(command),
     }
 }
 

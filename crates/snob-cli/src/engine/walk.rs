@@ -9,7 +9,7 @@ use anyhow::Result;
 use snob_core::Epoch;
 use snob_core::model::{ListKind, User};
 use snob_ig::pace::Pace;
-use snob_ig::pager::{ListRequest, ListWalker, WalkError};
+use snob_ig::pager::{ListRequest, ListWalker, OverBudget, WalkError};
 use snob_store::store::{now, snapshots};
 
 use crate::app::App;
@@ -28,22 +28,8 @@ pub async fn fetch(
     let opened = open_snapshot(app, args, kind, target, declared)?;
     let id = opened.id;
 
-    let request = ListRequest {
-        pk: target.pk,
-        // Empty when the name was never learned, which the pager documents as
-        // allowed and simply leaves the referer generic. It used to be the
-        // numeric id, so the walk announced
-        // `Referer: https://www.instagram.com/42/followers/` — a page
-        // no browser would ever have been on.
-        username: target.username.as_deref().unwrap_or_default(),
-        direction: kind.into(),
-        from: opened.cursor.as_deref(),
-        estimated: declared,
-        max_pages: args.max_pages,
-        already_stored: opened.already_stored,
-    };
+    let over_budget = choose_over_budget(app, args, declared, opened.already_stored)?;
 
-    let cancel = app.cancel().clone();
     // Somebody else's lists are walked more slowly. This is the one place that
     // decides it, so the set commands and `scan` inherit it by coming through
     // here rather than each remembering to ask.
@@ -53,38 +39,82 @@ pub async fn fetch(
         Pace::third_party()
     };
 
-    // The borrow of the store is handed to the callback for the duration of the
-    // walk, which is why the three come out together.
-    let (client, db, progress) = app.parts();
-    let walker = ListWalker::new(client).with_cancel(cancel).with_pace(pace);
+    let mut cursor = opened.cursor.clone();
+    let mut already_stored = opened.already_stored;
+    // Pages read in the rounds before this one, so `--max-pages` caps the
+    // walk and not each stretch between two pauses.
+    let mut pages_before: u32 = 0;
 
-    let summary = match walker
-        .walk(
-            request,
-            |page, _| {
-                let batch: Vec<User> = page.users.iter().map(User::from).collect();
-                Ok(snapshots::save_page(db, id, &batch, page.next_cursor())?.added)
-            },
-            |event| progress.event(&event),
-        )
-        .await
-    {
-        Ok(summary) => summary,
-        // Reachable only when the cooldown lands between the check in
-        // `engine::list` and the walk, e.g. set by another process.
-        Err(WalkError::Cooldown { until_ms, .. }) => {
-            return Err(crate::report::refuse_cooldown_mid_walk(until_ms));
+    // Round again only when the walk paused for the day's accounts and the
+    // choice was to wait for them: the same snapshot, from the cursor it
+    // stopped at, under the claim this process has kept alive while asleep.
+    let summary = loop {
+        let request = ListRequest {
+            pk: target.pk,
+            // Empty when the name was never learned, which the pager documents
+            // as allowed and simply leaves the referer generic. It used to be
+            // the numeric id, so the walk announced
+            // `Referer: https://www.instagram.com/42/followers/` — a page
+            // no browser would ever have been on.
+            username: target.username.as_deref().unwrap_or_default(),
+            direction: kind.into(),
+            from: cursor.as_deref(),
+            estimated: declared,
+            max_pages: args.max_pages.map(|max| max.saturating_sub(pages_before)),
+            already_stored,
+            over_budget,
+        };
+
+        let cancel = app.cancel().clone();
+        // The borrow of the store is handed to the callback for the duration
+        // of the walk, which is why the three come out together.
+        let (client, db, progress) = app.parts();
+        let walker = ListWalker::new(client).with_cancel(cancel).with_pace(pace);
+
+        let mut summary = match walker
+            .walk(
+                request,
+                |page, _| {
+                    let batch: Vec<User> = page.users.iter().map(User::from).collect();
+                    Ok(snapshots::save_page(db, id, &batch, page.next_cursor())?.added)
+                },
+                |event| progress.event(&event),
+            )
+            .await
+        {
+            Ok(summary) => summary,
+            // Reachable only when the cooldown lands between the check in
+            // `engine::list` and the walk, e.g. set by another process.
+            Err(WalkError::Cooldown { until_ms, .. }) => {
+                return Err(crate::report::refuse_cooldown_mid_walk(until_ms));
+            }
+            // A crossing walks two lists in the same run, so "the walk failed"
+            // did not say which one stopped. The name goes through `printable`
+            // for the same reason every other account name this tool prints
+            // does: it came off Instagram, not out of anybody's keyboard.
+            Err(error) => {
+                let who = crate::app::target_label(target.username.as_deref());
+                return Err(anyhow::Error::new(error)
+                    .context(format!("could not read {who}'s {kind} list")));
+            }
+        };
+
+        let Some(wait) = summary.paused_for else {
+            break summary;
+        };
+        app.progress().finish();
+        app.warn(&crate::report::paused_for_the_day(wait));
+        if !sleep_keeping_claim(app, id, wait).await? {
+            summary.reason = snob_core::model::StopReason::Canceled;
+            break summary;
         }
-        // A crossing walks two lists in the same run, so "the walk failed" did
-        // not say which one stopped. The name goes through `printable` for the
-        // same reason every other account name this tool prints does: it came
-        // off Instagram, not out of anybody's keyboard.
-        Err(error) => {
-            let who = crate::app::target_label(target.username.as_deref());
-            return Err(
-                anyhow::Error::new(error).context(format!("could not read {who}'s {kind} list"))
-            );
-        }
+        cursor = summary.pending_cursor.clone();
+        // The walker counts from what was already stored, so its total is the
+        // snapshot's. Adding it to the old figure counted every stored account
+        // twice, and the completion check then took a list that had come back
+        // short for a whole one.
+        already_stored = summary.users;
+        pages_before += summary.pages;
     };
 
     snapshots::close(app.db().conn(), id, summary.reason)?;
@@ -128,6 +158,70 @@ pub async fn fetch(
             resumable,
         },
     ))
+}
+
+/// What to do if the day's accounts run out mid-walk, and saying so first
+/// when it will matter.
+///
+/// **It pauses unless `--same-day` said otherwise, and it asks nothing.** It
+/// used to ask whether to finish today, which broke the rule that a command
+/// asks one question and `-y` answers it in advance: a crossing walks two
+/// lists and could ask twice, a stranger's list asked it after the consent
+/// question, and `-y` answered neither. Pausing is the answer that cannot make
+/// things worse with Instagram, so it is the one given without asking, and the
+/// warning names the flag that gives the other.
+///
+/// The warning is only worth giving when the rest of the list is larger than
+/// what the day has left, and only a walk against Instagram has a day to
+/// spend — the pager ignores the budget against a test server. Without a
+/// counter the size is unknown and nothing is said; the walk pauses if it has
+/// to.
+fn choose_over_budget(
+    app: &App,
+    args: &ListQuery,
+    declared: Option<u64>,
+    already_stored: usize,
+) -> Result<OverBudget> {
+    if let Some(chosen) = args.over_budget {
+        return Ok(chosen);
+    }
+    let Some(declared) = declared else {
+        return Ok(OverBudget::Pause);
+    };
+    if !app.client().is_live() {
+        return Ok(OverBudget::Pause);
+    }
+    let needed = declared.saturating_sub(already_stored as u64);
+    let left = u64::from(app.client().pacer().accounts_left()?);
+    if needed > left {
+        app.warn(&crate::report::over_the_day(needed, left));
+        app.warn(crate::report::PAUSING_BY_DEFAULT);
+    }
+    Ok(OverBudget::Pause)
+}
+
+/// Waits for the day to make room, telling other processes every few minutes
+/// that this walk is asleep rather than dead.
+///
+/// `false` when the wait was cut short: the person asked to stop, or another
+/// process took the walk over, which [`snapshots::keep_claim`] reports and
+/// which leaves nothing for this one to continue.
+async fn sleep_keeping_claim(app: &App, id: i64, wait: std::time::Duration) -> Result<bool> {
+    /// Well inside `snapshots::CLAIM_TTL_SECS`, so the claim never lapses.
+    const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    let mut left = wait;
+    while !left.is_zero() {
+        let step = left.min(HEARTBEAT);
+        if app.cancel().sleep_or_cancel(step).await {
+            return Ok(false);
+        }
+        if !snapshots::keep_claim(app.db(), id)? {
+            return Ok(false);
+        }
+        left -= step;
+    }
+    Ok(true)
 }
 
 /// The snapshot this walk will fill, and what is already known about it.

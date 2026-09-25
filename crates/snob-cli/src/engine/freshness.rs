@@ -71,6 +71,19 @@ pub async fn decide_and_fetch(
         return serve(app, snapshot, Provenance::CounterVerified);
     }
 
+    // The counter moved, or the capture aged out; either way the list has
+    // stopped answering. A caller that walks on a timer can still say it has
+    // walked this one recently enough, and then the change waits for a later
+    // walk rather than costing a whole list every time a counter ticks.
+    if !args.refresh
+        && let Some(gap) = args.walk_at_most_every
+        && let Some(snapshot) = &stored
+        && now() - snapshot.taken_at.unwrap_or_default()
+            < i64::try_from(gap.as_secs()).unwrap_or(i64::MAX)
+    {
+        return serve(app, snapshot, Provenance::WalkedRecently);
+    }
+
     walk::fetch(app, args, kind, target, declared).await
 }
 

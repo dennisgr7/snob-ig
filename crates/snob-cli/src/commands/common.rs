@@ -122,6 +122,10 @@ fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
         max_age: walk.max_age,
         no_resume: walk.no_resume,
         max_pages: walk.max_pages,
+        over_budget: walk
+            .same_day
+            .then_some(snob_ig::pager::OverBudget::Continue),
+        walk_at_most_every: None,
     }
 }
 

@@ -59,6 +59,62 @@ pub trait RateBudget: Send + Sync {
 
     /// Puts the account in cooldown and returns until when.
     fn start_cooldown(&self, reason: &str, minimum: Duration) -> Result<EpochMs, RateBudgetError>;
+
+    /// How long until `accounts` more may be read off a list today. Zero means
+    /// now. Asks without spending.
+    ///
+    /// **The second budget, and the one the account is judged on.** The
+    /// buckets above count requests; this counts what came back in them.
+    /// Meta's paper on the system that issues the automated-activity warning
+    /// (arXiv 2502.17693) weighs each request by how many accounts it returns,
+    /// and a list page is nothing but accounts. See [`accounts_per_day`].
+    ///
+    /// The default grants everything, which is what every test double wants;
+    /// the one real budget overrides all three.
+    fn accounts_wait(&self, accounts: u32) -> Result<Duration, RateBudgetError> {
+        let _ = accounts;
+        Ok(Duration::ZERO)
+    }
+
+    /// Records that `accounts` were read off a list.
+    fn spend_accounts(&self, accounts: u32) -> Result<(), RateBudgetError> {
+        let _ = accounts;
+        Ok(())
+    }
+
+    /// How many accounts may still be read today without waiting.
+    fn accounts_left(&self) -> Result<u32, RateBudgetError> {
+        Ok(u32::MAX)
+    }
+}
+
+/// Accounts a day read off follower and following lists, in the ordinary case.
+///
+/// The closest thing to a measured number anybody has published: the careful
+/// monitor in this category (misiektoja/instagram_monitor, 4.0, September
+/// 2026) defaults to it, and its collaborators' testing puts the flags that
+/// arrive within a day at list walks past it. InstagramUnfollowers users were
+/// logged out for automated activity at about 1,600 in one sitting in the same
+/// month. It is a ceiling, not a target.
+const ACCOUNTS_PER_DAY: u32 = 2_000;
+
+/// The same after Instagram has pushed back on this account recently.
+const ACCOUNTS_PER_DAY_AFTER_PUSH_BACK: u32 = 1_000;
+
+/// How long a push-back keeps the lower ceiling in force.
+const PUSH_BACK_MEMORY: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The daily ceiling on accounts read, given when the last cooldown began.
+///
+/// Policy rather than storage, so it lives here next to the cooldown lengths;
+/// the store only remembers when.
+pub fn accounts_per_day(last_push_back: Option<EpochMs>, now: EpochMs) -> u32 {
+    match last_push_back {
+        Some(at) if now - at < PUSH_BACK_MEMORY.as_millis() as i64 => {
+            ACCOUNTS_PER_DAY_AFTER_PUSH_BACK
+        }
+        _ => ACCOUNTS_PER_DAY,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +185,26 @@ mod tests {
     /// `store::rate_budget`'s tests, next to the numbers when the numbers were
     /// there; a test asserting a value from another crate through its accessor
     /// asserts the accessor.
+    /// The daily ceiling on accounts, and the week it stays halved for.
+    #[test]
+    fn the_account_ceiling_halves_for_a_week_after_a_push_back() {
+        let now = EpochMs::new(10 * 86_400_000);
+        let day = 86_400_000_i64;
+        assert_eq!(accounts_per_day(None, now), 2_000);
+        assert_eq!(
+            accounts_per_day(Some(EpochMs::new(now.get() - day)), now),
+            1_000
+        );
+        assert_eq!(
+            accounts_per_day(Some(EpochMs::new(now.get() - 7 * day + 1)), now),
+            1_000
+        );
+        assert_eq!(
+            accounts_per_day(Some(EpochMs::new(now.get() - 7 * day)), now),
+            2_000
+        );
+    }
+
     #[test]
     fn the_cooldowns_are_the_documented_ones() {
         assert_eq!(rate_limit_cooldown(), Duration::from_secs(2 * 3600));

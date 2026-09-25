@@ -55,6 +55,22 @@ async fn mount_list(server: &MockServer, kind: &str, pks: &[u64]) {
         .await;
 }
 
+/// Moves every stored capture a day and an hour into the past.
+///
+/// The monitor walks a list at most once a day however its counter moves
+/// (`engine::watch::REUSE_WINDOW`), so a test about what a *walk* finds on the
+/// second run has to let a day go by between the two.
+fn a_day_passes(root: &std::path::Path) {
+    open_db(root)
+        .conn()
+        .execute(
+            "UPDATE snapshots SET started_at = started_at - 90000,
+                                  taken_at = taken_at - 90000",
+            [],
+        )
+        .unwrap();
+}
+
 /// A whole run: look, then record having reported it.
 ///
 /// The command does these as two steps so the body can be built in between --
@@ -193,6 +209,8 @@ async fn a_counter_that_moved_is_walked_and_the_arrival_is_reported() {
         run(&mut app, &Watched::own()).await;
     }
 
+    a_day_passes(tmp.path());
+
     // A fresh server, because the counter and the list both have to change.
     let server = MockServer::start().await;
     mount_profile(&server, 3, 2).await;
@@ -208,6 +226,48 @@ async fn a_counter_that_moved_is_walked_and_the_arrival_is_reported() {
     assert!(
         changes.following.is_empty(),
         "the following counter did not move, so that list was not walked"
+    );
+}
+
+/// Within a day of the last walk, a counter that moved waits for a later run
+/// rather than costing the whole list again — and says so, without moving the
+/// monitor on, so the change is reported by the walk that does read it.
+#[tokio::test]
+async fn a_counter_that_moved_within_a_day_waits_for_a_later_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    {
+        let server = MockServer::start().await;
+        mount_profile(&server, 2, 2).await;
+        mount_list(&server, "followers", &[1, 2]).await;
+        mount_list(&server, "following", &[8, 9]).await;
+
+        let mut app = app(&server, open_db(tmp.path()));
+        run(&mut app, &Watched::own()).await;
+    }
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 3, 2).await;
+    mount_list(&server, "followers", &[1, 2, 3]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+
+    let mut app = app(&server, open_db(tmp.path()));
+    let tick = run(&mut app, &Watched::own()).await;
+
+    assert_eq!(
+        requests(&server).await,
+        1,
+        "the counter poll and nothing else: neither list was walked"
+    );
+    assert!(tick.report.changes().followers.gained.is_empty());
+    assert!(
+        tick.lists.iter().any(|l| l.kind == ListKind::Followers
+            && l.skipped
+                == Some(snob_cli::engine::watch::Skipped::NobodyLooked(
+                    snob_cli::engine::Provenance::WalkedRecently
+                ))),
+        "the list is refused as not looked at, so the arrival is still news later: {:?}",
+        tick.lists
     );
 }
 
@@ -800,6 +860,8 @@ async fn a_cooldown_on_the_second_list_keeps_the_first_ones_news() {
         );
     }
 
+    a_day_passes(tmp.path());
+
     // Run two: followers loses somebody and is walked, and the cooldown lands
     // once that is paid for.
     let server = MockServer::start().await;
@@ -865,6 +927,8 @@ async fn a_rename_in_the_list_that_was_read_is_not_announced_again_next_run() {
         )
         .unwrap();
     }
+
+    a_day_passes(tmp.path());
 
     // Run two: followers answers and is compared, following is refused. The
     // rename is announced, and the cursor may not move.

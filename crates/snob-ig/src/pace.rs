@@ -1,6 +1,6 @@
 //! Request pacing and cancellation.
 //!
-//! The numbers in [`Pace`] are copied from InstagramUnfollowers, which has
+//! The numbers in [`Pace`] are copied from InstagramUnfollowers, which had
 //! years of real use without incident, and have only been changed to make
 //! *fewer* requests. **They are not changed without a documented reason** —
 //! each one carries below what it is for, and that is what stops a number being
@@ -23,6 +23,28 @@
 //!   spends roughly twice the requests for the same answer. What offsets that is
 //!   a budget that persists across runs, which the reference also does not have.
 //!
+//! **And the provenance itself stopped holding in September 2026.** The
+//! reference moved off GraphQL — its query hash began answering a correct
+//! total with no accounts in it — onto this very endpoint,
+//! `/api/v1/friendships/{pk}/{kind}/?count=50`, keeping the cadence above. It
+//! runs inside the person's own browser, so its requests carry the real TLS
+//! handshake, the real cookies and the real address. Within days its tracker
+//! filled with the reports this project exists to avoid: logged out for
+//! "automated activity" at about 1,600 of 2,600 followers (issue #333, 11
+//! September), logged out or asked to change the email "every second or third
+//! time" (#340, 15 September), no settings that still work past 2,000
+//! followers (#342, 19 September). This tool's own users have since reported
+//! the same warning, in the app and on the web.
+//!
+//! So what these numbers can claim is narrower than the paragraph above says.
+//! The cadence has a record on this endpoint now, the record is short, and it
+//! is bad from a client that looks better on the wire than this one does.
+//! What the public record agrees on instead is volume: Meta's paper on the
+//! system that issues these warnings (arXiv 2502.17693, February 2025) weighs
+//! each request by the number of accounts it returns, and a list page is
+//! nothing but accounts. The pace below decides how fast a walk goes; how many
+//! walks there are, and how long they are, is what the account is judged on.
+//!
 //! **And there is a third limit, which is the honest one: nothing behind these
 //! numbers is a published rate.** An audit in August 2026 went looking for one
 //! and this is what there is, written down here because it is the sort of thing
@@ -30,20 +52,20 @@
 //!
 //! The best public figure for this endpoint family is instaloader's
 //! field-report guess of 75 requests per 660 seconds for its non-GraphQL calls.
-//! Against that, this walks at about 172 in the same window — because the
-//! cadence was copied from a project that walks **GraphQL**, which is a
+//! Against that, this walked at about 172 in the same window — because the
+//! cadence was copied from a project that walked **GraphQL**, which is a
 //! different endpoint family with different weighting, and that difference was
-//! never noticed when the numbers were taken.
+//! never noticed when the numbers were taken. It now walks at about five.
 //!
-//! **This is recorded, not proposed, and the arithmetic is why.** Slowing to
-//! instaloader's guess means about 8.8 seconds a request; a 235-page walk then
-//! takes 34 minutes against a 900-second resume window, so an interrupted walk
-//! could never be continued and would begin again at page one. Worse, a list
-//! that took 34 minutes to read no longer describes one moment, and one list
-//! describing one moment is worth more than the rate — the whole comparison
-//! rests on it, which is what `engine::cooldown::check_same_moment` exists to
-//! protect. Trading that away to match a number that is itself a guess would be
-//! paying a certain cost for an uncertain benefit.
+//! **That used to end with "recorded, not proposed", and the arithmetic was
+//! why.** Slowing down meant a walk longer than the fifteen-minute resume
+//! window, so an interrupted walk could never be continued, and a list that
+//! took half an hour no longer described one moment. Both have since been
+//! answered rather than argued round: the resume window is a day and a half,
+//! and `engine::cooldown::check_same_moment` measures the gap *between* two
+//! walks rather than their lengths, so two lists walked back to back still
+//! cross however long each took. What the slower walk costs now is time, and
+//! September 2026 settled whether that is worth paying.
 //!
 //! **One local measurement, August 2026, and the four reasons it settles
 //! nothing.** A real Chrome session against instagram.com was recorded over the
@@ -51,11 +73,12 @@
 //! unfollow, block, unblock, like. In 251 seconds it made 193 requests to
 //! `/api/v1/` and the two GraphQL routes, and was refused none of them: no 429,
 //! no `Retry-After`, no rate-limit header of any kind. Scaled to the window
-//! used here that is about 507, against this walker's 172 and instaloader's 75.
+//! used here that is about 507, against this walker's old 172 and instaloader's
+//! 75.
 //!
-//! It is worth having for one thing only: it is the only number anybody here
-//! has taken rather than inherited, and it is evidence against slowing *down*
-//! to 75, which is not what a client on this endpoint family does.
+//! It was taken as evidence against slowing *down* to 75, on the grounds that a
+//! client on this endpoint family does not go that slowly. A browsing session
+//! does not; a list walk, it turned out, has to.
 //!
 //! It is not evidence that 507 is safe, and the reasons are worth spelling out
 //! because a number in a comment gets quoted back as permission:
@@ -72,7 +95,7 @@
 //!   somewhere above the largest un-refused session anyone has recorded, which
 //!   is where it was before.
 //!
-//! The rate stays at 172. What the capture did produce is in
+//! What the capture did produce is in
 //! `IgClient::note_push_back`: Instagram volunteers `x-ig-capacity-level` and
 //! `x-ig-peak-time` on its answers, and those are now written down when it
 //! pushes back — so that the run which finally *is* refused says what the load
@@ -121,16 +144,33 @@ pub struct Pace {
 }
 
 impl Default for Pace {
+    /// **About a minute and a half a page, and a long break every five
+    /// hundred or so accounts.** It was about four seconds a page, the
+    /// cadence of the project this was modeled on — and in September 2026
+    /// that project's users started being logged out for automated activity
+    /// at that cadence on this very endpoint, from inside their own browsers
+    /// (see the module header).
+    ///
+    /// Where the new numbers come from, since none of them is a published
+    /// rate: the most careful project in the category documents twenty to
+    /// twenty-five accounts per ninety to a hundred and twenty seconds as what
+    /// its collaborators found to hold, and anything at or under a minute a
+    /// batch as what never did. A followers page is about twenty-five
+    /// accounts, so a page every one to two minutes sits on that line; the
+    /// long break every twenty pages keeps any one sitting to about five
+    /// hundred.
+    ///
+    /// The price is that a list of a thousand takes most of an hour, and a
+    /// crossing of two lists several. That is what the resume window in
+    /// `snapshots.rs` was widened for, and it is the trade the account is
+    /// worth.
     fn default() -> Self {
         Self {
             per_page: 50,
-            micro_pause_ms: (500, 2_000),
-            cycle_wait_ms: (1_000, 1_300),
-            long_pause_ms: (5_000, 15_000),
-            // The original project calls its constant "after five", but its
-            // condition is `scrollCycle > 6`, which is every seven. The
-            // behavior is what gets copied, not the name.
-            pages_per_long_pause: 7,
+            micro_pause_ms: (1_000, 4_000),
+            cycle_wait_ms: (55_000, 110_000),
+            long_pause_ms: (600_000, 1_200_000),
+            pages_per_long_pause: 20,
             network_retries: 3,
             backoff_base_ms: 2_000,
         }
@@ -142,8 +182,8 @@ impl Pace {
     ///
     /// Reading an account that is not yours is a heavier thing to ask for than
     /// reading your own, and Instagram is correspondingly readier to refuse it,
-    /// so the walk is stretched out: every wait is roughly two to three times
-    /// the default and the long pause comes round almost twice as often. Going
+    /// so the walk is stretched out: every wait is about half as long again as
+    /// the default and the long pause comes round twice as often. Going
     /// slower is the courtesy owed to whoever's service and whoever's account
     /// this is, neither of them ours.
     ///
@@ -151,20 +191,13 @@ impl Pace {
     /// mean more requests for the same users, and requests are the thing being
     /// counted — slowing down must not turn into knocking more often.
     ///
-    /// The cost is that a walk takes about three times as long, and the resume
-    /// window is measured from when it started. Somewhere past two thousand
-    /// accounts on the followers list — which answers about 25 a page whatever
-    /// is asked, see `per_page` — or four thousand on the following list,
-    /// where 50 is honored, an interrupted walk stops being resumable and
-    /// begins again from the top. That is the right trade anyway: a walk that
-    /// long no longer describes a single moment, which is what the window is
-    /// there to protect.
+    /// The cost is that a walk takes about half as long again as your own.
     pub fn third_party() -> Self {
         Self {
-            micro_pause_ms: (1_500, 4_000),
-            cycle_wait_ms: (2_500, 4_000),
-            long_pause_ms: (10_000, 30_000),
-            pages_per_long_pause: 4,
+            micro_pause_ms: (2_000, 6_000),
+            cycle_wait_ms: (85_000, 170_000),
+            long_pause_ms: (900_000, 1_800_000),
+            pages_per_long_pause: 10,
             // One fewer than the default: on somebody else's account, a network
             // failure is a reason to stop rather than to insist.
             network_retries: 2,
@@ -303,6 +336,33 @@ impl Pacer {
         tokio::task::spawn_blocking(move || budget.cooldown())
             .await
             .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+    }
+
+    /// How long until `accounts` more may be read today. See
+    /// [`RateBudget::accounts_wait`]; off the async worker for the reason
+    /// [`Self::cooldown_off_thread`] gives.
+    pub async fn accounts_wait(&self, accounts: u32) -> Result<Duration, crate::error::IgError> {
+        let budget = Arc::clone(&self.budget);
+        tokio::task::spawn_blocking(move || budget.accounts_wait(accounts))
+            .await
+            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+    }
+
+    /// Records the accounts a list page carried.
+    pub async fn spend_accounts(&self, accounts: u32) -> Result<(), crate::error::IgError> {
+        let budget = Arc::clone(&self.budget);
+        tokio::task::spawn_blocking(move || budget.spend_accounts(accounts))
+            .await
+            .map_err(|e| crate::error::IgError::Budget(format!("the budget task failed: {e}")))?
+            .map_err(|e| crate::error::IgError::Budget(e.to_string()))
+    }
+
+    /// How many accounts may still be read today without waiting.
+    pub fn accounts_left(&self) -> Result<u32, crate::error::IgError> {
+        self.budget
+            .accounts_left()
             .map_err(|e| crate::error::IgError::Budget(e.to_string()))
     }
 
@@ -487,10 +547,22 @@ mod tests {
     fn the_default_pace_is_the_documented_one() {
         let p = Pace::default();
         assert_eq!(p.per_page, 50);
-        assert_eq!(p.pages_per_long_pause, 7);
-        assert_eq!(p.micro_pause_ms, (500, 2_000));
-        assert_eq!(p.cycle_wait_ms, (1_000, 1_300));
-        assert_eq!(p.long_pause_ms, (5_000, 15_000));
+        assert_eq!(p.pages_per_long_pause, 20);
+        assert_eq!(p.micro_pause_ms, (1_000, 4_000));
+        assert_eq!(p.cycle_wait_ms, (55_000, 110_000));
+        assert_eq!(p.long_pause_ms, (600_000, 1_200_000));
+    }
+
+    /// A page every one to two minutes, whichever end of both ranges is drawn.
+    /// The line the numbers were chosen to sit on, asserted rather than
+    /// remembered.
+    #[test]
+    fn a_page_takes_one_to_two_minutes() {
+        let p = Pace::default();
+        let fastest = p.micro_pause_ms.0 + p.cycle_wait_ms.0;
+        let slowest = p.micro_pause_ms.1 + p.cycle_wait_ms.1;
+        assert!((55_000..=65_000).contains(&fastest), "{fastest}");
+        assert!((110_000..=120_000).contains(&slowest), "{slowest}");
     }
 
     #[test]
@@ -507,10 +579,10 @@ mod tests {
         assert!(other.pages_per_long_pause < own.pages_per_long_pause);
         assert!(other.network_retries < own.network_retries);
 
-        assert_eq!(other.micro_pause_ms, (1_500, 4_000));
-        assert_eq!(other.cycle_wait_ms, (2_500, 4_000));
-        assert_eq!(other.long_pause_ms, (10_000, 30_000));
-        assert_eq!(other.pages_per_long_pause, 4);
+        assert_eq!(other.micro_pause_ms, (2_000, 6_000));
+        assert_eq!(other.cycle_wait_ms, (85_000, 170_000));
+        assert_eq!(other.long_pause_ms, (900_000, 1_800_000));
+        assert_eq!(other.pages_per_long_pause, 10);
     }
 
     #[test]

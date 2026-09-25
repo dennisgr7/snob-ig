@@ -240,7 +240,7 @@ impl IgClient {
     /// for, and the rule that a real account is never walked without the
     /// limiter rested on nobody asking. A test server cannot be Instagram, and
     /// Instagram cannot be a test server, so the question answers itself.
-    pub(crate) fn is_live(&self) -> bool {
+    pub fn is_live(&self) -> bool {
         static LIVE: std::sync::LazyLock<Url> =
             std::sync::LazyLock::new(|| Url::parse(BASE_URL).expect("BASE_URL parses"));
         same_origin(&self.base, &LIVE)
