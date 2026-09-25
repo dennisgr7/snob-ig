@@ -36,7 +36,9 @@ snob-core.workspace = true
 snob-store.workspace = true
 snob-ig.workspace = true
 clap.workspace = true
-tokio.workspace = true
+# `net` and `io-util` for the loopback page `headless.rs` serves for one
+# question; both were already compiled in through reqwest.
+tokio = { workspace = true, features = ["net", "io-util"] }
 anyhow.workspace = true
 serde_json.workspace = true
 # Already in the tree through snob-core, so this costs no extra compilation.

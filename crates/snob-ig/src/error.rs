@@ -90,6 +90,15 @@ pub enum IgError {
     #[error("could not consult the request budget: {0}")]
     Budget(String),
 
+    /// The browser the requests are sent from failed: it would not start, it
+    /// went away, or the page would not answer.
+    ///
+    /// Its reaction is `Abort` rather than `Retry` on purpose. A retry would
+    /// relaunch a browser, which is not a network blip, and a browser that
+    /// will not start will not start three times either.
+    #[error("the browser snob sends its requests from failed: {0}")]
+    Browser(String),
+
     /// The mutation's identifier could not be found in Instagram's own code.
     ///
     /// Instagram rotates these, and this crate reads the current one out of the

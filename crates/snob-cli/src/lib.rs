@@ -15,6 +15,7 @@ pub mod cli;
 pub mod commands;
 pub mod engine;
 pub mod exit;
+pub mod headless;
 pub(crate) mod interrupt;
 pub mod output;
 /// Starting the browser with the debugging protocol on a pipe rather than on a

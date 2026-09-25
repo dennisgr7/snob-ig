@@ -28,6 +28,7 @@
 
 mod headers;
 mod media;
+pub mod page;
 mod read;
 mod transport;
 mod write;
@@ -90,6 +91,10 @@ pub struct IgClient {
     hints: ClientHints,
     /// Instagram's session-continuity token. See [`IgClient::claim`].
     claim: Mutex<String>,
+    /// The browser tab every request to Instagram is sent from, when there is
+    /// one. See [`page`]. `None` sends them with `reqwest`, which is what a
+    /// test server is reached with.
+    page: Option<std::sync::Arc<dyn page::Page>>,
 }
 
 /// What a browser sends before the server has told it anything.
@@ -148,7 +153,15 @@ impl IgClient {
     }
 
     fn pointed_at(session: Session, pacer: Pacer, base: Url) -> Result<Self, IgError> {
+        static LIVE: std::sync::LazyLock<Url> =
+            std::sync::LazyLock::new(|| Url::parse(BASE_URL).expect("BASE_URL parses"));
+        let page = if same_origin(&base, &LIVE) || page::used_off_instagram() {
+            page::page_for(&session)
+        } else {
+            None
+        };
         Ok(Self {
+            page,
             hints: ClientHints::from_user_agent(&session.user_agent),
             api: build_client(&session.user_agent, api_policy())?,
             cdn: OnceLock::new(),

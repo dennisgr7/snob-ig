@@ -111,6 +111,18 @@ pub struct Cli {
     )]
     pub ig_base_url: Option<url::Url>,
 
+    /// Send the requests to `--ig-base-url` from the browser, as they are sent
+    /// to Instagram. A testing build only.
+    #[cfg(feature = "testing")]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        display_order = 904,
+        requires = "ig_base_url"
+    )]
+    pub through_the_browser: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -345,14 +357,9 @@ pub struct LoginArgs {
     )]
     pub csrftoken: Option<String>,
 
-    /// Keep the browser profile "--browser" creates, so a later login skips
-    /// the Instagram form
-    ///
-    /// Off by default, and the default is the point. That profile is 87 MB and
-    /// holds a second copy of the live session, at rest, indefinitely — more
-    /// than the binary and a year of the database together. It exists so the
-    /// login does not happen in the user's everyday browser, not so it
-    /// survives the login.
+    /// Keep the browser profile after logging in. Always kept now when the
+    /// login works: it is where snob sends its requests from
+    // Accepted so scripts written for it still run.
     #[arg(long, requires = "browser")]
     pub keep_profile: bool,
 }

@@ -182,6 +182,10 @@ pub(super) async fn scheduled(
             {
                 report::print_error(&e, wording);
             }
+            // The browser does not sleep through the hours to the next run
+            // with the profile locked: a person running a command in between
+            // would be told another snob has it.
+            crate::headless::shutdown().await;
             continue;
         }
 

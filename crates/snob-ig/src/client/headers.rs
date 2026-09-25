@@ -174,6 +174,53 @@ impl IgClient {
         self.dressed(request, referer, style)
     }
 
+    /// The request [`Self::dressed`] would build, for the browser to send.
+    ///
+    /// Only what the site's own script adds goes in the list: the app's
+    /// identifiers and the claim for an `/api/v1/` call, the operation's name
+    /// and `lsd` for a Relay one. `X-CSRFToken` is added in the page, from the
+    /// cookie the browser holds at that moment, because only the page knows
+    /// its current value — it rotates, and this process never sees the
+    /// `Set-Cookie` that rotates it. Everything else a browser adds on its
+    /// own, correctly, and adding it here would only be a second opinion.
+    pub(super) fn page_request(
+        &self,
+        method: &'static str,
+        url: &Url,
+        referer: &str,
+        style: Surface<'_>,
+        body: Option<String>,
+    ) -> super::page::PageRequest {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if style.announces_the_app() {
+            headers.push(("X-IG-App-ID".into(), IG_APP_ID.into()));
+            headers.push(("X-ASBD-ID".into(), client_hints::ASBD_ID.into()));
+            headers.push(("Accept".into(), style.accept().into()));
+        }
+        if matches!(style, Surface::App) {
+            headers.push(("X-IG-WWW-Claim".into(), self.claim()));
+            headers.push(("X-Requested-With".into(), "XMLHttpRequest".into()));
+        }
+        if let Surface::Relay { friendly_name, lsd } = style {
+            headers.push(("X-FB-Friendly-Name".into(), friendly_name.into()));
+            headers.push(("X-FB-LSD".into(), lsd.into()));
+            headers.push((
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            ));
+        }
+        super::page::PageRequest {
+            method,
+            url: url.to_string(),
+            headers,
+            referrer: format!("{}{referer}", self.base),
+            body,
+            navigate: matches!(style, Surface::Document),
+            cap: super::transport::MAX_BODY_BYTES,
+            timeout_ms: 60_000,
+        }
+    }
+
     /// The headers every request to Instagram carries, whatever its method.
     ///
     /// Split out of [`Self::api_request`] at the merge, because the write path

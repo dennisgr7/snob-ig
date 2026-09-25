@@ -122,7 +122,9 @@ impl IgClient {
         // does not spend a slot discovering it. The token itself is put on the
         // request by `dressed`, which adds it whenever the session has
         // one; this guard is what makes "whenever" mean "always" on this path.
-        if self.session.csrftoken.is_none() {
+        // From the page, the token is the browser's own and is read there, so
+        // a session stored without one can still write.
+        if self.page.is_none() && self.session.csrftoken.is_none() {
             return Err(IgError::NoCsrfToken);
         }
 
@@ -130,6 +132,25 @@ impl IgClient {
         tracing::debug!(%url, operation = write.friendly_name(), "POST");
 
         self.pacer.clear_to_send_write().await?;
+
+        // The page follows no redirect on a POST (`redirect: "manual"`), and
+        // nothing races the cancel token here either: a write in flight is the
+        // one request Ctrl+C does not abandon, from the page as from `reqwest`.
+        if let Some(page) = &self.page {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(form)
+                .finish();
+            let request = self.page_request("POST", &url, referer, style, Some(body));
+            let response = page.send(request).await.map_err(IgError::Browser)?;
+            if response.status == 0 || (300..400).contains(&response.status) {
+                return Err(IgError::Unexpected {
+                    status: response.status,
+                    body: "Instagram redirected a write, which is never followed".into(),
+                });
+            }
+            let answer = self.answer_from_page(&url, response).await?;
+            return self.decode(&answer);
+        }
 
         let request = self
             .dressed(self.writer()?.post(url), referer, style)
