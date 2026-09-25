@@ -251,8 +251,8 @@ pub struct ListQuery {
     /// Stop after this many pages.
     pub max_pages: Option<u32>,
     /// What a walk does when the day's accounts run out before the list
-    /// does. `None` asks, when somebody is there to answer and the list will
-    /// not fit; otherwise it pauses.
+    /// does. `None` pauses, and says so first when the list will not fit;
+    /// `Some` is a caller that already knows and wants nothing said.
     pub over_budget: Option<snob_ig::pager::OverBudget>,
     /// The shortest gap between two walks of one list, whatever the counter
     /// says. `None` walks whenever the stored list no longer answers.

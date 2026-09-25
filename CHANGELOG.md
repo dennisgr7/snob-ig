@@ -17,10 +17,9 @@
   pushes back. The old cadence, about a page every four seconds, is the one
   InstagramUnfollowers' users began getting logged out for automated activity
   at in September 2026. When the rest of a list will not fit in the day, the
-  run says so first and asks: pause when the day runs out and continue on its
-  own when it makes room, or finish today. `--spread` and `--same-day` answer
-  in advance; with nobody to ask, and always in the monitor, it pauses. An
-  interrupted walk can now be resumed for a day and a half rather than
+  run says so first, then pauses when the day runs out and continues on its
+  own when it makes room; `--same-day` finishes it today instead. Nothing is
+  asked, and the monitor always pauses. An interrupted walk can now be resumed for a day and a half rather than
   fifteen minutes, and a walk asleep on the budget keeps its claim on the
   capture.
 

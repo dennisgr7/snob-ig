@@ -488,13 +488,9 @@ pub fn over_the_day(needed: u64, left: u64) -> String {
     )
 }
 
-/// The choice, asked with pausing as the default because it is the one that
-/// cannot make things worse with Instagram.
-pub const ASK_FINISH_TODAY: &str = "Finish it today anyway? (No pauses when the budget runs out \
-     and continues on its own when the day makes room)";
-
-/// Said when nobody was there to ask.
-pub const PAUSING_WITHOUT_ASKING: &str = "it will pause when the budget runs out and continue on \
+/// What happens instead, and the flag that changes it. Nothing is asked: see
+/// `engine::walk::choose_over_budget`.
+pub const PAUSING_BY_DEFAULT: &str = "it will pause when the budget runs out and continue on \
      its own; --same-day finishes it today instead";
 
 /// The walk stopped for the day's accounts and is waiting to go on.

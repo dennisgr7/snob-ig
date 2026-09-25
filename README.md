@@ -515,7 +515,7 @@ to:
   out for automated activity in September 2026. A list that does not fit in
   what is left of the day is flagged before the walk starts: by default the
   walk pauses when the day runs out and continues on its own when it makes
-  room (`--spread`), and `--same-day` finishes it anyway. A scan of a thousand
+  room, and `--same-day` finishes it anyway. A scan of a thousand
   followers now takes most of an hour. Nothing in snob can send a request
   without paying for it first.
 - **The first refusal stops the run.** A 429, a `feedback_required` or a

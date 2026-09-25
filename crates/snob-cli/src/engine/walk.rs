@@ -28,7 +28,7 @@ pub async fn fetch(
     let opened = open_snapshot(app, args, kind, target, declared)?;
     let id = opened.id;
 
-    let over_budget = choose_over_budget(app, args, declared, opened.already_stored).await?;
+    let over_budget = choose_over_budget(app, args, declared, opened.already_stored)?;
 
     // Somebody else's lists are walked more slowly. This is the one place that
     // decides it, so the set commands and `scan` inherit it by coming through
@@ -160,15 +160,23 @@ pub async fn fetch(
     ))
 }
 
-/// What to do if the day's accounts run out mid-walk, asking when the answer
-/// matters and somebody can give it.
+/// What to do if the day's accounts run out mid-walk, and saying so first
+/// when it will matter.
 ///
-/// It only matters when the rest of the list is larger than what the day has
-/// left, and only a walk against Instagram has a day to spend — the pager
-/// ignores the budget against a test server, so asking there would be asking
-/// about nothing. Without a counter the size is unknown and nothing is asked;
-/// the walk pauses if it has to, which is the answer that cannot hurt.
-async fn choose_over_budget(
+/// **It pauses unless `--same-day` said otherwise, and it asks nothing.** It
+/// used to ask whether to finish today, which broke the rule that a command
+/// asks one question and `-y` answers it in advance: a crossing walks two
+/// lists and could ask twice, a stranger's list asked it after the consent
+/// question, and `-y` answered neither. Pausing is the answer that cannot make
+/// things worse with Instagram, so it is the one given without asking, and the
+/// warning names the flag that gives the other.
+///
+/// The warning is only worth giving when the rest of the list is larger than
+/// what the day has left, and only a walk against Instagram has a day to
+/// spend — the pager ignores the budget against a test server. Without a
+/// counter the size is unknown and nothing is said; the walk pauses if it has
+/// to.
+fn choose_over_budget(
     app: &App,
     args: &ListQuery,
     declared: Option<u64>,
@@ -185,26 +193,11 @@ async fn choose_over_budget(
     }
     let needed = declared.saturating_sub(already_stored as u64);
     let left = u64::from(app.client().pacer().accounts_left()?);
-    if needed <= left {
-        return Ok(OverBudget::Pause);
+    if needed > left {
+        app.warn(&crate::report::over_the_day(needed, left));
+        app.warn(crate::report::PAUSING_BY_DEFAULT);
     }
-
-    app.warn(&crate::report::over_the_day(needed, left));
-    if !crate::ui::can_be_asked() {
-        app.warn(crate::report::PAUSING_WITHOUT_ASKING);
-        return Ok(OverBudget::Pause);
-    }
-    let finish_today = crate::ui::confirm_off_thread(
-        app.progress(),
-        crate::report::ASK_FINISH_TODAY.to_string(),
-        false,
-    )
-    .await?;
-    Ok(if finish_today {
-        OverBudget::Continue
-    } else {
-        OverBudget::Pause
-    })
+    Ok(OverBudget::Pause)
 }
 
 /// Waits for the day to make room, telling other processes every few minutes
