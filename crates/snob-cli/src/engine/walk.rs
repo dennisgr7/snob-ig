@@ -41,6 +41,9 @@ pub async fn fetch(
 
     let mut cursor = opened.cursor.clone();
     let mut already_stored = opened.already_stored;
+    // Pages read in the rounds before this one, so `--max-pages` caps the
+    // walk and not each stretch between two pauses.
+    let mut pages_before: u32 = 0;
 
     // Round again only when the walk paused for the day's accounts and the
     // choice was to wait for them: the same snapshot, from the cursor it
@@ -57,7 +60,7 @@ pub async fn fetch(
             direction: kind.into(),
             from: cursor.as_deref(),
             estimated: declared,
-            max_pages: args.max_pages,
+            max_pages: args.max_pages.map(|max| max.saturating_sub(pages_before)),
             already_stored,
             over_budget,
         };
@@ -106,7 +109,12 @@ pub async fn fetch(
             break summary;
         }
         cursor = summary.pending_cursor.clone();
-        already_stored += summary.users;
+        // The walker counts from what was already stored, so its total is the
+        // snapshot's. Adding it to the old figure counted every stored account
+        // twice, and the completion check then took a list that had come back
+        // short for a whole one.
+        already_stored = summary.users;
+        pages_before += summary.pages;
     };
 
     snapshots::close(app.db().conn(), id, summary.reason)?;
