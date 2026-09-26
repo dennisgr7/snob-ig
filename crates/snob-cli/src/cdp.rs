@@ -406,10 +406,10 @@ pub struct Cdp {
 /// for the one tab it was sent to. A worker the page starts, a frame from
 /// another site and the service worker the site registers are targets of their
 /// own, and each of them went out as the bare headless browser: measured on
-/// Chromium 153, a service worker's requests carried no `Sec-CH-UA` at all.
-/// With auto-attach, the browser pauses every such target before its first
-/// line runs and tells this connection; the target is given these commands
-/// and then let go.
+/// Chromium 153, a service worker called itself `HeadlessChrome`. With
+/// auto-attach, the browser pauses every such target before its first line
+/// runs and tells this connection; the target is given these commands and then
+/// let go.
 #[derive(Debug, Clone, Default)]
 pub struct OnAttach {
     /// For a page or a frame, which has the `Emulation` domain.
