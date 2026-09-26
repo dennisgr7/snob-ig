@@ -159,7 +159,8 @@ the two together. The musl target is the container's own architecture.
 
 Remote CI (`.github/workflows/ci.yml`) runs fmt, clippy with `--all-features`,
 and the suite on Linux x86_64 and ARM64 (against musl, which is what Linux
-users get), Windows and macOS, then builds the five release targets. The Linux
+users get), Windows x86_64 and ARM64 (the one on schannel), and macOS, then
+builds the five release targets. The Linux
 jobs install a keyring daemon so the backend under test is the one users get.
 
 **The browser recorder is `node tools/capture/record.js`** (needs
@@ -378,6 +379,13 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 - **Instagram commands never carry an at sign in examples** — on PowerShell
   `@` is the splatting operator and the argument vanishes before `main` runs;
   `language.rs` fails the build on one. Names are accepted without the sign.
+- **The site's own page is loaded, and not charged.** The tab opens
+  `https://www.instagram.com/` once per run and Instagram's app then makes
+  requests of its own, which do not go through the `Pacer`; the counts snob
+  reports are its own API calls. That traffic is kept on purpose: it is what
+  a person's browser sends around the calls, and the calls without it are
+  what a script looks like. Hosting them on a page that boots no app was
+  weighed and declined for that reason.
 - **Everything is per user, never per directory** — the working directory only
   decides where an export lands without `-o`.
 
@@ -392,11 +400,6 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   truncation stops being detectable for that account;
   `WebProfileInfo::counters_are_knowable` is the question, and both
   `engine::target` and `watch check` say it out loud.
-- **Opening the site is not paid for.** The tab loads `https://www.instagram.com/`
-  once per run, and Instagram's own page then makes requests of its own; none
-  of it goes through the `Pacer`, so the counts snob reports cover its API
-  calls only. Loading the page is what a browser does; whether to host the
-  calls on a page that boots no app instead is open.
 - **WebGL is absent in the headless browser.** Without a GPU it will use,
   `getContext('webgl')` returns nothing, which few desktops do; the switch that
   enables the software renderer is one Chromium calls unsafe, and it is not
@@ -424,10 +427,11 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
     while a command waits for its reply, which is enough for auto-attach but
     not for listening: a reader task routing replies by id and events by
     session is what the next three need.
-  - *Honest accounting of the page's own traffic.* With `Network` events the
-    requests Instagram's page makes on load could be counted — or the calls
-    hosted on a same-origin document that boots no app, which sends less and
-    looks less like a person. Decide which before either is built.
+  - *Listening to the page's own traffic.* Not to charge it (that is
+    settled: see "The site's own page is loaded, and not charged"), but
+    because it is Instagram talking to this session too: a 429 or a
+    challenge on one of the app's calls is a push-back snob hears today
+    only at its own next request.
   - *One owner of the browser.* Two runs cannot share the profile, so the
     monitor and a typed command collide. A long-lived process that owns the
     browser, with the commands as its clients over a local socket, removes

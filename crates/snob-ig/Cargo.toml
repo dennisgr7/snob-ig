@@ -50,7 +50,7 @@ url.workspace = true
 # out of support, so that case does not arise here.
 #
 # What the split costs: two TLS stacks, so the ARM64 Windows binary is not
-# byte-for-byte the others. CI builds and runs all five. schannel compiles no
+# byte-for-byte the others. CI builds all five and runs the suite on it. schannel compiles no
 # C, involves no OpenSSL, reaches the same trust store rustls-platform-verifier
 # was using, and still advertises `h2` over ALPN — which is the property that
 # matters, because HTTP/1.1 draws 429s from these endpoints where h2 does not.
