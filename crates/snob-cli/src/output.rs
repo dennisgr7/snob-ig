@@ -115,6 +115,13 @@ pub fn effective_format(requested: Option<Format>, destination: Option<&Path>) -
     if let Some(format) = destination.and_then(format_from_extension) {
         return format;
     }
+    // A file whose extension says nothing gets the plain list, wherever this
+    // runs. It used to fall through to the question below, which is about
+    // standard output and not about the file: `-o notes.txt` wrote names from
+    // a terminal and JSON from cron, into the same file name.
+    if destination.is_some() {
+        return Format::Table;
+    }
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         Format::Table
     } else {
@@ -486,15 +493,14 @@ mod tests {
     }
 
     /// An extension nobody claimed keeps the old behavior rather than
-    /// guessing: `-o notes.txt` is still a plain list.
+    /// guessing: `-o notes.txt` is a plain list, whether or not standard
+    /// output is a terminal — which is what this test could not tell apart
+    /// when it accepted either answer.
     #[test]
     fn an_unknown_extension_does_not_guess() {
         for name in ["notes.txt", "notes"] {
             let got = effective_format(None, Some(Path::new(name)));
-            assert!(
-                matches!(got, Format::Table | Format::Json),
-                "{name} gave {got:?}"
-            );
+            assert_eq!(got, Format::Table, "{name}");
         }
     }
 

@@ -42,8 +42,9 @@ below.
 
 The commands: `login`, `whoami`, `logout`, `purge`; the five lists
 (`unfollowers`, `fans`, `friends`, `followers`, `following`) and `scan`;
-`profile`, `pfp`, `stories`, `highlights`; `follow` and `unfollow`; and the
-`watch` monitor (`watch`, `once`, `diff`, `check`, `setup`, `status`).
+`profile`, `pfp`, `stories`, `highlights`; `follow` and `unfollow`; the
+`watch` monitor (`watch`, `once`, `diff`, `check`, `setup`, `status`); and
+`import dyi`, which reads Instagram's own export and sends nothing.
 
 ## Rules
 

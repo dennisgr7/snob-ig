@@ -267,9 +267,12 @@ pub fn run_with(
         ));
     }
 
+    // 130, as the exit codes promise for a confirmation not given and as
+    // `follow` answers it: a script that asked for a purge and got a "no" has
+    // not had its purge, and 0 said it had.
     if !args.consent.yes && !ui::confirm("\nDelete all of it?", false)? {
         crate::ui::say!("Nothing was deleted.");
-        return Ok(ExitCode::Ok);
+        return Ok(ExitCode::Interrupted);
     }
 
     let failures = execute(&plan, &store);

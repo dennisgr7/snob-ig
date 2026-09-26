@@ -156,12 +156,16 @@ pub async fn run(args: ScanArgs, secrets: SecretStore, paths: &AppPaths) -> Resu
     }
 
     let filtered = !filter.is_empty();
+    // Cut by the same filter as the five counts, which the footer promises
+    // ("filters active: the counts reflect them"): `--hide verified` still
+    // named verified accounts on this one line, in the text and in the JSON.
+    let followed_by_people = followed_by.as_ref().map(|f| filter.apply(f.people.clone()));
     let summary = Summary {
         counts: summarize(&followers, &following, &filter),
         target: &target,
         explicit_target,
         filtered,
-        followed_by: followed_by.as_ref().map(|f| f.people.as_slice()),
+        followed_by: followed_by_people.as_deref(),
         followed_by_at: followed_by.as_ref().map(|f| f.taken_at),
         followers: &followers_outcome,
         following: &following_outcome,

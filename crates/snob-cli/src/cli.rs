@@ -206,7 +206,8 @@ Exit codes:
 
 Environment:
   NO_COLOR          no styling, whatever the terminal supports
-  CLICOLOR_FORCE    styling even where stdout is not a terminal
+  CLICOLOR_FORCE    styled messages on standard error even where it is not a
+                    terminal; a result is styled only on a terminal
   FORCE_HYPERLINK   OSC 8 hyperlinks even where they were not detected
   SNOB_LOG          what --verbose shows, as target=level pairs
   SNOB_NO_BROWSER   send the requests directly instead of from a browser, for
@@ -217,7 +218,8 @@ Environment:
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Store your Instagram session in the system keyring
+    /// Store your Instagram session: in the system keyring, or in a file
+    /// where there is none
     Login(LoginArgs),
 
     /// Show which account you are authenticated as
@@ -307,13 +309,21 @@ pub enum Command {
 
     /// Track an account over time and report what changed
     #[command(
-        after_help = "With no subcommand it stays up and runs on a schedule; the subcommands                       are the things a person does by hand. \"--json\" here emits one JSON                       object per run, one per line -- what the list commands would call                       ndjson, spelled --json because each object is the state of one run.
-
-                      An account named like a subcommand -- \"status\", \"once\", \"diff\",                       \"check\", \"setup\" -- is read as the subcommand; write it \"@status\"                       to watch the account."
+        after_help = "With no subcommand it stays up and runs on a schedule; the subcommands \
+                      are the things a person does by hand. \"--json\" here emits one JSON \
+                      object per run, one per line -- what the list commands would call \
+                      ndjson, spelled --json because each object is the state of one run.\n\n\
+                      An account named like a subcommand -- \"status\", \"once\", \"diff\", \
+                      \"check\", \"setup\" -- is read as the subcommand; write it \"@status\" \
+                      to watch the account."
     )]
     Watch(WatchArgs),
 
     /// Read Instagram's own data export, with no session and no request
+    // Behind the same feature as the module, which it shares `zip` with: a
+    // build without `xlsx` has neither, and naming the variant anyway was a
+    // build error there that nothing ran into until the CI job did.
+    #[cfg(feature = "xlsx")]
     #[command(
         subcommand,
         after_help = "The one way to answer who does not follow you back without anything \
@@ -1067,7 +1077,10 @@ pub struct MediaActionArgs {
 
     /// Where a download goes. A directory when several are saved, a file when
     /// one is.
-    #[arg(short = 'o', long, value_name = "PATH")]
+    // Refused beside `-i` rather than accepted and ignored: the browser's own
+    // D saves into the working directory, one item at a time, and has nowhere
+    // to take a path from. `pfp` draws the same line.
+    #[arg(short = 'o', long, value_name = "PATH", conflicts_with = "interactive")]
     pub output: Option<PathBuf>,
 }
 
@@ -1476,6 +1489,12 @@ mod tests {
         assert!(
             Cli::try_parse_from(["snob", "pfp", "x", "--no-interactive", "-o", "f.jpg"]).is_ok()
         );
+        // The media browsers save where they were started, so a destination
+        // beside -i would be accepted and ignored.
+        for command in ["stories", "highlights"] {
+            assert!(Cli::try_parse_from(["snob", command, "x", "-i", "-o", "dir"]).is_err());
+            assert!(Cli::try_parse_from(["snob", command, "x", "-d", "1", "-o", "dir"]).is_ok());
+        }
     }
 
     /// `--cache` was the spelling until August 2026; a script written against

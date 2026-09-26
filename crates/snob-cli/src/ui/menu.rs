@@ -30,8 +30,11 @@ use super::tui::{self, Tui};
 
 /// Draws the list of `labels` under `prompt` and waits for a choice.
 ///
-/// `Some(index)` on Enter, `None` on Esc or `q`. Ctrl+C is an error, so the
-/// caller's `?` ends the command the way every other interrupt does. The
+/// `Some(index)` on Enter, `None` on Esc or `q`. Ctrl+C is an error that
+/// carries exit code 130, so the caller's `?` ends the command the way every
+/// other interrupt does. It was a bare "canceled", which `main` could only
+/// report as a failure, exit 1, and which a caller falling back on any error
+/// read as "use the default" — Ctrl+C at the browser menu opened a browser. The
 /// caller decides whether a menu can be shown at all -- `ui::can_show_a_menu`
 /// is the gate, asked before this is reached -- so this assumes a terminal on
 /// both standard input and standard error.
@@ -54,7 +57,11 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
                 Step::Interrupt => {
                     tui.terminal.clear()?;
                     drop(tui);
-                    anyhow::bail!("canceled");
+                    return Err(crate::exit::ExitError::new(
+                        crate::exit::ExitCode::Interrupted,
+                        "canceled",
+                    )
+                    .into());
                 }
             },
         }

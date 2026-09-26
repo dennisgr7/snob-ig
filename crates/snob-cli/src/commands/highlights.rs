@@ -48,7 +48,9 @@ use snob_store::secrets::SecretStore;
 
 use crate::cli::{DownloadSelection, Format, HighlightsArgs, StoryFormat};
 use crate::commands::common;
-use crate::commands::stories::{Saved, Story, bytes_of, download_many, save_story, story_from};
+use crate::commands::stories::{
+    Saved, Story, bytes_of, download_many, empty_document, save_story, story_from,
+};
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
@@ -129,6 +131,12 @@ pub async fn run(args: HighlightsArgs, secrets: SecretStore, paths: &AppPaths) -
             "@{} has no highlights.",
             printable(&tray.username)
         ));
+        if args.action.selection().is_none() && !args.action.interactive {
+            let destination = args.action.output.as_deref();
+            let format =
+                common::checked_format(args.list.format, destination, "a highlight listing")?;
+            empty_document(format, destination, || tray_json(&tray, format))?;
+        }
         return Ok(ExitCode::Ok);
     }
 
@@ -192,6 +200,14 @@ async fn inside_one(
     }
     if items.is_empty() {
         ui::info(&empty_highlight(tray, number));
+        if args.action.selection().is_none() {
+            let destination = args.action.output.as_deref();
+            let format =
+                common::checked_format(args.list.format, destination, "a highlight's listing")?;
+            empty_document(format, destination, || {
+                items_json(tray, number, &items, format)
+            })?;
+        }
         return Ok(ExitCode::Ok);
     }
 

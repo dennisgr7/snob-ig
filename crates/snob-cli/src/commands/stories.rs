@@ -133,6 +133,11 @@ pub async fn run(args: StoriesArgs, secrets: SecretStore, paths: &AppPaths) -> R
             "@{} has no stories up right now.",
             printable(&stories.username)
         ));
+        if args.action.selection().is_none() && !args.action.interactive {
+            let destination = args.action.output.as_deref();
+            let format = common::checked_format(args.list.format, destination, "a story listing")?;
+            empty_document(format, destination, || as_json(&stories, format))?;
+        }
         return Ok(ExitCode::Ok);
     }
 
@@ -284,6 +289,26 @@ fn list(
         ));
     }
     Ok(ExitCode::Ok)
+}
+
+/// An empty tray is still an answer, and a document asked for is written
+/// even when there is nothing in it: `{"username": …, "stories": []}`, the
+/// way an empty list command prints `[]`. It used to print nothing at all,
+/// so a script reading JSON from a pipe got an empty stream and a parse
+/// error for an account that simply had nothing up. NDJSON with no rows is
+/// already nothing, and a table has nothing to draw; the sentence on
+/// standard error says what happened in both.
+pub(crate) fn empty_document(
+    format: Format,
+    destination: Option<&Path>,
+    json: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    if format != Format::Json {
+        return Ok(());
+    }
+    let mut text = json()?;
+    text.push('\n');
+    output::write_rendered(&Rendered::Text(text), destination)
 }
 
 fn as_table(stories: &Stories, presentation: Presentation) -> String {

@@ -14,7 +14,7 @@ use snob_store::paths::{self, AppPaths};
 use snob_store::secrets::{Backend, SecretStore};
 
 use crate::cli::LoginArgs;
-use crate::exit::ExitCode;
+use crate::exit::{ExitCode, ExitError};
 use crate::progress::Progress;
 use crate::report;
 use crate::ui::{self, LoginMethod};
@@ -56,9 +56,11 @@ pub async fn run(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Resul
 
     announce_replacement(&store);
 
+    // A question not answered is 130, as it is everywhere else — `watch
+    // setup`'s menu, a confirmation — and as the exit codes say.
     let Some(method) = choose_method(&args)? else {
         ui::info("Login canceled.");
-        return Ok(ExitCode::Ok);
+        return Ok(ExitCode::Interrupted);
     };
 
     match method {
@@ -140,12 +142,19 @@ fn choose_method(args: &LoginArgs) -> Result<Option<LoginMethod>> {
 /// processes to answer a question worth three. Detecting twice also meant the
 /// count that decides whether to ask "is that the right browser?" came from a
 /// different snapshot than the browser actually chosen.
-fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<browser::Browser> {
+///
+/// Esc and Ctrl+C end the command, with 130: a question the person declined is
+/// not one to answer for them. Only a menu that could not be drawn falls back
+/// on the preferred browser.
+fn choose_browser(
+    purpose: &str,
+    installed: &[browser::Browser],
+) -> Result<Option<browser::Browser>> {
     // Nothing to ask about: `first` is already `None` on an empty list and
     // already the only entry on a list of one, so the two cases that have no
     // question in them and the case where there is nobody to ask are one line.
     if installed.len() < 2 || !ui::can_show_a_menu() {
-        return installed.first().cloned();
+        return Ok(installed.first().cloned());
     }
 
     let labels: Vec<String> = installed
@@ -156,10 +165,14 @@ fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<brows
     match ui::choose(purpose, &refs) {
         // `get` rather than `nth`: total where the old one relied on the index
         // being in range.
-        Ok(Some(i)) => installed.get(i).cloned(),
-        // Esc, or the menu failing to draw: the preferred one still beats
-        // refusing to continue.
-        _ => installed.first().cloned(),
+        Ok(Some(i)) => Ok(installed.get(i).cloned()),
+        Ok(None) => {
+            Err(ExitError::new(ExitCode::Interrupted, "no browser was chosen".to_string()).into())
+        }
+        Err(e) if ExitCode::from_chain(&e) == Some(ExitCode::Interrupted) => Err(e),
+        // The menu failing to draw: the preferred one still beats refusing to
+        // continue.
+        Err(_) => Ok(installed.first().cloned()),
     }
 }
 
@@ -175,7 +188,7 @@ async fn by_browser(
     pacer: Pacer,
 ) -> Result<ExitCode> {
     let installed = browser::detect_all();
-    let Some(found) = choose_browser("Which browser should snob open?", &installed) else {
+    let Some(found) = choose_browser("Which browser should snob open?", &installed)? else {
         bail!(
             "no Chromium-based browser was found installed, and this needs one to \
              open.\n\
@@ -505,7 +518,7 @@ impl ChosenAgent {
 fn resolve_user_agent() -> Result<ChosenAgent> {
     let installed = browser::detect_all();
 
-    if let Some(b) = choose_browser("Which browser is your Instagram session in?", &installed) {
+    if let Some(b) = choose_browser("Which browser is your Instagram session in?", &installed)? {
         let user_agent = b.user_agent();
         ui::info(&format!(
             "Using the User-Agent of {} {}.",

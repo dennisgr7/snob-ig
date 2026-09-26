@@ -659,17 +659,20 @@ fn as_text(profile: &Profile, explicit_target: bool, hints: bool) -> String {
         Visibility::Shown(list) if list.is_empty() => rows.push("Highlights:   none".to_string()),
         Visibility::Shown(list) => {
             rows.push(format!("{:<14}{}", "Highlights:", list.len()));
+            // Columns, not characters: a title in CJK or with an emoji is two
+            // columns a character, and `{:<width$}` pads by characters, so the
+            // item counts beside such a title came out crooked.
             let width = list
                 .iter()
-                .map(|h| h.title.chars().count())
+                .map(|h| console::measure_text_width(&h.title))
                 .max()
                 .unwrap_or(0)
                 .min(24);
             for (index, h) in list.iter().enumerate() {
                 let mut row = format!(
-                    "  {:>2}  {:<width$}  {}",
+                    "  {:>2}  {}  {}",
                     index + 1,
-                    clip(&h.title, 24),
+                    console::pad_str(&clip(&h.title, 24), width, console::Alignment::Left, None),
                     match h.items {
                         Some(1) => "1 item".to_string(),
                         Some(n) => format!("{n} items"),
@@ -743,13 +746,11 @@ fn wrapped(names: impl Iterator<Item = String>, width: usize) -> Vec<String> {
 }
 
 /// Cuts a title to a display width, with an ellipsis when it had to.
+///
+/// Measured in columns. It counted characters, so a title of wide characters
+/// clipped to "24" came out 48 columns across.
 fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut s: String = text.chars().take(width.saturating_sub(1)).collect();
-    s.push('…');
-    s
+    console::truncate_str(text, width, "…").into_owned()
 }
 
 fn as_markdown(profile: &Profile) -> String {
@@ -1031,5 +1032,10 @@ mod tests {
         let clipped = clip(&long, 24);
         assert_eq!(clipped.chars().count(), 24);
         assert!(clipped.ends_with('…'));
+
+        // Two columns a character: clipped to 24 columns, not 24 characters.
+        let wide = clip(&"字".repeat(30), 24);
+        assert!(console::measure_text_width(&wide) <= 24, "{wide}");
+        assert!(wide.ends_with('…'));
     }
 }

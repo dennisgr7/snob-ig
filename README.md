@@ -151,9 +151,10 @@ a.verified   Verified Account verified
 33 accounts you follow that do not follow you back - 33 of 139 - 12 requests
 ```
 
-That table is what a pipe, a redirect, `--format` or `--no-interactive`
-gets — JSON down a pipe on its own, a real table with clickable usernames
-where the terminal supports it.
+That is the printed form, what `--no-interactive` or `--format table` shows on
+a terminal: a real table, with clickable usernames where the terminal supports
+them. Down a pipe the default is JSON instead, and into a file whose extension
+names no format, one name per line.
 
 The other crossings are `snob fans` (they follow you, you do not follow them)
 and `snob friends` (you follow each other). `snob followers` and
@@ -161,10 +162,9 @@ and `snob friends` (you follow each other). `snob followers` and
 
 On a terminal any of the five opens as a list you move through with the
 arrow keys — Enter opens the account's profile in your browser, `/` narrows
-the list as you type, `q` leaves. In a pipe or a redirect it prints the
-table instead, `--format` and `-o` always print or write, and
-`--no-interactive` prints it on a terminal too, the same rule `stories` and
-`highlights` keep.
+the list as you type, `q` leaves. In a pipe or a redirect it prints instead,
+`--format` and `-o` always print or write, and `--no-interactive` prints it on
+a terminal too, the same rule `stories` and `highlights` keep.
 
 ```bash
 snob profile someone
@@ -272,11 +272,12 @@ snob unfollow someone
 
 One of the two things snob changes, and it asks first. The other is
 `snob follow`. One account per command — see [staying a light client](#staying-a-light-client)
-for why there is no bulk mode — and they need a session with a CSRF token,
-which `snob login --browser` picks up on its own. If you logged in by pasting,
-`snob login --paste --csrftoken <token>` is how to add it.
+for why there is no bulk mode. The CSRF token a write needs is the browser's
+own, read at the moment of sending, so a pasted session can write too; with
+`SNOB_NO_BROWSER` it has to come with the session, which `snob login --browser`
+captures and `snob login --paste --csrftoken <token>` adds.
 
-Every list takes `--format json|ndjson|csv|xlsx|md` and `-o file`, filters like
+Every list takes `--format table|json|ndjson|csv|xlsx|md` and `-o file`, filters like
 `--only private` or `--hide verified`, and `--limit`. Run `snob --help` for the
 rest.
 
