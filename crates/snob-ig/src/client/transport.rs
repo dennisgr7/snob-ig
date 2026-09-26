@@ -367,12 +367,13 @@ impl IgClient {
     /// [`Self::get_body`], sent from the browser tab.
     ///
     /// The same three promises as the `reqwest` loop above, kept differently.
-    /// **Paid for first**, through the same `clear_to_send`. **A redirect is
-    /// paid for too**: the browser follows it by itself, so the hop is charged
-    /// after the fact rather than before — once, because a page cannot see how
-    /// many there were, and one is what an API redirect to the login page is.
-    /// **The origin rule holds**: an answer that ended up anywhere but where it
-    /// started is refused, exactly as a hop off-origin is refused above.
+    /// **Paid for first**, through the same `clear_to_send`. **No hop goes out
+    /// unpaid**: the page follows no redirect on an API call (see `FETCH` in
+    /// `headless.rs`), so a redirect comes back as status 0 and is refused
+    /// here, with nothing sent after it. **The origin rule holds** for the one
+    /// request a browser does follow redirects on, a document navigation:
+    /// [`Self::answer_from_page`] refuses an answer that ended up anywhere but
+    /// where it started, and charges the hop.
     async fn get_body_in_page(
         &self,
         page: &dyn super::page::Page,
@@ -394,23 +395,39 @@ impl IgClient {
             () = self.pacer.cancel_token().canceled() => return Err(IgError::Canceled),
             sent = page.send(request) => sent.map_err(IgError::Browser)?,
         };
+        // An opaque redirect: Instagram pointed somewhere and the page did
+        // not go. `Unexpected` with no status is an `Abort` everywhere it is
+        // read — no retry, no second route, no rediscovery — which is the
+        // reqwest path's answer to a hop it will not follow as well.
+        if response.status == 0 && !response.redirected {
+            return Err(IgError::Unexpected {
+                status: 0,
+                body: "Instagram answered with a redirect, which is not followed".into(),
+            });
+        }
         self.answer_from_page(&url, response).await
     }
 
     /// What the page said, read the way an answer off the wire is read.
+    ///
+    /// A redirect here is a document navigation's, the only request the
+    /// browser follows one on. It went out before this process could pay for
+    /// it, so it is paid for now — and **what Instagram answered is kept even
+    /// when paying is refused**: a cooldown already running, or a Ctrl+C, used
+    /// to return from the charge with a 429 in hand and never classify it, so
+    /// the push-back that answer carried was not written down.
     pub(super) async fn answer_from_page(
         &self,
         asked: &Url,
         response: super::page::PageResponse,
     ) -> Result<Answer, IgError> {
         if response.redirected {
-            self.pacer.clear_to_send().await?;
             let landed = Url::parse(&response.url).map_err(|_| IgError::OffOrigin {
-                to: response.url.clone(),
+                to: crate::error::body_excerpt(&response.url),
             })?;
             if !same_origin(asked, &landed) {
                 return Err(IgError::OffOrigin {
-                    to: landed.to_string(),
+                    to: crate::error::body_excerpt(landed.as_str()),
                 });
             }
         }
@@ -426,12 +443,23 @@ impl IgClient {
             .into_iter()
             .filter_map(|name| response.header(name).map(|value| format!("{name}={value}")))
             .collect();
-        Ok(Answer {
+        let answer = Answer {
             status: response.status,
             retry_after: response.header("retry-after").map(str::to_string),
             load: (!load.is_empty()).then(|| load.join(" ")),
             body: response.body,
-        })
+        };
+        if response.redirected
+            && let Err(refused) = self.pacer.clear_to_send().await
+        {
+            if !answer.is_success() {
+                // Recorded for what it says; the refusal to pay is still what
+                // the caller hears, because it is why nothing else is sent.
+                let _ = self.refuse(&answer);
+            }
+            return Err(refused);
+        }
+        Ok(answer)
     }
 
     /// Sends the request, or gives up the moment the user asks it to.

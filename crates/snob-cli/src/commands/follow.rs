@@ -68,7 +68,7 @@ pub async fn run(
     // `--csrftoken` was given — and finding out from Instagram's 403 would cost
     // a request, a slot of write budget, and a message telling the user their
     // session had expired when it had not.
-    if app.client().session().csrftoken.is_none() {
+    if !app.client().can_write() {
         return Err(ExitError::new(
             ExitCode::NoSession,
             format!(

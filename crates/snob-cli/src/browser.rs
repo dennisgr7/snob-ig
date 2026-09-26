@@ -283,7 +283,16 @@ fn candidates() -> Vec<Candidate> {
         (
             "Chrome",
             None,
-            on_path(&["google-chrome-stable", "google-chrome", "chromium"]),
+            // `chromium-browser` is the name Ubuntu's snap wrapper and Fedora
+            // install under; Debian's is `chromium`. The label says Chrome
+            // for all four, which only the login's menu shows: what is sent
+            // is the brand list the binary reports for itself.
+            on_path(&[
+                "google-chrome-stable",
+                "google-chrome",
+                "chromium",
+                "chromium-browser",
+            ]),
         ),
         (
             "Edge",

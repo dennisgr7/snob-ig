@@ -1,0 +1,236 @@
+//! The headless transport, driven end to end: the real binary, a real browser,
+//! and a fake Instagram served locally.
+//!
+//! Every request to Instagram leaves from a browser tab now, and nothing else
+//! in the suite sends one that way — `sandbox.rs` reaches its mock servers with
+//! `reqwest`, on purpose, so it runs on a machine with no browser. This is the
+//! one place the path users actually take is exercised: the tab is opened, the
+//! pasted session is written into the browser, the page load sets a CSRF
+//! cookie, and the API calls go out with the browser's own cookie jar and
+//! headers. `--through-the-browser` is what points that path at a local
+//! server; like `--ig-base-url` it exists only in a testing build.
+//!
+//! **Skipped when no browser will start**, for the reason `browser_pipe.rs`
+//! gives: a machine where Chromium cannot run is a machine where snob cannot
+//! either, and a test that cannot run there should say nothing rather than
+//! something false. It asks the browser directly before anything else, so a
+//! browser that starts and then misbehaves under snob is a failure, not a
+//! skip.
+#![cfg(feature = "testing")]
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use snob_cli::{browser, cdp};
+use snob_ig::pace::CancelToken;
+use snob_store::paths::AppPaths;
+use wiremock::matchers::{method, path as url_path, path_regex, query_param};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+const SESSIONID: &str = "42%3Aheadless%3A17";
+
+/// What the fake Instagram sets on the page load. A pasted session carries no
+/// CSRF token at all, so seeing this one on an API call means the call went
+/// out with the browser's own cookie jar — `reqwest` never learns it.
+const SERVED_CSRF: &str = "set-by-the-page-load";
+
+/// Whether a browser will start headless on this machine at all.
+async fn a_browser_starts() -> bool {
+    let Some(found) = browser::detect() else {
+        eprintln!("no browser installed; skipping");
+        return false;
+    };
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let paths = AppPaths::rooted_at(temporary.path());
+    let cancel = CancelToken::default();
+    let flags = ["--headless=new".to_string()];
+    let started = match cdp::launch_headless(&found, &paths, &flags, &cancel).await {
+        Ok(launched) => cdp::Cdp::connect(launched, &cancel).await,
+        Err(e) => Err(e),
+    };
+    match started {
+        Ok(cdp) => {
+            cdp.close().await;
+            true
+        }
+        Err(e) => {
+            eprintln!("the browser found here will not start ({e}); skipping");
+            false
+        }
+    }
+}
+
+async fn fake_instagram() -> MockServer {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .insert_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .set_body_string("<!doctype html><title>Instagram</title><p>fake</p>"),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/friendships/42/following/"))
+        .and(query_param("count", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ig-set-www-claim", "hmac.from-the-server")
+                .set_body_string(r#"{"users":[]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/42/info/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"user":{"pk":42,"username":"me","full_name":"Me"}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"42","username":"me",
+                "edge_followed_by":{"count":2},"edge_follow":{"count":2}}}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    for kind in ["followers", "following"] {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(r"^/api/v1/friendships/\d+/{kind}/$")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"users":[{"pk":1000,"username":"user0"},{"pk":1001,"username":"user1"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+    }
+
+    server
+}
+
+fn snob(root: &Path, instagram: &MockServer, args: &[&str], typed: Option<&str>) -> Output {
+    use std::io::Write;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snob"))
+        .arg("--sandbox-root")
+        .arg(root)
+        .arg("--ig-base-url")
+        .arg(instagram.uri())
+        .arg("--through-the-browser")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env_remove("SNOB_NO_BROWSER")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    if let Some(typed) = typed {
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(typed.as_bytes())
+            .expect("the binary reads what it is given");
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().expect("the binary finishes")
+}
+
+fn said(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request.headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The whole promise of the transport, asked of what the server received.
+#[tokio::test]
+async fn every_request_leaves_from_the_browser() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some(&format!("{SESSIONID}\n")),
+    );
+    assert!(out.status.success(), "the login failed: {}", said(&out));
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["unfollowers", "--format", "json"],
+        None,
+    );
+    assert!(out.status.success(), "the crossing failed: {}", said(&out));
+
+    let received = instagram.received_requests().await.unwrap_or_default();
+    let first_api = received
+        .iter()
+        .position(|r| r.url.path().starts_with("/api/"))
+        .expect("the API was called");
+    assert!(
+        received[..first_api].iter().any(|r| r.url.path() == "/"),
+        "the tab opens the site before it asks the API anything"
+    );
+
+    for request in received
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/"))
+    {
+        let what = request.url.to_string();
+        let agent = header(request, "user-agent").unwrap_or_default();
+        assert!(!agent.is_empty(), "{what}: no User-Agent");
+        assert!(!agent.contains("Headless"), "{what}: {agent}");
+        let brands = header(request, "sec-ch-ua").unwrap_or_default();
+        assert!(!brands.contains("Headless"), "{what}: {brands}");
+
+        // Only the browser's own jar holds the token the page load set.
+        assert_eq!(
+            header(request, "x-csrftoken"),
+            Some(SERVED_CSRF),
+            "{what}: the CSRF token is not the browser's"
+        );
+        let cookie = header(request, "cookie").unwrap_or_default();
+        assert!(cookie.contains("sessionid="), "{what}: no session cookie");
+        assert!(
+            cookie.contains(&format!("csrftoken={SERVED_CSRF}")),
+            "{what}: the cookie jar is not the browser's: {cookie}"
+        );
+
+        // Set by the browser's network stack on a fetch, and by nothing else
+        // snob sends from here.
+        assert_eq!(header(request, "sec-fetch-mode"), Some("cors"), "{what}");
+        assert_eq!(
+            header(request, "sec-fetch-site"),
+            Some("same-origin"),
+            "{what}"
+        );
+    }
+
+    // The claim the server handed out comes back on the calls after it.
+    let claimed = received
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/"))
+        .skip_while(|r| header(r, "x-ig-www-claim") != Some("hmac.from-the-server"))
+        .count();
+    assert!(claimed > 0, "the claim the server set was never sent back");
+}

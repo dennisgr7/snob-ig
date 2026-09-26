@@ -123,8 +123,8 @@ impl IgClient {
         // request by `dressed`, which adds it whenever the session has
         // one; this guard is what makes "whenever" mean "always" on this path.
         // From the page, the token is the browser's own and is read there, so
-        // a session stored without one can still write.
-        if self.page.is_none() && self.session.csrftoken.is_none() {
+        // a session stored without one can still write: see `can_write`.
+        if !self.can_write() {
             return Err(IgError::NoCsrfToken);
         }
 
@@ -301,7 +301,7 @@ impl IgClient {
         // hundred kilobytes and a paid-for request. A session that cannot write
         // is the common case — every `snob login --paste` without `--csrftoken`
         // produces one — so this is the ordinary path, not the odd one.
-        if self.session.csrftoken.is_none() {
+        if !self.can_write() {
             return Err(IgError::NoCsrfToken);
         }
 

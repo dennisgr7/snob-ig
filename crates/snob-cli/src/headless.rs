@@ -25,10 +25,14 @@
 //!   browser's own, which the session already carries.
 //! - That flag alone leaves `Sec-CH-UA-Full-Version-List` **empty**, which is
 //!   worse than the name it hides. `Emulation.setUserAgentOverride` with full
-//!   metadata fixes every client hint: the brands are built by the same
-//!   algorithm `client_hints.rs` checks against real captures, the versions
-//!   come from the running browser, and the platform details are read from
-//!   the machine itself (see [`probe_platform`]).
+//!   metadata fixes the tab's client hints: the brands are the ones the
+//!   browser reports for itself, the versions come from the running browser,
+//!   and the architecture falls back to this machine's (see
+//!   [`probe_platform`] for what the flag blanks and why that matters).
+//!   **Only the tab is overridden**: a worker the page starts inherits the
+//!   flag's User-Agent and the blanked metadata. Covering every target needs
+//!   the protocol connection to answer events as they arrive, which `cdp.rs`
+//!   does not do yet.
 //! - The screen is 800 by 600. `--window-size` and `--screen-info`.
 //! - `navigator.languages` is `en-US`. The override's language list, read
 //!   from the system like `Accept-Language` always was.
@@ -188,9 +192,18 @@ impl Headless {
                      was found on this machine"
                 )
             })?;
-        // The session's User-Agent is the installed browser's, kept current by
-        // `browser::refresh_user_agent` on every run.
-        let user_agent = session.user_agent.replace("HeadlessChrome/", "Chrome/");
+        // The User-Agent of the binary being started, not the one stored with
+        // the session. The brands below are what this binary reports, and a
+        // stored string that has fallen behind — refreshed once a day at
+        // most, and never for a session that came from elsewhere — would put
+        // one major version in the User-Agent and another in every client
+        // hint beside it. A User-Agent the person pinned at login is theirs
+        // to keep.
+        let user_agent = if session.user_agent_pinned {
+            session.user_agent.replace("HeadlessChrome/", "Chrome/")
+        } else {
+            browser.user_agent()
+        };
 
         let flags = vec![
             "--headless=new".to_string(),
@@ -276,11 +289,26 @@ async fn attach_to_a_tab(cdp: &mut Cdp) -> Result<String> {
         .ok_or_else(|| anyhow!("the browser would not attach to its tab"))
 }
 
-/// What this machine really is, asked of the browser before anything is
-/// overridden: the operating system's version, the architecture, the bitness.
+/// What the browser says about itself before the tab is overridden: its brands
+/// above all, and whatever of the operating system's version, the
+/// architecture and the bitness it will still tell.
 ///
-/// Those are only readable from a secure context, and `about:blank` is not
-/// one; `http://127.0.0.1` is. So a page is served on a loopback port for the
+/// **The brands are the part that is always there, and the part that
+/// matters.** A headless Chromium since the new mode reports the same brands
+/// its windowed build does — measured on Chromium 153: `Chromium` and the
+/// GREASE entry, no `HeadlessChrome` — and `--user-agent` does not touch
+/// them. Computing them from the User-Agent instead named every Chromium on
+/// Linux `Google Chrome`, because the two send the same User-Agent and only
+/// the brand list tells them apart.
+///
+/// **The rest comes back empty**, and is not to be trusted as a value: with
+/// `--user-agent` on the command line Chromium blanks `architecture`,
+/// `bitness`, `platformVersion` and the full version list, on the grounds that
+/// it can no longer vouch for them. [`metadata`] treats an empty string as
+/// "not said".
+///
+/// Only readable from a secure context, and `about:blank` is not one;
+/// `http://127.0.0.1` is. So a page is served on a loopback port for the
 /// length of one question. Nothing leaves the machine, and nothing about
 /// Instagram is involved.
 async fn probe_platform(cdp: &mut Cdp, tab: &str) -> Result<Value> {
@@ -307,7 +335,8 @@ async fn probe_platform(cdp: &mut Cdp, tab: &str) -> Result<Value> {
             cdp,
             tab,
             "navigator.userAgentData.getHighEntropyValues(\
-             ['architecture','bitness','model','platformVersion','wow64'])",
+             ['architecture','bitness','model','platformVersion','wow64'])\
+             .then(v => Object.assign({ brands: navigator.userAgentData.brands }, v))",
             COMMAND_TIMEOUT,
         )
         .await?;
@@ -319,8 +348,30 @@ async fn probe_platform(cdp: &mut Cdp, tab: &str) -> Result<Value> {
 }
 
 /// The client-hints metadata the override states.
+///
+/// The brands are the browser's own when it said them (see
+/// [`probe_platform`]), and computed from the User-Agent only when it did
+/// not. Every other field is what the browser said, unless it said nothing —
+/// an empty string included — and then the one thing this process knows for
+/// itself, or empty rather than invented.
 fn metadata(user_agent: &str, full_version: &str, platform: Option<&Value>) -> Value {
-    let brands = snob_ig::client_hints::brand_list(user_agent).unwrap_or_default();
+    let said = platform
+        .and_then(|p| p.get("brands"))
+        .and_then(Value::as_array)
+        .map(|all| {
+            all.iter()
+                .filter_map(|b| {
+                    Some((
+                        b.get("brand")?.as_str()?.to_string(),
+                        b.get("version")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|brands| !brands.is_empty());
+    let brands = said
+        .or_else(|| snob_ig::client_hints::brand_list(user_agent))
+        .unwrap_or_default();
     let full = |version: &str| {
         if version.parse::<u32>().is_ok() && full_version.starts_with(&format!("{version}.")) {
             full_version.to_string()
@@ -332,6 +383,7 @@ fn metadata(user_agent: &str, full_version: &str, platform: Option<&Value>) -> V
         platform
             .and_then(|p| p.get(name))
             .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
             .unwrap_or(fallback)
             .to_string()
     };
@@ -471,45 +523,85 @@ async fn navigate_tab(cdp: &mut Cdp, tab: &str, url: &str) -> Result<()> {
 }
 
 /// A navigation whose answer is the document it lands on.
+///
+/// **The status and the address are the ones the browser saw**, not assumed.
+/// This used to answer 200 and "not redirected" whatever happened, so a 429
+/// on the page a write reads its tokens from, or a redirect to the login or
+/// challenge page, arrived as a page with no tokens in it and was reported as
+/// an expired session — with no cooldown written. The navigation's own
+/// timing entry carries the status (Chromium 109 and later) and how many
+/// redirects led to it; a browser too old to say is taken at its word that
+/// the page loaded.
 async fn navigate_and_read(live: &mut Live, url: &str) -> Result<PageResponse> {
     navigate(live, url).await?;
     let page = evaluate(
         &mut live.cdp,
         &live.tab,
-        "({ url: location.href, body: document.documentElement.outerHTML })",
+        "(() => { const n = performance.getEntriesByType('navigation')[0] || {}; \
+         return { url: location.href, status: n.responseStatus || 0, \
+         hops: n.redirectCount || 0, body: document.documentElement.outerHTML }; })()",
         COMMAND_TIMEOUT,
     )
     .await?;
-    live.origin = origin_of(page.get("url").and_then(Value::as_str).unwrap_or(url))?;
+    let landed = page
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or(url)
+        .to_string();
+    live.origin = origin_of(&landed)?;
+    let status = page
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok())
+        .filter(|s| *s != 0)
+        .unwrap_or(200);
+    let hops = page.get("hops").and_then(Value::as_u64).unwrap_or(0);
     Ok(PageResponse {
-        status: 200,
+        status,
         headers: Vec::new(),
         body: page
             .get("body")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        url: page
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or(url)
-            .to_string(),
-        redirected: false,
+        redirected: hops > 0 || !same_document(url, &landed),
+        url: landed,
         too_large: false,
     })
+}
+
+/// Whether two addresses name the same document: the fragment aside, which a
+/// page is free to change without anything having been requested.
+fn same_document(asked: &str, landed: &str) -> bool {
+    let strip = |u: &str| {
+        url::Url::parse(u).ok().map(|mut u| {
+            u.set_fragment(None);
+            u
+        })
+    };
+    strip(asked) == strip(landed)
 }
 
 /// The script that sends one request from the page.
 ///
 /// `X-CSRFToken` is read from the cookie at the moment of sending, because the
 /// browser rotates it and this process never sees the rotation. The claim is
-/// the app's own when this process has not been given one yet. A GET follows
-/// redirects the way the app's own calls do; a POST follows none, because a
-/// followed redirect is a write sent twice.
+/// the app's own when this process has not been given one yet.
+///
+/// **No redirect is followed, GET or POST.** A hop the browser follows by
+/// itself is a request sent before this process could pay for it, and to
+/// wherever the answer pointed — so it could only be charged afterwards and
+/// held to the origin rule after it had already gone. Instagram's API does
+/// not redirect a working call; the one it is known to redirect is a dead
+/// session's, to the login page. With `manual` that arrives as an opaque
+/// redirect, status 0, and is refused without a second request having been
+/// made. A POST was always this way: a followed redirect is a write sent
+/// twice.
 const FETCH: &str = r#"(async (q) => {
   const headers = new Headers(q.headers);
   const csrf = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]*)/);
   if (csrf) headers.set('X-CSRFToken', decodeURIComponent(csrf[1]));
+  else if (q.method !== 'GET') return { error: 'the browser holds no CSRF token to write with' };
   if (headers.get('X-IG-WWW-Claim') === '0') {
     try {
       const kept = sessionStorage.getItem('www-claim-v2');
@@ -524,7 +616,7 @@ const FETCH: &str = r#"(async (q) => {
       headers,
       body: q.body === null ? undefined : q.body,
       referrer: q.referrer,
-      redirect: q.method === 'GET' ? 'follow' : 'manual',
+      redirect: 'manual',
       signal: abort.signal,
     });
     const fresh = r.headers.get('x-ig-set-www-claim');
@@ -693,6 +785,58 @@ mod tests {
         assert_eq!(m["mobile"], false);
     }
 
+    /// A Chromium says it is Chromium. Linux's `chromium` sends the same
+    /// User-Agent as Google Chrome, so computing the brands from it claimed a
+    /// brand the binary does not have — measured on the wire from Chromium
+    /// 153. The probe is what the browser reports, and it wins.
+    #[test]
+    fn a_chromium_is_not_announced_as_google_chrome() {
+        let probed = json!({
+            "brands": [
+                { "brand": "Chromium", "version": "153" },
+                { "brand": "Not_A Brand", "version": "8" },
+            ],
+            "architecture": "",
+            "bitness": "",
+            "platformVersion": "",
+        });
+        let m = metadata(UA, "153.0.8010.52", Some(&probed));
+
+        let brands: Vec<&str> = m["brands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["brand"].as_str().unwrap())
+            .collect();
+        assert_eq!(brands, ["Chromium", "Not_A Brand"]);
+        let full: Vec<&str> = m["fullVersionList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(full, ["153.0.8010.52", "8.0.0.0"]);
+    }
+
+    /// `--user-agent` makes Chromium answer the high-entropy fields with empty
+    /// strings. Those are "not said", not values: stating `architecture: ""`
+    /// is a header no browser sends.
+    #[test]
+    fn an_empty_answer_is_not_a_value() {
+        let blank = json!({ "architecture": "", "bitness": "", "platformVersion": "" });
+        let m = metadata(UA, "141.0.7390.54", Some(&blank));
+        assert_eq!(
+            m["architecture"],
+            if cfg!(target_arch = "aarch64") {
+                "arm"
+            } else {
+                "x86"
+            }
+        );
+        assert_eq!(m["bitness"], "64");
+        assert_eq!(m["platformVersion"], "");
+    }
+
     /// Without the probe, the platform version is left empty rather than
     /// guessed, and the rest still holds.
     #[test]
@@ -700,6 +844,24 @@ mod tests {
         let m = metadata(UA, "141.0.7390.54", None);
         assert_eq!(m["platformVersion"], "");
         assert_eq!(m["bitness"], "64");
+    }
+
+    /// A fragment is not a redirect; a different path or query is.
+    #[test]
+    fn only_a_different_document_counts_as_a_redirect() {
+        let asked = "https://www.instagram.com/someone/";
+        assert!(same_document(
+            asked,
+            "https://www.instagram.com/someone/#top"
+        ));
+        assert!(!same_document(
+            asked,
+            "https://www.instagram.com/accounts/login/?next=%2Fsomeone%2F"
+        ));
+        assert!(!same_document(
+            asked,
+            "https://www.instagram.com/challenge/"
+        ));
     }
 
     #[test]

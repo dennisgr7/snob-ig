@@ -97,6 +97,9 @@ pub struct Launched {
     transport: PipeTransport,
     /// Only to name it in a message when the browser leaves early.
     profile: PathBuf,
+    /// Started without a window, to send requests from rather than to log in
+    /// with. Only to word that same message: there is no window to close.
+    windowless: bool,
 }
 
 /// Forgets the pid when the browser goes.
@@ -181,7 +184,7 @@ pub fn kill_launched() {
 /// Starts the browser against our own profile with debugging enabled, in a
 /// window, on the login page.
 pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -> Result<Launched> {
-    launch_with(browser, paths, &[], LOGIN_URL, cancel).await
+    launch_with(browser, paths, &[], LOGIN_URL, false, cancel).await
 }
 
 /// Starts the same browser on the same profile with no window, for snob to
@@ -192,7 +195,7 @@ pub async fn launch_headless(
     flags: &[String],
     cancel: &CancelToken,
 ) -> Result<Launched> {
-    launch_with(browser, paths, flags, "about:blank", cancel).await
+    launch_with(browser, paths, flags, "about:blank", true, cancel).await
 }
 
 async fn launch_with(
@@ -200,6 +203,7 @@ async fn launch_with(
     paths: &AppPaths,
     flags: &[String],
     start_at: &str,
+    windowless: bool,
     cancel: &CancelToken,
 ) -> Result<Launched> {
     // The profile ends up holding a live Instagram session, so the directory it
@@ -257,8 +261,14 @@ async fn launch_with(
         process,
         transport,
         profile: profile.to_path_buf(),
+        windowless,
     })
 }
+
+/// Chromium's exit code for "another instance holds this profile and would not
+/// take the command line". The code a second headless launch on a busy
+/// profile exits with, where a windowed one hands over and exits 0.
+const PROFILE_IN_USE: i32 = 21;
 
 /// What to say when the browser started and stopped again.
 ///
@@ -269,7 +279,10 @@ fn died_early(code: Option<i32>, profile: &Path) -> String {
     match code {
         // Exiting cleanly and immediately is the singleton: the browser handed
         // its command line to the instance that already has this profile open.
-        Some(0) => format!(
+        // 21 is the same answer where there was nobody to hand it to —
+        // Chromium's `PROFILE_IN_USE`, measured on Linux against a profile a
+        // headless snob held.
+        Some(0 | PROFILE_IN_USE) => format!(
             "the browser closed straight away, which means one is already open on snob's \
              profile at {}.\n\
              Close that window and try again, or use \"snob login --paste\".",
@@ -285,6 +298,31 @@ fn died_early(code: Option<i32>, profile: &Path) -> String {
         Some(code) => format!(
             "the browser exited with code {code} instead of starting.\n\
              Try \"snob login --paste\" instead."
+        ),
+    }
+}
+
+/// The same, for the browser snob sends its requests from.
+///
+/// Its own wording because the login's is wrong here twice over: there is no
+/// window to close, and `snob login --paste` is no way round it, since a
+/// pasted session is sent from this same browser. Exiting cleanly at once is
+/// still the singleton — and with no window, what holds the profile is
+/// another snob in the middle of a run, the monitor's included.
+fn windowless_died_early(code: Option<i32>, profile: &Path) -> String {
+    match code {
+        Some(0 | PROFILE_IN_USE) => format!(
+            "another snob is using the browser snob sends its requests from (its profile \
+             is at {}).\n\
+             Wait for that run to finish and try again.",
+            profile.display()
+        ),
+        None => "the browser snob sends its requests from was killed before it started.\n\
+                 Try again."
+            .to_string(),
+        Some(code) => format!(
+            "the browser snob sends its requests from exited with code {code} instead of \
+             starting."
         ),
     }
 }
@@ -339,7 +377,12 @@ impl Cdp {
             // The browser leaving is an answer too, and a faster one than the
             // deadline.
             if let Ok(Some(ended)) = self.launched.process.try_wait() {
-                bail!("{}", died_early(ended.code, &self.launched.profile));
+                let said = if self.launched.windowless {
+                    windowless_died_early(ended.code, &self.launched.profile)
+                } else {
+                    died_early(ended.code, &self.launched.profile)
+                };
+                bail!("{said}");
             }
             match tokio::time::timeout(POLL_FOR_READY, self.launched.transport.recv()).await {
                 Ok(Some(message)) => {
@@ -637,6 +680,26 @@ mod tests {
         assert!(
             !said.contains("did not open"),
             "that is the startup timeout, a different failure: {said}"
+        );
+    }
+
+    /// Without a window, the profile is held by another snob mid-run, and the
+    /// login's advice — close the window, paste instead — would send somebody
+    /// looking for a window that does not exist.
+    #[test]
+    fn a_windowless_browser_names_the_other_snob() {
+        let profile = Path::new("/home/someone/.local/share/snob/browser-profile");
+        let said = windowless_died_early(Some(0), profile);
+        assert!(said.contains("another snob"), "{said}");
+        assert!(said.contains("browser-profile"), "{said}");
+        for wrong in ["window", "--paste"] {
+            assert!(!said.contains(wrong), "{wrong}: {said}");
+        }
+        assert_eq!(windowless_died_early(Some(PROFILE_IN_USE), profile), said);
+        let said = windowless_died_early(Some(3), profile);
+        assert!(
+            said.contains('3') && !said.contains("another snob"),
+            "{said}"
         );
     }
 

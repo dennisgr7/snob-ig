@@ -238,6 +238,19 @@ impl IgClient {
         &self.session
     }
 
+    /// Whether this client can send a write at all.
+    ///
+    /// A write needs a CSRF token. Sent with `reqwest`, that is the one the
+    /// session was stored with, and `snob login --paste` without
+    /// `--csrftoken` stores none. Sent from the browser it is the browser's
+    /// own, read from its cookie jar at the moment of sending — Instagram sets
+    /// one on every page load — so any session can write. One question with
+    /// one answer, because three places asked it and only one of them had been
+    /// told about the browser.
+    pub fn can_write(&self) -> bool {
+        self.page.is_some() || self.session.csrftoken.is_some()
+    }
+
     pub fn pacer(&self) -> &Pacer {
         &self.pacer
     }
