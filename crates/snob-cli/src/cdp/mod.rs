@@ -1,4 +1,4 @@
-//! As much of the Chrome DevTools Protocol as capturing a login needs.
+//! The browser snob starts, and the DevTools protocol it is driven over.
 //!
 //! **Nothing here touches the user's own browser, or the cookie store that
 //! belongs to it.** What this drives is a browser *this program started*,
@@ -40,6 +40,10 @@ use snob_store::paths::AppPaths;
 
 use crate::browser::Browser;
 use crate::pipe::{BrowserProcess, PipeTransport};
+
+mod connection;
+
+pub use connection::{CallError, Connection, Event, OnAttach};
 
 /// How long to wait for the browser to answer its first command. Opening the
 /// pipe is the first thing it does, so this only ever runs out when it did not
@@ -95,7 +99,8 @@ const LOGIN_URL: &str = "https://www.instagram.com/accounts/login/";
 /// that no code of ours can reach.
 pub struct Launched {
     process: BrowserProcess,
-    transport: PipeTransport,
+    /// Taken by [`Cdp::connect`], which hands it to the dispatcher.
+    transport: Option<PipeTransport>,
     /// Only to name it in a message when the browser leaves early.
     profile: PathBuf,
     /// Started without a window, to send requests from rather than to log in
@@ -319,7 +324,7 @@ fn launch_in(
 
     Ok(Launched {
         process,
-        transport,
+        transport: Some(transport),
         profile: profile.to_path_buf(),
         windowless,
     })
@@ -391,31 +396,17 @@ fn windowless_died_early(code: Option<i32>, profile: &Path) -> String {
 ///
 /// The two travel together because neither is useful alone: the connection is
 /// what asks the browser to leave, and the browser is what has to be killed if
-/// it will not.
-pub struct Cdp {
-    launched: Launched,
-    next_id: u64,
-    /// What a target the browser attaches on its own is given before it runs.
-    /// `None` for the login's browser, which asks for no auto-attaching.
-    on_attach: Option<OnAttach>,
-}
-
-/// The commands a newly attached target gets, by what kind of target it is.
+/// it will not — and what says why, when the connection ends first.
 ///
-/// **Why a browser engine needs this.** `Emulation.setUserAgentOverride` holds
-/// for the one tab it was sent to. A worker the page starts, a frame from
-/// another site and the service worker the site registers are targets of their
-/// own, and each of them went out as the bare headless browser: measured on
-/// Chromium 153, a service worker called itself `HeadlessChrome`. With
-/// auto-attach, the browser pauses every such target before its first line
-/// runs and tells this connection; the target is given these commands and then
-/// let go.
-#[derive(Debug, Clone, Default)]
-pub struct OnAttach {
-    /// For a page or a frame, which has the `Emulation` domain.
-    pub page: Vec<(&'static str, Value)>,
-    /// For a worker of any kind, which has `Network` and not `Emulation`.
-    pub worker: Vec<(&'static str, Value)>,
+/// Every method takes `&self`: the connection has a reader of its own
+/// ([`connection`]), so any number of calls may be in flight at once, and
+/// dropping one — a timeout, a Ctrl+C — leaves the others and the connection
+/// as they were.
+pub struct Cdp {
+    connection: Connection,
+    /// Behind a lock only for `try_wait`, which wants `&mut`; never held
+    /// across an `.await`.
+    launched: std::sync::Mutex<Launched>,
 }
 
 impl Cdp {
@@ -429,11 +420,13 @@ impl Cdp {
     /// already holding the profile and exit within a second, and watching only
     /// the pipe meant waiting the full thirty seconds and then blaming the
     /// debugging transport, which is the wrong problem.
-    pub async fn connect(launched: Launched, cancel: &CancelToken) -> Result<Self> {
-        let mut cdp = Self {
-            launched,
-            next_id: 1,
-            on_attach: None,
+    pub async fn connect(mut launched: Launched, cancel: &CancelToken) -> Result<Self> {
+        let Some(transport) = launched.transport.take() else {
+            bail!("the browser's pipe was already taken");
+        };
+        let cdp = Self {
+            connection: Connection::start(transport),
+            launched: std::sync::Mutex::new(launched),
         };
         match cdp.wait_until_ready(cancel).await {
             Ok(()) => Ok(cdp),
@@ -446,11 +439,16 @@ impl Cdp {
         }
     }
 
-    async fn wait_until_ready(&mut self, cancel: &CancelToken) -> Result<()> {
+    async fn wait_until_ready(&self, cancel: &CancelToken) -> Result<()> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send("Browser.getVersion", json!({}), id).await?;
+        let asked = self
+            .connection
+            .call(None, "Browser.getVersion", json!({}), STARTUP_TIMEOUT);
+        tokio::pin!(asked);
+        // Set once the pipe has closed without an answer. The future is done
+        // then, and must not be polled again; the process check at the top of
+        // each turn is what says why.
+        let mut closed = false;
 
         loop {
             if cancel.is_canceled() {
@@ -458,24 +456,18 @@ impl Cdp {
             }
             // The browser leaving is an answer too, and a faster one than the
             // deadline.
-            if let Ok(Some(ended)) = self.launched.process.try_wait() {
-                let said = if self.launched.windowless {
-                    windowless_died_early(ended.code, &self.launched.profile)
-                } else {
-                    died_early(ended.code, &self.launched.profile)
-                };
+            if let Some(said) = self.left_early() {
                 bail!("{said}");
             }
-            match tokio::time::timeout(POLL_FOR_READY, self.launched.transport.recv()).await {
-                Ok(Some(message)) => {
-                    if reply_to(id, &message).is_some() {
-                        return Ok(());
-                    }
+            if closed {
+                tokio::time::sleep(POLL_FOR_READY).await;
+            } else {
+                match tokio::time::timeout(POLL_FOR_READY, &mut asked).await {
+                    // Any answer at all means it is reading the pipe.
+                    Ok(Ok(_) | Err(CallError::Refused { .. })) => return Ok(()),
+                    Ok(Err(_)) => closed = true,
+                    Err(_) => {}
                 }
-                // The pipe closed. The process check at the top of the next
-                // turn is what says why, so this only has to not spin.
-                Ok(None) => tokio::time::sleep(POLL_FOR_READY).await,
-                Err(_) => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!(
@@ -486,218 +478,85 @@ impl Cdp {
         }
     }
 
+    /// What to say about a browser that has already exited, if it has.
+    fn left_early(&self) -> Option<String> {
+        let mut launched = self.launched.lock().unwrap_or_else(|e| e.into_inner());
+        let ended = launched.process.try_wait().ok().flatten()?;
+        Some(if launched.windowless {
+            windowless_died_early(ended.code, &launched.profile)
+        } else {
+            died_early(ended.code, &launched.profile)
+        })
+    }
+
     /// Closes the browser politely, so the profile is not left looking like it
     /// crashed and offering to restore tabs on the next login.
-    pub async fn close(mut self) {
+    pub async fn close(self) {
         // `call` carries its own timeout, so a browser that has stopped
         // answering delays the exit rather than preventing it.
-        let _ = self.call("Browser.close", json!({})).await;
+        let _ = self
+            .connection
+            .call(None, "Browser.close", json!({}), CALL_TIMEOUT)
+            .await;
         // It was asked to leave; this makes sure it did. `Launched` clears the
         // pid on the way out, so nothing here has to remember to.
-        if self
+        let mut launched = self
             .launched
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        if launched
             .process
             .wait_up_to(Duration::from_secs(5))
             .await
             .is_none()
         {
-            self.launched.process.kill();
+            launched.process.kill();
         }
-    }
-
-    async fn send(&mut self, method: &str, params: Value, id: u64) -> Result<()> {
-        self.send_to(None, method, params, id).await
     }
 
     /// Asks for every target attached from now on to be given `plan`.
-    pub fn on_attach(&mut self, plan: OnAttach) {
-        self.on_attach = Some(plan);
+    pub fn on_attach(&self, plan: OnAttach) {
+        self.connection.set_on_attach(plan);
     }
 
-    /// Sends a command nobody waits for. Its reply, when it comes, carries an
-    /// id nothing is waiting on and is dropped like any other.
-    async fn fire(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<()> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send_to(session, method, params, id).await
-    }
-
-    /// Reads a message that was not the reply being waited for, in case it is
-    /// a target that needs its commands.
-    ///
-    /// **Handled here, inside the read loops, and that is enough.** A target
-    /// waits paused until it is let go, and the only reads of this pipe are the
-    /// commands this program sends; a paused service worker could only hold up
-    /// a request from the page, and that request is itself a command whose
-    /// reply this loop is reading towards, so the attach is always drained
-    /// first. The page's own traffic can wait for the next request, and waits
-    /// only while snob is between requests anyway.
-    async fn noticed(&mut self, message: &[u8]) -> Result<()> {
-        const ATTACHED: &[u8] = b"\"Target.attachedToTarget\"";
-        const PAUSED: &[u8] = b"\"Fetch.requestPaused\"";
-        let mentions = |name: &[u8]| message.windows(name.len()).any(|w| w == name);
-        if mentions(PAUSED) {
-            return self.refuse_paused(message).await;
-        }
-        if self.on_attach.is_none() || !mentions(ATTACHED) {
-            return Ok(());
-        }
-        let Ok(event) = serde_json::from_slice::<Value>(message) else {
-            return Ok(());
-        };
-        if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
-            return Ok(());
-        }
-        let params = event.get("params").cloned().unwrap_or(Value::Null);
-        let Some(session) = params.get("sessionId").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let kind = params
-            .pointer("/targetInfo/type")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let waiting = params
-            .get("waitingForDebugger")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        tracing::debug!(%kind, waiting, "a target attached");
-        let plan = self.on_attach.clone().unwrap_or_default();
-        let commands = match kind {
-            "page" | "iframe" => plan.page,
-            kind if kind.ends_with("worker") => plan.worker,
-            _ => Vec::new(),
-        };
-        for (method, params) in commands {
-            self.fire(Some(session), method, params).await?;
-        }
-        // A frame holds frames and a worker can start workers; each is paused
-        // and handed over the same way.
-        self.fire(
-            Some(session),
-            "Target.setAutoAttach",
-            json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
-        )
-        .await?;
-        if waiting {
-            self.fire(Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Fails a request the browser paused for this connection.
-    ///
-    /// Nothing is paused but what a `Fetch.enable` asked for, and the only one
-    /// sent is `headless.rs`'s, which asks for video and nothing else: so a
-    /// paused request is one to refuse, and it is refused the way a content
-    /// blocker refuses one — `BlockedByClient`, which is what a page sees
-    /// from the extensions a great many people run. It waits paused until
-    /// this loop reads it; a video that waits does not play either.
-    async fn refuse_paused(&mut self, message: &[u8]) -> Result<()> {
-        let Ok(event) = serde_json::from_slice::<Value>(message) else {
-            return Ok(());
-        };
-        if event.get("method").and_then(Value::as_str) != Some("Fetch.requestPaused") {
-            return Ok(());
-        }
-        let Some(request) = event.pointer("/params/requestId").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let session = event.get("sessionId").and_then(Value::as_str);
-        self.fire(
-            session,
-            "Fetch.failRequest",
-            json!({ "requestId": request, "errorReason": "BlockedByClient" }),
-        )
-        .await
-    }
-
-    async fn send_to(
-        &mut self,
-        session: Option<&str>,
-        method: &str,
-        params: Value,
-        id: u64,
-    ) -> Result<()> {
-        let mut request = json!({ "id": id, "method": method, "params": params });
-        if let Some(session) = session {
-            request["sessionId"] = json!(session);
-        }
-        self.launched
-            .transport
-            .send(request.to_string().into_bytes())
-            .await
-            .with_context(|| format!("could not send {method} to the browser"))
-    }
-
-    /// Sends one command and waits for the answer with its id.
-    ///
-    /// The protocol interleaves events with replies, so anything that is not
-    /// the reply being waited for is dropped: this subscribes to no events, and
-    /// the browser emits some regardless.
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        tokio::time::timeout(CALL_TIMEOUT, self.call_forever(method, params))
-            .await
-            .map_err(|_| anyhow!("the browser stopped answering ({method})"))?
-    }
-
-    async fn call_forever(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(method, params, id).await?;
-
-        while let Some(message) = self.launched.transport.recv().await {
-            let Some(reply) = reply_to(id, &message) else {
-                self.noticed(&message).await?;
-                continue;
-            };
-            if let Some(error) = reply.get("error") {
-                bail!("the browser refused {method}: {error}");
-            }
-            return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
-        }
-
-        Err(anyhow!(
-            "the browser closed the connection before answering {method}"
-        ))
+    /// The connection itself, for what the façade does not cover: events,
+    /// and commands nobody waits for.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// One command to the browser itself, with the ordinary timeout.
-    pub async fn browser_call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.call(method, params).await
+    pub async fn browser_call(&self, method: &str, params: Value) -> Result<Value> {
+        self.connection
+            .call(None, method, params, CALL_TIMEOUT)
+            .await
+            .map_err(|e| self.explained(e))
     }
 
     /// One command to a tab this connection is attached to, with a timeout of
     /// the caller's choosing: a page fetch can legitimately take longer than
     /// the twenty seconds a browser command gets.
     pub async fn page_call(
-        &mut self,
+        &self,
         session: &str,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let reply = async {
-            self.send_to(Some(session), method, params, id).await?;
-            while let Some(message) = self.launched.transport.recv().await {
-                let Some(reply) = reply_to(id, &message) else {
-                    self.noticed(&message).await?;
-                    continue;
-                };
-                if let Some(error) = reply.get("error") {
-                    bail!("the browser refused {method}: {error}");
-                }
-                return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
-            }
-            Err(anyhow!(
-                "the browser closed the connection before answering {method}"
-            ))
-        };
-        tokio::time::timeout(timeout, reply)
+        self.connection
+            .call(Some(session), method, params, timeout)
             .await
-            .map_err(|_| anyhow!("the browser stopped answering ({method})"))?
+            .map_err(|e| self.explained(e))
+    }
+
+    /// A failed call, with the browser's exit added when that is why.
+    fn explained(&self, error: CallError) -> anyhow::Error {
+        if let CallError::Closed { method, .. } = &error
+            && let Some(said) = self.left_early()
+        {
+            return anyhow!("{said}\n(while waiting for {method})");
+        }
+        anyhow::Error::new(error)
     }
 
     /// The browser's process id.
@@ -706,7 +565,11 @@ impl Cdp {
     /// listening on. Nothing in the program needs it: `kill_launched` reads the
     /// global, because it runs where this value cannot be reached.
     pub fn browser_pid(&self) -> u32 {
-        self.launched.process.id()
+        self.launched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process
+            .id()
     }
 
     /// The exact User-Agent this browser sends.
@@ -714,8 +577,8 @@ impl Cdp {
     /// Worth asking for rather than reconstructing: the session is tied to it,
     /// and a User-Agent that does not match the browser that created the cookie
     /// is what makes Instagram answer `useragent mismatch`.
-    pub async fn user_agent(&mut self) -> Result<String> {
-        let result = self.call("Browser.getVersion", json!({})).await?;
+    pub async fn user_agent(&self) -> Result<String> {
+        let result = self.browser_call("Browser.getVersion", json!({})).await?;
         result
             .get("userAgent")
             .and_then(Value::as_str)
@@ -724,8 +587,8 @@ impl Cdp {
     }
 
     /// The Instagram session currently in this browser, if there is one.
-    pub async fn instagram_cookies(&mut self) -> Result<Option<BrowserCookies>> {
-        let result = self.call("Storage.getCookies", json!({})).await?;
+    pub async fn instagram_cookies(&self) -> Result<Option<BrowserCookies>> {
+        let result = self.browser_call("Storage.getCookies", json!({})).await?;
         let cookies = result
             .get("cookies")
             .and_then(Value::as_array)
@@ -733,31 +596,6 @@ impl Cdp {
             .unwrap_or_default();
         Ok(collect(cookies))
     }
-}
-
-/// One protocol message, if it is the reply to `id`.
-///
-/// Split out because two places need it, and because it is what stands between
-/// a browser's chatter and a command's answer: events carry no `id`, and
-/// replies to commands nobody is waiting for any more carry somebody else's.
-/// A message that is not JSON at all is not a reply either — the transport
-/// hands over bytes and says nothing about what is in them.
-fn reply_to(id: u64, message: &[u8]) -> Option<Value> {
-    // The `id` is read off the raw bytes before anything is built. A browser
-    // narrates -- target events, console output, the cookie jar every two
-    // seconds while somebody logs in -- and building a `Value` for each of
-    // those only to read one integer and drop the tree was the bulk of this
-    // function's work. `serde_json::Deserializer` with a struct that names
-    // only `id` skips everything else at the tokenizer.
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        id: Option<u64>,
-    }
-    let envelope: Envelope = serde_json::from_slice(message).ok()?;
-    if envelope.id != Some(id) {
-        return None;
-    }
-    serde_json::from_slice(message).ok()
 }
 
 /// Picks the Instagram cookies out of everything the browser holds.
@@ -797,7 +635,7 @@ fn collect(cookies: &[Value]) -> Option<BrowserCookies> {
 }
 
 /// Waits for the login to happen, checking every couple of seconds.
-pub async fn wait_for_login(cdp: &mut Cdp, cancel: &CancelToken) -> Result<BrowserCookies> {
+pub async fn wait_for_login(cdp: &Cdp, cancel: &CancelToken) -> Result<BrowserCookies> {
     let started = tokio::time::Instant::now();
     let deadline = started + LOGIN_TIMEOUT;
 
@@ -896,30 +734,6 @@ mod tests {
         let said = died_early(Some(127), Path::new("/tmp/p"));
         assert!(said.contains("127"), "{said}");
         assert!(!said.contains("already open"), "{said}");
-    }
-
-    /// The reply to a command is told from everything else the browser says.
-    ///
-    /// Over a WebSocket this was a library's problem. Over a pipe it is ours,
-    /// and it is the piece that decides whether a login reads the cookies or
-    /// hangs: the browser emits events nobody subscribed to, and an event
-    /// carries no `id` at all.
-    #[test]
-    fn only_the_reply_with_our_id_counts() {
-        assert!(reply_to(7, br#"{"id":7,"result":{"ok":true}}"#).is_some());
-        assert!(reply_to(7, br#"{"id":8,"result":{}}"#).is_none());
-        assert!(reply_to(7, br#"{"method":"Target.targetCreated","params":{}}"#).is_none());
-        assert!(reply_to(7, b"not json at all").is_none());
-        assert!(reply_to(7, b"").is_none());
-    }
-
-    /// A refusal is carried back rather than read as an answer, and an id that
-    /// arrived as a string is not our id.
-    #[test]
-    fn a_refusal_is_still_the_reply_it_answers() {
-        let refused = reply_to(3, br#"{"id":3,"error":{"code":-32601}}"#).unwrap();
-        assert!(refused.get("error").is_some());
-        assert!(reply_to(3, br#"{"id":"3","result":{}}"#).is_none());
     }
 
     fn cookie(name: &str, value: &str, domain: &str) -> Value {

@@ -37,8 +37,11 @@ snob-store.workspace = true
 snob-ig.workspace = true
 clap.workspace = true
 # `net` and `io-util` for the loopback page `headless.rs` serves for one
-# question; both were already compiled in through reqwest.
-tokio = { workspace = true, features = ["net", "io-util"] }
+# question; both were already compiled in through reqwest. `sync` for the
+# channels `cdp::connection`'s dispatcher answers callers on -- also already
+# compiled in, through hyper, and named here because this crate now uses it
+# directly rather than by accident.
+tokio = { workspace = true, features = ["net", "io-util", "sync"] }
 anyhow.workspace = true
 serde_json.workspace = true
 # Already in the tree through snob-core, so this costs no extra compilation.

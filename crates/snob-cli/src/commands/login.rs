@@ -316,14 +316,14 @@ async fn capture(
     paths: &AppPaths,
     cancel: &CancelToken,
 ) -> Result<(login::BrowserCookies, String)> {
-    let mut cdp = cdp::Cdp::connect(cdp::launch(found, paths, cancel).await?, cancel).await?;
-    let outcome = collect(&mut cdp, found, requested_user_agent, cancel).await;
+    let cdp = cdp::Cdp::connect(cdp::launch(found, paths, cancel).await?, cancel).await?;
+    let outcome = collect(&cdp, found, requested_user_agent, cancel).await;
     cdp.close().await;
     outcome
 }
 
 async fn collect(
-    cdp: &mut cdp::Cdp,
+    cdp: &cdp::Cdp,
     found: &browser::Browser,
     requested_user_agent: Option<String>,
     cancel: &CancelToken,

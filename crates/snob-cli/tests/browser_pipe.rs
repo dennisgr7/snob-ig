@@ -62,7 +62,7 @@ async fn the_browser_answers_on_the_pipe_and_opens_no_port() {
         Ok(launched) => cdp::Cdp::connect(launched, &cancel).await,
         Err(e) => Err(e),
     };
-    let mut cdp = match started {
+    let cdp = match started {
         Ok(cdp) => cdp,
         Err(e) => {
             eprintln!("the browser found here will not start ({e}); skipping");

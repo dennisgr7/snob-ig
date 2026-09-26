@@ -86,9 +86,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// The most a page may hand back, measured the way it travels: as a protocol
 /// message on the pipe, where every character outside printable ASCII is six
 /// bytes (`\uXXXX`) and a quote or backslash two. Two megabytes short of the
-/// pipe's ceiling, for the envelope. A message over that ceiling ends the
-/// connection rather than failing the one request, so the cap has to be
-/// applied in the page, before anything is sent back.
+/// pipe's ceiling, for the envelope. A message over that ceiling is dropped on
+/// the way in and fails its request as a browser failure, so the cap is
+/// applied in the page, before anything is sent back: an answer too large then
+/// arrives as `too_large`, which the client reads as what it is.
 const PAGE_WIRE_CAP: u64 = (crate::pipe::MAX_MESSAGE_BYTES - 2 * 1024 * 1024) as u64;
 
 /// The screen the browser says it is on: the commonest desktop size.
@@ -311,7 +312,7 @@ impl Headless {
         let launched = crate::cdp::launch_headless(&browser, &self.paths, &flags, &cancel)
             .await
             .with_context(|| format!("could not start {} without a window", browser.name))?;
-        let mut cdp = Cdp::connect(launched, &cancel).await?;
+        let cdp = Cdp::connect(launched, &cancel).await?;
         if claim || hints.fresh {
             mark.write(&self.paths);
         }
@@ -368,7 +369,7 @@ impl Headless {
         )
         .await?;
 
-        let tab = attach_to_a_tab(&mut cdp).await?;
+        let tab = attach_to_a_tab(&cdp).await?;
         for (method, params) in page_commands {
             cdp.page_call(&tab, method, params, COMMAND_TIMEOUT).await?;
         }
@@ -379,6 +380,12 @@ impl Headless {
             COMMAND_TIMEOUT,
         )
         .await?;
+        // So that a tab that crashes says so, and the request waiting on it
+        // fails at once rather than at its timeout: `Inspector.targetCrashed`
+        // is only sent to a session that asked for the domain. Nothing about
+        // it reaches the page.
+        cdp.page_call(&tab, "Inspector.enable", json!({}), COMMAND_TIMEOUT)
+            .await?;
 
         Ok(Live {
             cdp,
@@ -448,7 +455,7 @@ impl Page for Headless {
 
 /// Attaches to the tab the browser opened with, in flat mode so its commands
 /// travel on the same pipe.
-async fn attach_to_a_tab(cdp: &mut Cdp) -> Result<String> {
+async fn attach_to_a_tab(cdp: &Cdp) -> Result<String> {
     let targets = cdp.browser_call("Target.getTargets", json!({})).await?;
     let page = targets
         .get("targetInfos")
@@ -541,9 +548,9 @@ async fn ask_without_the_flag(
         let cancel = CancelToken::default();
         let flags = ["--headless=new".to_string()];
         let launched = crate::cdp::launch_throwaway(browser, &dir, &flags, &cancel).await?;
-        let mut cdp = Cdp::connect(launched, &cancel).await?;
-        let found = match attach_to_a_tab(&mut cdp).await {
-            Ok(tab) => probe_platform(&mut cdp, &tab).await,
+        let cdp = Cdp::connect(launched, &cancel).await?;
+        let found = match attach_to_a_tab(&cdp).await {
+            Ok(tab) => probe_platform(&cdp, &tab).await,
             Err(e) => Err(e),
         };
         cdp.close().await;
@@ -573,7 +580,7 @@ async fn ask_without_the_flag(
 /// `http://127.0.0.1` is. So a page is served on a loopback port for the
 /// length of one question. Nothing leaves the machine, and nothing about
 /// Instagram is involved.
-async fn probe_platform(cdp: &mut Cdp, tab: &str) -> Result<Value> {
+async fn probe_platform(cdp: &Cdp, tab: &str) -> Result<Value> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let server = tokio::spawn(async move {
@@ -899,7 +906,7 @@ impl ProfileMark {
 async fn navigate(live: &mut Live, url: &str) -> Result<(), PageError> {
     // The world dies with the document it was made in.
     live.world = None;
-    navigate_tab(&mut live.cdp, &live.tab, url).await?;
+    navigate_tab(&live.cdp, &live.tab, url).await?;
     tokio::time::sleep(SETTLE).await;
     Ok(())
 }
@@ -907,7 +914,7 @@ async fn navigate(live: &mut Live, url: &str) -> Result<(), PageError> {
 /// The navigation itself. A page that could not be reached, or never finished
 /// loading, is the network's failure and says so; a protocol command that
 /// failed is the browser's.
-async fn navigate_tab(cdp: &mut Cdp, tab: &str, url: &str) -> Result<(), PageError> {
+async fn navigate_tab(cdp: &Cdp, tab: &str, url: &str) -> Result<(), PageError> {
     let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
     let went = cdp
         .page_call(tab, "Page.navigate", json!({ "url": url }), COMMAND_TIMEOUT)
@@ -951,7 +958,7 @@ async fn navigate_and_read(live: &mut Live, url: &str) -> Result<PageResponse, P
     let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
     navigate(live, url).await?;
     let page = evaluate(
-        &mut live.cdp,
+        &live.cdp,
         &live.tab,
         &format!(
             "(() => {{ const n = performance.getEntriesByType('navigation')[0] || {{}}; \
@@ -1082,7 +1089,7 @@ async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse, P
     let expression = format!("(() => {{ {WIRE_LENGTH} return {FETCH}({argument}); }})()");
     let timeout = Duration::from_millis(request.timeout_ms) + Duration::from_secs(10);
     let world = isolated_world(live).await?;
-    let answer = evaluate_in(&mut live.cdp, &live.tab, Some(world), &expression, timeout)
+    let answer = evaluate_in(&live.cdp, &live.tab, Some(world), &expression, timeout)
         .await
         .map_err(|e| PageError::Browser(format!("{e:#}")))?;
     if let Some(error) = answer.get("error").and_then(Value::as_str) {
@@ -1137,13 +1144,13 @@ async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse, P
 /// `Runtime.evaluate` without `Runtime.enable`: enabling the domain is what
 /// makes the console report objects back over the pipe, and that reporting is
 /// the side effect pages use to notice a debugger is attached.
-async fn evaluate(cdp: &mut Cdp, tab: &str, expression: &str, timeout: Duration) -> Result<Value> {
+async fn evaluate(cdp: &Cdp, tab: &str, expression: &str, timeout: Duration) -> Result<Value> {
     evaluate_in(cdp, tab, None, expression, timeout).await
 }
 
 /// [`evaluate`], in a given world of the tab's document.
 async fn evaluate_in(
-    cdp: &mut Cdp,
+    cdp: &Cdp,
     tab: &str,
     world: Option<i64>,
     expression: &str,

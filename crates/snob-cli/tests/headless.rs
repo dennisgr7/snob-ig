@@ -491,3 +491,75 @@ async fn no_video_the_site_loads_reaches_the_page() {
         "a video reached the page: {paths:?}"
     );
 }
+
+/// A worker the page starts while snob is between requests runs at once.
+///
+/// The protocol used to be read only while one of snob's own commands waited
+/// for its answer, and a target the browser paused in the gap stayed paused
+/// until the next command came along: measured, a worker created one second
+/// into a six-second gap started 5.1 s late, which is itself a timing tell.
+/// The page here starts one during the pause after the site loads, when snob
+/// has nothing in flight, and reports how long it took to begin.
+#[tokio::test]
+async fn a_worker_created_while_snob_is_idle_starts_at_once() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .set_body_raw(
+                    "<!doctype html><title>Instagram</title><script>
+                    setTimeout(() => {
+                      const made = Date.now();
+                      const code = new Blob(['postMessage(Date.now())'],
+                        { type: 'text/javascript' });
+                      const worker = new Worker(URL.createObjectURL(code));
+                      worker.onmessage = (e) => fetch('/worker-probe?ms=' + (e.data - made));
+                    }, 200);
+                    </script>",
+                    "text/html",
+                ),
+        )
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/worker-probe"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&instagram)
+        .await;
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some(&format!("{SESSIONID}\n")),
+    );
+    assert!(out.status.success(), "the login failed: {}", said(&out));
+
+    let received = instagram.received_requests().await.unwrap_or_default();
+    let paths: Vec<String> = received.iter().map(|r| r.url.to_string()).collect();
+    let probe = received
+        .iter()
+        .find(|r| r.url.path() == "/worker-probe")
+        .unwrap_or_else(|| panic!("the worker ran and reported: {paths:?}"));
+    let late: u64 = probe
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == "ms")
+        .and_then(|(_, v)| v.parse().ok())
+        .expect("the delay is a number of milliseconds");
+    eprintln!("the worker started {late} ms after it was created");
+    // Held until the next command, the worker waited out the rest of the
+    // page's settling pause: 1,309 ms, measured before this changed. A reader of its own lets it
+    // go in milliseconds; the margin is for a slow runner.
+    assert!(
+        late < 500,
+        "the worker started {late} ms after it was created"
+    );
+}

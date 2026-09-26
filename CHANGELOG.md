@@ -15,6 +15,14 @@
   from, and `snob logout` deletes it; `--keep-profile` and
   `--purge-profile` are accepted and do nothing.
 
+- **The browser answers its own workers at once.** A worker or frame the
+  page started while snob was between requests used to stay paused until
+  snob's next request — 1.3 s after the site loads, measured, and up to the
+  whole gap between pages on a walk — which is a timing no person's browser
+  shows. It now starts in milliseconds. A tab that crashes fails the request
+  waiting on it at once instead of twenty seconds later, and an answer too
+  large to take fails that one request rather than the browser.
+
 - **`snob import dyi` is in.** It reads the archive Instagram itself hands
   over under "Download your information" and prints the same four answers
   the live commands give, with no session and no request. It was written and

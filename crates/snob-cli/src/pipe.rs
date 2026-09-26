@@ -47,9 +47,15 @@ use anyhow::Result;
 /// The transport reads until a NUL, so without a ceiling a browser that never
 /// sent one would decide how much memory this process uses. `Browser.getVersion`
 /// and `Storage.getCookies` answer in kilobytes; this is far above anything
-/// real. A message over it ends the connection, so what `headless.rs` asks
-/// the page to hand back is capped below it, in the bytes it will take here.
+/// real. A message over it is skipped to its terminator and fails only the
+/// call it answers ([`Frame::Oversized`]); what `headless.rs` asks the page to
+/// hand back is still capped below it, in the bytes it will take here, so an
+/// answer that matters is never the one thrown away.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of a message past the ceiling is kept: enough to read the `id` it
+/// answers, which the browser writes first.
+const OVERSIZED_HEAD_BYTES: usize = 256;
 
 /// How the two ends of the protocol are numbered.
 ///
@@ -61,84 +67,126 @@ const CHILD_WRITE_FD: usize = 4;
 /// One message, in either direction, without its NUL terminator.
 pub type Message = Vec<u8>;
 
+/// What the reader hands over: a message, or word of one that was too large to
+/// keep.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// A whole message, without its terminator.
+    Message(Message),
+    /// A message past [`MAX_MESSAGE_BYTES`], skipped to its terminator. Only
+    /// its first bytes are kept, which is where the browser writes the `id` of
+    /// the call it answers: that call fails and nothing else does. Ending the
+    /// whole connection over one answer, as this used to, took every other
+    /// call down with it and the browser along with them.
+    Oversized { head: Vec<u8> },
+}
+
 /// The browser's end of the protocol.
 ///
 /// Reading and writing are done by two ordinary threads rather than by async
 /// file handles, because a pipe is not pollable the same way on both platforms
 /// and this needs no concurrency beyond "one reader, one writer". The channels
-/// are what the async side sees.
+/// are what the async side sees, and [`crate::cdp`]'s dispatcher is the one
+/// thing that reads them.
 pub struct PipeTransport {
-    to_browser: tokio::sync::mpsc::Sender<Message>,
-    from_browser: tokio::sync::mpsc::Receiver<Message>,
-}
-
-impl PipeTransport {
-    /// Sends one message. `Err` means the browser's end has gone.
-    pub async fn send(&self, message: Message) -> Result<()> {
-        self.to_browser
-            .send(message)
-            .await
-            .map_err(|_| anyhow::anyhow!("the connection to the browser broke"))
-    }
-
-    /// Waits for the next message. `None` means the browser closed the pipe.
-    pub async fn recv(&mut self) -> Option<Message> {
-        self.from_browser.recv().await
-    }
+    /// Unbounded, so that nothing sending ever waits on the browser: the
+    /// dispatcher answers a target's attach by writing, and a write that could
+    /// wait would be a dispatcher that could stop reading. What goes this way
+    /// is only ever what this process decided to send.
+    pub(crate) to_browser: tokio::sync::mpsc::UnboundedSender<Message>,
+    /// Bounded, so a browser narrating faster than it is read cannot grow this
+    /// without limit; the dispatcher drains it continuously.
+    pub(crate) from_browser: tokio::sync::mpsc::Receiver<Frame>,
 }
 
 /// Pulls whole messages out of whatever has arrived so far.
 ///
 /// The protocol over a pipe is JSON documents separated by NUL bytes, and a
 /// read returns whatever the pipe had — half a message, several messages, a
-/// message and half of the next. Split out as a pure function precisely so that
-/// case can be tested without a browser: it was the one part of this transport
-/// that a WebSocket library used to do for us.
+/// message and half of the next. Split out and kept free of any I/O precisely
+/// so that case can be tested without a browser: it was the one part of this
+/// transport that a WebSocket library used to do for us.
 ///
-/// Anything left over stays in `buffer` for the next read, and `scanned`
-/// remembers how much of it has already been searched.
-///
-/// The cursor is what keeps this linear. Without it, every read re-searched
-/// the buffer from byte zero while a message arrived in pieces, which is
-/// O(len²/chunk): at the 8 MiB ceiling that is on the order of four billion
-/// bytes scanned to deliver one message -- and `Storage.getCookies` against a
-/// real profile is exactly the kind of answer that arrives in pieces. The
-/// caller owns the cursor for the same reason it owns the buffer: this stays
-/// a pure function a test can drive.
-fn take_messages(buffer: &mut Vec<u8>, scanned: &mut usize) -> Vec<Message> {
-    let mut out = Vec::new();
-    while let Some(end) = buffer[*scanned..]
-        .iter()
-        .position(|byte| *byte == 0)
-        .map(|found| found + *scanned)
-    {
-        let mut message: Vec<u8> = buffer.drain(..=end).collect();
-        message.pop();
-        out.push(message);
-        // The drain shifted everything left, so the next search starts over
-        // -- at the front of a buffer that no longer holds what was searched.
-        *scanned = 0;
+/// **Every byte is looked at once.** Only what has just arrived is searched
+/// for a terminator; what came before it is already known to hold none. The
+/// first version searched the whole buffer on every read while a message
+/// arrived in pieces, which is O(len²/chunk): at the 8 MiB ceiling that was on
+/// the order of four billion bytes scanned to deliver one message -- and
+/// `Storage.getCookies` against a real profile is exactly the kind of answer
+/// that arrives in pieces.
+#[derive(Debug, Default)]
+struct Framer {
+    /// The message in progress, never past the ceiling.
+    buffer: Vec<u8>,
+    /// Set while a message past the ceiling is being skipped: its head.
+    skipping: Option<Vec<u8>>,
+}
+
+impl Framer {
+    /// Everything that `bytes` completes, in order.
+    fn push(&mut self, mut bytes: &[u8]) -> Vec<Frame> {
+        let mut out = Vec::new();
+        loop {
+            let end = bytes.iter().position(|byte| *byte == 0);
+            if let Some(head) = &mut self.skipping {
+                let Some(end) = end else {
+                    return out;
+                };
+                out.push(Frame::Oversized {
+                    head: std::mem::take(head),
+                });
+                self.skipping = None;
+                bytes = &bytes[end + 1..];
+                continue;
+            }
+            let taken = end.unwrap_or(bytes.len());
+            if self.buffer.len() + taken > MAX_MESSAGE_BYTES {
+                // Copied out rather than truncated in place, which would keep
+                // the eight megabytes allocated for as long as the skip lasts.
+                let head: Vec<u8> = self
+                    .buffer
+                    .iter()
+                    .chain(&bytes[..taken])
+                    .take(OVERSIZED_HEAD_BYTES)
+                    .copied()
+                    .collect();
+                self.buffer = Vec::new();
+                match end {
+                    Some(end) => {
+                        out.push(Frame::Oversized { head });
+                        bytes = &bytes[end + 1..];
+                        continue;
+                    }
+                    None => {
+                        self.skipping = Some(head);
+                        return out;
+                    }
+                }
+            }
+            self.buffer.extend_from_slice(&bytes[..taken]);
+            let Some(end) = end else {
+                return out;
+            };
+            out.push(Frame::Message(std::mem::take(&mut self.buffer)));
+            bytes = &bytes[end + 1..];
+        }
     }
-    *scanned = buffer.len();
-    out
 }
 
 /// Wires two blocking file handles up to the channels above.
-fn pump<R, W>(reader: R, writer: W) -> PipeTransport
+pub(crate) fn pump<R, W>(reader: R, writer: W) -> PipeTransport
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    // Bounded, so a browser narrating faster than the login loop reads cannot
-    // grow this without limit. Sixty-four is far more than the handful of
-    // messages a login exchanges.
-    let (to_browser, mut outgoing) = tokio::sync::mpsc::channel::<Message>(64);
-    let (incoming, from_browser) = tokio::sync::mpsc::channel::<Message>(64);
+    let (to_browser, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    // Sixty-four frames of slack between the reader thread and the dispatcher,
+    // which never waits on anything but this channel.
+    let (incoming, from_browser) = tokio::sync::mpsc::channel::<Frame>(64);
 
     let mut reader = reader;
     std::thread::spawn(move || {
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut scanned = 0usize;
+        let mut framer = Framer::default();
         // 64 KiB rather than 8: a cookie answer runs to hundreds of
         // kilobytes, and the chunk size is how many syscalls that costs.
         let mut chunk = [0u8; 65536];
@@ -147,13 +195,11 @@ where
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
-            buffer.extend_from_slice(&chunk[..read]);
-            if buffer.len() > MAX_MESSAGE_BYTES {
-                tracing::warn!("the browser sent a protocol message past the ceiling");
-                return;
-            }
-            for message in take_messages(&mut buffer, &mut scanned) {
-                if incoming.blocking_send(message).is_err() {
+            for frame in framer.push(&chunk[..read]) {
+                if let Frame::Oversized { .. } = frame {
+                    tracing::warn!("the browser sent a protocol message past the ceiling");
+                }
+                if incoming.blocking_send(frame).is_err() {
                     return;
                 }
             }
@@ -852,38 +898,93 @@ mod tests {
     /// can be tested without a browser.
     #[test]
     fn messages_are_reassembled_across_reads() {
-        let mut buffer = Vec::new();
-        let mut scanned = 0;
+        let mut framer = Framer::default();
 
-        buffer.extend_from_slice(br#"{"id":1}"#);
         assert!(
-            take_messages(&mut buffer, &mut scanned).is_empty(),
+            framer.push(br#"{"id":1}"#).is_empty(),
             "no terminator has arrived yet"
         );
-        assert_eq!(scanned, buffer.len(), "what was searched is remembered");
-
-        buffer.push(0);
-        let first = take_messages(&mut buffer, &mut scanned);
-        assert_eq!(first, vec![br#"{"id":1}"#.to_vec()]);
-        assert!(buffer.is_empty());
-        assert_eq!(scanned, 0);
+        assert_eq!(
+            framer.push(b"\0"),
+            vec![Frame::Message(br#"{"id":1}"#.to_vec())]
+        );
+        assert!(framer.buffer.is_empty());
 
         // Two whole messages and the beginning of a third, in one read.
-        buffer.extend_from_slice(b"{\"id\":2}\0{\"id\":3}\0{\"id\"");
-        let rest = take_messages(&mut buffer, &mut scanned);
-        assert_eq!(rest, vec![br#"{"id":2}"#.to_vec(), br#"{"id":3}"#.to_vec()]);
-        assert_eq!(buffer, b"{\"id\"");
-        assert_eq!(scanned, buffer.len());
+        let rest = framer.push(b"{\"id\":2}\0{\"id\":3}\0{\"id\"");
+        assert_eq!(
+            rest,
+            vec![
+                Frame::Message(br#"{"id":2}"#.to_vec()),
+                Frame::Message(br#"{"id":3}"#.to_vec()),
+            ]
+        );
+        assert_eq!(framer.buffer, b"{\"id\"");
+        assert_eq!(
+            framer.push(b":4}\0"),
+            vec![Frame::Message(br#"{"id":4}"#.to_vec())]
+        );
     }
 
     /// An empty message is a message. Dropping it would desynchronize the
     /// stream rather than skip a blank line.
     #[test]
     fn an_empty_message_is_still_one() {
-        let mut buffer = b"\0a\0".to_vec();
         assert_eq!(
-            take_messages(&mut buffer, &mut 0),
-            vec![Vec::new(), b"a".to_vec()]
+            Framer::default().push(b"\0a\0"),
+            vec![Frame::Message(Vec::new()), Frame::Message(b"a".to_vec())]
         );
+    }
+
+    /// A message past the ceiling is skipped to its end, in pieces or whole,
+    /// and the stream carries on after it: the message behind it arrives, and
+    /// the head that names the call it answered is kept.
+    #[test]
+    fn a_message_past_the_ceiling_is_skipped_and_the_next_one_arrives() {
+        let head = br#"{"id":9,"result":{"body":""#;
+        let mut huge = head.to_vec();
+        huge.resize(MAX_MESSAGE_BYTES + 10, b'x');
+
+        // Arriving in pieces, the way a pipe hands it over.
+        let mut framer = Framer::default();
+        let mut frames = Vec::new();
+        for piece in huge.chunks(65536) {
+            frames.extend(framer.push(piece));
+        }
+        assert!(frames.is_empty(), "nothing is complete yet");
+        assert!(framer.buffer.capacity() < 1024, "the skip holds no buffer");
+        frames.extend(framer.push(b"xx\0{\"id\":10}\0"));
+        match frames.as_slice() {
+            [Frame::Oversized { head: kept }, Frame::Message(next)] => {
+                assert!(
+                    kept.starts_with(head),
+                    "{:?}",
+                    String::from_utf8_lossy(kept)
+                );
+                assert!(kept.len() <= OVERSIZED_HEAD_BYTES);
+                assert_eq!(next, br#"{"id":10}"#);
+            }
+            other => panic!("{} frames", other.len()),
+        }
+
+        // And whole, terminator included, in one read.
+        let mut whole = huge.clone();
+        whole.push(0);
+        whole.extend_from_slice(b"{\"id\":11}\0");
+        let frames = Framer::default().push(&whole);
+        assert!(matches!(frames.first(), Some(Frame::Oversized { .. })));
+        assert_eq!(
+            frames.get(1),
+            Some(&Frame::Message(br#"{"id":11}"#.to_vec()))
+        );
+    }
+
+    /// A message exactly at the ceiling is still a message.
+    #[test]
+    fn a_message_at_the_ceiling_is_kept() {
+        let mut exact = vec![b' '; MAX_MESSAGE_BYTES];
+        exact.push(0);
+        let frames = Framer::default().push(&exact);
+        assert!(matches!(frames.as_slice(), [Frame::Message(m)] if m.len() == MAX_MESSAGE_BYTES));
     }
 }

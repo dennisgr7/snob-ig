@@ -6,8 +6,9 @@ reasoning behind individual changes live in the commit messages, not here.
 
 **Detailed reasoning lives in the doc-comment above the code it governs, not
 here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
-schema in `store/sql/`, the cookie boundary in `cdp.rs`, the browser requests
-are sent from in `headless.rs`, the headers in `client_hints.rs`. Read those before changing any of them — they explain what a
+schema in `store/sql/`, the cookie boundary in `cdp/mod.rs`, the protocol's
+reader in `cdp/connection.rs`, the browser requests are sent from in
+`headless.rs`, the headers in `client_hints.rs`. Read those before changing any of them — they explain what a
 number is for, which is what stops it being changed into something that no
 longer does the job it was there to do.
 
@@ -149,6 +150,13 @@ the suite needs no browser. Plain
 `cargo test --workspace` compiles none of this, so run the `testing` suite
 too before pushing — CI runs it as its own step on every platform.
 
+**`tests/headless.rs` skips where no browser will start**, and that is both
+Linux runners (no Chrome on ARM64, no user namespaces for its sandbox on
+x86_64) and anything running as root. It runs for real on the Windows x86_64,
+Windows ARM64 and macOS runners, against Chrome and Edge. Locally on Linux,
+build the tests as usual and run the `headless-*` binary as an ordinary user
+with a `chromium` on `PATH`.
+
 **The Linux CI job runs on this machine too**, in a container: `bash
 tools/ci/run.sh` (from Git Bash on Windows). It is the job that differs most
 from a developer's host — musl, a real Secret Service keyring behind a session
@@ -262,9 +270,10 @@ each location.
 | A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::sync_cookies`, `ProfileMark` |
 | The profile a failed login finds is never deleted; only one it created | `login::by_browser` |
 | A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
-| Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs | `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
+| Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs, is let go at once whoever is waiting, and keeps the identity when the session that gave it goes | the dispatcher in `cdp::connection` (`attached`, `detached`), `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
+| A protocol call can be given up at any point, and a crash, a lost session or a closed pipe fails exactly the calls waiting on it | `cdp::Connection::call` (the id is registered before the write and forgotten on drop); the dispatcher never awaits a reply of its own |
 | snob's requests run where the page's scripts cannot see them | `headless::isolated_world` |
-| No video the site loads reaches the page, so opening it adds no plays to anybody's reels | `headless::refuse_video`, `Cdp::refuse_paused`; `tests/headless.rs` |
+| No video the site loads reaches the page, so opening it adds no plays to anybody's reels | `headless::refuse_video`, `refuse_paused` in `cdp::connection`; `tests/headless.rs` |
 | Nothing is spent while the account is in cooldown | `Pacer::clear`; `SNOB_IGNORE_COOLDOWN` is the undocumented escape hatch |
 | A 429 or push-back puts the account in cooldown | `IgClient::classify_and_record` |
 | A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route` |
@@ -362,6 +371,12 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 - **The browser is talked to over a pipe; there is no debugging port.**
   A port was demonstrated to hand the session cookie to any local process.
   `pipe.rs` carries the launch mechanics; `tests/browser_pipe.rs` holds it.
+- **The protocol client is our own.** `chromiumoxide` is WebSocket-only and
+  enables `Runtime` on every frame; `headless_chrome` is port-only, not
+  flattened, quits after 30 s without a message and `expect`s in its reader.
+  Neither handles the inherited pipe descriptors or the Windows job object,
+  which are the hard part. `cdp/connection.rs` follows Puppeteer's
+  `Connection` and Playwright's `crConnection.ts`.
 - **`snob purge` deletes the stored data and not the binary**, session first;
   the package manager owns the binary. **`snob logout` deletes the browser
   profile** as well as the stored session: the profile is where the live
@@ -433,47 +448,12 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   account: `friendships/pending/` (follow requests awaiting an answer) and
   `archive/reel/day_shells/` (the story archive).
 - **The browser as the whole engine, and several accounts.** Researched,
-  measured and planned in September 2026; nothing below is built. In order,
-  because each step is what the next one stands on:
-  1. **A protocol client with its own reader.** `cdp.rs` reads the pipe only
-     while a command waits for its reply, and takes one caller at a time
-     (`&mut self`, behind `Headless`'s mutex). Measured and read, what that
-     costs today:
-     - A target auto-attached while snob sleeps between requests stays
-       paused until the next one: a worker created one second into a
-       six-second gap started 5.1 s late (8–12 ms with a reader). A late
-       worker is itself a timing tell.
-     - `Cdp::noticed` runs inside the caller's future, so a timeout or a
-       Ctrl+C that drops it between taking an attach and sending
-       `Runtime.runIfWaitingForDebugger` leaves that target paused for good.
-       `fire`'s failures are never seen.
-     - Every service worker is attached twice, once by the browser-level
-       auto-attach and once by the tab's; it works by accident.
-     - A crashed tab (`Inspector.targetCrashed`) leaves the pending call to
-       run out its whole timeout; a message over `pipe::MAX_MESSAGE_BYTES`
-       ends the connection rather than failing one call.
-
-     The design: one dispatcher task owns the read side and routes replies
-     by id (a guard registered before sending removes the pending entry when
-     the caller's future is dropped, so calls are cancel-safe and
-     concurrent) and events by `sessionId`; it handles each attach itself,
-     once per target, and fails a session's calls on `detachedFromTarget`,
-     `Inspector.targetCrashed` or a `-32001` reply, and every call with the
-     exit reason when the pipe closes. It never awaits a reply of its own —
-     that would deadlock it — and never panics (`panic = "abort"`). An
-     oversized frame is skipped to its terminator and fails only its call.
-     Subscribers get events with `try_send` and lose them rather than hold
-     up replies. `Cdp` stays as a façade while the callers move over.
-     **No crate:** `chromiumoxide` is WebSocket-only and enables `Runtime`
-     on every frame; `headless_chrome` is port-only, not flat, quits after
-     30 s without a message and `expect`s in its reader. Neither handles the
-     inherited pipe descriptors or the Windows job object, which are the
-     hard part here. Puppeteer's `Connection` and Playwright's
-     `crConnection.ts` are the structure to copy. Tests: the dispatcher
-     against a scripted fake browser over `Read + Write` (out-of-order
-     replies, a dropped future, end of stream, a crash, `-32001`), and a
-     browser test that a worker created while snob is idle starts in under
-     200 ms.
+  measured and planned in September 2026. In order, because each step is
+  what the next one stands on; the first is built (`cdp/connection.rs`: one
+  reader of its own, calls that can be dropped and run side by side, an
+  attach answered the moment it arrives — a worker created while snob was
+  idle started 1,309 ms late before it and 9–12 ms after, measured on
+  Chromium 141 by `tests/headless.rs`), and the rest stand on it:
   2. **A browser profile per account** (`browser-profile/<pk>`), with its
      own mark. Today there is one profile and switching accounts clears its
      cookies and site data so two accounts do not share a device identity;
@@ -525,13 +505,8 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
      the stored copy never learns; reading them back at shutdown keeps a
      profile loss from reverting to a stale session.
 - **Checks nobody has run yet.**
-  - `tests/headless.rs` has only run against Chromium on Linux ARM64. The
-    first CI run on Windows (x86_64 and ARM64) and macOS is its first
-    against Chrome or Edge there; a red run is most likely there.
   - Whether a headless Chrome or Edge on a Windows desktop reaches the real
     GPU (see the WebGL wall).
-  - Whether detaching from a service worker drops the identity it was given,
-    and whether a worker attached twice needs releasing twice.
   - Whether Ubuntu's snap Chromium can open a profile under a hidden
     directory of the home at all (suspected not).
   - The Homebrew and Scoop notes (`packaging/render.sh`) gain the line that
