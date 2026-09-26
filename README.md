@@ -21,8 +21,9 @@ macOS on Apple Silicon.
 
 **Almost all of snob reads.** It changes exactly two things, one account per
 command and after asking: `snob follow` and `snob unfollow`. It never blocks,
-never removes a follower, never likes, comments or messages, and never marks a
-story as seen.
+never removes a follower, never likes, comments or messages, never marks a
+story as seen, and plays no video: the feed the browser opens would play one on
+its own, and that would count as a play on somebody's reel.
 
 > **Early version.** Every command works and has been used against the real API.
 > `snob import dyi` reads the data export Instagram hands over itself, and sends

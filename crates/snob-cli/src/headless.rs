@@ -47,9 +47,15 @@
 //!   wrapped and its resource timing list both see them; they run in an
 //!   isolated world ([`isolated_world`]).
 //!
+//! And one thing that is not about looking like a browser but about what a
+//! browser does to other people: the feed plays videos on its own, and a play
+//! counts. No video reaches the page ([`refuse_video`]).
+//!
 //! What is left is left knowingly: WebGL is absent — `getContext` returns
 //! nothing without a GPU the browser will use headless — and the switch that
-//! brings in the software renderer is one Chromium itself calls unsafe.
+//! brings in the software renderer is one Chromium itself calls unsafe, and
+//! would only name SwiftShader instead. Whether a headless browser on a
+//! Windows desktop reaches the real GPU is to be measured there first.
 //! `navigator.languages` and `Accept-Language` are the profile's own, which is
 //! what the login sent.
 
@@ -336,10 +342,14 @@ impl Headless {
                 "Emulation.setFocusEmulationEnabled",
                 json!({ "enabled": true }),
             ),
+            ("Fetch.enable", refuse_video()),
         ];
         cdp.on_attach(crate::cdp::OnAttach {
             page: page_commands.clone(),
-            worker: vec![("Network.setUserAgentOverride", identity)],
+            worker: vec![
+                ("Network.setUserAgentOverride", identity),
+                ("Fetch.enable", refuse_video()),
+            ],
         });
         cdp.browser_call(
             "Target.setAutoAttach",
@@ -379,6 +389,34 @@ impl Headless {
             mark,
         })
     }
+}
+
+/// The requests the browser pauses for this connection to refuse: every video
+/// the site would load, feed and reels and stories alike.
+///
+/// **So that nothing plays.** Opening the site renders the feed, and the feed
+/// plays a video that scrolls into view, muted, on its own; Instagram counts a
+/// play of a reel from its start. A run of snob would add plays to other
+/// people's videos that nobody watched. Measured on Chromium 153, a muted video
+/// plays under every `--autoplay-policy` there is, the strictest included —
+/// those only hold back sound — and a minimized window freezes the page, the
+/// calls with it. What holds is the video never arriving: refused as a content
+/// blocker refuses it (`Cdp::refuse_paused`), it fails to load, and a page gets
+/// that from the blockers a great many people run.
+///
+/// By address rather than by kind: the site's player fetches its video in
+/// pieces with `fetch()`, which the browser files as a fetch, not as media.
+/// Every piece is an `.mp4` on the CDN; nothing snob sends has that in its
+/// address, and snob's own downloads of stories do not go through the browser.
+fn refuse_video() -> Value {
+    json!({
+        "patterns": [
+            { "urlPattern": "*.mp4*" },
+            { "urlPattern": "*.webm*" },
+            { "urlPattern": "*.m3u8*" },
+            { "resourceType": "Media" },
+        ],
+    })
 }
 
 /// Chromium will not run as root with its sandbox on, and snob does not turn

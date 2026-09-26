@@ -534,7 +534,12 @@ impl Cdp {
     /// only while snob is between requests anyway.
     async fn noticed(&mut self, message: &[u8]) -> Result<()> {
         const ATTACHED: &[u8] = b"\"Target.attachedToTarget\"";
-        if self.on_attach.is_none() || !message.windows(ATTACHED.len()).any(|w| w == ATTACHED) {
+        const PAUSED: &[u8] = b"\"Fetch.requestPaused\"";
+        let mentions = |name: &[u8]| message.windows(name.len()).any(|w| w == name);
+        if mentions(PAUSED) {
+            return self.refuse_paused(message).await;
+        }
+        if self.on_attach.is_none() || !mentions(ATTACHED) {
             return Ok(());
         }
         let Ok(event) = serde_json::from_slice::<Value>(message) else {
@@ -578,6 +583,33 @@ impl Cdp {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Fails a request the browser paused for this connection.
+    ///
+    /// Nothing is paused but what a `Fetch.enable` asked for, and the only one
+    /// sent is `headless.rs`'s, which asks for video and nothing else: so a
+    /// paused request is one to refuse, and it is refused the way a content
+    /// blocker refuses one — `BlockedByClient`, which is what a page sees
+    /// from the extensions a great many people run. It waits paused until
+    /// this loop reads it; a video that waits does not play either.
+    async fn refuse_paused(&mut self, message: &[u8]) -> Result<()> {
+        let Ok(event) = serde_json::from_slice::<Value>(message) else {
+            return Ok(());
+        };
+        if event.get("method").and_then(Value::as_str) != Some("Fetch.requestPaused") {
+            return Ok(());
+        }
+        let Some(request) = event.pointer("/params/requestId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let session = event.get("sessionId").and_then(Value::as_str);
+        self.fire(
+            session,
+            "Fetch.failRequest",
+            json!({ "requestId": request, "errorReason": "BlockedByClient" }),
+        )
+        .await
     }
 
     async fn send_to(

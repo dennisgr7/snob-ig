@@ -426,3 +426,68 @@ async fn the_page_and_its_worker_look_like_a_desktop_browser() {
         "the service worker names itself: {agent}"
     );
 }
+
+/// No video the site loads reaches the page, so none plays.
+///
+/// The feed plays a video that scrolls into view, muted, on its own, and a
+/// play of a reel counts from its start: every run would add plays nobody
+/// watched to other people's videos. Both ways a page loads one are tried
+/// here — a `<video>` element, and a piece fetched by script the way the
+/// site's player does — and the server must never be asked for either.
+#[tokio::test]
+async fn no_video_the_site_loads_reaches_the_page() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .set_body_raw(
+                    "<!doctype html><title>Instagram</title>
+                    <video muted autoplay playsinline src='/clip.mp4'></video>
+                    <script>
+                    fetch('/v/t16/piece.mp4?bytestart=0&byteend=999').catch(() => {});
+                    fetch('/page-probe').catch(() => {});
+                    </script>",
+                    "text/html",
+                ),
+        )
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    for path in ["/clip.mp4", "/v/t16/piece.mp4", "/page-probe"] {
+        Mock::given(method("GET"))
+            .and(url_path(path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x"))
+            .mount(&instagram)
+            .await;
+    }
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some(&format!("{SESSIONID}\n")),
+    );
+    assert!(out.status.success(), "the login failed: {}", said(&out));
+
+    let paths: Vec<String> = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p == "/page-probe"),
+        "the page ran its script, so the check below means something: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with(".mp4")),
+        "a video reached the page: {paths:?}"
+    );
+}

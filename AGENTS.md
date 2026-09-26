@@ -264,6 +264,7 @@ each location.
 | A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
 | Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs | `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
 | snob's requests run where the page's scripts cannot see them | `headless::isolated_world` |
+| No video the site loads reaches the page, so opening it adds no plays to anybody's reels | `headless::refuse_video`, `Cdp::refuse_paused`; `tests/headless.rs` |
 | Nothing is spent while the account is in cooldown | `Pacer::clear`; `SNOB_IGNORE_COOLDOWN` is the undocumented escape hatch |
 | A 429 or push-back puts the account in cooldown | `IgClient::classify_and_record` |
 | A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route` |
@@ -400,11 +401,15 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   truncation stops being detectable for that account;
   `WebProfileInfo::counters_are_knowable` is the question, and both
   `engine::target` and `watch check` say it out loud.
-- **WebGL is absent in the headless browser.** Without a GPU it will use,
-  `getContext('webgl')` returns nothing, which few desktops do; the switch that
-  enables the software renderer is one Chromium calls unsafe, and it is not
-  turned on. Everything else a page or its service worker measured is
-  corrected in `headless.rs`, whose header lists each with its measurement.
+- **WebGL is absent in the headless browser, and waits on a measurement on
+  Windows.** On the Raspberry Pi, with no GPU a headless browser will use,
+  `getContext('webgl')` returns nothing, which few desktops do. The software
+  renderer would only trade "no WebGL" for "GPU: SwiftShader", which says the
+  same thing, behind a switch Chromium calls unsafe, so it is not turned on.
+  What would fix it is the machine's real GPU, and whether a headless Chrome or
+  Edge on a Windows desktop reaches it has not been measured: that is the next
+  step, before anything is built. Everything else a page or its service worker
+  measured is corrected in `headless.rs`, whose header lists each.
 - **Two snob runs cannot share the browser.** The profile is Chromium's, and a
   second launch on it exits (0 or 21); the second run fails and says another
   snob holds it rather than waiting its turn.
