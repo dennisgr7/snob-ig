@@ -16,29 +16,42 @@
 //! the end of the run by [`shutdown`]. Nothing that spends no network starts
 //! it.
 //!
-//! **What a headless Chrome gives away, and what is done about each.** Every
-//! item was measured against Chromium 141 in September 2026:
+//! **What a headless Chrome gives away, and what is done about each.** The
+//! first four were measured against Chromium 141, the rest against Chromium
+//! 153 on Linux ARM64, in September 2026, each from a script on a page and a
+//! service worker the way a site would ask:
 //!
 //! - `navigator.webdriver` is `true` under the debugging pipe, headless or
 //!   not. `--disable-blink-features=AutomationControlled`, in `cdp.rs`.
-//! - The User-Agent says `HeadlessChrome`. `--user-agent` with the installed
-//!   browser's own, which the session already carries.
-//! - That flag alone leaves `Sec-CH-UA-Full-Version-List` **empty**, which is
-//!   worse than the name it hides. `Emulation.setUserAgentOverride` with full
-//!   metadata fixes the tab's client hints: the brands are the ones the
-//!   browser reports for itself, the versions come from the running browser,
-//!   and the architecture falls back to this machine's (see
-//!   [`probe_platform`] for what the flag blanks and why that matters).
-//!   **Only the tab is overridden**: a worker the page starts inherits the
-//!   flag's User-Agent and the blanked metadata. Covering every target needs
-//!   the protocol connection to answer events as they arrive, which `cdp.rs`
-//!   does not do yet.
-//! - The screen is 800 by 600. `--window-size` and `--screen-info`.
-//! - `navigator.languages` is `en-US`. The override's language list, read
-//!   from the system like `Accept-Language` always was.
+//! - The User-Agent says `HeadlessChrome`. `--user-agent` with the launched
+//!   browser's own; it is what covers the few requests that belong to no
+//!   target, a service worker's script among them.
+//! - That flag blanks the high-entropy client hints — architecture, bitness,
+//!   platform version, full version list — which is worse than the name it
+//!   hides. They are asked once of a browser started without it, and kept
+//!   ([`machine_hints`]); the brands are the ones the browser reports for
+//!   itself, so a Chromium does not claim to be Google Chrome.
+//! - `setUserAgentOverride` holds for one target, and a worker or the
+//!   service worker a site registers is a target of its own: the service
+//!   worker called itself `HeadlessChrome`. Every target is paused as it
+//!   attaches and handed the same override (`cdp::OnAttach`). Its requests
+//!   carry no `Sec-CH-UA` either way — neither does a windowed Chromium's,
+//!   measured under Xvfb, so that is Chromium and not a tell.
+//! - `document.hasFocus()` was `false`: focus is emulated.
+//! - The screen was all work area, `availHeight` equal to `height`, and the
+//!   window ran off it from (10,10): a taskbar's strip is kept, and the window
+//!   fills the rest from the corner.
+//! - `(pointer: fine)` and `(hover: hover)` were both false, a phone's answer:
+//!   a mouse is declared through `--blink-settings`.
+//! - The requests ran in the page's main world, where a `fetch` the site
+//!   wrapped and its resource timing list both see them; they run in an
+//!   isolated world ([`isolated_world`]).
 //!
-//! What is left is left knowingly: WebGL reports a software renderer, as it
-//! does on any machine without a GPU the browser will use headless.
+//! What is left is left knowingly: WebGL is absent — `getContext` returns
+//! nothing without a GPU the browser will use headless — and the switch that
+//! brings in the software renderer is one Chromium itself calls unsafe.
+//! `navigator.languages` and `Accept-Language` are the profile's own, which is
+//! what the login sent.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -72,8 +85,16 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// applied in the page, before anything is sent back.
 const PAGE_WIRE_CAP: u64 = (crate::pipe::MAX_MESSAGE_BYTES - 2 * 1024 * 1024) as u64;
 
-/// The window, and the screen it claims to be on. The commonest desktop size.
-const WINDOW: (u32, u32) = (1920, 1080);
+/// The screen the browser says it is on: the commonest desktop size.
+const SCREEN: (u32, u32) = (1920, 1080);
+
+/// The strip at the bottom of that screen a taskbar keeps for itself.
+///
+/// A headless screen is all work area, so `screen.availHeight` equalled
+/// `screen.height` — measured, 1080 of 1080 — which no desktop with a taskbar
+/// or a dock reports. The window fills what is left, from the corner, rather
+/// than sitting at (10,10) and running off the bottom edge.
+const TASKBAR: u32 = 48;
 
 /// The one browser of this process, once something has asked for it.
 static HEADLESS: OnceLock<Arc<Headless>> = OnceLock::new();
@@ -116,6 +137,9 @@ struct Live {
     tab: String,
     /// The origin the tab is on. `about:blank` until the first request.
     origin: String,
+    /// The isolated world the requests are sent from, in the document the tab
+    /// is on now; `None` until one is made. See [`isolated_world`].
+    world: Option<i64>,
     /// The account whose cookies have been checked in the browser.
     synced: Option<Pk>,
     /// What is known about the profile; see [`ProfileMark`].
@@ -253,18 +277,36 @@ impl Headless {
             browser.user_agent()
         };
 
+        // What this browser says about the machine, asked of it once without
+        // `--user-agent` (which blanks it) and kept. See `machine_hints`.
+        let hints = machine_hints(&browser, &self.paths, &mut mark).await;
+
         let flags = vec![
             "--headless=new".to_string(),
+            // Kept although every target is overridden below: a few requests
+            // belong to no target — the script of a service worker is one — and
+            // without it they would name `HeadlessChrome`.
             format!("--user-agent={user_agent}"),
-            format!("--window-size={},{}", WINDOW.0, WINDOW.1),
-            format!("--screen-info={{{}x{}}}", WINDOW.0, WINDOW.1),
+            format!(
+                "--screen-info={{0,0 {}x{} workAreaBottom={TASKBAR}}}",
+                SCREEN.0, SCREEN.1
+            ),
+            "--window-position=0,0".to_string(),
+            format!("--window-size={},{}", SCREEN.0, SCREEN.1 - TASKBAR),
+            // A headless browser has no pointer: `(pointer: fine)` and
+            // `(hover: hover)` were both false, which is a phone's answer on a
+            // desktop's screen. A mouse is what the machine this claims to be
+            // has.
+            "--blink-settings=primaryPointerType=4,availablePointerTypes=4,\
+             primaryHoverType=2,availableHoverTypes=2"
+                .to_string(),
         ];
         let cancel = CancelToken::default();
         let launched = crate::cdp::launch_headless(&browser, &self.paths, &flags, &cancel)
             .await
             .with_context(|| format!("could not start {} without a window", browser.name))?;
         let mut cdp = Cdp::connect(launched, &cancel).await?;
-        if claim {
+        if claim || hints.fresh {
             mark.write(&self.paths);
         }
 
@@ -276,23 +318,54 @@ impl Headless {
             .unwrap_or_default()
             .to_string();
 
+        // **Every target, not only the tab.** A worker, a frame and the
+        // service worker the site registers are targets of their own, and
+        // `setUserAgentOverride` holds for the one it was sent to; measured,
+        // a service worker's requests carried no client hints at all. With
+        // auto-attach each one is paused before it runs and handed the same
+        // override (`cdp::OnAttach`). The language is left alone everywhere:
+        // the profile's own, which is what the login sent.
+        let metadata = metadata(&user_agent, &full_version, hints.values.as_ref());
+        let identity = json!({ "userAgent": user_agent, "userAgentMetadata": metadata });
+        let page_commands = vec![
+            ("Emulation.setUserAgentOverride", identity.clone()),
+            // A headless tab never has focus, and `document.hasFocus()` said
+            // so — measured false — where a page somebody is looking at says
+            // true.
+            (
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            ),
+        ];
+        cdp.on_attach(crate::cdp::OnAttach {
+            page: page_commands.clone(),
+            worker: vec![("Network.setUserAgentOverride", identity)],
+        });
+        cdp.browser_call(
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+                // The service and shared workers, which belong to the browser
+                // rather than to a tab. The tab's own are asked for on it.
+                "filter": [
+                    { "type": "service_worker", "exclude": false },
+                    { "type": "shared_worker", "exclude": false },
+                    { "exclude": true },
+                ],
+            }),
+        )
+        .await?;
+
         let tab = attach_to_a_tab(&mut cdp).await?;
-        let platform = match probe_platform(&mut cdp, &tab).await {
-            Ok(found) => Some(found),
-            Err(e) => {
-                tracing::debug!(error = %e, "could not read the platform details");
-                None
-            }
-        };
-        let metadata = metadata(&user_agent, &full_version, platform.as_ref());
+        for (method, params) in page_commands {
+            cdp.page_call(&tab, method, params, COMMAND_TIMEOUT).await?;
+        }
         cdp.page_call(
             &tab,
-            "Emulation.setUserAgentOverride",
-            json!({
-                "userAgent": user_agent,
-                "acceptLanguage": snob_ig::client_hints::languages(),
-                "userAgentMetadata": metadata,
-            }),
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
             COMMAND_TIMEOUT,
         )
         .await?;
@@ -301,6 +374,7 @@ impl Headless {
             cdp,
             tab,
             origin: "about:blank".to_string(),
+            world: None,
             synced: None,
             mark,
         })
@@ -362,23 +436,100 @@ async fn attach_to_a_tab(cdp: &mut Cdp) -> Result<String> {
         .ok_or_else(|| anyhow!("the browser would not attach to its tab"))
 }
 
-/// What the browser says about itself before the tab is overridden: its brands
-/// above all, and whatever of the operating system's version, the
-/// architecture and the bitness it will still tell.
+/// What [`machine_hints`] came back with.
+struct Hints {
+    values: Option<Value>,
+    /// Asked just now rather than read from the mark, which then needs writing.
+    fresh: bool,
+}
+
+/// What this browser says about the machine: the brands, the architecture,
+/// the bitness, the operating system's version — the client hints a page can
+/// ask for.
 ///
-/// **The brands are the part that is always there, and the part that
-/// matters.** A headless Chromium since the new mode reports the same brands
-/// its windowed build does — measured on Chromium 153: `Chromium` and the
-/// GREASE entry, no `HeadlessChrome` — and `--user-agent` does not touch
-/// them. Computing them from the User-Agent instead named every Chromium on
-/// Linux `Google Chrome`, because the two send the same User-Agent and only
-/// the brand list tells them apart.
+/// **Asked of a second browser, once, and kept.** The browser the requests go
+/// from runs with `--user-agent`, and that flag makes Chromium blank every one
+/// of these fields (see [`probe_platform`]); the fallbacks for a blank are only
+/// true on some machines — an empty platform version is Linux's answer and
+/// nobody else's. So a throwaway browser with no such flag is asked, on a
+/// profile of its own that is deleted after, and the answer is written into
+/// the profile mark for this browser and major version. It costs a browser
+/// start the first time and after each browser update, and nothing on any
+/// other run. A failure costs only the fallbacks.
+async fn machine_hints(
+    browser: &crate::browser::Browser,
+    paths: &AppPaths,
+    mark: &mut ProfileMark,
+) -> Hints {
+    if let Some(known) = &mark.hints
+        && known.browser == browser.path
+        && known.major == browser.major_version
+    {
+        return Hints {
+            values: Some(known.values.clone()),
+            fresh: false,
+        };
+    }
+    match ask_without_the_flag(browser, paths).await {
+        Ok(values) => {
+            mark.hints = Some(MachineHints {
+                browser: browser.path.clone(),
+                major: browser.major_version,
+                values: values.clone(),
+            });
+            Hints {
+                values: Some(values),
+                fresh: true,
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "could not ask the browser about the machine");
+            Hints {
+                values: None,
+                fresh: false,
+            }
+        }
+    }
+}
+
+async fn ask_without_the_flag(
+    browser: &crate::browser::Browser,
+    paths: &AppPaths,
+) -> Result<Value> {
+    paths.ensure_dirs()?;
+    let dir = paths.data_dir().join("browser-probe");
+    snob_store::paths::create_fresh_private_dir(&dir)?;
+    let asked = async {
+        let cancel = CancelToken::default();
+        let flags = ["--headless=new".to_string()];
+        let launched = crate::cdp::launch_throwaway(browser, &dir, &flags, &cancel).await?;
+        let mut cdp = Cdp::connect(launched, &cancel).await?;
+        let found = match attach_to_a_tab(&mut cdp).await {
+            Ok(tab) => probe_platform(&mut cdp, &tab).await,
+            Err(e) => Err(e),
+        };
+        cdp.close().await;
+        found
+    }
+    .await;
+    if let Err(e) = snob_store::paths::remove_tree(&dir) {
+        tracing::debug!(error = %e, "could not remove the probe's profile");
+    }
+    asked
+}
+
+/// What a browser says about itself and the machine: its brands, the
+/// operating system's version, the architecture, the bitness.
 ///
-/// **The rest comes back empty**, and is not to be trusted as a value: with
-/// `--user-agent` on the command line Chromium blanks `architecture`,
-/// `bitness`, `platformVersion` and the full version list, on the grounds that
-/// it can no longer vouch for them. [`metadata`] treats an empty string as
-/// "not said".
+/// Asked of the throwaway browser [`machine_hints`] starts **without**
+/// `--user-agent`, because with it Chromium blanks every field but the brands,
+/// on the grounds that it can no longer vouch for them. The brands matter most:
+/// a headless Chromium reports the ones its windowed build does — measured on
+/// Chromium 153, `Chromium` and the GREASE entry, no `HeadlessChrome` — and
+/// computing them from the User-Agent instead named every Chromium on Linux
+/// `Google Chrome`, since the two send the same User-Agent and only the brand
+/// list tells them apart. [`metadata`] still treats an empty string as "not
+/// said", for the day a field comes back blank anyway.
 ///
 /// Only readable from a secure context, and `about:blank` is not one;
 /// `http://127.0.0.1` is. So a page is served on a loopback port for the
@@ -640,6 +791,18 @@ pub struct ProfileMark {
     /// The fingerprint of the stored session last handed to the profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// What the browser said about the machine; see [`machine_hints`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hints: Option<MachineHints>,
+}
+
+/// The browser's own description of the machine, kept per browser and major
+/// version. Not a secret, and not about any account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MachineHints {
+    pub browser: std::path::PathBuf,
+    pub major: u32,
+    pub values: Value,
 }
 
 impl ProfileMark {
@@ -669,10 +832,12 @@ impl ProfileMark {
     /// The mark a browser login leaves: the profile was made by `browser`, and
     /// the session it produced is the one being stored.
     pub fn after_login(paths: &AppPaths, browser: &crate::browser::Browser, session: &Session) {
+        let kept = Self::read(paths).hints;
         Self {
             browser: Some(browser.path.clone()),
             pk: Some(session.ds_user_id.get()),
             session: Some(session.fingerprint()),
+            hints: kept,
         }
         .write(paths);
     }
@@ -680,6 +845,8 @@ impl ProfileMark {
 
 /// Sends the tab somewhere and waits for it to finish loading.
 async fn navigate(live: &mut Live, url: &str) -> Result<(), PageError> {
+    // The world dies with the document it was made in.
+    live.world = None;
     navigate_tab(&mut live.cdp, &live.tab, url).await?;
     tokio::time::sleep(SETTLE).await;
     Ok(())
@@ -862,7 +1029,8 @@ async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse, P
     });
     let expression = format!("(() => {{ {WIRE_LENGTH} return {FETCH}({argument}); }})()");
     let timeout = Duration::from_millis(request.timeout_ms) + Duration::from_secs(10);
-    let answer = evaluate(&mut live.cdp, &live.tab, &expression, timeout)
+    let world = isolated_world(live).await?;
+    let answer = evaluate_in(&mut live.cdp, &live.tab, Some(world), &expression, timeout)
         .await
         .map_err(|e| PageError::Browser(format!("{e:#}")))?;
     if let Some(error) = answer.get("error").and_then(Value::as_str) {
@@ -918,17 +1086,27 @@ async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse, P
 /// makes the console report objects back over the pipe, and that reporting is
 /// the side effect pages use to notice a debugger is attached.
 async fn evaluate(cdp: &mut Cdp, tab: &str, expression: &str, timeout: Duration) -> Result<Value> {
+    evaluate_in(cdp, tab, None, expression, timeout).await
+}
+
+/// [`evaluate`], in a given world of the tab's document.
+async fn evaluate_in(
+    cdp: &mut Cdp,
+    tab: &str,
+    world: Option<i64>,
+    expression: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut params = json!({
+        "expression": expression,
+        "awaitPromise": true,
+        "returnByValue": true,
+    });
+    if let Some(world) = world {
+        params["contextId"] = json!(world);
+    }
     let result = cdp
-        .page_call(
-            tab,
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "awaitPromise": true,
-                "returnByValue": true,
-            }),
-            timeout,
-        )
+        .page_call(tab, "Runtime.evaluate", params, timeout)
         .await?;
     if let Some(details) = result.get("exceptionDetails") {
         let text = details
@@ -944,6 +1122,48 @@ async fn evaluate(cdp: &mut Cdp, tab: &str, expression: &str, timeout: Duration)
         .and_then(|r| r.get("value"))
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+/// The world the requests are sent from, made once per document.
+///
+/// **Not the page's own.** `Runtime.evaluate` runs in the page's main world by
+/// default, where the site's scripts run too: a `fetch` they have wrapped sees
+/// every call snob makes, and the page's resource timing lists each one —
+/// both measured. An isolated world shares the document, its cookies and its
+/// storage, sends as the page's origin, and is out of the page's reach. It
+/// dies with its document, so [`navigate`] forgets it and the next request
+/// makes another.
+async fn isolated_world(live: &mut Live) -> Result<i64, PageError> {
+    if let Some(world) = live.world {
+        return Ok(world);
+    }
+    let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
+    let tree = live
+        .cdp
+        .page_call(&live.tab, "Page.getFrameTree", json!({}), COMMAND_TIMEOUT)
+        .await
+        .map_err(broken)?;
+    let frame = tree
+        .pointer("/frameTree/frame/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PageError::Browser("the tab has no document".to_string()))?
+        .to_string();
+    let made = live
+        .cdp
+        .page_call(
+            &live.tab,
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame, "worldName": "" }),
+            COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(broken)?;
+    let world = made
+        .get("executionContextId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| PageError::Browser("the browser made no world".to_string()))?;
+    live.world = Some(world);
+    Ok(world)
 }
 
 /// Scheme, host and port, with no trailing slash.

@@ -215,8 +215,67 @@ async fn launch_with(
     let profile = paths.browser_profile();
     snob_store::paths::create_private_dir(&profile)
         .with_context(|| format!("could not create {}", profile.display()))?;
-    let profile = profile.as_path();
+    #[cfg(unix)]
+    clear_a_lock_left_by_another_host(&profile);
+    launch_in(browser, &profile, flags, start_at, windowless, cancel)
+}
 
+/// Starts the browser on a profile of the caller's, with no window: for a
+/// question asked of the browser itself, away from the profile the requests
+/// are sent from. The caller creates the directory and removes it.
+pub async fn launch_throwaway(
+    browser: &Browser,
+    profile: &Path,
+    flags: &[String],
+    cancel: &CancelToken,
+) -> Result<Launched> {
+    launch_in(browser, profile, flags, "about:blank", true, cancel)
+}
+
+/// Removes a profile lock another machine left behind.
+///
+/// Chromium locks a profile with a link named after the host and process that
+/// hold it, clears one whose process on *this* host is gone, and refuses one
+/// from any other host, since it cannot see whether that process lives. A
+/// container recreated over a kept volume is a new host every time: measured,
+/// every launch then exits 21 for good, and the only way out was deleting the
+/// file by hand. Nothing but this program uses this profile, and nothing on
+/// another host is using it now, so a lock naming another host is stale.
+#[cfg(unix)]
+fn clear_a_lock_left_by_another_host(profile: &Path) {
+    let Ok(target) = std::fs::read_link(profile.join("SingletonLock")) else {
+        return;
+    };
+    let target = target.to_string_lossy();
+    let Some((host, _pid)) = target.rsplit_once('-') else {
+        return;
+    };
+    let mut name = [0u8; 256];
+    // SAFETY: the buffer is valid for its whole length, and the call writes at
+    // most that many bytes into it.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return;
+    }
+    let ours = std::ffi::CStr::from_bytes_until_nul(&name)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if ours.is_empty() || host == ours {
+        return;
+    }
+    tracing::debug!(%host, %ours, "clearing a profile lock left by another host");
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let _ = std::fs::remove_file(profile.join(name));
+    }
+}
+
+fn launch_in(
+    browser: &Browser,
+    profile: &Path,
+    flags: &[String],
+    start_at: &str,
+    windowless: bool,
+    cancel: &CancelToken,
+) -> Result<Launched> {
     // A leftover from when this listened on a port. Removed rather than
     // ignored: a file named `DevToolsActivePort` sitting in snob's profile is
     // exactly the thing the reader of this code will go looking for to decide
@@ -336,6 +395,27 @@ fn windowless_died_early(code: Option<i32>, profile: &Path) -> String {
 pub struct Cdp {
     launched: Launched,
     next_id: u64,
+    /// What a target the browser attaches on its own is given before it runs.
+    /// `None` for the login's browser, which asks for no auto-attaching.
+    on_attach: Option<OnAttach>,
+}
+
+/// The commands a newly attached target gets, by what kind of target it is.
+///
+/// **Why a browser engine needs this.** `Emulation.setUserAgentOverride` holds
+/// for the one tab it was sent to. A worker the page starts, a frame from
+/// another site and the service worker the site registers are targets of their
+/// own, and each of them went out as the bare headless browser: measured on
+/// Chromium 153, a service worker's requests carried no `Sec-CH-UA` at all.
+/// With auto-attach, the browser pauses every such target before its first
+/// line runs and tells this connection; the target is given these commands
+/// and then let go.
+#[derive(Debug, Clone, Default)]
+pub struct OnAttach {
+    /// For a page or a frame, which has the `Emulation` domain.
+    pub page: Vec<(&'static str, Value)>,
+    /// For a worker of any kind, which has `Network` and not `Emulation`.
+    pub worker: Vec<(&'static str, Value)>,
 }
 
 impl Cdp {
@@ -353,6 +433,7 @@ impl Cdp {
         let mut cdp = Self {
             launched,
             next_id: 1,
+            on_attach: None,
         };
         match cdp.wait_until_ready(cancel).await {
             Ok(()) => Ok(cdp),
@@ -428,6 +509,77 @@ impl Cdp {
         self.send_to(None, method, params, id).await
     }
 
+    /// Asks for every target attached from now on to be given `plan`.
+    pub fn on_attach(&mut self, plan: OnAttach) {
+        self.on_attach = Some(plan);
+    }
+
+    /// Sends a command nobody waits for. Its reply, when it comes, carries an
+    /// id nothing is waiting on and is dropped like any other.
+    async fn fire(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send_to(session, method, params, id).await
+    }
+
+    /// Reads a message that was not the reply being waited for, in case it is
+    /// a target that needs its commands.
+    ///
+    /// **Handled here, inside the read loops, and that is enough.** A target
+    /// waits paused until it is let go, and the only reads of this pipe are the
+    /// commands this program sends; a paused service worker could only hold up
+    /// a request from the page, and that request is itself a command whose
+    /// reply this loop is reading towards, so the attach is always drained
+    /// first. The page's own traffic can wait for the next request, and waits
+    /// only while snob is between requests anyway.
+    async fn noticed(&mut self, message: &[u8]) -> Result<()> {
+        const ATTACHED: &[u8] = b"\"Target.attachedToTarget\"";
+        if self.on_attach.is_none() || !message.windows(ATTACHED.len()).any(|w| w == ATTACHED) {
+            return Ok(());
+        }
+        let Ok(event) = serde_json::from_slice::<Value>(message) else {
+            return Ok(());
+        };
+        if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+            return Ok(());
+        }
+        let params = event.get("params").cloned().unwrap_or(Value::Null);
+        let Some(session) = params.get("sessionId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let kind = params
+            .pointer("/targetInfo/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let waiting = params
+            .get("waitingForDebugger")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        tracing::debug!(%kind, waiting, "a target attached");
+        let plan = self.on_attach.clone().unwrap_or_default();
+        let commands = match kind {
+            "page" | "iframe" => plan.page,
+            kind if kind.ends_with("worker") => plan.worker,
+            _ => Vec::new(),
+        };
+        for (method, params) in commands {
+            self.fire(Some(session), method, params).await?;
+        }
+        // A frame holds frames and a worker can start workers; each is paused
+        // and handed over the same way.
+        self.fire(
+            Some(session),
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
+        )
+        .await?;
+        if waiting {
+            self.fire(Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn send_to(
         &mut self,
         session: Option<&str>,
@@ -464,6 +616,7 @@ impl Cdp {
 
         while let Some(message) = self.launched.transport.recv().await {
             let Some(reply) = reply_to(id, &message) else {
+                self.noticed(&message).await?;
                 continue;
             };
             if let Some(error) = reply.get("error") {
@@ -498,6 +651,7 @@ impl Cdp {
             self.send_to(Some(session), method, params, id).await?;
             while let Some(message) = self.launched.transport.recv().await {
                 let Some(reply) = reply_to(id, &message) else {
+                    self.noticed(&message).await?;
                     continue;
                 };
                 if let Some(error) = reply.get("error") {

@@ -354,6 +354,13 @@ fn init_tracing(verbose: bool) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .without_time()
+        // **The filter below decides, and nothing before it.** The builder
+        // carries a ceiling of its own, INFO by default, and it ran first: every
+        // `debug!` in the workspace was dropped before `log_filter` was asked,
+        // so `--verbose` and `SNOB_LOG=…=debug` printed nothing at all, and the
+        // push-back measurements `note_push_back` exists to record went
+        // nowhere. Found by asking a run to show what it sent.
+        .with_max_level(tracing::Level::TRACE)
         .finish()
         .with(log_filter(verbose, spec.as_deref()))
         .init();

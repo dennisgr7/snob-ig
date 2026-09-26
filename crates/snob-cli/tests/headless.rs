@@ -327,3 +327,102 @@ async fn a_second_account_does_not_inherit_the_first_ones_device() {
         "the first account's cookies went with the second: {carried}"
     );
 }
+
+/// What the page and its service worker give away, asked of them from inside.
+///
+/// The fake site's own page reports what a script can read about the browser
+/// it runs in, and registers a service worker that reports its User-Agent.
+/// Each was measured wrong on a headless Chromium before the engine covered
+/// it: no focus, a screen with no taskbar, no mouse, and a service worker
+/// calling itself `HeadlessChrome` — a target of its own that the tab's
+/// override never reached.
+#[tokio::test]
+async fn the_page_and_its_worker_look_like_a_desktop_browser() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+    // Mounted first, so it wins over the plain page.
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(
+            // `set_body_raw`, because `set_body_string` makes it text/plain
+            // whatever the header says, and a page shown as text runs nothing.
+            ResponseTemplate::new(200)
+                .append_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .set_body_raw(
+                    "<!doctype html><title>Instagram</title><script>
+                    navigator.serviceWorker.register('/sw.js');
+                    fetch('/page-probe?focus=' + document.hasFocus()
+                      + '&avail=' + (screen.availHeight < screen.height)
+                      + '&pointer=' + matchMedia('(pointer: fine)').matches
+                      + '&hover=' + matchMedia('(hover: hover)').matches
+                      + '&webdriver=' + navigator.webdriver);
+                    </script>",
+                    "text/html",
+                ),
+        )
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/sw.js"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "self.addEventListener('install', e => e.waitUntil(fetch('/sw-probe')));",
+            "text/javascript",
+        ))
+        .mount(&instagram)
+        .await;
+    for probe in ["/page-probe", "/sw-probe"] {
+        Mock::given(method("GET"))
+            .and(url_path(probe))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&instagram)
+            .await;
+    }
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some(&format!("{SESSIONID}\n")),
+    );
+    assert!(out.status.success(), "the login failed: {}", said(&out));
+    // A second run, so the worker registered by the first has certainly been
+    // installed and has asked for what it asks for.
+    let out = snob(tmp.path(), &instagram, &["whoami"], None);
+    assert!(out.status.success(), "{}", said(&out));
+
+    let received = instagram.received_requests().await.unwrap_or_default();
+    let paths: Vec<String> = received.iter().map(|r| r.url.path().to_string()).collect();
+    let page = received
+        .iter()
+        .find(|r| r.url.path() == "/page-probe")
+        .unwrap_or_else(|| panic!("the page ran its script: {paths:?}"));
+    let said_by_page: std::collections::HashMap<_, _> = page.url.query_pairs().collect();
+    for (what, expected) in [
+        ("focus", "true"),
+        ("avail", "true"),
+        ("pointer", "true"),
+        ("hover", "true"),
+        ("webdriver", "false"),
+    ] {
+        assert_eq!(
+            said_by_page.get(what).map(|v| v.as_ref()),
+            Some(expected),
+            "{what}: {}",
+            page.url
+        );
+    }
+
+    let worker = received
+        .iter()
+        .find(|r| r.url.path() == "/sw-probe")
+        .expect("the service worker was installed and asked");
+    let agent = header(worker, "user-agent").unwrap_or_default();
+    assert!(
+        !agent.is_empty() && !agent.contains("Headless"),
+        "the service worker names itself: {agent}"
+    );
+}

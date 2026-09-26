@@ -261,6 +261,8 @@ each location.
 | A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::sync_cookies`, `ProfileMark` |
 | The profile a failed login finds is never deleted; only one it created | `login::by_browser` |
 | A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
+| Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs | `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
+| snob's requests run where the page's scripts cannot see them | `headless::isolated_world` |
 | Nothing is spent while the account is in cooldown | `Pacer::clear`; `SNOB_IGNORE_COOLDOWN` is the undocumented escape hatch |
 | A 429 or push-back puts the account in cooldown | `IgClient::classify_and_record` |
 | A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route` |
@@ -395,10 +397,11 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   of it goes through the `Pacer`, so the counts snob reports cover its API
   calls only. Loading the page is what a browser does; whether to host the
   calls on a page that boots no app instead is open.
-- **Only the tab is overridden.** A service worker the site registers keeps
-  the flag's User-Agent and the client hints `--user-agent` blanks; covering
-  every target needs `cdp.rs` to answer protocol events as they arrive
-  (`Target.setAutoAttach`), which it does not yet.
+- **WebGL is absent in the headless browser.** Without a GPU it will use,
+  `getContext('webgl')` returns nothing, which few desktops do; the switch that
+  enables the software renderer is one Chromium calls unsafe, and it is not
+  turned on. Everything else a page or its service worker measured is
+  corrected in `headless.rs`, whose header lists each with its measurement.
 - **Two snob runs cannot share the browser.** The profile is Chromium's, and a
   second launch on it exits (0 or 21); the second run fails and says another
   snob holds it rather than waiting its turn.
@@ -415,6 +418,27 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 - Two endpoints worth a command someday, both GETs about the viewer's own
   account: `friendships/pending/` (follow requests awaiting an answer) and
   `archive/reel/day_shells/` (the story archive).
+- **The browser as the whole engine**, in the order the pieces depend on each
+  other. Each step is open, and none is required by the one before it works:
+  - *A protocol client with its own reader.* `cdp.rs` reads the pipe only
+    while a command waits for its reply, which is enough for auto-attach but
+    not for listening: a reader task routing replies by id and events by
+    session is what the next three need.
+  - *Honest accounting of the page's own traffic.* With `Network` events the
+    requests Instagram's page makes on load could be counted — or the calls
+    hosted on a same-origin document that boots no app, which sends less and
+    looks less like a person. Decide which before either is built.
+  - *One owner of the browser.* Two runs cannot share the profile, so the
+    monitor and a typed command collide. A long-lived process that owns the
+    browser, with the commands as its clients over a local socket, removes
+    that and keeps one warm, continuous session — the terminal as the skin.
+  - *Reading the app instead of calling the API.* Opening an account's
+    followers and scrolling, reading the app's own answers off the network,
+    makes every request exactly one the app itself sends. Slower, and tied
+    to the page's markup; the fetch path stays as the fallback.
+  - *The session back into the keyring.* The browser rotates cookies and the
+    stored copy never learns; reading them back at shutdown keeps a profile
+    loss from reverting to a stale session.
 
 ## Costs worth knowing
 

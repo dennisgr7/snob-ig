@@ -7,8 +7,8 @@
 //! hints, handshake and header order; the argument below about not copying a
 //! browser was about a process that was not one, and stands for that path
 //! alone — `SNOB_NO_BROWSER`, and tests against a mock server. What the
-//! browser path takes from here is [`languages`] and, when the browser cannot
-//! say its own brands, [`brand_list`].
+//! browser path takes from here is [`brand_list`], when the browser cannot say
+//! its own brands, and [`platform_name`].
 //!
 //! These are ordinary HTTP request headers with a written specification:
 //! `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, `Priority` and
@@ -373,17 +373,6 @@ fn brand_entries(brand: &str, major: u32) -> [(String, String); 3] {
 /// wants it.
 pub fn platform_name(user_agent: &str) -> &'static str {
     platform_of(user_agent).trim_matches('"')
-}
-
-/// The language list without weights, which is how the browser is told it:
-/// Chromium adds the `q=` values itself when it builds the header.
-pub fn languages() -> String {
-    accept_language()
-        .split(',')
-        .map(|part| part.split(';').next().unwrap_or("").trim())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// The `sec-ch-ua-platform` value, from the enumerated list the specification
