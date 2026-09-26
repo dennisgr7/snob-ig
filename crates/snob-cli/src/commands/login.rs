@@ -207,7 +207,13 @@ async fn by_browser(
     // said -- the two exits below went round this line, so the default of
     // "the profile does not outlive the login" held only on the path that
     // succeeded.
-    if !args.keep_profile {
+    //
+    // **Kept when the login worked.** The profile is the device every request
+    // is now sent from (`headless.rs`): removing it would make each login a
+    // new, never-seen browser, and the next run would have nowhere to send
+    // from but a fresh one. It still goes when the login did not happen,
+    // which is the case the paragraph above is about.
+    if captured.is_err() || cancel.is_canceled() {
         // Off the worker: the removal retries with sleeps adding up to five
         // seconds, and this runtime has two workers, one of which has to stay
         // free for the Ctrl+C task to run at all.

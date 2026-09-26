@@ -305,6 +305,26 @@ fn brand_of(user_agent: &str) -> &'static str {
 /// The algorithm is Chromium's `GetGreasedUserAgentBrandVersion`, kept here
 /// because there is nowhere to read it from at runtime.
 fn brands(brand: &str, major: u32) -> String {
+    brand_entries(brand, major)
+        .iter()
+        .map(|(name, version)| format!("\"{name}\";v=\"{version}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The brands of a User-Agent, in the order Chromium lists them, each with its
+/// major version — what `navigator.userAgentData.brands` holds.
+///
+/// Public for the headless browser, which has to state them itself: a
+/// headless Chrome describes itself as `HeadlessChrome`, and the override
+/// that corrects that needs the list rather than the header built from it.
+pub fn brand_list(user_agent: &str) -> Option<Vec<(String, String)>> {
+    let major = chromium_major(user_agent)?;
+    Some(brand_entries(brand_of(user_agent), major).to_vec())
+}
+
+/// The three entries, GREASE included, in Chromium's order for this version.
+fn brand_entries(brand: &str, major: u32) -> [(String, String); 3] {
     const GREASE_CHARS: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
     const GREASE_VERSIONS: [&str; 3] = ["8", "99", "24"];
     const ORDERS: [[usize; 3]; 6] = [
@@ -317,25 +337,44 @@ fn brands(brand: &str, major: u32) -> String {
     ];
 
     let seed = major as usize;
-    let greased = format!(
-        "\"Not{}A{}Brand\";v=\"{}\"",
-        GREASE_CHARS[seed % 11],
-        GREASE_CHARS[(seed + 1) % 11],
-        GREASE_VERSIONS[seed % 3],
+    let greased = (
+        format!(
+            "Not{}A{}Brand",
+            GREASE_CHARS[seed % 11],
+            GREASE_CHARS[(seed + 1) % 11],
+        ),
+        GREASE_VERSIONS[seed % 3].to_string(),
     );
 
     let entries = [
         greased,
-        format!("\"Chromium\";v=\"{major}\""),
-        format!("\"{brand}\";v=\"{major}\""),
+        ("Chromium".to_string(), major.to_string()),
+        (brand.to_string(), major.to_string()),
     ];
 
     let order = ORDERS[seed % 6];
-    let mut shuffled = [""; 3];
-    for (i, entry) in entries.iter().enumerate() {
+    let mut shuffled: [(String, String); 3] = Default::default();
+    for (i, entry) in entries.into_iter().enumerate() {
         shuffled[order[i]] = entry;
     }
-    shuffled.join(", ")
+    shuffled
+}
+
+/// The platform a User-Agent claims, unquoted, as the client-hints metadata
+/// wants it.
+pub fn platform_name(user_agent: &str) -> &'static str {
+    platform_of(user_agent).trim_matches('"')
+}
+
+/// The language list without weights, which is how the browser is told it:
+/// Chromium adds the `q=` values itself when it builds the header.
+pub fn languages() -> String {
+    accept_language()
+        .split(',')
+        .map(|part| part.split(';').next().unwrap_or("").trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The `sec-ch-ua-platform` value, from the enumerated list the specification

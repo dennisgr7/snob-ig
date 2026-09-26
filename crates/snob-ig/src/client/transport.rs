@@ -294,6 +294,12 @@ impl IgClient {
         referer: &str,
         style: Surface<'_>,
     ) -> Result<Answer, IgError> {
+        if let Some(page) = &self.page {
+            return self
+                .get_body_in_page(page.as_ref(), path, query, referer, style)
+                .await;
+        }
+
         let mut url = self.base.join(path)?;
         let mut query: Option<&[(&str, &str)]> = Some(query);
         let mut hops: usize = 0;
@@ -356,6 +362,76 @@ impl IgClient {
                 load,
             });
         }
+    }
+
+    /// [`Self::get_body`], sent from the browser tab.
+    ///
+    /// The same three promises as the `reqwest` loop above, kept differently.
+    /// **Paid for first**, through the same `clear_to_send`. **A redirect is
+    /// paid for too**: the browser follows it by itself, so the hop is charged
+    /// after the fact rather than before — once, because a page cannot see how
+    /// many there were, and one is what an API redirect to the login page is.
+    /// **The origin rule holds**: an answer that ended up anywhere but where it
+    /// started is refused, exactly as a hop off-origin is refused above.
+    async fn get_body_in_page(
+        &self,
+        page: &dyn super::page::Page,
+        path: &str,
+        query: &[(&str, &str)],
+        referer: &str,
+        style: Surface<'_>,
+    ) -> Result<Answer, IgError> {
+        let mut url = self.base.join(path)?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        tracing::debug!(%url, "GET from the page");
+
+        self.pacer.clear_to_send().await?;
+        let request = self.page_request("GET", &url, referer, style, None);
+        let response = tokio::select! {
+            biased;
+            () = self.pacer.cancel_token().canceled() => return Err(IgError::Canceled),
+            sent = page.send(request) => sent.map_err(IgError::Browser)?,
+        };
+        self.answer_from_page(&url, response).await
+    }
+
+    /// What the page said, read the way an answer off the wire is read.
+    pub(super) async fn answer_from_page(
+        &self,
+        asked: &Url,
+        response: super::page::PageResponse,
+    ) -> Result<Answer, IgError> {
+        if response.redirected {
+            self.pacer.clear_to_send().await?;
+            let landed = Url::parse(&response.url).map_err(|_| IgError::OffOrigin {
+                to: response.url.clone(),
+            })?;
+            if !same_origin(asked, &landed) {
+                return Err(IgError::OffOrigin {
+                    to: landed.to_string(),
+                });
+            }
+        }
+        if let Some(fresh) = response.header("x-ig-set-www-claim") {
+            *self.claim.lock().unwrap_or_else(|e| e.into_inner()) = fresh.to_string();
+        }
+        if response.too_large {
+            return Err(IgError::TooLarge {
+                limit: MAX_BODY_BYTES as usize,
+            });
+        }
+        let load: Vec<String> = ["x-ig-capacity-level", "x-ig-peak-time"]
+            .into_iter()
+            .filter_map(|name| response.header(name).map(|value| format!("{name}={value}")))
+            .collect();
+        Ok(Answer {
+            status: response.status,
+            retry_after: response.header("retry-after").map(str::to_string),
+            load: (!load.is_empty()).then(|| load.join(" ")),
+            body: response.body,
+        })
     }
 
     /// Sends the request, or gives up the moment the user asks it to.

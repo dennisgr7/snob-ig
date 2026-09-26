@@ -201,6 +201,12 @@ fn wiring(cli: &Cli) -> anyhow::Result<(AppPaths, bool, Option<String>)> {
             snob_ig::client::point_every_client_at(base)
                 .map_err(|already| anyhow::anyhow!("already pointed at {already}"))?;
         }
+        // The browser path against the fake server too, so it can be driven
+        // end to end. Off by default: the rest of the suite reaches its mock
+        // servers directly, with no browser on the machine required.
+        if cli.through_the_browser {
+            snob_ig::client::page::use_the_page_off_instagram();
+        }
         return Ok((
             AppPaths::rooted_at(root),
             true,
@@ -242,7 +248,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         None => store,
     };
 
-    match cli.command {
+    // Every request to Instagram goes out from a browser from here on, unless
+    // this run was told not to — see `headless.rs`. The switch is for a
+    // machine with no Chromium browser on it, and for comparing the two.
+    if std::env::var_os("SNOB_NO_BROWSER").is_none() {
+        snob_cli::headless::install(&paths);
+    }
+
+    let outcome = match cli.command {
         Command::Login(args) => commands::login::run(args, store, &paths).await,
         Command::Whoami(args) => commands::whoami::run(args, store, &paths).await,
         Command::Logout(args) => commands::logout::run(args, store, &paths),
@@ -271,7 +284,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Watch(args) => commands::watch::run(args, store, &paths).await,
         Command::Import(command) => commands::import::run(command),
-    }
+    };
+    snob_cli::headless::shutdown().await;
+    outcome
 }
 
 /// Gives the cursor back if the process dies with a menu on screen.

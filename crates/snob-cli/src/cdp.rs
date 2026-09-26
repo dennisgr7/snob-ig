@@ -178,8 +178,30 @@ pub fn kill_launched() {
         .status();
 }
 
-/// Starts the browser against our own profile with debugging enabled.
+/// Starts the browser against our own profile with debugging enabled, in a
+/// window, on the login page.
 pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -> Result<Launched> {
+    launch_with(browser, paths, &[], LOGIN_URL, cancel).await
+}
+
+/// Starts the same browser on the same profile with no window, for snob to
+/// send its requests from. See `headless.rs` for why each flag is there.
+pub async fn launch_headless(
+    browser: &Browser,
+    paths: &AppPaths,
+    flags: &[String],
+    cancel: &CancelToken,
+) -> Result<Launched> {
+    launch_with(browser, paths, flags, "about:blank", cancel).await
+}
+
+async fn launch_with(
+    browser: &Browser,
+    paths: &AppPaths,
+    flags: &[String],
+    start_at: &str,
+    cancel: &CancelToken,
+) -> Result<Launched> {
     // The profile ends up holding a live Instagram session, so the directory it
     // sits in has to be the owner's alone. On a fresh install with the keyring
     // backend nothing has created the data directory yet, and a bare
@@ -196,17 +218,26 @@ pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -
     // whether a port is open, and finding a stale one would answer wrongly.
     let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
 
-    let arguments = vec![
+    let mut arguments = vec![
         format!("--user-data-dir={}", profile.display()),
         // The protocol on two inherited pipes rather than on a loopback
         // socket. Nothing else on this machine can reach it, because there is
         // no address for it to reach.
         "--remote-debugging-pipe".to_string(),
+        // **The pipe alone makes the page report `navigator.webdriver ===
+        // true`.** Measured in September 2026 against Chromium 141, headful
+        // and headless: `--remote-debugging-pipe` sets the same
+        // automation-controlled bit `--enable-automation` does, and the first
+        // thing a login page's bot check reads is that property. The person
+        // logging in is typing into the window themselves; the pipe is only
+        // how the cookies come back afterwards.
+        "--disable-blink-features=AutomationControlled".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-features=Translate".to_string(),
-        LOGIN_URL.to_string(),
     ];
+    arguments.extend(flags.iter().cloned());
+    arguments.push(start_at.to_string());
 
     // Chrome narrates to standard error: GCM registration failures, a
     // TensorFlow notice. None of it is ours and all of it lands in the middle
@@ -350,7 +381,20 @@ impl Cdp {
     }
 
     async fn send(&mut self, method: &str, params: Value, id: u64) -> Result<()> {
-        let request = json!({ "id": id, "method": method, "params": params });
+        self.send_to(None, method, params, id).await
+    }
+
+    async fn send_to(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        id: u64,
+    ) -> Result<()> {
+        let mut request = json!({ "id": id, "method": method, "params": params });
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
+        }
         self.launched
             .transport
             .send(request.to_string().into_bytes())
@@ -387,6 +431,43 @@ impl Cdp {
         Err(anyhow!(
             "the browser closed the connection before answering {method}"
         ))
+    }
+
+    /// One command to the browser itself, with the ordinary timeout.
+    pub async fn browser_call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call(method, params).await
+    }
+
+    /// One command to a tab this connection is attached to, with a timeout of
+    /// the caller's choosing: a page fetch can legitimately take longer than
+    /// the twenty seconds a browser command gets.
+    pub async fn page_call(
+        &mut self,
+        session: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let reply = async {
+            self.send_to(Some(session), method, params, id).await?;
+            while let Some(message) = self.launched.transport.recv().await {
+                let Some(reply) = reply_to(id, &message) else {
+                    continue;
+                };
+                if let Some(error) = reply.get("error") {
+                    bail!("the browser refused {method}: {error}");
+                }
+                return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
+            }
+            Err(anyhow!(
+                "the browser closed the connection before answering {method}"
+            ))
+        };
+        tokio::time::timeout(timeout, reply)
+            .await
+            .map_err(|_| anyhow!("the browser stopped answering ({method})"))?
     }
 
     /// The browser's process id.
