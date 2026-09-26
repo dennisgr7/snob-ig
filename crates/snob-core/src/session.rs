@@ -164,6 +164,23 @@ impl Session {
         })
     }
 
+    /// A short, one-way name for this credential: which session it is,
+    /// without being it.
+    ///
+    /// For the browser snob sends its requests from, which has to tell a
+    /// session it already carries from one a new login produced, and writes
+    /// down which it was given in a file beside its profile. Sixteen hex
+    /// digits of SHA-256 cannot be turned back into the cookie, so that file
+    /// holds no credential; comparing two of them is all this is for.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.sessionid.expose().as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// Value of the `Cookie` header. The `sessionid` goes exactly as the
     /// browser handed it over, undecoded: the `%3A` travels literally.
     ///

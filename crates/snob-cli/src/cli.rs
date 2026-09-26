@@ -209,6 +209,8 @@ Environment:
   CLICOLOR_FORCE    styling even where stdout is not a terminal
   FORCE_HYPERLINK   OSC 8 hyperlinks even where they were not detected
   SNOB_LOG          what --verbose shows, as target=level pairs
+  SNOB_NO_BROWSER   send the requests directly instead of from a browser, for
+                    a machine with none; Instagram can tell the difference
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
                     see \"snob login --help\" and \"snob watch --help\"";
@@ -357,10 +359,10 @@ pub struct LoginArgs {
     )]
     pub csrftoken: Option<String>,
 
-    /// Keep the browser profile after logging in. Always kept now when the
-    /// login works: it is where snob sends its requests from
-    // Accepted so scripts written for it still run.
-    #[arg(long, requires = "browser")]
+    /// Does nothing any more: the profile a login creates is always kept,
+    /// because snob sends its requests from it. Hidden and accepted, so a
+    /// script written for it still runs.
+    #[arg(long, requires = "browser", hide = true)]
     pub keep_profile: bool,
 }
 
@@ -376,8 +378,10 @@ pub struct WhoamiArgs {
 
 #[derive(Args, Debug)]
 pub struct LogoutArgs {
-    /// Also delete the browser profile used by "snob login"
-    #[arg(long)]
+    /// Does nothing any more: logout always deletes the browser profile, which
+    /// holds the session snob sends its requests with. Hidden and accepted, so
+    /// a script written for it still runs.
+    #[arg(long, hide = true)]
     pub purge_profile: bool,
 }
 
@@ -1555,6 +1559,7 @@ mod tests {
             "CLICOLOR_FORCE",
             "FORCE_HYPERLINK",
             "SNOB_LOG",
+            "SNOB_NO_BROWSER",
             "SNOB_CSRFTOKEN",
             "SNOB_SIGNING_KEY",
         ] {

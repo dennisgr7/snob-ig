@@ -141,7 +141,7 @@ impl IgClient {
                 .extend_pairs(form)
                 .finish();
             let request = self.page_request("POST", &url, referer, style, Some(body));
-            let response = page.send(request).await.map_err(IgError::Browser)?;
+            let response = page.send(request).await.map_err(IgError::from)?;
             if response.status == 0 || (300..400).contains(&response.status) {
                 return Err(IgError::Unexpected {
                     status: response.status,

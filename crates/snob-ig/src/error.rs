@@ -99,6 +99,16 @@ pub enum IgError {
     #[error("the browser snob sends its requests from failed: {0}")]
     Browser(String),
 
+    /// The browser is fine and the request got no answer: the network went,
+    /// or the page's own timeout ran out.
+    ///
+    /// What [`IgError::Network`] is for a request `reqwest` sends, and read
+    /// the same way — `Retry`, and tolerable at login. It used to arrive as
+    /// [`IgError::Browser`], so a dropped Wi-Fi connection aborted a monitor
+    /// run and failed a login, and relaunched the browser besides.
+    #[error("network error in the browser: {0}")]
+    Unreachable(String),
+
     /// The mutation's identifier could not be found in Instagram's own code.
     ///
     /// Instagram rotates these, and this crate reads the current one out of the
@@ -248,7 +258,7 @@ impl IgError {
             // Still reachable: the CDN client keeps a policy of its own, and a
             // hop it refuses arrives this way.
             Self::Network(e) if e.is_redirect() => Reaction::Abort,
-            Self::Network(_) => Reaction::Retry,
+            Self::Network(_) | Self::Unreachable(_) => Reaction::Retry,
             // A 5xx is the server's problem, not ours.
             Self::Unexpected { status, .. } if *status >= 500 => Reaction::Retry,
             Self::RateLimited | Self::FeedbackRequired => Reaction::Cooldown,
@@ -265,7 +275,10 @@ impl IgError {
     /// Not a retry criterion: during a walk, throttling is a hard stop. That is
     /// what [`IgError::reaction`] is for.
     pub fn is_login_tolerable(&self) -> bool {
-        matches!(self, Self::RateLimited | Self::Network(_))
+        matches!(
+            self,
+            Self::RateLimited | Self::Network(_) | Self::Unreachable(_)
+        )
     }
 
     /// Whether a **second, different** request is allowed to be sent after this
@@ -471,6 +484,26 @@ pub fn declares_failure(body: &str) -> bool {
 /// A pure function: it takes the status code and the raw body. It is the base
 /// the rate control is built on, so being testable without touching the network
 /// matters.
+/// What a document navigation that was redirected to `path` means, when the
+/// place it landed says it on its own.
+///
+/// Only a browser navigation is ever redirected in front of this crate — the
+/// API calls follow nothing — and Instagram sends a page it will not show to
+/// one of two places. Landing on the challenge is a challenge, with the
+/// cooldown [`cooldown_for`] gives one; landing on the login form is a session
+/// that has gone. Anything else is left to the page that loaded.
+pub fn landed_on(path: &str) -> Option<IgError> {
+    if path.starts_with("/challenge") {
+        return Some(IgError::Challenge {
+            url: checked_url(path.to_string()),
+        });
+    }
+    if path.starts_with("/accounts/login") {
+        return Some(IgError::SessionExpired);
+    }
+    None
+}
+
 pub fn classify(status: u16, body: &str) -> IgError {
     let parsed: ErrorBody = serde_json::from_str(body).unwrap_or_default();
     // Every place a reason might be, not just the REST one. See
@@ -592,6 +625,22 @@ fn checked_url(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A navigation that ends on the challenge is one, and earns its cooldown;
+    /// one that ends on the login form is a session that has gone.
+    #[test]
+    fn where_a_navigation_lands_is_an_answer() {
+        assert!(matches!(
+            landed_on("/challenge/action/AbC/"),
+            Some(IgError::Challenge { url: Some(_) })
+        ));
+        assert!(cooldown_for(&landed_on("/challenge/").unwrap()).is_some());
+        assert!(matches!(
+            landed_on("/accounts/login/"),
+            Some(IgError::SessionExpired)
+        ));
+        assert!(landed_on("/someone/").is_none());
+    }
 
     #[test]
     fn an_expired_session() {

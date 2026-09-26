@@ -4,9 +4,10 @@
 //! belongs to it.** What this drives is a browser *this program started*,
 //! pointed at a profile directory under snob's own data directory — empty until
 //! the user logs into Instagram themselves, in the window that opens in front
-//! of them. The cookie then comes back from that browser, through the browser's
-//! own debugging protocol, and describes a session the user created a moment
-//! earlier.
+//! of them, or until `headless.rs` writes a pasted session into it. The cookie
+//! then comes back from that browser, through the browser's own debugging
+//! protocol, and describes a session the user created a moment earlier. The
+//! same profile, without a window, is what every request is sent from.
 //!
 //! That boundary is deliberate, and it is where the project stops. Reading the
 //! real browser's store instead would mean going through the encryption the

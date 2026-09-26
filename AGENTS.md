@@ -6,8 +6,8 @@ reasoning behind individual changes live in the commit messages, not here.
 
 **Detailed reasoning lives in the doc-comment above the code it governs, not
 here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
-schema in `store/sql/`, the cookie boundary in `cdp.rs`, the headers in
-`client_hints.rs`. Read those before changing any of them — they explain what a
+schema in `store/sql/`, the cookie boundary in `cdp.rs`, the browser requests
+are sent from in `headless.rs`, the headers in `client_hints.rs`. Read those before changing any of them — they explain what a
 number is for, which is what stops it being changed into something that no
 longer does the job it was there to do.
 
@@ -17,8 +17,9 @@ longer does the job it was there to do.
 Instagram, and tracks changes to your followers and following over time. It
 also follows and unfollows one account at a time, shows an account's page the
 way Instagram does, and shows and downloads the stories an account has up and
-the highlights its profile keeps. Single binary, no runtime. Windows and Linux
-on x86_64 and ARM64, macOS on Apple Silicon.
+the highlights its profile keeps. Single binary, which drives a Chromium-based
+browser installed on the machine. Windows and Linux on x86_64 and ARM64, macOS
+on Apple Silicon.
 
 It is a convenience tool for a person's own account, signed in as themselves.
 Everything it shows is what the app already shows the same person, read faster
@@ -28,7 +29,11 @@ the person could do by scrolling.
 
 There is no official API for listing followers — Meta removed it in 2018 — so
 this asks the same web API instagram.com asks, with the user's own session
-cookie. Automating that is outside Instagram's Terms of Use, as it is for every
+cookie, **from a real browser**: every request leaves from a Chrome, Edge,
+Brave or Chromium that snob runs without a window against its own profile,
+sent with `fetch()` from an instagram.com tab (`headless.rs`). The owner's
+direction is that the browser becomes the whole engine — a complete client
+toward Instagram — with the terminal as the skin on top of it. Automating that is outside Instagram's Terms of Use, as it is for every
 tool in this category, and the realistic outcome for a user is that Instagram
 asks their account to verify itself. **Most of the design goes into being a
 light, well-behaved client** — modest volume, honest requests, and an immediate
@@ -101,6 +106,8 @@ risk:
   route is a browser **we launched against our own profile**, which the user
   logs into themselves and which hands the cookies over through its debugging
   protocol. The boundary is whose profile it is and who hands the data over.
+  The same profile is what every request is sent from; a pasted session is
+  written into it, never taken out of anybody else's.
 - **On the first 429, `spam:true`, `feedback_required` or
   `challenge_required`: hard stop.** No retry within that run, and the account
   goes into cooldown. When a service says no, the answer is to stop asking.
@@ -127,13 +134,17 @@ cargo test -p snob-cli --features testing --locked   # the binary itself
 ```
 
 **The `testing` feature is what lets a test drive the program**; everything
-else in the suite drives a library. It adds two flags a released binary
-contains neither of (`crates/snob-store/tests/sandbox.rs` reads the source to
+else in the suite drives a library. It adds three flags a released binary
+contains none of (`crates/snob-store/tests/sandbox.rs` reads the source to
 hold that down): `--sandbox-root` puts every file a run touches under one
 directory, forces the file secret backend, and derives a keyring service name
 from that root — which is what actually separates a sandbox from the real
 credentials. `--ig-base-url` **requires** `--sandbox-root`; that pairing is
-the whole safety argument, and `main::wiring` carries the reasoning. Plain
+the whole safety argument, and `main::wiring` carries the reasoning.
+`--through-the-browser` sends the redirected requests from the headless
+browser too, which is how `tests/headless.rs` drives the path users take;
+without it a sandbox reaches its mock server with `reqwest`, so the rest of
+the suite needs no browser. Plain
 `cargo test --workspace` compiles none of this, so run the `testing` suite
 too before pushing — CI runs it as its own step on every platform.
 
@@ -180,8 +191,8 @@ the split is for: the Instagram client compiles no SQLite, no keyring, no TOML
 parser. It is a dependency-graph split, not a compile-time one; the dominant
 build cost is `snob-cli` either way.
 
-The tool is a session, a database and a request budget. Everything else is a
-way of asking those three something:
+The tool is a session, a database and a request budget, and a browser the
+requests leave from. Everything else is a way of asking those something:
 
 ```
                          app::App
@@ -212,6 +223,14 @@ Two rules keep it that way:
   directly (a connection is not held across a day-long sleep; `status`
   answers without a session).
 
+**The browser is behind a seam.** `snob-ig` defines the shape of a request a
+page sends (`client::page`) and compiles no browser code; `snob-cli`'s
+`headless.rs` launches the browser on a run's first request, shares it across
+every client in the process, and closes it at the end (`main::run`, and
+between monitor runs). Pacing, budgets, cooldowns and classification are the
+same for both transports: only the last hop changes hands. `SNOB_NO_BROWSER=1`
+keeps `reqwest` as the last hop, and the CDN downloads always use it.
+
 The interactive views draw with `ratatui` (`default-features = false`) and
 read keys with `crossterm` through `ui::browser::input`; `ui::tui::Tui` is the
 one terminal guard, browsers collect receipt lines and print them after it
@@ -236,7 +255,11 @@ each location.
 
 | Rule | Where it lives |
 |---|---|
-| Every request is paid for, once per redirect hop | `Pacer::clear_to_send`, inside `IgClient::get_body` |
+| Every request is paid for, once per redirect hop | `Pacer::clear_to_send`, inside `IgClient::get_body`; the page follows no redirect on an API call (`FETCH` in `headless.rs`) and a navigation's hop is paid in `answer_from_page` |
+| Every request to Instagram leaves from snob's own browser, unless told otherwise | `client::page`, installed from `main::run`; `SNOB_NO_BROWSER` |
+| A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::sync_cookies`, `ProfileMark` |
+| The profile a failed login finds is never deleted; only one it created | `login::by_browser` |
+| A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
 | Nothing is spent while the account is in cooldown | `Pacer::clear`; `SNOB_IGNORE_COOLDOWN` is the undocumented escape hatch |
 | A 429 or push-back puts the account in cooldown | `IgClient::classify_and_record` |
 | A refusal is never worked around by asking somewhere else | `IgError::worth_a_second_route` |
@@ -250,7 +273,7 @@ each location.
 | An account id, a moment and a count cannot be confused | `snob_core::{Pk, Epoch, EpochMs}` newtypes — the mix-ups are build errors |
 | Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
 | The credential cannot be printed, and clears itself when dropped | `secret::Secret` |
-| The login browser's debugging protocol has no address, and the browser dies with this process | `pipe::spawn` — `--remote-debugging-pipe` on inherited descriptors, plus the Windows job object; `cdp::kill_on_panic` for panics |
+| The browser's debugging protocol has no address, and the browser dies with this process | `pipe::spawn` — `--remote-debugging-pipe` on inherited descriptors, plus the Windows job object; `cdp::kill_on_panic` for panics |
 | Two stored lists are crossed only if nothing happened between the walks | `engine::cooldown::check_same_moment` |
 | A walk in progress has exactly one writer, and two processes never share one | `snapshots::resumable`/`save_page`/`close`; `is_resumable` asks without claiming |
 | A temporal diff never compares an incomplete capture; a first run reports nothing | `watch::Basis::decide` over `usable_snapshots`; `Basis::Baseline` |
@@ -276,7 +299,11 @@ each location.
 
 ## Running headless
 
-Supported on purpose — a homelab is a first-class place to run this. `snob
+Supported on purpose — a homelab is a first-class place to run this. It needs
+a Chromium-based browser installed (no display: it runs headless) and an
+ordinary user, since Chromium refuses root with its sandbox on and snob does
+not turn the sandbox off; `SNOB_NO_BROWSER=1` is the way round both, at the
+cost of requests Instagram can tell from a browser's. `snob
 login` probes where the session can go before asking for anything and falls
 back from the keyring to a file (DPAPI-sealed on Windows, plain JSON at 0600
 elsewhere), saying which backend it landed on; `--no-keyring` forces the file.
@@ -308,9 +335,13 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   how Instagram built it.
 - **The pacing has no published reference behind it and stays where it is** —
   the reasoning is at `pace.rs`, where somebody changing a number will look.
-- **The wire signature is not tuned to resemble anything** — headers are sent
-  for internal consistency, not disguise (`client_hints.rs`, `headers.rs`).
-  One target differs for build reasons alone: Windows ARM64 uses schannel,
+- **The wire signature is the browser's own.** With the browser as transport,
+  the TLS handshake, HTTP/2, cookies and headers are Chromium's; snob corrects
+  only what running headless changes (the `HeadlessChrome` token, the screen,
+  `navigator.webdriver`) and states the client hints the browser reports for
+  itself (`headless.rs`). `client_hints.rs` and `headers.rs` still dress the
+  `reqwest` path, which is sent for internal consistency, not disguise. One
+  target differs for build reasons alone: Windows ARM64 uses schannel,
   documented in `crates/snob-ig/Cargo.toml`, and `--strict-roots` is refused
   there rather than ignored.
 - **The trust store is narrowed only when asked** (`--strict-roots`,
@@ -323,11 +354,13 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 - **A challenge's cooldown is not lifted by clearing the challenge** — lifting
   it would trust a login that was never validated, or spend the retry the
   hard-stop rule forbids.
-- **The login browser is talked to over a pipe; there is no debugging port.**
+- **The browser is talked to over a pipe; there is no debugging port.**
   A port was demonstrated to hand the session cookie to any local process.
   `pipe.rs` carries the launch mechanics; `tests/browser_pipe.rs` holds it.
 - **`snob purge` deletes the stored data and not the binary**, session first;
-  the package manager owns the binary.
+  the package manager owns the binary. **`snob logout` deletes the browser
+  profile** as well as the stored session: the profile is where the live
+  session is.
 - **The Windows credential is `CRED_PERSIST_LOCAL_MACHINE`** — it stays on the
   machine that created it; `secrets.rs::entry_for` carries the experiment.
 - **There is no lease over `watch_marks`**: two overlapping runs can report
@@ -356,6 +389,18 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   truncation stops being detectable for that account;
   `WebProfileInfo::counters_are_knowable` is the question, and both
   `engine::target` and `watch check` say it out loud.
+- **Opening the site is not paid for.** The tab loads `https://www.instagram.com/`
+  once per run, and Instagram's own page then makes requests of its own; none
+  of it goes through the `Pacer`, so the counts snob reports cover its API
+  calls only. Loading the page is what a browser does; whether to host the
+  calls on a page that boots no app instead is open.
+- **Only the tab is overridden.** A service worker the site registers keeps
+  the flag's User-Agent and the client hints `--user-agent` blanks; covering
+  every target needs `cdp.rs` to answer protocol events as they arrive
+  (`Target.setAutoAttach`), which it does not yet.
+- **Two snob runs cannot share the browser.** The profile is Chromium's, and a
+  second launch on it exits (0 or 21); the second run fails and says another
+  snob holds it rather than waiting its turn.
 - **Real behavior on a live 429 has never been provoked on purpose.** The
   handling is verified against a recorded body; `Retry-After` and the load
   headers are logged (`IgClient::note_push_back`) and deliberately not acted
@@ -379,8 +424,8 @@ comments next to the tables they concern.
 - The binary is ~5.2 MB on `aarch64-pc-windows-msvc` (x86_64 about a third
   larger). Bundled SQLite is ~9% of it; the `xlsx` feature ~9% more (it is a
   default feature a source build can leave out); `ratatui` cost +106 KiB.
-- The Chromium profile `snob login --browser` creates is ~87 MB, which dwarfs
-  all of that — `login` removes it when it is done.
+- The Chromium profile is ~87 MB, which dwarfs all of that. It is kept — the
+  requests are sent from it — and `snob logout` removes it.
 - `clap` without `color` and `zstd` out of `Accept-Encoding` would save real
   bytes and are **kept anyway**, as positions: help in color, and an
   `Accept-Encoding` that is Chrome's character for character.

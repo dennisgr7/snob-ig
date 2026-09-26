@@ -167,7 +167,7 @@ fn choose_browser(purpose: &str, installed: &[browser::Browser]) -> Option<brows
 ///
 /// Nothing is read out of the user's own browser profile. This one is ours,
 /// under our data directory, and the browser hands the cookies over itself
-/// through its debugging protocol. `snob logout --purge-profile` deletes it.
+/// through its debugging protocol. `snob logout` deletes it.
 async fn by_browser(
     args: LoginArgs,
     store: SecretStore,
@@ -197,6 +197,12 @@ async fn by_browser(
         cdp::LOGIN_TIMEOUT.as_secs() / 60
     ));
 
+    // Asked before the browser can create it. A profile that was already here
+    // is the device every request is sent from, and it may be in use right
+    // now by another snob — a failed or abandoned login below is no reason to
+    // take it away. Only one this login created is.
+    let existed = profile.exists();
+
     // Anything from here on can be interrupted, and a Ctrl+C has to read as
     // one rather than as a failure, so the result is held rather than unwrapped
     // until the browser has been shut down.
@@ -211,9 +217,12 @@ async fn by_browser(
     // **Kept when the login worked.** The profile is the device every request
     // is now sent from (`headless.rs`): removing it would make each login a
     // new, never-seen browser, and the next run would have nowhere to send
-    // from but a fresh one. It still goes when the login did not happen,
-    // which is the case the paragraph above is about.
-    if captured.is_err() || cancel.is_canceled() {
+    // from but a fresh one. It still goes when the login did not happen and
+    // this login is what created it, which is the case the paragraph above is
+    // about. **Never when it was already here**: the commonest way for this
+    // launch to fail is another snob holding that very profile, and deleting
+    // it under that snob's browser was what the old condition did.
+    if !existed && (captured.is_err() || cancel.is_canceled()) {
         // Off the worker: the removal retries with sleeps adding up to five
         // seconds, and this runtime has two workers, one of which has to stay
         // free for the Ctrl+C task to run at all.
@@ -231,18 +240,18 @@ async fn by_browser(
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
     session.browser = Some(found.name.to_string());
+    // The profile made this session, and is the browser's to keep current from
+    // now on: the next run must not write the stored copy back over it.
+    crate::headless::ProfileMark::after_login(paths, &found, &session);
     finish(session, store, pacer, LoginMethod::Browser).await
 }
 
-/// Removes the profile the browser was driven in, once its cookies are ours.
+/// Removes a profile a login created and did not finish.
 ///
-/// **87.2 MB and 886 files, holding a live Instagram session at rest.** More
-/// than the binary and a year of the database put together, and a second copy
-/// of the credential — protected by whatever the data directory's permissions
-/// happen to be, which on Windows is not something this tool sets. The profile
-/// exists so that logging in does not happen in the user's everyday browser;
-/// nothing about that purpose needs it to survive the login. `--keep-profile`
-/// is for whoever wants the next login to skip the Instagram form.
+/// **87.2 MB and 886 files, and possibly a half-finished session.** A login
+/// that worked keeps its profile, because every request is sent from it now
+/// (`headless.rs`); one that failed or was abandoned has nothing to keep it
+/// for, and was the only thing that made it. `by_browser` says which.
 ///
 /// Guarded by `is_safe_to_remove` like every other recursive delete here, and
 /// retried briefly: the browser has just been told to close and Windows holds
@@ -277,7 +286,7 @@ fn discard_profile(profile: &std::path::Path) {
         ui::warn(&format!(
             "the browser profile at {} could not be removed ({e}). It holds a \
              logged-in session; delete it by hand, or run \
-             \"snob logout --purge-profile\" later.",
+             \"snob logout\" later.",
             profile.display()
         ));
     }
@@ -325,7 +334,7 @@ async fn collect(
             ui::info(
                 "This browser profile was still logged in, so that session is the one \
                  being stored.\n\
-                 To sign in as somebody else, run \"snob logout --purge-profile\" first.",
+                 To sign in as somebody else, run \"snob logout\" first.",
             );
             existing
         }
@@ -422,7 +431,8 @@ async fn finish(
                     }
                     LoginMethod::Browser => {
                         "Instagram rejected the session the browser handed over. It may \
-                             have been signed out in the meantime; try again"
+                             have been signed out in the meantime; run \"snob logout\" and \
+                             log in again"
                     }
                 }),
             _ => anyhow::anyhow!(e),

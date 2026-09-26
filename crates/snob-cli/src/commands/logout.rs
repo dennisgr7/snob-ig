@@ -34,44 +34,37 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
         (Err(_), _) => {}
     }
 
+    // **Always, now.** The browser profile is where every request is sent
+    // from (`headless.rs`), so it holds the live session — kept current by
+    // the browser, fresher than the stored copy — and a logout that left it
+    // would leave the session on the machine while saying it had gone. The
+    // flag that used to ask for this is accepted and changes nothing.
+    let _ = args.purge_profile;
     let profile = paths.browser_profile();
     let mut profile_failure = None;
-    match (args.purge_profile, profile.exists()) {
-        // The flag was typed on purpose, so it is not second-guessed: asking
-        // for confirmation would also make it a no-op in a script, where
-        // `confirm` answers with its default and nothing gets deleted.
+    if profile.exists() {
         // Guarded like every other recursive delete in the tool. The path
         // comes from `directories` rather than from anything typed, but that
         // is exactly the case the guard is for: a `ProjectDirs` that resolved
         // oddly is what turns "remove the browser profile" into something far
         // worse, and `purge` treats this check as mandatory.
-        (true, true) if !paths::is_safe_to_remove(&profile) => {
+        if !paths::is_safe_to_remove(&profile) {
             ui::warn(&format!(
                 "{} is too close to the root to remove; delete it by hand",
                 profile.display()
             ));
+        } else {
+            // Collected rather than `?`-ed, for the same reason `removal`
+            // above is: one refusal must not decide the other. A browser still
+            // open on the profile makes this fail — another snob mid-run — and
+            // with `?` here the early return jumped over `removal?` at the
+            // end, so a user whose keyring had *also* refused was told about
+            // the locked directory and nothing at all about the session.
+            match std::fs::remove_dir_all(&profile) {
+                Ok(()) => crate::ui::say!("Browser profile deleted."),
+                Err(e) => profile_failure = Some(e),
+            }
         }
-        // Collected rather than `?`-ed, for the same reason `removal` above is:
-        // one refusal must not decide the other. A browser still open on the
-        // profile makes this fail, and with `?` here the early return jumped
-        // over `removal?` at the end — so a user whose keyring had *also*
-        // refused was told about the locked directory and nothing at all about
-        // the session, which was still in the keyring. `purge::execute`
-        // already collects its failures for exactly this.
-        (true, true) => match std::fs::remove_dir_all(&profile) {
-            Ok(()) => crate::ui::say!("Browser profile deleted."),
-            Err(e) => profile_failure = Some(e),
-        },
-        (true, false) => crate::ui::say!("There is no browser profile to delete."),
-        // Deleting the stored session leaves the browser one behind, and
-        // someone who just ran logout reasonably believes the credential is
-        // gone from their machine. It is not.
-        (false, true) => ui::info(&format!(
-            "A browser profile at {} still holds a logged-in session.\n\
-             Run \"snob logout --purge-profile\" to remove that too.",
-            profile.display()
-        )),
-        (false, false) => {}
     }
 
     // After the profile, so that one refusal does not decide the other. There

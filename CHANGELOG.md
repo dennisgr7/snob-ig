@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Every request now comes from a browser.** snob sends each call to
+  Instagram from a Chrome, Edge, Brave or Chromium installed on the machine,
+  running without a window against snob's own profile, with `fetch()` from an
+  instagram.com tab: the connection, the cookies — rotating as a browser's do
+  — and the headers are that browser's own. A session a browser created, used
+  by something that was visibly not that browser, is what Instagram's
+  automated-activity warning looks for. Pacing, budgets and cooldowns are
+  unchanged. It needs such a browser installed and an ordinary user;
+  `SNOB_NO_BROWSER=1` sends the requests directly instead. The profile is now
+  kept after `snob login --browser`, since it is the device the requests come
+  from, and `snob logout` deletes it; `--keep-profile` and
+  `--purge-profile` are accepted and do nothing.
+
 - **`snob import dyi` is in.** It reads the archive Instagram itself hands
   over under "Download your information" and prints the same four answers
   the live commands give, with no session and no request. It was written and

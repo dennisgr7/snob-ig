@@ -77,9 +77,37 @@ impl PageResponse {
     }
 }
 
+/// Why a page handed back no answer. Three different things, read three
+/// different ways — which is why this is not a string.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PageError {
+    /// The request got no answer: the network, or the page's own timeout.
+    /// Worth a retry, as the same failure through `reqwest` is.
+    #[error("{0}")]
+    Unreachable(String),
+    /// A write, and the browser holds no CSRF token to send it with.
+    #[error("the browser holds no CSRF token to write with")]
+    NoCsrfToken,
+    /// The browser itself: it would not start, went away, or stopped
+    /// answering its protocol.
+    #[error("{0}")]
+    Browser(String),
+}
+
+impl From<PageError> for crate::error::IgError {
+    fn from(error: PageError) -> Self {
+        match error {
+            PageError::Unreachable(why) => Self::Unreachable(why),
+            PageError::NoCsrfToken => Self::NoCsrfToken,
+            PageError::Browser(why) => Self::Browser(why),
+        }
+    }
+}
+
 /// What sending returns: boxed, because the one implementation is behind a
 /// trait object and lives in another crate.
-pub type PageFuture<'a> = Pin<Box<dyn Future<Output = Result<PageResponse, String>> + Send + 'a>>;
+pub type PageFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PageResponse, PageError>> + Send + 'a>>;
 
 /// A browser tab on Instagram that sends what it is given.
 pub trait Page: Send + Sync {

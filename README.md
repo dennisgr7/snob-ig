@@ -14,8 +14,10 @@ same work done in a terminal — quicker, scriptable, and with the answer in a
 format you can keep. It is the housekeeping the app has never put a button on,
 at the size one person's account actually is.
 
-One binary, no runtime, nothing to install alongside it. Windows and Linux on
-x86_64 and ARM64, macOS on Apple Silicon.
+One binary, and a browser you most likely already have: snob sends its requests
+from a Chrome, Edge, Brave or Chromium installed on the machine, running without
+a window against a profile of its own. Windows and Linux on x86_64 and ARM64,
+macOS on Apple Silicon.
 
 **Almost all of snob reads.** It changes exactly two things, one account per
 command and after asking: `snob follow` and `snob unfollow`. It never blocks,
@@ -23,7 +25,8 @@ never removes a follower, never likes, comments or messages, and never marks a
 story as seen.
 
 > **Early version.** Every command works and has been used against the real API.
-> Reading Instagram's own data export is planned and not built yet.
+> `snob import dyi` reads the data export Instagram hands over itself, and sends
+> nothing at all.
 
 ## Install
 
@@ -60,6 +63,15 @@ page. The install scripts below run the same check when `gh` is installed.
 The Linux builds are statically linked, so they carry no glibc version
 requirement and run on any distribution.
 
+**It needs a Chromium-based browser.** Every request to Instagram is sent by
+one — Chrome, Edge, Brave or Chromium — running without a window, so what
+Instagram sees is a browser and not a script. Most desktops already have one;
+on a server, `sudo apt install chromium` (or your distribution's equivalent) is
+enough, and no desktop is needed. Chromium will not run as root with its sandbox
+on, so run snob as an ordinary user. `SNOB_NO_BROWSER=1` sends the requests
+directly instead, for a machine that cannot have a browser; Instagram can tell
+the difference.
+
 **Without a package manager.** These download the release for your platform and
 check it against the published SHA256. The PowerShell one adds the install
 directory to your user `PATH`; the shell one prints the line to add to your
@@ -83,8 +95,8 @@ cargo install --locked --git https://github.com/dennisgr7/snob-ig snob-cli
 ```
 
 **By hand** — every release has an archive per platform on the [releases
-page][releases]. Unpack it, put `snob` anywhere on your `PATH`, done. There is
-no runtime to install.
+page][releases]. Unpack it, put `snob` anywhere on your `PATH`, done. Beyond the
+browser, there is nothing else to install.
 
 ### Updating
 
@@ -118,7 +130,8 @@ hand it over, and `snob login` offers both:
   cookie the browser hands over through its debugging protocol.
 - **Paste it.** You copy `sessionid` out of your browser's developer tools and
   paste it in. `snob login --paste` goes straight here, which is what a server
-  with no desktop needs.
+  with no desktop needs. The requests still leave from a browser on that
+  machine, which never needs to show a window.
 
 Check it worked with `snob whoami`. The session lasts until you log out of
 Instagram from that browser, or Instagram expires it.
@@ -449,11 +462,11 @@ snob watch --every 6h --json >> events.ndjson
 ## Where your data goes
 
 Nowhere. There is no server, no account and no telemetry: snob talks to
-Instagram and to nothing else.
+Instagram and to nothing else. The browser it drives is still that vendor's
+browser, and talks to that vendor's services the way it does whenever it runs.
 
-On your machine it keeps two things, both under your user profile and both
-per-user rather than per-folder, so it does not matter which directory you run
-it from:
+On your machine it keeps these, all under your user profile and all per-user
+rather than per-folder, so it does not matter which directory you run it from:
 
 - **The session**, in the operating system's keyring — Credential Manager,
   Keychain or Secret Service. With `--no-keyring` it goes to a file instead,
@@ -467,11 +480,13 @@ it from:
 - **The monitor's settings**, if you ran `snob watch setup` — a `watch.toml` you
   can read and edit. Any token or signing key it needs goes to the keyring
   rather than into that file.
+- **A browser profile of its own**, about 90 MB, which the requests are sent
+  from. It holds the live session — the browser keeps it current — and
+  `snob logout` deletes it along with the stored one.
 
 **Your browser's own cookie store is never read, copied or decrypted.** The
-browser `snob login` opens is a separate one with a profile of its own. That
-does mean the session then also exists inside that profile;
-`snob logout --purge-profile` removes it along with the stored one.
+browser snob drives is a separate one with a profile of its own, which you log
+into yourself or which is handed the session you pasted.
 
 To take everything off the machine, including the keyring entry that no package
 manager can reach:
@@ -525,10 +540,14 @@ to:
 - **Nothing is asked twice.** A recent list is reused from storage instead of
   walked again, and an interrupted walk resumes rather than starting over. The
   cheapest request is the one that is never sent.
-- **The requests are well-formed.** The headers are derived from a browser
-  actually installed on the machine, so they agree with each other instead of
-  describing something that does not exist. snob does not dress itself up as a
-  browser; it just does not send a self-contradictory request.
+- **The requests come from a real browser.** Each one is sent by a Chrome,
+  Edge, Brave or Chromium running without a window, from an instagram.com tab,
+  with that browser's own connection, cookies and headers. What snob adjusts is
+  only what running without a window changes — the `HeadlessChrome` in the
+  User-Agent, the screen size, and the flag that says the browser is automated
+  — and the browser's description of itself goes out as the browser gives it.
+  Opening the site loads Instagram's own page, which makes requests of its own
+  that snob does not count.
 
 One thing here is not snob's to control, and it decides more than any of the
 above: **where the requests come from**. Instagram serves a home connection and

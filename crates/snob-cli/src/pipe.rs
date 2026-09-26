@@ -47,8 +47,9 @@ use anyhow::Result;
 /// The transport reads until a NUL, so without a ceiling a browser that never
 /// sent one would decide how much memory this process uses. `Browser.getVersion`
 /// and `Storage.getCookies` answer in kilobytes; this is far above anything
-/// real.
-const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// real. A message over it ends the connection, so what `headless.rs` asks
+/// the page to hand back is capped below it, in the bytes it will take here.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// How the two ends of the protocol are numbered.
 ///

@@ -47,7 +47,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use snob_core::Pk;
 use snob_core::session::Session;
-use snob_ig::client::page::{Page, PageFactory, PageFuture, PageRequest, PageResponse};
+use snob_ig::client::page::{Page, PageError, PageFactory, PageFuture, PageRequest, PageResponse};
 use snob_ig::pace::CancelToken;
 use snob_store::paths::AppPaths;
 
@@ -63,6 +63,14 @@ const SETTLE: Duration = Duration::from_millis(1_500);
 
 /// How long a single browser command may take when it is not a fetch.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The most a page may hand back, measured the way it travels: as a protocol
+/// message on the pipe, where every character outside printable ASCII is six
+/// bytes (`\uXXXX`) and a quote or backslash two. Two megabytes short of the
+/// pipe's ceiling, for the envelope. A message over that ceiling ends the
+/// connection rather than failing the one request, so the cap has to be
+/// applied in the page, before anything is sent back.
+const PAGE_WIRE_CAP: u64 = (crate::pipe::MAX_MESSAGE_BYTES - 2 * 1024 * 1024) as u64;
 
 /// The window, and the screen it claims to be on. The commonest desktop size.
 const WINDOW: (u32, u32) = (1920, 1080);
@@ -110,6 +118,8 @@ struct Live {
     origin: String,
     /// The account whose cookies have been checked in the browser.
     synced: Option<Pk>,
+    /// What is known about the profile; see [`ProfileMark`].
+    mark: ProfileMark,
 }
 
 impl Headless {
@@ -139,17 +149,23 @@ impl Headless {
         }
     }
 
-    async fn send_inner(&self, request: PageRequest) -> Result<PageResponse> {
+    async fn send_inner(&self, request: PageRequest) -> Result<PageResponse, PageError> {
         let mut state = self.state.lock().await;
         if state.is_none() {
-            *state = Some(self.start().await?);
+            *state = Some(
+                self.start()
+                    .await
+                    .map_err(|e| PageError::Browser(format!("{e:#}")))?,
+            );
         }
         let live = state.as_mut().expect("started just above");
 
         let result = self.send_on(live, &request).await;
-        if result.is_err() {
-            // A tab that failed once is not trusted with the next request: the
-            // browser may be gone. The next request starts a fresh one.
+        if let Err(PageError::Browser(_)) = &result {
+            // A browser that failed once is not trusted with the next request:
+            // it may be gone. The next request starts a fresh one. Only then —
+            // a request the network dropped says nothing about the browser,
+            // and relaunching it would load the site again for nothing.
             if let Some(live) = state.take() {
                 live.cdp.close().await;
             }
@@ -157,11 +173,23 @@ impl Headless {
         result
     }
 
-    async fn send_on(&self, live: &mut Live, request: &PageRequest) -> Result<PageResponse> {
-        let origin = origin_of(&request.url)?;
-        let session = self.wanted()?;
+    async fn send_on(
+        &self,
+        live: &mut Live,
+        request: &PageRequest,
+    ) -> Result<PageResponse, PageError> {
+        let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
+        let origin = origin_of(&request.url).map_err(broken)?;
+        let session = self.wanted().map_err(broken)?;
         if live.synced != Some(session.ds_user_id) {
-            sync_cookies(live, &session, &origin).await?;
+            let mut mark = live.mark.clone();
+            sync_cookies(live, &session, &origin, &mut mark)
+                .await
+                .map_err(broken)?;
+            if mark != live.mark {
+                mark.write(&self.paths);
+                live.mark = mark;
+            }
             live.synced = Some(session.ds_user_id);
             // A tab already on the site loaded as whoever was there before.
             live.origin = String::new();
@@ -181,17 +209,37 @@ impl Headless {
     /// and says in so many words.
     async fn start(&self) -> Result<Live> {
         let session = self.wanted()?;
-        let browser = session
-            .browser
-            .as_deref()
-            .and_then(crate::browser::detect_named)
+        let mut mark = ProfileMark::read(&self.paths);
+        // The browser that made the profile, while it is still installed; then
+        // the one the session names; then the first found. See `ProfileMark`
+        // for why the first answer is the one that matters.
+        let made_it = mark.browser.as_deref().and_then(|path| {
+            crate::browser::detect_all()
+                .into_iter()
+                .find(|b| b.path == path)
+        });
+        let browser = made_it
+            .or_else(|| {
+                session
+                    .browser
+                    .as_deref()
+                    .and_then(crate::browser::detect_named)
+            })
             .or_else(crate::browser::detect)
             .ok_or_else(|| {
                 anyhow!(
-                    "snob sends its requests from a browser, and no Chrome, Edge or Chromium \
-                     was found on this machine"
+                    "snob sends its requests from a browser, and no Chrome, Edge, Brave or \
+                     Chromium was found on this machine.\n\
+                     Install one (Chromium is enough), or set SNOB_NO_BROWSER=1 to send \
+                     them directly — which Instagram can tell apart from a browser."
                 )
             })?;
+        refuse_root()?;
+        // A profile nothing has claimed yet, or whose browser is gone: from
+        // here on it is this one's. Written once the launch has created the
+        // directory it lives in.
+        let claim = mark.browser.as_deref() != Some(browser.path.as_path());
+        mark.browser = Some(browser.path.clone());
         // The User-Agent of the binary being started, not the one stored with
         // the session. The brands below are what this binary reports, and a
         // stored string that has fallen behind — refreshed once a day at
@@ -216,6 +264,9 @@ impl Headless {
             .await
             .with_context(|| format!("could not start {} without a window", browser.name))?;
         let mut cdp = Cdp::connect(launched, &cancel).await?;
+        if claim {
+            mark.write(&self.paths);
+        }
 
         let version = cdp.browser_call("Browser.getVersion", json!({})).await?;
         let full_version = version
@@ -251,13 +302,35 @@ impl Headless {
             tab,
             origin: "about:blank".to_string(),
             synced: None,
+            mark,
         })
     }
 }
 
+/// Chromium will not run as root with its sandbox on, and snob does not turn
+/// the sandbox off for anybody: this browser loads pages and media a server
+/// chose, which is what the sandbox is for. Measured: it exits 1 at once, and
+/// "exited with code 1" says nothing about why. Root is the ordinary user in
+/// a container, which is where this is most likely to be met.
+fn refuse_root() -> Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` takes nothing, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            bail!(
+                "snob sends its requests from a browser, and Chromium will not run as root \
+                 with its sandbox on.\n\
+                 Run snob as an ordinary user, or set SNOB_NO_BROWSER=1 to send the requests \
+                 directly — which Instagram can tell apart from a browser."
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Page for Headless {
     fn send(&self, request: PageRequest) -> PageFuture<'_> {
-        Box::pin(async move { self.send_inner(request).await.map_err(|e| format!("{e:#}")) })
+        Box::pin(self.send_inner(request))
     }
 }
 
@@ -413,44 +486,92 @@ fn metadata(user_agent: &str, full_version: &str, platform: Option<&Value>) -> V
     })
 }
 
-/// Makes sure the browser carries this session.
+/// Makes sure the browser carries this session, and only this account.
 ///
-/// The profile is where the login happened, so ordinarily it already does and
-/// nothing is written: the browser's own cookies are fresher than anything
-/// stored. A session that came from a paste, or one stored before requests
-/// moved into the browser, is written in once.
-async fn sync_cookies(live: &mut Live, session: &Session, origin: &str) -> Result<()> {
+/// **A login is authoritative; after it, the browser is.** The browser's cookie
+/// jar is fresher than anything stored — it is where `csrftoken` and `rur`
+/// rotate — so a session it already carries is left alone. What tells "the
+/// session it already carries" apart from "a new login's" is the profile mark
+/// ([`ProfileMark`]): the fingerprint of the stored session last handed to
+/// this profile. A stored session whose fingerprint is not the mark's came
+/// from a login since, and its cookies are written in over whatever the
+/// browser had. This used to ask only whether the browser held *a* session
+/// for the account, so pasting a fresh session over a dead one changed
+/// nothing, and every retry validated the dead one again.
+///
+/// **Another account's browser is emptied first.** Cookies and site data both:
+/// `mid`, `ig_did` and `datr` name the device, and carrying one account's
+/// into another's session is how two accounts come to look like one person's.
+async fn sync_cookies(
+    live: &mut Live,
+    session: &Session,
+    origin: &str,
+    mark: &mut ProfileMark,
+) -> Result<()> {
     let host = url::Url::parse(origin)?
         .host_str()
         .unwrap_or_default()
         .to_string();
     let on_instagram = host == "instagram.com" || host.ends_with(".instagram.com");
+    let ours = |c: &&Value| {
+        let domain = c.get("domain").and_then(Value::as_str).unwrap_or("");
+        if on_instagram {
+            domain == "instagram.com" || domain.ends_with(".instagram.com")
+        } else {
+            domain.trim_start_matches('.') == host
+        }
+    };
+    let named = |c: &Value, name: &str| c.get("name").and_then(Value::as_str) == Some(name);
 
-    let cookies = live
+    let jar = live
         .cdp
         .browser_call("Storage.getCookies", json!({}))
         .await?;
-    let already = cookies
+    let site: Vec<&Value> = jar
         .get("cookies")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|c| {
-            let domain = c.get("domain").and_then(Value::as_str).unwrap_or("");
-            if on_instagram {
-                domain == "instagram.com" || domain.ends_with(".instagram.com")
-            } else {
-                domain.trim_start_matches('.') == host
-            }
-        })
-        .any(|c| {
-            c.get("name").and_then(Value::as_str) == Some("sessionid")
-                && c.get("value")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.starts_with(&format!("{}%3A", session.ds_user_id)))
-        });
-    if already {
+        .filter(ours)
+        .collect();
+    let this_account = format!("{}%3A", session.ds_user_id);
+    let held = site
+        .iter()
+        .filter(|c| named(c, "sessionid"))
+        .filter_map(|c| c.get("value").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let holds_this_account = held.iter().any(|v| v.starts_with(&this_account));
+    let holds_another = held.iter().any(|v| !v.starts_with(&this_account))
+        || mark.pk.is_some_and(|pk| pk != session.ds_user_id.get());
+    let given = session.fingerprint();
+
+    if holds_this_account && !holds_another && mark.session.as_deref() == Some(given.as_str()) {
         return Ok(());
+    }
+
+    let mut device_kept = std::collections::HashSet::new();
+    if holds_another {
+        live.cdp
+            .browser_call("Storage.clearCookies", json!({}))
+            .await?;
+        // Sent to the tab, not the browser: on the browser's own session this
+        // answers "Internal error" whatever it is asked, measured on Chromium
+        // 153, and on a tab's it clears.
+        live.cdp
+            .page_call(
+                &live.tab,
+                "Storage.clearDataForOrigin",
+                json!({ "origin": origin, "storageTypes": "all" }),
+                COMMAND_TIMEOUT,
+            )
+            .await?;
+    } else {
+        // The device cookies the browser already has are its own, and stay.
+        for name in ["mid", "ig_did", "datr"] {
+            if site.iter().any(|c| named(c, name)) {
+                device_kept.insert(name);
+            }
+        }
     }
 
     let a_year = snob_core::clock::now().get() + 365 * 24 * 3600;
@@ -483,40 +604,115 @@ async fn sync_cookies(live: &mut Live, session: &Session, origin: &str) -> Resul
         ("ig_did", session.ig_did.as_deref()),
         ("datr", session.datr.as_deref()),
     ] {
-        if let Some(value) = value.filter(|v| !v.is_empty()) {
+        if let Some(value) = value.filter(|v| !v.is_empty())
+            && !device_kept.contains(name)
+        {
             set.push(cookie(name, value, name != "mid"));
         }
     }
     live.cdp
         .browser_call("Storage.setCookies", json!({ "cookies": set }))
         .await?;
+
+    mark.pk = Some(session.ds_user_id.get());
+    mark.session = Some(given);
     Ok(())
 }
 
+/// What snob writes down beside the browser's profile, in the profile's own
+/// directory so that it goes wherever the profile goes.
+///
+/// Two facts the profile cannot tell about itself. **Which browser made it**:
+/// Chrome, Chromium and Edge each seal their cookies with a key of their own,
+/// so a profile opened by the wrong one looks logged out at best, and a newer
+/// profile opened by an older browser can be damaged — and "the first browser
+/// found" changes the day somebody installs another. **Which session it was
+/// given**: see [`sync_cookies`]. Neither is a secret; the session is named by
+/// [`Session::fingerprint`], which cannot be turned back into the cookie.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileMark {
+    /// The executable that created the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<std::path::PathBuf>,
+    /// The account the profile holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pk: Option<u64>,
+    /// The fingerprint of the stored session last handed to the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl ProfileMark {
+    const FILE: &'static str = "snob-profile.json";
+
+    /// The mark beside this profile, or an empty one: a profile without a
+    /// mark is one nothing is known about, which is what empty says.
+    pub fn read(paths: &AppPaths) -> Self {
+        std::fs::read(paths.browser_profile().join(Self::FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Written in place: the file is a hint, and a torn one reads as empty,
+    /// which costs one cookie write on the next run and nothing else.
+    pub fn write(&self, paths: &AppPaths) {
+        let path = paths.browser_profile().join(Self::FILE);
+        let written = serde_json::to_vec_pretty(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&path, bytes));
+        if let Err(e) = written {
+            tracing::debug!(error = %e, path = %path.display(), "could not write the profile mark");
+        }
+    }
+
+    /// The mark a browser login leaves: the profile was made by `browser`, and
+    /// the session it produced is the one being stored.
+    pub fn after_login(paths: &AppPaths, browser: &crate::browser::Browser, session: &Session) {
+        Self {
+            browser: Some(browser.path.clone()),
+            pk: Some(session.ds_user_id.get()),
+            session: Some(session.fingerprint()),
+        }
+        .write(paths);
+    }
+}
+
 /// Sends the tab somewhere and waits for it to finish loading.
-async fn navigate(live: &mut Live, url: &str) -> Result<()> {
+async fn navigate(live: &mut Live, url: &str) -> Result<(), PageError> {
     navigate_tab(&mut live.cdp, &live.tab, url).await?;
     tokio::time::sleep(SETTLE).await;
     Ok(())
 }
 
-async fn navigate_tab(cdp: &mut Cdp, tab: &str, url: &str) -> Result<()> {
+/// The navigation itself. A page that could not be reached, or never finished
+/// loading, is the network's failure and says so; a protocol command that
+/// failed is the browser's.
+async fn navigate_tab(cdp: &mut Cdp, tab: &str, url: &str) -> Result<(), PageError> {
+    let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
     let went = cdp
         .page_call(tab, "Page.navigate", json!({ "url": url }), COMMAND_TIMEOUT)
-        .await?;
+        .await
+        .map_err(broken)?;
     if let Some(error) = went.get("errorText").and_then(Value::as_str)
         && !error.is_empty()
     {
-        bail!("the browser could not open {url}: {error}");
+        return Err(PageError::Unreachable(format!(
+            "the browser could not open {url}: {error}"
+        )));
     }
     let deadline = tokio::time::Instant::now() + LOAD_TIMEOUT;
     loop {
-        let ready = evaluate(cdp, tab, "document.readyState", COMMAND_TIMEOUT).await?;
+        let ready = evaluate(cdp, tab, "document.readyState", COMMAND_TIMEOUT)
+            .await
+            .map_err(broken)?;
         if ready.as_str() == Some("complete") {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("{url} did not finish loading");
+            return Err(PageError::Unreachable(format!(
+                "{url} did not finish loading"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -532,23 +728,29 @@ async fn navigate_tab(cdp: &mut Cdp, tab: &str, url: &str) -> Result<()> {
 /// timing entry carries the status (Chromium 109 and later) and how many
 /// redirects led to it; a browser too old to say is taken at its word that
 /// the page loaded.
-async fn navigate_and_read(live: &mut Live, url: &str) -> Result<PageResponse> {
+async fn navigate_and_read(live: &mut Live, url: &str) -> Result<PageResponse, PageError> {
+    let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
     navigate(live, url).await?;
     let page = evaluate(
         &mut live.cdp,
         &live.tab,
-        "(() => { const n = performance.getEntriesByType('navigation')[0] || {}; \
-         return { url: location.href, status: n.responseStatus || 0, \
-         hops: n.redirectCount || 0, body: document.documentElement.outerHTML }; })()",
+        &format!(
+            "(() => {{ const n = performance.getEntriesByType('navigation')[0] || {{}}; \
+             const body = document.documentElement.outerHTML; {WIRE_LENGTH} \
+             const tooLarge = wire(body) > {PAGE_WIRE_CAP}; \
+             return {{ url: location.href, status: n.responseStatus || 0, \
+             hops: n.redirectCount || 0, body: tooLarge ? '' : body, tooLarge }}; }})()"
+        ),
         COMMAND_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(broken)?;
     let landed = page
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or(url)
         .to_string();
-    live.origin = origin_of(&landed)?;
+    live.origin = origin_of(&landed).map_err(broken)?;
     let status = page
         .get("status")
         .and_then(Value::as_u64)
@@ -566,9 +768,21 @@ async fn navigate_and_read(live: &mut Live, url: &str) -> Result<PageResponse> {
             .to_string(),
         redirected: hops > 0 || !same_document(url, &landed),
         url: landed,
-        too_large: false,
+        too_large: page
+            .get("tooLarge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
+
+/// How many bytes a string takes as a protocol message: six for every
+/// character outside printable ASCII, which the browser writes as `\uXXXX`,
+/// two for a quote or a backslash, one for the rest. Declared into the
+/// scripts that hand a body back, so the cap is measured in what it protects.
+const WIRE_LENGTH: &str = "const wire = (t) => { let n = t.length; \
+    for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); \
+    if (c < 0x20 || c > 0x7e) n += 5; else if (c === 34 || c === 92) n += 1; } \
+    return n; };";
 
 /// Whether two addresses name the same document: the fragment aside, which a
 /// page is free to change without anything having been requested.
@@ -601,7 +815,7 @@ const FETCH: &str = r#"(async (q) => {
   const headers = new Headers(q.headers);
   const csrf = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]*)/);
   if (csrf) headers.set('X-CSRFToken', decodeURIComponent(csrf[1]));
-  else if (q.method !== 'GET') return { error: 'the browser holds no CSRF token to write with' };
+  else if (q.method !== 'GET') return { error: 'no CSRF token', kind: 'csrf' };
   if (headers.get('X-IG-WWW-Claim') === '0') {
     try {
       const kept = sessionStorage.getItem('www-claim-v2');
@@ -624,33 +838,39 @@ const FETCH: &str = r#"(async (q) => {
     const list = [];
     r.headers.forEach((value, name) => list.push([name, value]));
     const text = r.type === 'opaqueredirect' ? '' : await r.text();
-    const tooLarge = text.length > q.cap;
+    const tooLarge = wire(text) > q.cap;
     return {
       status: r.status, headers: list, body: tooLarge ? '' : text,
       url: r.url, redirected: r.redirected, tooLarge,
     };
   } catch (e) {
-    return { error: String(e) };
+    return { error: String(e), kind: 'network' };
   } finally {
     clearTimeout(timer);
   }
 })"#;
 
-async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse> {
+async fn fetch(live: &mut Live, request: &PageRequest) -> Result<PageResponse, PageError> {
     let argument = json!({
         "method": request.method,
         "url": request.url,
         "headers": request.headers,
         "referrer": request.referrer,
         "body": request.body,
-        "cap": request.cap,
+        "cap": request.cap.min(PAGE_WIRE_CAP),
         "timeout_ms": request.timeout_ms,
     });
-    let expression = format!("{FETCH}({argument})");
+    let expression = format!("(() => {{ {WIRE_LENGTH} return {FETCH}({argument}); }})()");
     let timeout = Duration::from_millis(request.timeout_ms) + Duration::from_secs(10);
-    let answer = evaluate(&mut live.cdp, &live.tab, &expression, timeout).await?;
+    let answer = evaluate(&mut live.cdp, &live.tab, &expression, timeout)
+        .await
+        .map_err(|e| PageError::Browser(format!("{e:#}")))?;
     if let Some(error) = answer.get("error").and_then(Value::as_str) {
-        bail!("the page could not send the request: {error}");
+        return Err(match answer.get("kind").and_then(Value::as_str) {
+            Some("csrf") => PageError::NoCsrfToken,
+            Some("network") => PageError::Unreachable(error.to_string()),
+            _ => PageError::Browser(format!("the page could not send the request: {error}")),
+        });
     }
     Ok(PageResponse {
         status: answer

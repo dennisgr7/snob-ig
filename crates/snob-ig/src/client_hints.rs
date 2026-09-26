@@ -1,6 +1,15 @@
 //! The User-Agent Client Hints that go with a request, derived from the
 //! User-Agent itself.
 //!
+//! **This dresses the `reqwest` path, which is no longer the ordinary one.**
+//! Every request to Instagram now leaves from a real browser (`headless.rs` in
+//! `snob-cli`, behind [`crate::client::page`]), which sends its own client
+//! hints, handshake and header order; the argument below about not copying a
+//! browser was about a process that was not one, and stands for that path
+//! alone — `SNOB_NO_BROWSER`, and tests against a mock server. What the
+//! browser path takes from here is [`languages`] and, when the browser cannot
+//! say its own brands, [`brand_list`].
+//!
 //! These are ordinary HTTP request headers with a written specification:
 //! `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, `Priority` and
 //! `Accept-Language`.

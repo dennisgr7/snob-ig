@@ -393,7 +393,7 @@ impl IgClient {
         let response = tokio::select! {
             biased;
             () = self.pacer.cancel_token().canceled() => return Err(IgError::Canceled),
-            sent = page.send(request) => sent.map_err(IgError::Browser)?,
+            sent = page.send(request) => sent.map_err(IgError::from)?,
         };
         // An opaque redirect: Instagram pointed somewhere and the page did
         // not go. `Unexpected` with no status is an `Abort` everywhere it is
@@ -421,6 +421,7 @@ impl IgClient {
         asked: &Url,
         response: super::page::PageResponse,
     ) -> Result<Answer, IgError> {
+        let mut landing = None;
         if response.redirected {
             let landed = Url::parse(&response.url).map_err(|_| IgError::OffOrigin {
                 to: crate::error::body_excerpt(&response.url),
@@ -430,6 +431,7 @@ impl IgClient {
                     to: crate::error::body_excerpt(landed.as_str()),
                 });
             }
+            landing = crate::error::landed_on(landed.path());
         }
         if let Some(fresh) = response.header("x-ig-set-www-claim") {
             *self.claim.lock().unwrap_or_else(|e| e.into_inner()) = fresh.to_string();
@@ -449,6 +451,12 @@ impl IgClient {
             load: (!load.is_empty()).then(|| load.join(" ")),
             body: response.body,
         };
+        if let Some(refused) = landing {
+            // The hop went out whatever is decided now; it is paid for, and
+            // then the landing is the answer.
+            let _ = self.pacer.clear_to_send().await;
+            return Err(self.record(refused));
+        }
         if response.redirected
             && let Err(refused) = self.pacer.clear_to_send().await
         {

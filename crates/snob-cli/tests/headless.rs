@@ -68,14 +68,15 @@ async fn fake_instagram() -> MockServer {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/html")
-                .insert_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .append_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+                .append_header("Set-Cookie", "datr=device-of-the-first-account; Path=/")
                 .set_body_string("<!doctype html><title>Instagram</title><p>fake</p>"),
         )
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
-        .and(url_path("/api/v1/friendships/42/following/"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/following/$"))
         .and(query_param("count", "1"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -85,14 +86,15 @@ async fn fake_instagram() -> MockServer {
         .mount(&server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(url_path("/api/v1/users/42/info/"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"user":{"pk":42,"username":"me","full_name":"Me"}}"#),
-        )
-        .mount(&server)
-        .await;
+    for pk in [42, 43] {
+        Mock::given(method("GET"))
+            .and(url_path(format!("/api/v1/users/{pk}/info/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"user":{{"pk":{pk},"username":"user{pk}","full_name":"U"}}}}"#
+            )))
+            .mount(&server)
+            .await;
+    }
 
     Mock::given(method("GET"))
         .and(url_path("/api/v1/users/web_profile_info/"))
@@ -233,4 +235,95 @@ async fn every_request_leaves_from_the_browser() {
         .skip_while(|r| header(r, "x-ig-www-claim") != Some("hmac.from-the-server"))
         .count();
     assert!(claimed > 0, "the claim the server set was never sent back");
+}
+
+/// The session cookie the server saw on the last API call it was sent.
+async fn last_session_seen(instagram: &MockServer) -> String {
+    let received = instagram.received_requests().await.unwrap_or_default();
+    let last = received
+        .iter()
+        .rev()
+        .find(|r| r.url.path().starts_with("/api/"))
+        .expect("the API was called");
+    header(last, "cookie").unwrap_or_default().to_string()
+}
+
+/// A login is authoritative: a fresh paste for the same account reaches the
+/// browser, which already carries the old session and used to keep it.
+#[tokio::test]
+async fn a_new_login_for_the_same_account_reaches_the_browser() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+
+    for token in ["first", "second"] {
+        let sessionid = format!("42%3A{token}%3A17");
+        let out = snob(
+            tmp.path(),
+            &instagram,
+            &["login", "--paste"],
+            Some(&format!("{sessionid}\n")),
+        );
+        assert!(out.status.success(), "{token}: {}", said(&out));
+        let cookie = last_session_seen(&instagram).await;
+        assert!(
+            cookie.contains(&format!("sessionid={sessionid}")),
+            "{token}: the browser sent {cookie}"
+        );
+    }
+}
+
+/// Another account's browser is emptied before this one's session goes in:
+/// the device cookie the first account's page load set does not travel with
+/// the second account's requests.
+#[tokio::test]
+async fn a_second_account_does_not_inherit_the_first_ones_device() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some("42%3Afirst%3A17\n"),
+    );
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(
+        last_session_seen(&instagram)
+            .await
+            .contains("datr=device-of-the-first-account"),
+        "the first account's page load set the device cookie"
+    );
+
+    instagram.reset().await;
+    let second = fake_instagram().await;
+    let out = snob(
+        tmp.path(),
+        &second,
+        &["login", "--paste"],
+        Some("43%3Asecond%3A17\n"),
+    );
+    assert!(out.status.success(), "{}", said(&out));
+
+    // The page load on the second server sets a datr of its own; what must not
+    // happen is the first one's arriving at the API before that.
+    let received = second.received_requests().await.unwrap_or_default();
+    let first_load = received
+        .iter()
+        .find(|r| r.url.path() == "/")
+        .expect("the tab opened the site");
+    let carried = header(first_load, "cookie").unwrap_or_default();
+    assert!(
+        carried.contains("sessionid=43%3Asecond%3A17"),
+        "the second account's session went in: {carried}"
+    );
+    assert!(
+        !carried.contains("42%3A") && !carried.contains("device-of-the-first-account"),
+        "the first account's cookies went with the second: {carried}"
+    );
 }

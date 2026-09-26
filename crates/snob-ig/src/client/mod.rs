@@ -206,7 +206,13 @@ impl IgClient {
     /// straight away. Making the request is what earns the cooldown, so the
     /// place that makes requests is the place that records it.
     pub(in crate::client) fn classify_and_record(&self, status: u16, body: &str) -> IgError {
-        let error = classify(status, body);
+        self.record(classify(status, body))
+    }
+
+    /// The second half of [`Self::classify_and_record`], for an answer that
+    /// was classified some other way: a navigation's landing page, which has
+    /// no status or body to classify.
+    pub(in crate::client) fn record(&self, error: IgError) -> IgError {
         if let Some((reason, minimum)) = crate::error::cooldown_for(&error) {
             // A cooldown that cannot be written is not worth losing the real
             // error over: the caller still gets told what Instagram said.
