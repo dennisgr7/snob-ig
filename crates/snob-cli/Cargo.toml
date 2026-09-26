@@ -115,6 +115,11 @@ maintainer = "dennisgr7 <70021856+dennisgr7@users.noreply.github.com>"
 section = "utils"
 priority = "optional"
 depends = "$auto"
+# Recommended rather than required: every request is sent from one of these
+# (`headless.rs`), but `SNOB_NO_BROWSER=1` runs without, and a hard dependency
+# would pull a browser onto a server whose owner chose that. Debian's and
+# Ubuntu's Chromium names first, then the vendors' own repositories.
+recommends = "chromium | chromium-browser | google-chrome-stable | microsoft-edge-stable | brave-browser"
 # **This paragraph has three other copies**, and they say the same thing because
 # they are the same claim: `packaging/render.sh` renders it into the winget
 # manifest, `packaging/winget/dennisgr7.snob.locale.en-US.yaml` is that render

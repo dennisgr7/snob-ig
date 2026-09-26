@@ -25,7 +25,9 @@ $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitect
     default { throw "snob has no build for $_" }
 }
 
-$version = $env:SNOB_VERSION
+# A leading v is how the tags are spelled and how people type a version; the
+# archive names carry one of their own.
+$version = $env:SNOB_VERSION -replace '^v', ''
 if (-not $version) {
     $latest = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/latest"
     $version = $latest.tag_name -replace '^v', ''
@@ -53,7 +55,28 @@ try {
     # built it: SHA256SUMS comes from the same page as the archive. The release
     # workflow signs build provenance through Sigstore, and gh is the client
     # that reads it. Skipped, out loud, when gh is not here.
+    #
+    # A check that could not run is not a check that failed: `gh attestation`
+    # arrived in 2.49 and needs a login, and dying with "does not carry a valid
+    # build provenance" accused the release of tampering for something about
+    # this machine.
+    $canAttest = $false
     if (Get-Command gh -ErrorAction SilentlyContinue) {
+        # Windows PowerShell 5.1 turns a native command's standard error into
+        # a terminating error under 'Stop', redirected or not; these two are
+        # questions whose "no" is an answer.
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & gh attestation --help *> $null
+            $hasCommand = $LASTEXITCODE -eq 0
+            & gh auth status *> $null
+            $canAttest = $hasCommand -and $LASTEXITCODE -eq 0
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+    }
+    if ($canAttest) {
         & gh attestation verify $zip --repo $repo `
             --signer-workflow "$repo/.github/workflows/release.yml" | Out-Null
         if ($LASTEXITCODE -ne 0) {
@@ -61,14 +84,24 @@ try {
         }
         Write-Host "Build provenance verified"
     } else {
-        Write-Host "note: gh is not installed, so the build provenance was not verified (the checksum was)."
+        Write-Host "note: gh is missing, older than 2.49 or not logged in, so the build provenance was not verified (the checksum was)."
     }
 
     Expand-Archive $zip -DestinationPath $work -Force
     New-Item -ItemType Directory -Force $installDir | Out-Null
+
+    # A running snob.exe -- `snob watch` as a scheduled service, most often --
+    # cannot be overwritten, and the upgrade failed on it. Windows does let a
+    # running executable be renamed, so the old one is moved aside first and
+    # removed when nothing holds it any more.
+    $exe = Join-Path $installDir 'snob.exe'
+    if (Test-Path $exe) {
+        Get-ChildItem $installDir -Filter 'snob.exe.old-*' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Move-Item $exe (Join-Path $installDir "snob.exe.old-$([System.Guid]::NewGuid())") -Force
+    }
     Copy-Item (Join-Path $work "$name\*") $installDir -Force
 
-    $exe = Join-Path $installDir 'snob.exe'
     Write-Host "Installed $(& $exe --version) to $installDir"
 
     # The user's PATH, never the machine's: this installs for one account and

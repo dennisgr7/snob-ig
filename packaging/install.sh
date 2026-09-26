@@ -4,7 +4,7 @@
 #
 #     curl -fsSL https://raw.githubusercontent.com/dennisgr7/snob-ig/main/packaging/install.sh | sh
 #
-# Reads three variables, all optional:
+# Reads two variables, both optional:
 #
 #     SNOB_VERSION      a version to install instead of the latest
 #     SNOB_INSTALL_DIR  where to put the binary; default ~/.local/bin
@@ -31,10 +31,16 @@ target() {
     Linux/x86_64) echo "x86_64-unknown-linux-musl" ;;
     Linux/aarch64 | Linux/arm64) echo "aarch64-unknown-linux-musl" ;;
     Darwin/arm64) echo "aarch64-apple-darwin" ;;
-    # Named rather than lumped in with the unknown: an Intel Mac is a machine
-    # somebody actually has, and "unsupported platform" would not tell them
-    # that building from source is right there.
+    # A shell running under Rosetta reports x86_64 on an Apple Silicon Mac,
+    # which is not an Intel Mac: the kernel says which it really is.
     Darwin/x86_64)
+      if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ]; then
+        echo "aarch64-apple-darwin"
+        return
+      fi
+      # Named rather than lumped in with the unknown: an Intel Mac is a
+      # machine somebody actually has, and "unsupported platform" would not
+      # tell them that building from source is right there.
       die "snob has no build for Intel Macs. Build it from source instead:
     cargo install --locked --git https://github.com/$REPO snob-cli"
       ;;
@@ -84,6 +90,15 @@ attest() {
     echo "      (the checksum was). Install GitHub CLI to have it checked."
     return 0
   fi
+  # A check that could not run is not a check that failed. `gh attestation`
+  # arrived in 2.49 -- Debian 13 ships 2.46 -- and it needs a login; either
+  # way, dying with "does not carry a valid build provenance" accused the
+  # release of tampering for something about this machine.
+  if ! gh attestation --help >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "note: this gh cannot verify attestations (it is older than 2.49, or not"
+    echo "      logged in), so the build provenance was not verified (the checksum was)."
+    return 0
+  fi
   gh attestation verify "$archive" --repo "$REPO" \
     --signer-workflow "$REPO/.github/workflows/release.yml" >/dev/null \
     || die "$archive does not carry a valid build provenance from $REPO's release workflow"
@@ -93,7 +108,10 @@ attest() {
 main() {
   t=$(target)
 
+  # A leading v is how the tags are spelled and how people type a version;
+  # the archive names carry one of their own, so it is taken off here.
   version="${SNOB_VERSION:-}"
+  version="${version#v}"
   if [ -z "$version" ]; then
     tmp_tag=$(mktemp)
     download "https://api.github.com/repos/$REPO/releases/latest" "$tmp_tag"

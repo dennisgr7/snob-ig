@@ -292,16 +292,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      # One file rather than one per archive: `sha256sum -c SHA256SUMS` then
-      # verifies whatever the user downloaded without them having to know which
-      # line belongs to it.
+      # One file rather than one per archive: `sha256sum -c SHA256SUMS
+      # --ignore-missing` then verifies whatever the user downloaded without
+      # them having to know which line belongs to it.
       - name: Checksums
         working-directory: artifacts
         run: sha256sum snob-v* | tee SHA256SUMS
 
       # What a checksum file cannot say is who produced it. This binds every
       # archive's digest to this repository, this workflow and this commit,
-      # signed through Sigstore, so `gh release verify-asset` answers a
+      # signed through Sigstore, so `gh attestation verify` answers a
       # question `sha256sum -c` cannot: not "is this the file the release page
       # lists" but "did this file come out of this pipeline".
       #
@@ -328,10 +328,13 @@ jobs:
           ---
 
           Download the archive for your system, unpack it, and put `snob`
-          anywhere on your `PATH`. There is no runtime to install.
+          anywhere on your `PATH`. It sends its requests from a Chrome, Edge,
+          Brave or Chromium installed on the machine; there is nothing else to
+          install.
 
-          Verify a download with `sha256sum -c SHA256SUMS` on Linux or macOS, or
-          `Get-FileHash` on Windows.
+          Verify a download with `sha256sum -c SHA256SUMS --ignore-missing` on
+          Linux or macOS, or `Get-FileHash` on Windows, and where it was built
+          with `gh attestation verify <archive> --repo dennisgr7/snob-ig`.
           EOF
 
       - name: Publish
