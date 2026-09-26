@@ -205,7 +205,7 @@ async fn an_old_snapshot_is_still_served_during_the_cooldown() {
     .await
     .unwrap();
 
-    // Age the snapshot far past the default --max-age of six hours.
+    // Age the snapshot far past the default --max-age of a day.
     reopen(tmp.path())
         .conn()
         .execute("UPDATE snapshots SET taken_at = taken_at - 1000000", [])

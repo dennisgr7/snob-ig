@@ -83,19 +83,15 @@ pub async fn fetch(
             .await
         {
             Ok(summary) => summary,
-            // Reachable only when the cooldown lands between the check in
-            // `engine::list` and the walk, e.g. set by another process.
-            Err(WalkError::Cooldown { until_ms, .. }) => {
-                return Err(crate::report::refuse_cooldown_mid_walk(until_ms));
-            }
-            // A crossing walks two lists in the same run, so "the walk failed"
-            // did not say which one stopped. The name goes through `printable`
-            // for the same reason every other account name this tool prints
-            // does: it came off Instagram, not out of anybody's keyboard.
+            // Every failure lets go of the capture first, so the next run
+            // resumes it rather than paying for its pages again; see
+            // `snapshots::release`. A release that fails costs only that, and
+            // the walk's own error is the one worth reporting.
             Err(error) => {
-                let who = crate::app::target_label(target.username.as_deref());
-                return Err(anyhow::Error::new(error)
-                    .context(format!("could not read {who}'s {kind} list")));
+                if let Err(e) = snapshots::release(db.conn(), id) {
+                    tracing::debug!(error = %e, "could not let go of the capture");
+                }
+                return Err(walk_failed(error, target, kind));
             }
         };
 
@@ -206,6 +202,23 @@ fn choose_over_budget(
 /// `false` when the wait was cut short: the person asked to stop, or another
 /// process took the walk over, which [`snapshots::keep_claim`] reports and
 /// which leaves nothing for this one to continue.
+/// What a walk that stopped on an error is reported as.
+fn walk_failed(error: WalkError, target: &Target, kind: ListKind) -> anyhow::Error {
+    match error {
+        // Reachable only when the cooldown lands between the check in
+        // `engine::list` and the walk, e.g. set by another process.
+        WalkError::Cooldown { until_ms, .. } => crate::report::refuse_cooldown_mid_walk(until_ms),
+        // A crossing walks two lists in the same run, so "the walk failed" did
+        // not say which one stopped. The name goes through `printable` for the
+        // same reason every other account name this tool prints does: it came
+        // off Instagram, not out of anybody's keyboard.
+        error => {
+            let who = crate::app::target_label(target.username.as_deref());
+            anyhow::Error::new(error).context(format!("could not read {who}'s {kind} list"))
+        }
+    }
+}
+
 async fn sleep_keeping_claim(app: &App, id: i64, wait: std::time::Duration) -> Result<bool> {
     /// Well inside `snapshots::CLAIM_TTL_SECS`, so the claim never lapses.
     const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10 * 60);

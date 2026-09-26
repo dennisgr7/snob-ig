@@ -251,7 +251,12 @@ pub async fn fetch_tray(client: &IgClient, typed: &str, viewer: snob_core::Pk) -
         });
     }
 
-    let tray = client.highlights_tray(info.id, &info.username).await?;
+    // Zero is an answer the profile already gave; see `profile`.
+    let tray = if info.highlight_reel_count == Some(0) {
+        Vec::new()
+    } else {
+        client.highlights_tray(info.id, &info.username).await?
+    };
     Ok(Fetched::Tray(Tray {
         username: info.username,
         entries: tray
@@ -342,7 +347,7 @@ async fn download_entries(
     }
 
     let mut failed: Vec<String> = Vec::new();
-    for &number in &numbers {
+    for (at, &number) in numbers.iter().enumerate() {
         if app.cancel().is_canceled() {
             return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
         }
@@ -351,6 +356,23 @@ async fn download_entries(
             Ok(items) => items,
             Err(e) => {
                 failed.push(format!("highlight {number}: {e}"));
+                // **Past a failure, not past a refusal.** Keeping going is for
+                // an entry that would not come; a session that has gone, an
+                // account in cooldown or a browser that died answers every
+                // entry after it the same way, and each of those was one more
+                // request into a no. Stopped, and the ones not tried named.
+                let final_answer = e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<snob_ig::error::IgError>())
+                    .is_some_and(|ig| ig.reaction() != snob_ig::error::Reaction::Retry);
+                if final_answer {
+                    let rest: Vec<String> =
+                        numbers[at + 1..].iter().map(ToString::to_string).collect();
+                    if !rest.is_empty() {
+                        failed.push(format!("not tried after that: {}", rest.join(", ")));
+                    }
+                    break;
+                }
                 continue;
             }
         };

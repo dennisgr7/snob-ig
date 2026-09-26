@@ -364,6 +364,24 @@ pub fn keep_claim(store: &Store, id: i64) -> Result<bool, StoreError> {
     Ok(held > 0)
 }
 
+/// Lets go of a walk that stopped on an error, so the next run can resume it.
+///
+/// [`close`] releases the claim of a walk that ended, and a walk that failed
+/// never reaches it. Its claim then lived for [`CLAIM_TTL_SECS`] — and
+/// [`this_process`] is the pid and the moment the process started, so no later
+/// run is ever this one: for forty-five minutes every retry found the partial
+/// held, began a new capture, and paid again for pages already stored. At a
+/// page a minute or two, that is the whole list twice. Only the owner's claim
+/// is let go, and the row stays resumable: the cursor and the pages are kept.
+pub fn release(conn: &Connection, id: i64) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE snapshots SET claimed_by = NULL, claimed_at = NULL
+         WHERE id = ?1 AND claimed_by = ?2 AND complete = 0",
+        params![id, this_process()],
+    )?;
+    Ok(())
+}
+
 /// Saves a whole page in a single transaction: the users, their membership in
 /// the snapshot, and the cursor advance.
 ///
@@ -886,6 +904,24 @@ mod tests {
     /// Taking it is what `resumable` does, not something the caller remembers
     /// to do afterwards — so asking twice from two places cannot hand it out
     /// twice.
+    /// A walk that failed lets go, and the next run — a different process as
+    /// far as the claim can tell — picks it up where it stopped.
+    #[test]
+    fn a_failed_walk_is_resumable_at_once() {
+        let mut db = base();
+        let id = begin(db.conn(), Pk::new(1), ListKind::Followers, Some(10))
+            .unwrap()
+            .id;
+        save_page(&mut db, id, &[user(10)], Some("cursor")).unwrap();
+        assert!(
+            !is_resumable(db.conn(), Pk::new(1), ListKind::Followers).unwrap(),
+            "held by the walk that is still running"
+        );
+
+        release(db.conn(), id).unwrap();
+        assert!(is_resumable(db.conn(), Pk::new(1), ListKind::Followers).unwrap());
+    }
+
     #[test]
     fn resuming_takes_the_claim_in_the_same_breath() {
         let mut db = base();

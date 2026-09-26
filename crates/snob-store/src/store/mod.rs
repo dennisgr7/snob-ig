@@ -192,7 +192,23 @@ fn migrate(conn: &mut Connection, migrations: &Migrations<'_>) -> Result<(), Sto
     // Back on even if the chain failed: the connection is handed back to the
     // caller either way, and `open_at` only stops on the `?` below.
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    outcome?;
+    // **Another process may have got there first.** `rusqlite_migration`
+    // reads the version before it opens its transaction, so two snobs opening
+    // the database for the first time after an upgrade — the monitor and a
+    // command typed by hand — both decide to migrate, the second waits out the
+    // first's lock and then applies the same chain again, and "table already
+    // exists" failed its command. The chain is one transaction, so nothing was
+    // half-applied; what is left to ask is whether the database is now where
+    // it needed to be, and if it is, the error was only about who did it.
+    if let Err(e) = outcome {
+        if migrations
+            .pending_migrations(conn)
+            .map_or(true, |pending| pending > 0)
+        {
+            return Err(e.into());
+        }
+        tracing::debug!(error = %e, "another process migrated the database first");
+    }
 
     // **Once, and only when a migration actually ran.**
     //

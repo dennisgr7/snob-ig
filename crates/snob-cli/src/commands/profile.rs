@@ -321,7 +321,12 @@ pub async fn fetch(
         })
     };
 
-    let highlights = if visible {
+    // The profile already says how many there are; a count of zero is the
+    // answer, and asking the tray for it spent a request on an empty list.
+    // Unknown still asks.
+    let highlights = if visible && info.highlight_reel_count == Some(0) {
+        Visibility::Shown(Vec::new())
+    } else if visible {
         let tray = client.highlights_tray(info.id, &info.username).await?;
         Visibility::Shown(
             tray.into_iter()
@@ -425,7 +430,22 @@ pub(crate) async fn mutuals(
     let mut people: Vec<User> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut complete = false;
-    for _ in 0..MUTUAL_PAGE_CAP {
+    for page_number in 0..MUTUAL_PAGE_CAP {
+        // **A pause between pages, as a person scrolling the list makes.** Up
+        // to ten went out back to back, held only by the shared bucket, which
+        // lets a burst of twenty through: a list walk in all but name, at a
+        // speed no list walk here is allowed any more. Two to six seconds is
+        // `Pace::third_party`'s pause before each request — somebody else's
+        // list — without its minute-long wait between pages, which would make
+        // opening a profile a quarter of an hour.
+        // Only against Instagram, like every wait in the walker: a mock
+        // server is not somebody's account (`IgClient::is_live`).
+        if page_number > 0 && client.is_live() {
+            let pause = std::time::Duration::from_millis(fastrand::u64(2_000..=6_000));
+            if client.pacer().cancel_token().sleep_or_cancel(pause).await {
+                return Err(snob_ig::error::IgError::Canceled.into());
+            }
+        }
         let page = client
             .mutual_followers_page(pk, username, cursor.as_deref())
             .await?;

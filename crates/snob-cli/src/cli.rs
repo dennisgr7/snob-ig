@@ -643,8 +643,14 @@ pub struct WalkArgs {
     #[arg(long, alias = "cache", conflicts_with = "refresh")]
     pub offline: bool,
 
-    /// Maximum age of a reusable snapshot (30m, 6h, 2d)
-    #[arg(long, value_name = "DURATION", default_value = "6h", value_parser = duration)]
+    /// Maximum age of a reusable snapshot whose counter has not moved (30m,
+    /// 6h, 2d)
+    // A day, the monitor's `REUSE_WINDOW`, and for its reasons: a list is read
+    // at a page every minute or two now, so a walk takes hours, and a stored
+    // capture whose counter has not moved is the cheapest answer there is.
+    // At six hours a person asking once in the morning and once at night paid
+    // for both lists twice. A counter that moved still walks at once.
+    #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = duration)]
     pub max_age: std::time::Duration,
 
     /// Start from scratch instead of continuing an interrupted walk
