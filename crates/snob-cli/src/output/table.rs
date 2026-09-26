@@ -43,6 +43,13 @@ const PROFILE_NOTE: &str = "Profiles: https://www.instagram.com/<username>";
 /// scan, and keeps being true when comfy-table changes its mind. The fallback
 /// is the branch that already exists for terminals with no link support: the
 /// plain name, and the address named once underneath.
+///
+/// **It did change its mind, with `console` 0.16.6**, whose parser learned
+/// OSC: a wrapped link is no longer cut inside the address but closed with a
+/// style reset at the end of the line and reopened on the next — so every
+/// opener still found a terminator on its line, the old check passed, and the
+/// link ran across the border and the other columns anyway. The check now
+/// pairs openers with closers and wants every line to end outside a link.
 pub(crate) fn table(users: &[User], presentation: Presentation) -> String {
     if users.is_empty() {
         return String::new();
@@ -65,15 +72,58 @@ pub(crate) fn table(users: &[User], presentation: Presentation) -> String {
 
 /// Whether every hyperlink in a drawn table is still in one piece.
 ///
-/// An opener is whole when its terminator is on the same drawn line. Nothing
-/// else in a cell can hold an `ESC`: both strings a row is built from go
-/// through `printable` first, which is what makes this a question about the
-/// layout rather than about the accounts.
+/// Every OSC 8 sequence on a line has to be terminated there, every opener
+/// (a sequence with an address) has to be closed (one without) before the
+/// line ends, and no closer may come without its opener — which is what a
+/// line continuing a link from the one above looks like. Nothing else in a
+/// cell can hold an `ESC`: both strings a row is built from go through
+/// `printable` first, which is what makes this a question about the layout
+/// rather than about the accounts.
 fn links_are_whole(drawn: &str) -> bool {
     drawn.lines().all(|line| {
-        line.match_indices("\x1b]8;;")
-            .all(|(at, _)| line[at..].contains("\x1b\\"))
+        let mut open = false;
+        let mut rest = line;
+        while let Some(at) = rest.find("\x1b]8;") {
+            let after = &rest[at + "\x1b]8;".len()..];
+            let Some(end) = after.find("\x1b\\") else {
+                return false;
+            };
+            let address = after[..end].split_once(';').map_or("", |(_, uri)| uri);
+            match (address.is_empty(), open) {
+                (false, false) => open = true,
+                (true, true) => open = false,
+                // An opener inside a link, or a closer outside one.
+                _ => return false,
+            }
+            rest = &after[end + "\x1b\\".len()..];
+        }
+        !open
     })
+}
+
+/// Takes out every `ESC [ … m` the table library added on its own.
+///
+/// comfy-table, on `console` 0.16.6, closes each cell holding a hyperlink
+/// with a style reset whether or not styling was asked for, so a table drawn
+/// without color carried styling anyway. Only the library can have put one
+/// there: the names in the cells went through `printable`.
+fn without_styling(drawn: &str) -> String {
+    let mut out = String::with_capacity(drawn.len());
+    let mut rest = drawn;
+    while let Some(at) = rest.find("\x1b[") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        match after.find(|c: char| ('@'..='~').contains(&c)) {
+            Some(end) if after.as_bytes()[end] == b'm' => rest = &after[end + 1..],
+            // Not styling: kept as it was.
+            _ => {
+                out.push_str("\x1b[");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn draw(users: &[User], presentation: Presentation) -> String {
@@ -117,6 +167,9 @@ fn draw(users: &[User], presentation: Presentation) -> String {
     }
 
     let mut out = table.to_string();
+    if !presentation.color {
+        out = without_styling(&out);
+    }
     out.push('\n');
     if !presentation.hyperlinks {
         out.push_str(PROFILE_NOTE);
@@ -319,14 +372,14 @@ mod tests {
                 },
             );
 
-            for line in out.lines() {
-                for (at, _) in line.match_indices("\x1b]8;;") {
-                    assert!(
-                        line[at..].contains("\x1b\\"),
-                        "at {width} columns a link runs off the end of its line: {line:?}"
-                    );
-                }
-            }
+            // The same question the table asks itself, rather than a weaker
+            // copy of it: the inline check here only looked for a terminator
+            // after each opener, which a link reopened on every wrapped line
+            // satisfies.
+            assert!(
+                links_are_whole(&out),
+                "at {width} columns a link runs off the end of its line: {out:?}"
+            );
 
             if out.contains(PROFILE_NOTE) {
                 fell_back += 1;
@@ -393,24 +446,69 @@ mod tests {
         }
     }
 
-    /// Removes the OSC 8 sequences so a line can be measured the way a
+    /// Removes the escape sequences so a line can be measured the way a
     /// terminal would show it.
+    ///
+    /// Each form by its own ending: an OSC at the string terminator, a CSI at
+    /// its final byte. Stopping at the first `\\` or `m` for both used to end
+    /// an address at the `m` of "instagram.com" and count the rest of it as
+    /// text on the screen.
     fn strip_escapes(line: &str) -> String {
         let mut out = String::new();
-        let mut chars = line.chars();
+        let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
             if c != '\x1b' {
                 out.push(c);
                 continue;
             }
-            // Both forms end at the string terminator, `ESC \`.
-            for inner in chars.by_ref() {
-                if inner == '\\' || inner == 'm' {
-                    break;
+            match chars.next() {
+                Some(']') => {
+                    while let Some(inner) = chars.next() {
+                        if inner == '\x07' || (inner == '\x1b' && chars.next_if_eq(&'\\').is_some())
+                        {
+                            break;
+                        }
+                    }
                 }
+                Some('[') => {
+                    for inner in chars.by_ref() {
+                        if ('@'..='~').contains(&inner) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         out
+    }
+
+    /// The check pairs openers with closers: a link reopened on a wrapped
+    /// line with nothing closing it before the line ends is not whole, though
+    /// every opener on it has a terminator.
+    #[test]
+    fn a_link_left_open_at_the_end_of_a_line_is_not_whole() {
+        let link = |uri: &str| format!("\x1b]8;;{uri}\x1b\\");
+        let whole = format!("│ {}name{} │ x │", link("https://a/"), link(""));
+        assert!(links_are_whole(&whole));
+        let left_open = format!(
+            "│ {}na\x1b[0m │ x │\n│ {}me{} │",
+            link("https://a/"),
+            link("https://a/"),
+            link("")
+        );
+        assert!(!links_are_whole(&left_open));
+        let stray_closer = format!("│ me{} │", link(""));
+        assert!(!links_are_whole(&stray_closer));
+    }
+
+    #[test]
+    fn styling_is_taken_out_and_nothing_else() {
+        let drawn = "│ \x1b]8;;https://a/\x1b\\name\x1b]8;;\x1b\\\x1b[0m │ \x1b[1mbold\x1b[22m │";
+        assert_eq!(
+            without_styling(drawn),
+            "│ \x1b]8;;https://a/\x1b\\name\x1b]8;;\x1b\\ │ bold │"
+        );
     }
 
     /// An account name is the cheapest way into this program: anyone who

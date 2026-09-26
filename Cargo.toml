@@ -138,7 +138,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # `search` feature, which took `regex` and `aho-corasick` out of the tree.
 # `ansi` stays: it is what colors the level on a terminal, and costs one crate.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
-console = "0.16"
+console = "0.16.6"
 # **Already compiled into this binary before it was ever declared here**, by
 # `comfy-table`'s `tty` feature -- `cargo tree -i crossterm` shows the edge.
 # What it was built with is the `windows` feature and nothing else, so the crate
