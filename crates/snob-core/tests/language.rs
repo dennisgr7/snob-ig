@@ -461,16 +461,23 @@ fn a_rejoined_continuation_is_caught_and_deliberate_alignment_is_not() {
 }
 
 /// Files exempt from the space check.
-const LAYOUT_ALLOWLIST: [&str; 2] = [
+const LAYOUT_ALLOWLIST: [&str; 1] = [
     // This very file holds the examples, so it flags itself -- the same trap
     // the Spanish allowlist above records, for the same reason.
     "crates/snob-core/tests/language.rs",
-    // The long help is a two-column table written inside one string literal,
-    // so `login                          store your session` has exactly the
-    // shape of the defect. The cost of not writing a cleverer detector is that
-    // this one file is not watched for it.
-    "crates/snob-cli/src/cli.rs",
 ];
+
+/// A row of the help's example table: two spaces, the command, and its
+/// description aligned in a second column.
+///
+/// **Exempt by shape rather than by file.** The whole of `cli.rs` used to be
+/// on the list above, because this table has exactly the shape of the defect,
+/// and so nothing watched the rest of it: `snob watch --help` shipped with
+/// runs of twenty-three spaces in its sentences, from continuations `cargo
+/// fmt` had rejoined. No source line but a row of that table starts this way.
+fn is_an_example_row(line: &str) -> bool {
+    line.starts_with("  snob ")
+}
 
 /// No sentence this repository ships has a hole punched in it.
 #[test]
@@ -492,7 +499,7 @@ fn no_run_of_spaces_is_left_inside_a_sentence() {
         };
 
         for (number, line) in contents.lines().enumerate() {
-            if line.contains("layout-allow") {
+            if line.contains("layout-allow") || is_an_example_row(line) {
                 continue;
             }
             if let Some(found) = stray_spaces_in(line) {

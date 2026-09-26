@@ -463,7 +463,7 @@ async fn machine_hints(
 ) -> Hints {
     if let Some(known) = &mark.hints
         && known.browser == browser.path
-        && known.major == browser.major_version
+        && known.version == browser.full_version
     {
         return Hints {
             values: Some(known.values.clone()),
@@ -474,7 +474,7 @@ async fn machine_hints(
         Ok(values) => {
             mark.hints = Some(MachineHints {
                 browser: browser.path.clone(),
-                major: browser.major_version,
+                version: browser.full_version.clone(),
                 values: values.clone(),
             });
             Hints {
@@ -559,7 +559,8 @@ async fn probe_platform(cdp: &mut Cdp, tab: &str) -> Result<Value> {
             cdp,
             tab,
             "navigator.userAgentData.getHighEntropyValues(\
-             ['architecture','bitness','model','platformVersion','wow64'])\
+             ['architecture','bitness','model','platformVersion','wow64',\
+             'fullVersionList','uaFullVersion'])\
              .then(v => Object.assign({ brands: navigator.userAgentData.brands }, v))",
             COMMAND_TIMEOUT,
         )
@@ -611,15 +612,26 @@ fn metadata(user_agent: &str, full_version: &str, platform: Option<&Value>) -> V
             .unwrap_or(fallback)
             .to_string()
     };
+    // **The browser's own list, when it was said by this very version.** The
+    // computed one gives every real brand the product's version, which is
+    // right for Chrome and wrong for Edge, whose own number is not
+    // Chromium's: `"Chromium";v="141.0.3537.57"` names a Chromium build that
+    // never existed, on the browser most Windows machines have.
+    let said_in_full = platform
+        .filter(|p| p.get("uaFullVersion").and_then(Value::as_str) == Some(full_version))
+        .and_then(|p| p.get("fullVersionList"))
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+        .cloned();
     json!({
         "brands": brands
             .iter()
             .map(|(brand, version)| json!({ "brand": brand, "version": version }))
             .collect::<Vec<_>>(),
-        "fullVersionList": brands
+        "fullVersionList": said_in_full.unwrap_or_else(|| brands
             .iter()
             .map(|(brand, version)| json!({ "brand": brand, "version": full(version) }))
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()),
         "fullVersion": full_version,
         "platform": snob_ig::client_hints::platform_name(user_agent),
         "platformVersion": field("platformVersion", ""),
@@ -801,7 +813,9 @@ pub struct ProfileMark {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MachineHints {
     pub browser: std::path::PathBuf,
-    pub major: u32,
+    /// The browser's whole version when it was asked. A new one is asked
+    /// again: the full version list changes with every update.
+    pub version: String,
     pub values: Value,
 }
 
@@ -1275,6 +1289,33 @@ mod tests {
         );
         assert_eq!(m["bitness"], "64");
         assert_eq!(m["platformVersion"], "");
+    }
+
+    /// Edge's own number is not Chromium's. The list the browser said for
+    /// the version running is used as it was said; one said by another
+    /// version is not, and the computed one stands in.
+    #[test]
+    fn the_full_versions_are_the_browsers_own() {
+        let edge = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                    (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
+        let said = json!({
+            "brands": [
+                { "brand": "Microsoft Edge", "version": "141" },
+                { "brand": "Not?A_Brand", "version": "8" },
+                { "brand": "Chromium", "version": "141" },
+            ],
+            "uaFullVersion": "141.0.3537.57",
+            "fullVersionList": [
+                { "brand": "Microsoft Edge", "version": "141.0.3537.57" },
+                { "brand": "Not?A_Brand", "version": "8.0.0.0" },
+                { "brand": "Chromium", "version": "141.0.7390.54" },
+            ],
+        });
+        let m = metadata(edge, "141.0.3537.57", Some(&said));
+        assert_eq!(m["fullVersionList"], said["fullVersionList"]);
+
+        let stale = metadata(edge, "141.0.3537.71", Some(&said));
+        assert_ne!(stale["fullVersionList"], said["fullVersionList"]);
     }
 
     /// Without the probe, the platform version is left empty rather than

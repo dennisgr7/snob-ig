@@ -20,6 +20,10 @@ pub struct Browser {
     pub name: &'static str,
     pub path: PathBuf,
     pub major_version: u32,
+    /// The whole version, as the browser spells it: `153.0.8010.52`. What the
+    /// headless browser's description of the machine is kept against, since
+    /// a browser update can change it.
+    pub full_version: String,
     /// Chromium derivatives append their own brand at the end.
     suffix: Option<String>,
 }
@@ -192,11 +196,14 @@ fn probe(wanted: impl Fn(&str) -> bool) -> Vec<Browser> {
             if !path.is_file() {
                 continue;
             }
-            if let Some(major_version) = version_of(&path) {
+            if let Some(full_version) = version_of(&path)
+                && let Some(major_version) = major_version_from_text(&full_version)
+            {
                 found.push(Browser {
                     name,
                     path,
                     major_version,
+                    full_version,
                     suffix: suffix.clone(),
                 });
                 // One entry per brand: the same browser turns up under several
@@ -311,22 +318,35 @@ fn candidates() -> Vec<Candidate> {
 /// its files in a directory named after the version right next to the
 /// executable, and that holds for Chrome, Edge and Brave alike.
 #[cfg(windows)]
-fn version_of(path: &std::path::Path) -> Option<u32> {
+fn version_of(path: &std::path::Path) -> Option<String> {
     let directory = path.parent()?;
     std::fs::read_dir(directory)
         .ok()?
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| major_version_from_text(&e.file_name().to_string_lossy()))
-        .max()
+        .filter_map(|e| full_version_from_text(&e.file_name().to_string_lossy()))
+        // By number, part by part: as text, 99.0 would outrank 153.0.
+        .max_by_key(|v| {
+            v.split('.')
+                .map(|part| part.parse::<u32>().unwrap_or(0))
+                .collect::<Vec<_>>()
+        })
 }
 
 /// Off Windows the executable can be asked directly; it prints something like
 /// "Google Chrome 151.0.7922.47".
 #[cfg(not(windows))]
-fn version_of(path: &std::path::Path) -> Option<u32> {
+fn version_of(path: &std::path::Path) -> Option<String> {
     let output = Command::new(path).arg("--version").output().ok()?;
-    major_version_from_text(&String::from_utf8_lossy(&output.stdout))
+    full_version_from_text(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The first word shaped like a version, whole: "153.0.8010.52" out of
+/// "Chromium 153.0.8010.52 built on Debian GNU/Linux 13 (trixie)".
+fn full_version_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|word| major_version_from_text(word).is_some())
+        .map(str::to_string)
 }
 
 fn major_version_from_text(text: &str) -> Option<u32> {
@@ -373,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    fn it_keeps_the_whole_version_it_read() {
+        assert_eq!(
+            full_version_from_text("Chromium 153.0.8010.52 built on Debian GNU/Linux 13 (trixie)")
+                .as_deref(),
+            Some("153.0.8010.52")
+        );
+        assert_eq!(
+            full_version_from_text("Microsoft Edge 141.0.3537.57 ").as_deref(),
+            Some("141.0.3537.57")
+        );
+        assert_eq!(full_version_from_text("Locales"), None);
+    }
+
+    #[test]
     fn it_recognizes_a_version_directory_name() {
         // This is how the version is detected on Windows.
         assert_eq!(major_version_from_text("151.0.7922.47"), Some(151));
@@ -387,6 +421,7 @@ mod tests {
             name: "Chrome",
             path: PathBuf::new(),
             major_version: 151,
+            full_version: "151.0.7922.47".to_string(),
             suffix: None,
         };
         let ua = b.user_agent();
@@ -410,6 +445,7 @@ mod tests {
             name: "Edge",
             path: PathBuf::new(),
             major_version: 140,
+            full_version: "140.0.3485.54".to_string(),
             suffix: Some("Edg".to_string()),
         };
         assert!(b.user_agent().ends_with("Edg/140.0.0.0"));
