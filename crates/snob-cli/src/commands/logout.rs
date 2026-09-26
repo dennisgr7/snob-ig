@@ -40,9 +40,16 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     // would leave the session on the machine while saying it had gone. The
     // flag that used to ask for this is accepted and changes nothing.
     let _ = args.purge_profile;
-    let profile = paths.browser_profile();
+    //
+    // Every account's profile, not only the stored one's: each holds a live
+    // session, and only one session can be stored, so a profile of any other
+    // account is a session nothing here would ever use or clear again.
+    let mut deleted = false;
     let mut profile_failure = None;
-    if profile.exists() {
+    for profile in crate::headless::profile::every_profile(paths) {
+        if !profile.exists() {
+            continue;
+        }
         // Guarded like every other recursive delete in the tool. The path
         // comes from `directories` rather than from anything typed, but that
         // is exactly the case the guard is for: a `ProjectDirs` that resolved
@@ -53,21 +60,26 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
                 "{} is too close to the root to remove; delete it by hand",
                 profile.display()
             ));
-        } else {
-            // Collected rather than `?`-ed, for the same reason `removal`
-            // above is: one refusal must not decide the other. A browser still
-            // open on the profile makes this fail — another snob mid-run — and
-            // with `?` here the early return jumped over `removal?` at the
-            // end, so a user whose keyring had *also* refused was told about
-            // the locked directory and nothing at all about the session.
-            match std::fs::remove_dir_all(&profile) {
-                Ok(()) => crate::ui::say!("Browser profile deleted."),
-                Err(e) => profile_failure = Some(e),
+            continue;
+        }
+        // Collected rather than `?`-ed, for the same reason `removal` above
+        // is: one refusal must not decide the other. A browser still open on
+        // a profile makes this fail — another snob mid-run — and with `?`
+        // here the early return jumped over `removal?` at the end, so a user
+        // whose keyring had *also* refused was told about the locked
+        // directory and nothing at all about the session.
+        match std::fs::remove_dir_all(&profile) {
+            Ok(()) => deleted = true,
+            Err(e) => {
+                profile_failure.get_or_insert((profile, e));
             }
         }
     }
+    if deleted {
+        crate::ui::say!("Browser profiles deleted.");
+    }
 
-    // After the profile, so that one refusal does not decide the other. There
+    // After the profiles, so that one refusal does not decide the other. There
     // is no documented exit code for "a local delete was refused", and neither
     // 3 nor 5 would be true, so this becomes the generic failure.
     //
@@ -76,7 +88,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     // failure at the only thing this command exists for. The other is still
     // said out loud rather than swallowed.
     if removal.is_err()
-        && let Some(io) = &profile_failure
+        && let Some((profile, io)) = &profile_failure
     {
         ui::warn(&format!(
             "{} could not be removed either: {io}",
@@ -84,7 +96,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
         ));
     }
     removal?;
-    if let Some(e) = profile_failure {
+    if let Some((profile, e)) = profile_failure {
         return Err(
             anyhow::Error::new(e).context(format!("{} could not be removed", profile.display()))
         );

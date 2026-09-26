@@ -138,9 +138,30 @@ impl AppPaths {
             .collect()
     }
 
-    /// Browser profile used by `snob login`. Never the user's real profile.
+    /// The directory every browser profile snob uses lives under. Never the
+    /// user's real profile. `snob logout` removes it whole: each profile in it
+    /// holds a live session.
     pub fn browser_profile(&self) -> PathBuf {
         self.data.join("browser-profile")
+    }
+
+    /// The browser profile of one account: the device its requests are sent
+    /// from, and nobody else's.
+    ///
+    /// **One per account**, because one account is only ever sent from one
+    /// browser and two accounts never share one. A single profile used to be
+    /// emptied of cookies and site data at every switch of account, so that
+    /// two accounts did not come to look like one person's device; that threw
+    /// the device away each time, and a session that came back to it came
+    /// back from a browser Instagram had never seen.
+    pub fn browser_profile_for(&self, pk: snob_core::Pk) -> PathBuf {
+        self.browser_profile().join(pk.to_string())
+    }
+
+    /// What the browsers said about this machine, kept once for every profile:
+    /// it is about the machine, not about any account.
+    pub fn browser_hints_file(&self) -> PathBuf {
+        self.data.join("browser-hints.json")
     }
 
     /// Where `snob stories --interactive` puts a story it is about to hand to
@@ -959,6 +980,9 @@ mod tests {
         assert!(paths.db_file().starts_with(paths.data_dir()));
         assert!(paths.session_file().starts_with(paths.data_dir()));
         assert!(paths.browser_profile().starts_with(paths.data_dir()));
+        let account = paths.browser_profile_for(snob_core::Pk::new(42));
+        assert_eq!(account.parent(), Some(paths.browser_profile().as_path()));
+        assert!(paths.browser_hints_file().starts_with(paths.data_dir()));
     }
 
     /// Only what gets written to. A directory for a configuration file nobody
@@ -1104,6 +1128,8 @@ mod tests {
             paths.db_file(),
             paths.session_file(),
             paths.browser_profile(),
+            paths.browser_profile_for(snob_core::Pk::new(42)),
+            paths.browser_hints_file(),
             paths.legacy_session_file().unwrap(),
             // The configuration file. Written since `snob watch setup` landed,
             // and missing from this list until it was: taking `self.config` out

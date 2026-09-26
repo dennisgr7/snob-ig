@@ -36,7 +36,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use snob_ig::login::BrowserCookies;
 use snob_ig::pace::CancelToken;
-use snob_store::paths::AppPaths;
 
 use crate::browser::Browser;
 use crate::pipe::{BrowserProcess, PipeTransport};
@@ -187,42 +186,39 @@ pub fn kill_launched() {
         .status();
 }
 
-/// Starts the browser against our own profile with debugging enabled, in a
-/// window, on the login page.
-pub async fn launch(browser: &Browser, paths: &AppPaths, cancel: &CancelToken) -> Result<Launched> {
-    launch_with(browser, paths, &[], LOGIN_URL, false, cancel).await
+/// Starts the browser against one of our own profiles with debugging
+/// enabled, in a window, on the login page.
+pub async fn launch(browser: &Browser, profile: &Path, cancel: &CancelToken) -> Result<Launched> {
+    launch_with(browser, profile, &[], LOGIN_URL, false, cancel).await
 }
 
-/// Starts the same browser on the same profile with no window, for snob to
-/// send its requests from. See `headless/mod.rs` for why each flag is there.
+/// Starts the same browser on an account's profile with no window, for snob
+/// to send its requests from. See `headless/mod.rs` for why each flag is there.
 pub async fn launch_headless(
     browser: &Browser,
-    paths: &AppPaths,
+    profile: &Path,
     flags: &[String],
     cancel: &CancelToken,
 ) -> Result<Launched> {
-    launch_with(browser, paths, flags, "about:blank", true, cancel).await
+    launch_with(browser, profile, flags, "about:blank", true, cancel).await
 }
 
 async fn launch_with(
     browser: &Browser,
-    paths: &AppPaths,
+    profile: &Path,
     flags: &[String],
     start_at: &str,
     windowless: bool,
     cancel: &CancelToken,
 ) -> Result<Launched> {
-    // The profile ends up holding a live Instagram session, so the directory it
-    // sits in has to be the owner's alone. On a fresh install with the keyring
-    // backend nothing has created the data directory yet, and a bare
-    // `create_dir_all` would leave it at whatever the umask says.
-    paths.ensure_dirs()?;
-    let profile = paths.browser_profile();
-    snob_store::paths::create_private_dir(&profile)
+    // The profile ends up holding a live Instagram session, so the directory
+    // has to be the owner's alone. The data directory above it is made private
+    // by whoever chose the profile (`headless::profiles`); this is the leaf.
+    snob_store::paths::create_private_dir(profile)
         .with_context(|| format!("could not create {}", profile.display()))?;
     #[cfg(unix)]
-    clear_a_lock_left_by_another_host(&profile);
-    launch_in(browser, &profile, flags, start_at, windowless, cancel)
+    clear_a_lock_left_by_another_host(profile);
+    launch_in(browser, profile, flags, start_at, windowless, cancel)
 }
 
 /// Starts the browser on a profile of the caller's, with no window: for a

@@ -23,6 +23,16 @@
   waiting on it at once instead of twenty seconds later, and an answer too
   large to take fails that one request rather than the browser.
 
+- **Every account keeps a browser of its own.** The browser profile the
+  requests are sent from is now one per account, under
+  `browser-profile/<account id>`. There used to be one, emptied of its cookies
+  and site data whenever a different account logged in, so that two accounts
+  did not look like one person's browser; coming back to the first account
+  then came back from a device Instagram had never seen. The existing profile
+  is moved under the account it holds on the first run, `snob login
+  --browser` for a new account starts from a fresh profile that becomes the
+  account's, and `snob logout` deletes them all.
+
 - **`snob import dyi` is in.** It reads the archive Instagram itself hands
   over under "Download your information" and prints the same four answers
   the live commands give, with no session and no request. It was written and

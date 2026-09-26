@@ -6,17 +6,9 @@ use serde_json::{Value, json};
 use snob_ig::pace::CancelToken;
 use snob_store::paths::AppPaths;
 
-use super::profile::{MachineHints, ProfileMark};
 use super::tab::{evaluate, navigate_tab};
 use super::{COMMAND_TIMEOUT, attach_to_a_tab};
 use crate::cdp::Cdp;
-
-/// What [`machine_hints`] came back with.
-pub(super) struct Hints {
-    pub(super) values: Option<Value>,
-    /// Asked just now rather than read from the mark, which then needs writing.
-    pub(super) fresh: bool,
-}
 
 /// What this browser says about the machine: the brands, the architecture,
 /// the bitness, the operating system's version — the client hints a page can
@@ -27,43 +19,91 @@ pub(super) struct Hints {
 /// of these fields (see [`probe_platform`]); the fallbacks for a blank are only
 /// true on some machines — an empty platform version is Linux's answer and
 /// nobody else's. So a throwaway browser with no such flag is asked, on a
-/// profile of its own that is deleted after, and the answer is written into
-/// the profile mark for this browser and major version. It costs a browser
-/// start the first time and after each browser update, and nothing on any
-/// other run. A failure costs only the fallbacks.
+/// profile of its own that is deleted after, and the answer is kept in
+/// [`KnownHints`] for this browser and version. It costs a browser start the
+/// first time and after each browser update, and nothing on any other run. A
+/// failure costs only the fallbacks.
 pub(super) async fn machine_hints(
     browser: &crate::browser::Browser,
     paths: &AppPaths,
-    mark: &mut ProfileMark,
-) -> Hints {
-    if let Some(known) = &mark.hints
-        && known.browser == browser.path
-        && known.version == browser.full_version
-    {
-        return Hints {
-            values: Some(known.values.clone()),
-            fresh: false,
-        };
+) -> Option<Value> {
+    let mut known = KnownHints::read(paths);
+    if let Some(values) = known.for_browser(browser) {
+        return Some(values);
     }
     match ask_without_the_flag(browser, paths).await {
         Ok(values) => {
-            mark.hints = Some(MachineHints {
+            known.remember(MachineHints {
                 browser: browser.path.clone(),
                 version: browser.full_version.clone(),
                 values: values.clone(),
             });
-            Hints {
-                values: Some(values),
-                fresh: true,
-            }
+            known.write(paths);
+            Some(values)
         }
         Err(e) => {
             tracing::debug!(error = %e, "could not ask the browser about the machine");
-            Hints {
-                values: None,
-                fresh: false,
-            }
+            None
         }
+    }
+}
+
+/// The browser's own description of the machine, kept per browser and
+/// version. Not a secret, and not about any account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MachineHints {
+    pub browser: std::path::PathBuf,
+    /// The browser's whole version when it was asked. A new one is asked
+    /// again: the full version list changes with every update.
+    pub version: String,
+    pub values: Value,
+}
+
+/// Every browser's [`MachineHints`], in one file beside the profiles.
+///
+/// **Beside them, not in them.** They are about the machine, so one answer
+/// serves every account's profile; kept in each profile's mark, as they were
+/// while there was one profile, every new account would pay a browser start
+/// to ask again what the machine already said. One entry per browser, so a
+/// machine with an account on Chrome and another on Edge keeps both.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownHints {
+    #[serde(default)]
+    pub hints: Vec<MachineHints>,
+}
+
+impl KnownHints {
+    /// What is kept, or nothing: a file that is missing or torn costs one
+    /// question to a browser, and nothing else.
+    pub fn read(paths: &AppPaths) -> Self {
+        std::fs::read(paths.browser_hints_file())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn write(&self, paths: &AppPaths) {
+        let path = paths.browser_hints_file();
+        let written = serde_json::to_vec_pretty(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&path, bytes));
+        if let Err(e) = written {
+            tracing::debug!(error = %e, path = %path.display(), "could not keep the machine hints");
+        }
+    }
+
+    /// What this browser said, when it was this very version that said it.
+    pub fn for_browser(&self, browser: &crate::browser::Browser) -> Option<Value> {
+        self.hints
+            .iter()
+            .find(|h| h.browser == browser.path && h.version == browser.full_version)
+            .map(|h| h.values.clone())
+    }
+
+    /// Keeps `hints`, in place of whatever the same browser said before.
+    pub fn remember(&mut self, hints: MachineHints) {
+        self.hints.retain(|h| h.browser != hints.browser);
+        self.hints.push(hints);
     }
 }
 
@@ -354,6 +394,38 @@ mod tests {
 
         let stale = metadata(edge, "141.0.3537.71", Some(&said));
         assert_ne!(stale["fullVersionList"], said["fullVersionList"]);
+    }
+
+    /// One entry per browser: a machine with an account on Chrome and another
+    /// on Edge keeps what both said, and a browser that updated is asked
+    /// again rather than handed its old answer.
+    #[test]
+    fn what_each_browser_said_is_kept_apart() {
+        let browser = crate::browser::Browser::at;
+        let said = |path: &str, version: &str, n: u64| MachineHints {
+            browser: std::path::PathBuf::from(path),
+            version: version.to_string(),
+            values: json!({ "n": n }),
+        };
+        let mut known = KnownHints::default();
+        known.remember(said("/chrome", "141.0.1", 1));
+        known.remember(said("/edge", "141.0.9", 2));
+        assert_eq!(
+            known.for_browser(&browser("/chrome", "141.0.1")),
+            Some(json!({ "n": 1 }))
+        );
+        assert_eq!(
+            known.for_browser(&browser("/edge", "141.0.9")),
+            Some(json!({ "n": 2 }))
+        );
+        assert_eq!(known.for_browser(&browser("/chrome", "142.0.0")), None);
+
+        known.remember(said("/chrome", "142.0.0", 3));
+        assert_eq!(known.hints.len(), 2, "the newer answer replaced the older");
+        assert_eq!(
+            known.for_browser(&browser("/chrome", "142.0.0")),
+            Some(json!({ "n": 3 }))
+        );
     }
 
     /// Without the probe, the platform version is left empty rather than

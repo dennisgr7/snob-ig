@@ -107,7 +107,7 @@ page][releases].
 
 ### Uninstalling
 
-Run **`snob purge`** first. The session, the database and the browser profile
+Run **`snob purge`** first. The session, the database and the browser profiles
 live in your user directories, and no package manager can reach them — removing
 the binary leaves an Instagram session cookie behind. Then `scoop uninstall
 snob`, `brew uninstall snob`, `sudo apt remove snob`, or delete the file.
@@ -482,9 +482,10 @@ rather than per-folder, so it does not matter which directory you run it from:
 - **The monitor's settings**, if you ran `snob watch setup` — a `watch.toml` you
   can read and edit. Any token or signing key it needs goes to the keyring
   rather than into that file.
-- **A browser profile of its own**, about 90 MB, which the requests are sent
-  from. It holds the live session — the browser keeps it current — and
-  `snob logout` deletes it along with the stored one.
+- **A browser profile for each account** you have logged in with, about
+  90 MB each, which that account's requests are sent from. It holds the live
+  session — the browser keeps it current — and `snob logout` deletes them all
+  along with the stored session.
 
 **Your browser's own cookie store is never read, copied or decrypted.** The
 browser snob drives is a separate one with a profile of its own, which you log

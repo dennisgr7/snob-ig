@@ -196,7 +196,22 @@ async fn by_browser(
         );
     };
 
-    let profile = paths.browser_profile();
+    // The profile the login happens in. The account already stored keeps its
+    // own: a profile still signed in is taken as it is, and a new login there
+    // comes from the device Instagram already knows. Anybody else starts from
+    // a fresh one, which becomes the account's once the login says whose it
+    // is.
+    //
+    // Whether it was already there is asked before anything creates it. A
+    // profile that was already here is the device every request is sent from,
+    // and it may be in use right now by another snob — a failed or abandoned
+    // login below is no reason to take it away. Only one this login created
+    // is.
+    let stored = store.load().ok().flatten().map(|s| s.ds_user_id);
+    let (profile, existed) = match stored {
+        Some(pk) => crate::headless::profile::for_account(paths, pk)?,
+        None => (crate::headless::profile::for_a_login(paths)?, false),
+    };
     let cancel = interrupt::install();
 
     ui::info(&format!(
@@ -210,16 +225,10 @@ async fn by_browser(
         cdp::LOGIN_TIMEOUT.as_secs() / 60
     ));
 
-    // Asked before the browser can create it. A profile that was already here
-    // is the device every request is sent from, and it may be in use right
-    // now by another snob — a failed or abandoned login below is no reason to
-    // take it away. Only one this login created is.
-    let existed = profile.exists();
-
     // Anything from here on can be interrupted, and a Ctrl+C has to read as
     // one rather than as a failure, so the result is held rather than unwrapped
     // until the browser has been shut down.
-    let captured = capture(&found, args.user_agent.clone(), paths, &cancel).await;
+    let captured = capture(&found, args.user_agent.clone(), &profile, &cancel).await;
     // Whatever `capture` came back with. The profile holds a live session
     // from the moment the form was submitted, and a Ctrl+C or a failure
     // after that moment used to leave it on disk indefinitely, with nothing
@@ -253,10 +262,34 @@ async fn by_browser(
     let mut session = login::session_from_cookies(&cookies, &user_agent)?;
     session.user_agent_pinned = args.user_agent.is_some();
     session.browser = Some(found.name.to_string());
+
+    // The login happened in this profile, so it is the device Instagram just
+    // saw sign in, and it becomes the account's before anything is sent: the
+    // check below goes out from the account's profile. A profile the account
+    // had before is set aside until the session is known to be good. A move
+    // that will not happen costs a warning, not the login.
+    let swap =
+        match crate::headless::profile::ProfileSwap::replace(paths, &profile, session.ds_user_id) {
+            Ok(swap) => Some(swap),
+            Err(e) => {
+                ui::warn(&format!("{e:#}"));
+                None
+            }
+        };
+    let made_it = swap
+        .as_ref()
+        .map_or(profile.as_path(), |s| s.profile.as_path());
     // The profile made this session, and is the browser's to keep current from
     // now on: the next run must not write the stored copy back over it.
-    crate::headless::ProfileMark::after_login(paths, &found, &session);
-    finish(session, store, pacer, LoginMethod::Browser).await
+    crate::headless::ProfileMark::after_login(made_it, &found, &session);
+    let finished = finish(session, store, pacer, LoginMethod::Browser).await;
+    if let Some(swap) = swap {
+        match &finished {
+            Ok(_) => swap.keep(),
+            Err(_) => swap.undo(),
+        }
+    }
+    finished
 }
 
 /// Removes a profile a login created and did not finish.
@@ -313,10 +346,10 @@ fn discard_profile(profile: &std::path::Path) {
 async fn capture(
     found: &browser::Browser,
     requested_user_agent: Option<String>,
-    paths: &AppPaths,
+    profile: &std::path::Path,
     cancel: &CancelToken,
 ) -> Result<(login::BrowserCookies, String)> {
-    let cdp = cdp::Cdp::connect(cdp::launch(found, paths, cancel).await?, cancel).await?;
+    let cdp = cdp::Cdp::connect(cdp::launch(found, profile, cancel).await?, cancel).await?;
     let outcome = collect(&cdp, found, requested_user_agent, cancel).await;
     cdp.close().await;
     outcome

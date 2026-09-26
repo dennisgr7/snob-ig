@@ -44,10 +44,11 @@ async fn a_browser_starts() -> bool {
     let paths = AppPaths::rooted_at(temporary.path());
     let cancel = CancelToken::default();
     let flags = ["--headless=new".to_string()];
-    let started = match cdp::launch_headless(&found, &paths, &flags, &cancel).await {
-        Ok(launched) => cdp::Cdp::connect(launched, &cancel).await,
-        Err(e) => Err(e),
-    };
+    let started =
+        match cdp::launch_headless(&found, &paths.browser_profile(), &flags, &cancel).await {
+            Ok(launched) => cdp::Cdp::connect(launched, &cancel).await,
+            Err(e) => Err(e),
+        };
     match started {
         Ok(cdp) => {
             cdp.close().await;
@@ -520,7 +521,7 @@ async fn a_worker_created_while_snob_is_idle_starts_at_once() {
                         { type: 'text/javascript' });
                       const worker = new Worker(URL.createObjectURL(code));
                       worker.onmessage = (e) => fetch('/worker-probe?ms=' + (e.data - made));
-                    }, 200);
+                    }, 50);
                     </script>",
                     "text/html",
                 ),
@@ -556,10 +557,158 @@ async fn a_worker_created_while_snob_is_idle_starts_at_once() {
         .expect("the delay is a number of milliseconds");
     eprintln!("the worker started {late} ms after it was created");
     // Held until the next command, the worker waited out the rest of the
-    // page's settling pause: 1,309 ms, measured before this changed. A reader of its own lets it
-    // go in milliseconds; the margin is for a slow runner.
+    // page's one-and-a-half-second settling pause: 1,309 ms, measured before
+    // this changed, with the worker made 200 ms in. A reader of its own lets
+    // it go in about ten milliseconds here; a macOS runner with every test's
+    // browser starting at once took 581, so the line sits between the two.
     assert!(
-        late < 500,
+        late < 1_000,
         "the worker started {late} ms after it was created"
+    );
+}
+
+/// The fake site's page, handing a device cookie of its own to every browser
+/// that does not have one yet — the way Meta's `datr` is set on a first visit.
+struct HandsOutDevices(std::sync::atomic::AtomicUsize);
+
+impl wiremock::Respond for HandsOutDevices {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let answer = ResponseTemplate::new(200)
+            .insert_header("Content-Type", "text/html")
+            .append_header("Set-Cookie", format!("csrftoken={SERVED_CSRF}; Path=/"))
+            .set_body_string("<!doctype html><title>Instagram</title>");
+        if header(request, "cookie").is_some_and(|c| c.contains("datr=")) {
+            return answer;
+        }
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        // Kept for a year, as Meta's is: a cookie with no lifetime ends with
+        // the browser, and a device that does not outlive the run is not one.
+        answer.append_header(
+            "Set-Cookie",
+            format!("datr=device-{n}; Path=/; Max-Age=31536000"),
+        )
+    }
+}
+
+/// The cookies the first page load of a run carried.
+async fn first_page_load_carried(instagram: &MockServer, since: usize) -> String {
+    let received = instagram.received_requests().await.unwrap_or_default();
+    let load = received[since..]
+        .iter()
+        .find(|r| r.url.path() == "/")
+        .expect("the tab opened the site");
+    header(load, "cookie").unwrap_or_default().to_string()
+}
+
+/// Every account keeps its own device: the browser another account used in
+/// between is not this one's, and coming back finds the device it left.
+///
+/// There used to be one profile, emptied of cookies and site data whenever
+/// the account changed, so that two accounts did not look like one person's
+/// browser. That threw the device away each time: coming back to the first
+/// account came back from a browser Instagram had never seen.
+#[tokio::test]
+async fn each_account_keeps_a_device_of_its_own() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(HandsOutDevices(std::sync::atomic::AtomicUsize::new(0)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+
+    let mut seen = 0;
+    for (sessionid, carried) in [
+        ("42%3Afirst%3A17", None),
+        ("43%3Asecond%3A17", None),
+        ("42%3Afirst%3A17", Some("datr=device-1")),
+    ] {
+        let out = snob(
+            tmp.path(),
+            &instagram,
+            &["login", "--paste"],
+            Some(&format!("{sessionid}\n")),
+        );
+        assert!(out.status.success(), "{sessionid}: {}", said(&out));
+        let cookies = first_page_load_carried(&instagram, seen).await;
+        match carried {
+            Some(device) => assert!(
+                cookies.contains(device),
+                "{sessionid} came back from another device: {cookies}"
+            ),
+            None => assert!(
+                !cookies.contains("datr="),
+                "{sessionid} began with somebody's device: {cookies}"
+            ),
+        }
+        seen = instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+    }
+
+    let paths = AppPaths::rooted_at(tmp.path());
+    for pk in [42, 43] {
+        assert!(
+            paths.browser_profile_for(snob_core::Pk::new(pk)).is_dir(),
+            "account {pk} has a profile of its own"
+        );
+    }
+}
+
+/// A profile from before they were kept per account moves under the account
+/// it holds, and the browser still finds everything in it: the device it was
+/// given comes along.
+#[tokio::test]
+async fn a_profile_from_before_moves_under_its_account() {
+    if !a_browser_starts().await {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(url_path("/"))
+        .respond_with(HandsOutDevices(std::sync::atomic::AtomicUsize::new(0)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["login", "--paste"],
+        Some(&format!("{SESSIONID}\n")),
+    );
+    assert!(out.status.success(), "{}", said(&out));
+
+    // Laid out the way an earlier version left it: the profile is the
+    // directory itself.
+    let paths = AppPaths::rooted_at(tmp.path());
+    let root = paths.browser_profile();
+    let account = paths.browser_profile_for(snob_core::Pk::new(42));
+    let aside = tmp.path().join("old-layout");
+    std::fs::rename(&account, &aside).unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&aside, &root).unwrap();
+    assert!(root.join("snob-profile.json").is_file());
+
+    let seen = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    let out = snob(tmp.path(), &instagram, &["whoami"], None);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(account.join("snob-profile.json").is_file());
+    assert!(!root.join("snob-profile.json").exists());
+    let cookies = first_page_load_carried(&instagram, seen).await;
+    assert!(
+        cookies.contains("datr=device-1"),
+        "the moved profile kept its device: {cookies}"
     );
 }

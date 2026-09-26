@@ -59,10 +59,11 @@
 //! `navigator.languages` and `Accept-Language` are the profile's own, which is
 //! what the login sent.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use snob_core::Pk;
 use snob_core::session::Session;
@@ -73,12 +74,13 @@ use snob_store::paths::AppPaths;
 use crate::cdp::Cdp;
 
 mod identity;
-mod profile;
+pub mod profile;
 mod tab;
 
+pub use identity::{KnownHints, MachineHints};
 use identity::{machine_hints, metadata};
+pub use profile::ProfileMark;
 use profile::sync_cookies;
-pub use profile::{MachineHints, ProfileMark};
 use tab::{fetch, navigate, navigate_and_read};
 
 /// How long a navigation may take to finish loading.
@@ -142,13 +144,16 @@ pub struct Headless {
     paths: AppPaths,
     /// The session whose cookies the browser has to be carrying.
     wanted: std::sync::Mutex<Option<Session>>,
-    /// One request at a time: a tab is not a connection pool, and the pacing
-    /// never asks for two at once anyway.
-    state: tokio::sync::Mutex<Option<Live>>,
+    /// A browser per account, each on the account's own profile; one request
+    /// at a time: a tab is not a connection pool, and the pacing never asks
+    /// for two at once anyway.
+    state: tokio::sync::Mutex<HashMap<Pk, Live>>,
 }
 
 struct Live {
     cdp: Cdp,
+    /// The profile it runs on: the account's own.
+    profile: std::path::PathBuf,
     /// The DevTools session of the tab the requests are sent from.
     tab: String,
     /// The origin the tab is on. `about:blank` until the first request.
@@ -156,8 +161,10 @@ struct Live {
     /// The isolated world the requests are sent from, in the document the tab
     /// is on now; `None` until one is made. See [`tab::isolated_world`].
     world: Option<i64>,
-    /// The account whose cookies have been checked in the browser.
-    synced: Option<Pk>,
+    /// The session whose cookies have been checked in the browser, by its
+    /// fingerprint: a new login for the same account is a different session,
+    /// and has to reach a browser that is still open.
+    synced: Option<String>,
     /// What is known about the profile; see [`ProfileMark`].
     mark: ProfileMark,
 }
@@ -167,7 +174,7 @@ impl Headless {
         Self {
             paths,
             wanted: std::sync::Mutex::new(None),
-            state: tokio::sync::Mutex::new(None),
+            state: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -184,29 +191,37 @@ impl Headless {
     }
 
     async fn close(&self) {
-        if let Some(live) = self.state.lock().await.take() {
+        let open: Vec<Live> = self
+            .state
+            .lock()
+            .await
+            .drain()
+            .map(|(_, live)| live)
+            .collect();
+        for live in open {
             live.cdp.close().await;
         }
     }
 
     async fn send_inner(&self, request: PageRequest) -> Result<PageResponse, PageError> {
+        let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
+        let session = self.wanted().map_err(broken)?;
+        let account = session.ds_user_id;
         let mut state = self.state.lock().await;
-        if state.is_none() {
-            *state = Some(
-                self.start()
-                    .await
-                    .map_err(|e| PageError::Browser(format!("{e:#}")))?,
-            );
-        }
-        let live = state.as_mut().expect("started just above");
+        let live = match state.entry(account) {
+            std::collections::hash_map::Entry::Occupied(open) => open.into_mut(),
+            std::collections::hash_map::Entry::Vacant(none) => {
+                none.insert(self.start(&session).await.map_err(broken)?)
+            }
+        };
 
-        let result = self.send_on(live, &request).await;
+        let result = self.send_on(live, &session, &request).await;
         if let Err(PageError::Browser(_)) = &result {
             // A browser that failed once is not trusted with the next request:
             // it may be gone. The next request starts a fresh one. Only then —
             // a request the network dropped says nothing about the browser,
             // and relaunching it would load the site again for nothing.
-            if let Some(live) = state.take() {
+            if let Some(live) = state.remove(&account) {
                 live.cdp.close().await;
             }
         }
@@ -216,21 +231,22 @@ impl Headless {
     async fn send_on(
         &self,
         live: &mut Live,
+        session: &Session,
         request: &PageRequest,
     ) -> Result<PageResponse, PageError> {
         let broken = |e: anyhow::Error| PageError::Browser(format!("{e:#}"));
         let origin = origin_of(&request.url).map_err(broken)?;
-        let session = self.wanted().map_err(broken)?;
-        if live.synced != Some(session.ds_user_id) {
+        let given = session.fingerprint();
+        if live.synced.as_deref() != Some(given.as_str()) {
             let mut mark = live.mark.clone();
-            sync_cookies(live, &session, &origin, &mut mark)
+            sync_cookies(live, session, &origin, &mut mark)
                 .await
                 .map_err(broken)?;
             if mark != live.mark {
-                mark.write(&self.paths);
+                mark.write(&live.profile);
                 live.mark = mark;
             }
-            live.synced = Some(session.ds_user_id);
+            live.synced = Some(given);
             // A tab already on the site loaded as whoever was there before.
             live.origin = String::new();
         }
@@ -247,9 +263,9 @@ impl Headless {
     /// Starts the browser. A second snob already running one on this profile
     /// makes Chrome hand over to it and exit, which `cdp::connect` recognizes
     /// and says in so many words.
-    async fn start(&self) -> Result<Live> {
-        let session = self.wanted()?;
-        let mut mark = ProfileMark::read(&self.paths);
+    async fn start(&self, session: &Session) -> Result<Live> {
+        let (profile, _) = profile::for_account(&self.paths, session.ds_user_id)?;
+        let mut mark = ProfileMark::read(&profile);
         // The browser that made the profile, while it is still installed; then
         // the one the session names; then the first found. See `ProfileMark`
         // for why the first answer is the one that matters.
@@ -295,7 +311,7 @@ impl Headless {
 
         // What this browser says about the machine, asked of it once without
         // `--user-agent` (which blanks it) and kept. See `machine_hints`.
-        let hints = machine_hints(&browser, &self.paths, &mut mark).await;
+        let hints = machine_hints(&browser, &self.paths).await;
 
         let flags = vec![
             "--headless=new".to_string(),
@@ -318,12 +334,12 @@ impl Headless {
                 .to_string(),
         ];
         let cancel = CancelToken::default();
-        let launched = crate::cdp::launch_headless(&browser, &self.paths, &flags, &cancel)
+        let launched = crate::cdp::launch_headless(&browser, &profile, &flags, &cancel)
             .await
             .with_context(|| format!("could not start {} without a window", browser.name))?;
         let cdp = Cdp::connect(launched, &cancel).await?;
-        if claim || hints.fresh {
-            mark.write(&self.paths);
+        if claim {
+            mark.write(&profile);
         }
 
         let version = cdp.browser_call("Browser.getVersion", json!({})).await?;
@@ -341,7 +357,7 @@ impl Headless {
         // auto-attach each one is paused before it runs and handed the same
         // override (`cdp::OnAttach`). The language is left alone everywhere:
         // the profile's own, which is what the login sent.
-        let metadata = metadata(&user_agent, &full_version, hints.values.as_ref());
+        let metadata = metadata(&user_agent, &full_version, hints.as_ref());
         let identity = json!({ "userAgent": user_agent, "userAgentMetadata": metadata });
         let page_commands = vec![
             ("Emulation.setUserAgentOverride", identity.clone()),
@@ -398,6 +414,7 @@ impl Headless {
 
         Ok(Live {
             cdp,
+            profile,
             tab,
             origin: "about:blank".to_string(),
             world: None,
@@ -445,7 +462,7 @@ fn refuse_root() -> Result<()> {
     {
         // SAFETY: `geteuid` takes nothing, touches no memory and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
-            bail!(
+            anyhow::bail!(
                 "snob sends its requests from a browser, and Chromium will not run as root \
                  with its sandbox on.\n\
                  Run snob as an ordinary user, or set SNOB_NO_BROWSER=1 to send the requests \

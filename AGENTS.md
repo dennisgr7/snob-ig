@@ -267,8 +267,9 @@ each location.
 |---|---|
 | Every request is paid for, once per redirect hop | `Pacer::clear_to_send`, inside `IgClient::get_body`; the page follows no redirect on an API call (`FETCH` in `headless/tab.rs`) and a navigation's hop is paid in `answer_from_page` |
 | Every request to Instagram leaves from snob's own browser, unless told otherwise | `client::page`, installed from `main::run`; `SNOB_NO_BROWSER` |
-| A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::profile::sync_cookies`, `ProfileMark` |
-| The profile a failed login finds is never deleted; only one it created | `login::by_browser` |
+| One account is sent from one browser profile, and two accounts never share one | `AppPaths::browser_profile_for`, `headless::profile::for_account`; the engine keeps a browser per account |
+| A login is authoritative; after it, the browser's jar is, and a browser holding exactly the stored session is left alone; a profile holding another account's cookies is emptied first (a fallback, and said) | `headless::profile::sync_cookies`, `ProfileMark` |
+| The profile a failed login finds is never deleted, only one it created; a login's profile takes the account's place, and the older one comes back if the session is refused | `login::by_browser`, `headless::profile::ProfileSwap` |
 | A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
 | Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs, is let go at once whoever is waiting, and keeps the identity when the session that gave it goes | the dispatcher in `cdp::connection` (`attached`, `detached`), `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
 | A protocol call can be given up at any point, and a crash, a lost session or a closed pipe fails exactly the calls waiting on it | `cdp::Connection::call` (the id is registered before the write and forgotten on drop); the dispatcher never awaits a reply of its own |
@@ -378,9 +379,10 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   which are the hard part. `cdp/connection.rs` follows Puppeteer's
   `Connection` and Playwright's `crConnection.ts`.
 - **`snob purge` deletes the stored data and not the binary**, session first;
-  the package manager owns the binary. **`snob logout` deletes the browser
-  profile** as well as the stored session: the profile is where the live
-  session is.
+  the package manager owns the binary. **`snob logout` deletes every
+  account's browser profile** as well as the stored session: a profile is
+  where a live session is, and only one session is ever stored, so a profile
+  of any other account is a session nothing would use or clear again.
 - **The Windows credential is `CRED_PERSIST_LOCAL_MACHINE`** — it stays on the
   machine that created it; `secrets.rs::entry_for` carries the experiment.
 - **There is no lease over `watch_marks`**: two overlapping runs can report
@@ -449,20 +451,16 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   `archive/reel/day_shells/` (the story archive).
 - **The browser as the whole engine, and several accounts.** Researched,
   measured and planned in September 2026. In order, because each step is
-  what the next one stands on; the first is built (`cdp/connection.rs`: one
-  reader of its own, calls that can be dropped and run side by side, an
-  attach answered the moment it arrives — a worker created while snob was
-  idle started 1,309 ms late before it and 9–12 ms after, measured on
-  Chromium 141 by `tests/headless.rs`), and the rest stand on it:
-  2. **A browser profile per account** (`browser-profile/<pk>`), with its
-     own mark. Today there is one profile and switching accounts clears its
-     cookies and site data so two accounts do not share a device identity;
-     with several accounts stored that would throw the device away at every
-     switch. The rules: one account is only ever sent from one browser —
-     one session used from two browsers at once is the shape of a stolen
-     session — and two accounts never share a profile. Sharing the address
-     is ordinary; a household does. With this step, two accounts can run in
-     parallel, a browser each.
+  what the next one stands on. The first two are built: a protocol client
+  with a reader of its own (`cdp/connection.rs`: calls that can be dropped
+  and run side by side, an attach answered the moment it arrives — a worker
+  created while snob was idle started 1,309 ms late before it and 9–12 ms
+  after, measured on Chromium 141 by `tests/headless.rs`), and a browser
+  profile per account (`browser-profile/<pk>`, each with its own mark; the
+  one profile an earlier version kept is moved under the account it holds).
+  Several accounts at once need more than a browser each: only one session
+  can be stored, and the cooldown and budget in SQLite are the session's,
+  not an account's. The rest stand on these:
   3. **One owner of the browsers.** A process per user, started by the
      first command and gone when idle, holding one browser per account in
      use and closing each after some minutes without a request (memory is
@@ -522,8 +520,9 @@ comments next to the tables they concern.
 - The binary is ~5.2 MB on `aarch64-pc-windows-msvc` (x86_64 about a third
   larger). Bundled SQLite is ~9% of it; the `xlsx` feature ~9% more (it is a
   default feature a source build can leave out); `ratatui` cost +106 KiB.
-- The Chromium profile is ~87 MB, which dwarfs all of that. It is kept — the
-  requests are sent from it — and `snob logout` removes it.
+- A Chromium profile is ~87 MB, which dwarfs all of that, and there is one
+  per account logged in. Each is kept — the account's requests are sent from
+  it — and `snob logout` removes them all.
 - **What the browser costs a run**, measured September 2026 on a Raspberry Pi
   5 with Chromium 153 against a local fake Instagram: `snob whoami` went from
   0.12 s and 0.14 s of CPU to about 2.7 s and 1.9 s, and the browser holds

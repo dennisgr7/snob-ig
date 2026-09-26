@@ -42,6 +42,7 @@ async fn the_browser_answers_on_the_pipe_and_opens_no_port() {
 
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let paths = AppPaths::rooted_at(temporary.path());
+    let profile = paths.browser_profile_for(snob_core::Pk::new(1));
     let cancel = CancelToken::default();
 
     // **A browser that will not start is not a failed assertion here.**
@@ -58,7 +59,7 @@ async fn the_browser_answers_on_the_pipe_and_opens_no_port() {
     // rather than something false. The transport is still covered -- the
     // Windows and macOS runners both start a browser and run every assertion
     // below, and the port check is the whole point of the test.
-    let started = match cdp::launch(&found, &paths, &cancel).await {
+    let started = match cdp::launch(&found, &profile, &cancel).await {
         Ok(launched) => cdp::Cdp::connect(launched, &cancel).await,
         Err(e) => Err(e),
     };
@@ -79,7 +80,7 @@ async fn the_browser_answers_on_the_pipe_and_opens_no_port() {
     // The file the old transport wrote, and the one anything looking for the
     // port would read. `launch` removes a stale copy before starting, so its
     // absence here means this browser did not write one.
-    let active_port = paths.browser_profile().join("DevToolsActivePort");
+    let active_port = profile.join("DevToolsActivePort");
     assert!(
         !active_port.exists(),
         "the browser wrote {} , so it is listening on a port after all",

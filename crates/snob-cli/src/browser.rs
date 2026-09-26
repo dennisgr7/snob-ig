@@ -42,6 +42,18 @@ impl Browser {
         }
         ua
     }
+
+    /// A browser nobody detected, for the tests of what is kept about one.
+    #[cfg(test)]
+    pub(crate) fn at(path: &str, full_version: &str) -> Self {
+        Self {
+            name: "Chrome",
+            path: PathBuf::from(path),
+            major_version: major_version_from_text(full_version).unwrap_or(0),
+            full_version: full_version.to_string(),
+            suffix: None,
+        }
+    }
 }
 
 /// The platform part of the User-Agent.
