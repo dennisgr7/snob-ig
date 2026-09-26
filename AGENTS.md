@@ -410,9 +410,15 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   Edge on a Windows desktop reaches it has not been measured: that is the next
   step, before anything is built. Everything else a page or its service worker
   measured is corrected in `headless.rs`, whose header lists each.
-- **Two snob runs cannot share the browser.** The profile is Chromium's, and a
-  second launch on it exits (0 or 21); the second run fails and says another
-  snob holds it rather than waiting its turn.
+- **Two snob runs cannot share the browser, and a run holds it for as long
+  as it lasts.** The profile is Chromium's, and a second launch on it exits
+  (0 or 21); the second run fails and says another snob holds it rather than
+  waiting its turn. Measured with two runs of one account started together:
+  the second failed in 0.6 s. The browser is closed only when the command
+  ends (`main::run`) or between monitor runs, so an interactive view left
+  open — a profile card sitting idle in one terminal — holds it too, and
+  every command that needs the network fails in any other terminal. The way
+  out is the owner process in "Open, not yet taken".
 - **Real behavior on a live 429 has never been provoked on purpose.** The
   handling is verified against a recorded body; `Retry-After` and the load
   headers are logged (`IgClient::note_push_back`) and deliberately not acted
@@ -426,28 +432,111 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
 - Two endpoints worth a command someday, both GETs about the viewer's own
   account: `friendships/pending/` (follow requests awaiting an answer) and
   `archive/reel/day_shells/` (the story archive).
-- **The browser as the whole engine**, in the order the pieces depend on each
-  other. Each step is open, and none is required by the one before it works:
-  - *A protocol client with its own reader.* `cdp.rs` reads the pipe only
-    while a command waits for its reply, which is enough for auto-attach but
-    not for listening: a reader task routing replies by id and events by
-    session is what the next three need.
-  - *Listening to the page's own traffic.* Not to charge it (that is
-    settled: see "The site's own page is loaded, and not charged"), but
-    because it is Instagram talking to this session too: a 429 or a
-    challenge on one of the app's calls is a push-back snob hears today
-    only at its own next request.
-  - *One owner of the browser.* Two runs cannot share the profile, so the
-    monitor and a typed command collide. A long-lived process that owns the
-    browser, with the commands as its clients over a local socket, removes
-    that and keeps one warm, continuous session — the terminal as the skin.
-  - *Reading the app instead of calling the API.* Opening an account's
-    followers and scrolling, reading the app's own answers off the network,
-    makes every request exactly one the app itself sends. Slower, and tied
-    to the page's markup; the fetch path stays as the fallback.
-  - *The session back into the keyring.* The browser rotates cookies and the
-    stored copy never learns; reading them back at shutdown keeps a profile
-    loss from reverting to a stale session.
+- **The browser as the whole engine, and several accounts.** Researched,
+  measured and planned in September 2026; nothing below is built. In order,
+  because each step is what the next one stands on:
+  1. **A protocol client with its own reader.** `cdp.rs` reads the pipe only
+     while a command waits for its reply, and takes one caller at a time
+     (`&mut self`, behind `Headless`'s mutex). Measured and read, what that
+     costs today:
+     - A target auto-attached while snob sleeps between requests stays
+       paused until the next one: a worker created one second into a
+       six-second gap started 5.1 s late (8–12 ms with a reader). A late
+       worker is itself a timing tell.
+     - `Cdp::noticed` runs inside the caller's future, so a timeout or a
+       Ctrl+C that drops it between taking an attach and sending
+       `Runtime.runIfWaitingForDebugger` leaves that target paused for good.
+       `fire`'s failures are never seen.
+     - Every service worker is attached twice, once by the browser-level
+       auto-attach and once by the tab's; it works by accident.
+     - A crashed tab (`Inspector.targetCrashed`) leaves the pending call to
+       run out its whole timeout; a message over `pipe::MAX_MESSAGE_BYTES`
+       ends the connection rather than failing one call.
+
+     The design: one dispatcher task owns the read side and routes replies
+     by id (a guard registered before sending removes the pending entry when
+     the caller's future is dropped, so calls are cancel-safe and
+     concurrent) and events by `sessionId`; it handles each attach itself,
+     once per target, and fails a session's calls on `detachedFromTarget`,
+     `Inspector.targetCrashed` or a `-32001` reply, and every call with the
+     exit reason when the pipe closes. It never awaits a reply of its own —
+     that would deadlock it — and never panics (`panic = "abort"`). An
+     oversized frame is skipped to its terminator and fails only its call.
+     Subscribers get events with `try_send` and lose them rather than hold
+     up replies. `Cdp` stays as a façade while the callers move over.
+     **No crate:** `chromiumoxide` is WebSocket-only and enables `Runtime`
+     on every frame; `headless_chrome` is port-only, not flat, quits after
+     30 s without a message and `expect`s in its reader. Neither handles the
+     inherited pipe descriptors or the Windows job object, which are the
+     hard part here. Puppeteer's `Connection` and Playwright's
+     `crConnection.ts` are the structure to copy. Tests: the dispatcher
+     against a scripted fake browser over `Read + Write` (out-of-order
+     replies, a dropped future, end of stream, a crash, `-32001`), and a
+     browser test that a worker created while snob is idle starts in under
+     200 ms.
+  2. **A browser profile per account** (`browser-profile/<pk>`), with its
+     own mark. Today there is one profile and switching accounts clears its
+     cookies and site data so two accounts do not share a device identity;
+     with several accounts stored that would throw the device away at every
+     switch. The rules: one account is only ever sent from one browser —
+     one session used from two browsers at once is the shape of a stolen
+     session — and two accounts never share a profile. Sharing the address
+     is ordinary; a household does. With this step, two accounts can run in
+     parallel, a browser each.
+  3. **One owner of the browsers.** A process per user, started by the
+     first command and gone when idle, holding one browser per account in
+     use and closing each after some minutes without a request (memory is
+     the real cost, see "Costs worth knowing"). The commands become its
+     clients over a local socket restricted to the user (a 0700 directory;
+     an ACL on Windows) that speaks snob's own requests and never exposes the
+     protocol — a port once handed the session cookie to any local process.
+     Two views of one account share its browser, a tab each, their requests
+     interleaved and paced by the budget already shared through SQLite; a
+     terminal on another account gets that account's browser; and no
+     command pays a cold start. This is what makes two interfaces open at
+     once work, which is the ordinary case rather than two walks.
+  4. **Listening to the page's own traffic for push-back.** Not to charge it
+     (settled: "The site's own page is loaded, and not charged") but because
+     it is Instagram talking to this session: a 429 or a challenge on one of
+     the app's calls is heard today only at snob's own next request (7.2 s
+     against 3.3 s in the measurement above). `Network.enable` on the tab
+     with small buffers, and `Target.setDiscoverTargets` for the tab so an
+     in-app route to `/challenge/` is seen without a request. Only XHR, fetch
+     and document requests to Instagram's hosts count. A 429 counts at once;
+     other candidates are judged by `declares_failure` and `classify` from a
+     body read at `loadingFinished` — not earlier, when there is none yet,
+     and not after a main-frame navigation, which clears it — and **in a task
+     of its own**, since a read inside the dispatcher would wait on its own
+     reply. The first push-back is recorded once and latched; the tab goes to
+     `about:blank`, and `Page::send` refuses from then on. **snob's own
+     requests must not be recorded again**: a cooldown repeated within a day
+     doubles (`rate_budget.rs`), so one 429 would count twice. They are told
+     apart by their initiator (the isolated world's has an empty URL,
+     measured; that all of the app's have one is not). Capture the app's
+     real traffic with `tools/capture/record.js` before choosing the paths
+     and size thresholds. `Fetch.enable` stays what refuses video and is
+     never used to listen: it pauses every request it matches.
+  5. **Reading the app instead of calling the API.** Opening an account's
+     followers and scrolling, reading the app's own answers off the network
+     (`getResponseBody` at `loadingFinished`), makes every request one the app
+     itself sends. Slower, and tied to the page's markup; the fetch path stays
+     as the fallback.
+  6. **The session back into the keyring.** The browser rotates cookies and
+     the stored copy never learns; reading them back at shutdown keeps a
+     profile loss from reverting to a stale session.
+- **Checks nobody has run yet.**
+  - `tests/headless.rs` has only run against Chromium on Linux ARM64. The
+    first CI run on Windows (x86_64 and ARM64) and macOS is its first
+    against Chrome or Edge there; a red run is most likely there.
+  - Whether a headless Chrome or Edge on a Windows desktop reaches the real
+    GPU (see the WebGL wall).
+  - Whether detaching from a service worker drops the identity it was given,
+    and whether a worker attached twice needs releasing twice.
+  - Whether Ubuntu's snap Chromium can open a profile under a hidden
+    directory of the home at all (suspected not).
+  - The Homebrew and Scoop notes (`packaging/render.sh`) gain the line that
+    a Chromium-based browser is needed with the next release; they are
+    checked against the released 0.5.0, which did not need one.
 
 ## Costs worth knowing
 
@@ -460,6 +549,15 @@ comments next to the tables they concern.
   default feature a source build can leave out); `ratatui` cost +106 KiB.
 - The Chromium profile is ~87 MB, which dwarfs all of that. It is kept — the
   requests are sent from it — and `snob logout` removes it.
+- **What the browser costs a run**, measured September 2026 on a Raspberry Pi
+  5 with Chromium 153 against a local fake Instagram: `snob whoami` went from
+  0.12 s and 0.14 s of CPU to about 2.7 s and 1.9 s, and the browser holds
+  about 425 MB while it runs (proportional set size; summing each process's
+  resident size says ~960 MB, counting shared pages many times). Instagram's
+  real page, which boots the whole app, is heavier and has not been measured.
+  Beside a walk's page every one to two minutes the start is noise; it shows
+  on the quick commands and in memory, and each account in use at once is a
+  browser. The machine hints cost one more browser start per browser update.
 - `clap` without `color` and `zstd` out of `Accept-Encoding` would save real
   bytes and are **kept anyway**, as positions: help in color, and an
   `Accept-Encoding` that is Chrome's character for character.
