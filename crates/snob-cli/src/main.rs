@@ -250,7 +250,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     };
 
     // Every request to Instagram goes out from a browser from here on, unless
-    // this run was told not to — see `headless.rs`. The switch is for a
+    // this run was told not to — see `headless/`. The switch is for a
     // machine with no Chromium browser on it, and for comparing the two.
     if std::env::var_os("SNOB_NO_BROWSER").is_none() {
         snob_cli::headless::install(&paths);

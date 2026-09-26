@@ -228,7 +228,7 @@ async fn by_browser(
     // succeeded.
     //
     // **Kept when the login worked.** The profile is the device every request
-    // is now sent from (`headless.rs`): removing it would make each login a
+    // is now sent from (`headless/`): removing it would make each login a
     // new, never-seen browser, and the next run would have nowhere to send
     // from but a fresh one. It still goes when the login did not happen and
     // this login is what created it, which is the case the paragraph above is
@@ -263,7 +263,7 @@ async fn by_browser(
 ///
 /// **87.2 MB and 886 files, and possibly a half-finished session.** A login
 /// that worked keeps its profile, because every request is sent from it now
-/// (`headless.rs`); one that failed or was abandoned has nothing to keep it
+/// (`headless/`); one that failed or was abandoned has nothing to keep it
 /// for, and was the only thing that made it. `by_browser` says which.
 ///
 /// Guarded by `is_safe_to_remove` like every other recursive delete here, and

@@ -48,7 +48,7 @@ use anyhow::Result;
 /// sent one would decide how much memory this process uses. `Browser.getVersion`
 /// and `Storage.getCookies` answer in kilobytes; this is far above anything
 /// real. A message over it is skipped to its terminator and fails only the
-/// call it answers ([`Frame::Oversized`]); what `headless.rs` asks the page to
+/// call it answers ([`Frame::Oversized`]); what `headless/` asks the page to
 /// hand back is still capped below it, in the bytes it will take here, so an
 /// answer that matters is never the one thrown away.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;

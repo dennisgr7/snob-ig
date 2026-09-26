@@ -35,7 +35,7 @@ pub fn run(args: LogoutArgs, store: SecretStore, paths: &AppPaths) -> Result<Exi
     }
 
     // **Always, now.** The browser profile is where every request is sent
-    // from (`headless.rs`), so it holds the live session — kept current by
+    // from (`headless/`), so it holds the live session — kept current by
     // the browser, fresher than the stored copy — and a logout that left it
     // would leave the session on the machine while saying it had gone. The
     // flag that used to ask for this is accepted and changes nothing.

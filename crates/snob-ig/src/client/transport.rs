@@ -369,7 +369,7 @@ impl IgClient {
     /// The same three promises as the `reqwest` loop above, kept differently.
     /// **Paid for first**, through the same `clear_to_send`. **No hop goes out
     /// unpaid**: the page follows no redirect on an API call (see `FETCH` in
-    /// `headless.rs`), so a redirect comes back as status 0 and is refused
+    /// `headless/tab.rs`), so a redirect comes back as status 0 and is refused
     /// here, with nothing sent after it. **The origin rule holds** for the one
     /// request a browser does follow redirects on, a document navigation:
     /// [`Self::answer_from_page`] refuses an answer that ended up anywhere but

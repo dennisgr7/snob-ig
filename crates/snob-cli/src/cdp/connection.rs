@@ -628,7 +628,7 @@ impl Shared {
     /// Fails a request the browser paused for this connection.
     ///
     /// Nothing is paused but what a `Fetch.enable` asked for, and the only one
-    /// sent is `headless.rs`'s, which asks for video and nothing else: so a
+    /// sent is `headless/`'s, which asks for video and nothing else: so a
     /// paused request is one to refuse, and it is refused the way a content
     /// blocker refuses one — `BlockedByClient`, which is what a page sees
     /// from the extensions a great many people run.

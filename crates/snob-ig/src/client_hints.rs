@@ -2,7 +2,7 @@
 //! User-Agent itself.
 //!
 //! **This dresses the `reqwest` path, which is no longer the ordinary one.**
-//! Every request to Instagram now leaves from a real browser (`headless.rs` in
+//! Every request to Instagram now leaves from a real browser (`headless/` in
 //! `snob-cli`, behind [`crate::client::page`]), which sends its own client
 //! hints, handshake and header order; the argument below about not copying a
 //! browser was about a process that was not one, and stands for that path

@@ -13,7 +13,7 @@
 //!
 //! So this crate defines only the shape of such a request and the one place a
 //! client picks it up. Launching and driving the browser is `snob-cli`'s
-//! (`headless.rs`), which already owns the DevTools pipe for the login; this
+//! (`headless/`), which already owns the DevTools pipe for the login; this
 //! crate still compiles no browser code at all.
 //!
 //! The pacing, the budgets, the cooldowns and the classification of every

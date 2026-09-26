@@ -8,7 +8,7 @@ reasoning behind individual changes live in the commit messages, not here.
 here**: the request pacing in `pace.rs`, the stop conditions in `pager.rs`, the
 schema in `store/sql/`, the cookie boundary in `cdp/mod.rs`, the protocol's
 reader in `cdp/connection.rs`, the browser requests are sent from in
-`headless.rs`, the headers in `client_hints.rs`. Read those before changing any of them — they explain what a
+`headless/mod.rs`, the headers in `client_hints.rs`. Read those before changing any of them — they explain what a
 number is for, which is what stops it being changed into something that no
 longer does the job it was there to do.
 
@@ -32,7 +32,7 @@ There is no official API for listing followers — Meta removed it in 2018 — s
 this asks the same web API instagram.com asks, with the user's own session
 cookie, **from a real browser**: every request leaves from a Chrome, Edge,
 Brave or Chromium that snob runs without a window against its own profile,
-sent with `fetch()` from an instagram.com tab (`headless.rs`). The owner's
+sent with `fetch()` from an instagram.com tab (`headless/`). The owner's
 direction is that the browser becomes the whole engine — a complete client
 toward Instagram — with the terminal as the skin on top of it. Automating that is outside Instagram's Terms of Use, as it is for every
 tool in this category, and the realistic outcome for a user is that Instagram
@@ -235,7 +235,7 @@ Two rules keep it that way:
 
 **The browser is behind a seam.** `snob-ig` defines the shape of a request a
 page sends (`client::page`) and compiles no browser code; `snob-cli`'s
-`headless.rs` launches the browser on a run's first request, shares it across
+`headless/mod.rs` launches the browser on a run's first request, shares it across
 every client in the process, and closes it at the end (`main::run`, and
 between monitor runs). Pacing, budgets, cooldowns and classification are the
 same for both transports: only the last hop changes hands. `SNOB_NO_BROWSER=1`
@@ -265,14 +265,14 @@ each location.
 
 | Rule | Where it lives |
 |---|---|
-| Every request is paid for, once per redirect hop | `Pacer::clear_to_send`, inside `IgClient::get_body`; the page follows no redirect on an API call (`FETCH` in `headless.rs`) and a navigation's hop is paid in `answer_from_page` |
+| Every request is paid for, once per redirect hop | `Pacer::clear_to_send`, inside `IgClient::get_body`; the page follows no redirect on an API call (`FETCH` in `headless/tab.rs`) and a navigation's hop is paid in `answer_from_page` |
 | Every request to Instagram leaves from snob's own browser, unless told otherwise | `client::page`, installed from `main::run`; `SNOB_NO_BROWSER` |
-| A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::sync_cookies`, `ProfileMark` |
+| A login is authoritative; after it, the browser's jar is; another account's cookies are cleared first | `headless::profile::sync_cookies`, `ProfileMark` |
 | The profile a failed login finds is never deleted; only one it created | `login::by_browser` |
 | A page failure is told apart: network (retried), no CSRF token, the browser itself (restarted) | `client::page::PageError` |
 | Every target the browser starts — worker, frame, service worker — gets the tab's identity before it runs, is let go at once whoever is waiting, and keeps the identity when the session that gave it goes | the dispatcher in `cdp::connection` (`attached`, `detached`), `cdp::OnAttach`, `Target.setAutoAttach` in `headless::Headless::start` |
 | A protocol call can be given up at any point, and a crash, a lost session or a closed pipe fails exactly the calls waiting on it | `cdp::Connection::call` (the id is registered before the write and forgotten on drop); the dispatcher never awaits a reply of its own |
-| snob's requests run where the page's scripts cannot see them | `headless::isolated_world` |
+| snob's requests run where the page's scripts cannot see them | `headless::tab::isolated_world` |
 | No video the site loads reaches the page, so opening it adds no plays to anybody's reels | `headless::refuse_video`, `refuse_paused` in `cdp::connection`; `tests/headless.rs` |
 | Nothing is spent while the account is in cooldown | `Pacer::clear`; `SNOB_IGNORE_COOLDOWN` is the undocumented escape hatch |
 | A 429 or push-back puts the account in cooldown | `IgClient::classify_and_record` |
@@ -353,7 +353,7 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   the TLS handshake, HTTP/2, cookies and headers are Chromium's; snob corrects
   only what running headless changes (the `HeadlessChrome` token, the screen,
   `navigator.webdriver`) and states the client hints the browser reports for
-  itself (`headless.rs`). `client_hints.rs` and `headers.rs` still dress the
+  itself (`headless/`). `client_hints.rs` and `headers.rs` still dress the
   `reqwest` path, which is sent for internal consistency, not disguise. One
   target differs for build reasons alone: Windows ARM64 uses schannel,
   documented in `crates/snob-ig/Cargo.toml`, and `--strict-roots` is refused
@@ -424,7 +424,7 @@ One line each; the fuller reasoning is in the doc-comment at the pointer.
   What would fix it is the machine's real GPU, and whether a headless Chrome or
   Edge on a Windows desktop reaches it has not been measured: that is the next
   step, before anything is built. Everything else a page or its service worker
-  measured is corrected in `headless.rs`, whose header lists each.
+  measured is corrected in `headless/`, whose `mod.rs` header lists each.
 - **Two snob runs cannot share the browser, and a run holds it for as long
   as it lasts.** The profile is Chromium's, and a second launch on it exits
   (0 or 21); the second run fails and says another snob holds it rather than
